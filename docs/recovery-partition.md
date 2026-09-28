@@ -63,7 +63,7 @@ This is the honest outcome. A recovery partition that cannot meet the servicing 
 
 ## The OS partition resize sequence
 
-When the script needs to create a new partition, it performs this sequence:
+When the script needs to create a new partition, it performs this sequence.
 
 ### 1. Pre-checks
 
@@ -82,13 +82,34 @@ Since v38, the pre-check is **advisory**. The script proceeds with the destructi
 
 ### 3. Suspend BitLocker
 
-`Suspend-BitLockerForWinRE -MountPoint "C:"`. If suspension fails and BitLocker is not confirmed off, abort the destructive attempt.
+`Suspend-BitLockerForWinRE -MountPoint "C:"`. This is the v43 patch 5-guarded step. The function queries both `ProtectionStatus` and `VolumeStatus` from `Get-BitLockerVolume` and applies this decision table:
+
+| `ProtectionStatus` | `VolumeStatus` | Verdict | Action |
+|---|---|---|---|
+| `On` | any | Protected | `Suspend-BitLocker -RebootCount 1`, verify, proceed |
+| `Off` | `FullyDecrypted` | Confirmed unprotected | No suspension needed, proceed |
+| `Off` | empty | Confirmed unprotected (some builds report empty for never-touched volumes) | No suspension needed, proceed |
+| `Off` | any other value | Unknown — Device Encryption in progress | Refuse, abort the destructive attempt |
+
+The last row is the v43 patch 5 fix. Before patch 5, only `ProtectionStatus` was consulted, and a volume mid-encryption (`VolumeStatus=EncryptionInProgress` with `ProtectionStatus=Off`) was treated as confirmed unprotected. The Device Encryption service then claimed the newly created recovery partition before the recovery type GUID could be applied, and `reagentc /enable` refused. Two machines hit this in the same day; see [troubleshooting.md](troubleshooting.md) for the recovery procedure.
+
+When the guard refuses, it logs:
+
+```
+BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
+```
+
+and returns `$false`. `Ensure-AdequateRecoveryPartition` interprets this as a failure of the destructive attempt and returns `$null`. The main flow falls through to OS-fallback, or exits cleanly if the machine was not yet scheduled for a destructive rebuild.
+
+If `Get-BitLockerVolume` returns `$null`, the fallback path parses `manage-bde -status` text output for `Protection On` / `Protection Off`. The text-parse fallback does not have access to `VolumeStatus` and can therefore miss the mid-encryption case; it is present for compatibility with machines where the BitLocker module is not loaded, and it is not the primary path on modern hardware.
 
 ### 4. Delete existing recovery partitions
 
 For each recovery partition on the OS disk, `Remove-Partition`. If that fails, retry with `diskpart delete partition override`. If the partition survives both attempts, abort with `FATAL`.
 
 **Note: this is a point of no return.** The script logs this explicitly before the first delete. If a subsequent step fails and the script falls back to OS-fallback, the deleted partitions are gone. The script does not attempt to restore them; the OS-fallback path deploys the WIM to `C:\Recovery\WindowsRE` instead.
+
+This step only runs after step 3 has confirmed the BitLocker state is safe.
 
 ### 5. Extend the OS partition
 
@@ -128,18 +149,22 @@ If `Restore-OSPartitionSize` itself fails (either the resize or the post-resize 
 
 The new partition is created at an offset rounded up from the (new) OS partition end to the next 1 MiB boundary. Size is `bucketSizeMiB * 1MB`. If there is not enough space at that offset, restore the OS partition and abort.
 
-The partition is created with `New-Partition`, retried up to 3 times with offset recalculation between attempts.
+**v43 patch 5: the recovery type code is applied at creation time.** `New-Partition` is called with `-GptType {de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (GPT) or `-MbrType 0x27` (MBR). Before patch 5, the partition was created as a Basic Data partition and its type was changed minutes later by `Set-RecoveryPartitionAttributes`. On a machine with Device Encryption actively encrypting, the encryption service could claim that Basic Data partition during the window and start encrypting it. Applying the recovery type at creation makes that window zero-width: there is no moment when the partition is a plain data partition.
+
+The `New-Partition` call is retried up to 3 times with offset recalculation between attempts, matching the pre-patch-5 behaviour.
 
 ### 9. Format and attribute
 
 `Format-Volume -FileSystem NTFS -NewFileSystemLabel 'Recovery'`.
 
-Immediately after format, `Set-RecoveryPartitionAttributes` applies:
+Immediately after format, `Set-RecoveryPartitionAttributes` runs. It applies:
 
-- **GPT**: `set id=de94bba4-06d1-4d40-a16a-bfd50179d6ac` and `gpt attributes=0x8000000000000001`.
-- **MBR**: `set id=27`.
+- **GPT**: `set id=de94bba4-06d1-4d40-a16a-bfd50179d6ac` (idempotent with the type GUID already set at creation) and `gpt attributes=0x8000000000000001`.
+- **MBR**: `set id=27` (idempotent with the type code already set at creation).
 
-**Attributes are set before drive-letter assignment.** This is critical. A freshly-formatted NTFS partition with a normal data type GUID and a drive letter is a candidate for BitLocker Device Encryption auto-encryption on Windows 11 24H2+. Setting the recovery type GUID and the PLATFORM_REQUIRED + NO_DRIVE_LETTER attribute first tells BitLocker the partition is not a data volume. Confirmed by diagnostic: a recovery-typed partition with these attributes reports "The volume could not be opened by BitLocker" and has no `Win32_EncryptableVolume` entry, while still accepting a temporary drive letter for deployment.
+The type code is idempotent on this call; the attribute step is what actually adds new state here. **Attributes are set before drive-letter assignment.** This is critical. A freshly-formatted NTFS partition with a drive letter is a candidate for BitLocker Device Encryption auto-encryption on Windows 11 24H2+. Setting the recovery type GUID and the PLATFORM_REQUIRED + NO_DRIVE_LETTER attribute first tells BitLocker the partition is not a data volume. Confirmed by diagnostic: a recovery-typed partition with these attributes reports "The volume could not be opened by BitLocker" and has no `Win32_EncryptableVolume` entry, while still accepting a temporary drive letter for deployment.
+
+The v35 change introduced the attribute-before-letter ordering. The v43 patch 5 change introduced type-GUID-at-creation. Together they close the auto-encryption window from both sides: the type GUID is present from the moment the partition exists, and the attributes are present before any drive letter is assigned.
 
 ### 10. Drive letter and encryption verification
 
@@ -151,13 +176,15 @@ If it **is** encrypted (state `$true`), the script:
 
 1. Calls `Suspend-BitLockerForWinRE -MountPoint "C:"` again.
 2. Deletes the encrypted partition.
-3. Recreates it with a fresh offset (geometry may have changed).
+3. Recreates it with a fresh offset (geometry may have changed), and with the recovery type GUID applied at creation (v43 patch 5).
 4. Re-formats and re-applies attributes.
 5. Re-verifies.
 
 If it is **still** encrypted after the retry, `Remove-OrphanPartition` deletes it and the function returns `$null`. The main flow falls through to OS-fallback.
 
 If the state is **unknown** (`$null`), the script proceeds with a warning and lets `reagentc /enable` surface any issue.
+
+**Note on the retry:** the delete-and-recreate retry was the reactive fallback the pre-patch-5 code relied on. On a machine mid-Device-Encryption, the retry failed as well because the encryption service re-grabbed the second partition. With v43 patch 5, the step-3 guard prevents the destructive attempt from starting in that state, so the retry only fires when the partition was encrypted by some other mechanism (e.g. a BitLocker policy that auto-encrypts new partitions on a machine where C: is fully encrypted and protected). In that case the retry's second `Suspend-BitLockerForWinRE` call will suspend C: and the recreate should succeed.
 
 ### 11. Success
 
@@ -229,17 +256,21 @@ The script handles both partition styles.
 
 - Recovery type: `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}`.
 - Attributes: `0x8000000000000001` (`GPT_ATTRIBUTE_PLATFORM_REQUIRED` + `GPT_ATTRIBUTE_NO_DRIVE_LETTER`).
+- Type code applied at creation via `New-Partition -GptType` (v43 patch 5).
+- Attributes applied after format via `Set-RecoveryPartitionAttributes`.
 - Detection during `Get-RecoveryPartitions`: match on `GptType`.
 
 **MBR:**
 
 - Recovery type: `0x27` (`PARTITION_IFS` with the recovery flag).
+- Type code applied at creation via `New-Partition -MbrType 0x27` (v43 patch 5).
 - Detection during `Get-RecoveryPartitions`: match on `MbrType`.
 
-The script determines the style from `Get-OSDisk`'s `PartitionStyle` property and passes the appropriate value to `Set-RecoveryPartitionAttributes`.
+The script determines the style from `Get-OSDisk`'s `PartitionStyle` property and passes the appropriate value to both `New-Partition` and `Set-RecoveryPartitionAttributes`.
 
 ## Related documents
 
 - [architecture.md](architecture.md) — where the partition lifecycle fits in the pipeline.
 - [state-and-idempotency.md](state-and-idempotency.md) — how `GeometryRestoreFailed` interacts with the state file.
+- [troubleshooting.md](troubleshooting.md) — the recovery procedure if the partition is lost.
 - [driver-injection.md](driver-injection.md) — what happens before the partition work.
