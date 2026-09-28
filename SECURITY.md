@@ -13,20 +13,27 @@ Security-relevant areas:
 
 ## Reporting a vulnerability
 
-**Do not open a public issue.** Email `security@<yourdomain>` with:
+**Do not open a public issue.**
+
+Report vulnerabilities privately through one of these channels:
+
+1. **GitHub Security Advisories** (preferred) — open a private advisory at <https://github.com/ArthurJDurand/WinRE-Manager/security/advisories/new>.
+2. If you cannot use GitHub Security Advisories, open a blank issue at <https://github.com/ArthurJDurand/WinRE-Manager/issues/new> with only the word `security-contact` in the title and no body. A maintainer will reach out to you by reply.
+
+Include:
 
 - Affected version.
 - Reproduction steps.
 - Impact assessment.
 - Whether the vulnerability is reachable without elevation.
 
-You will receive a response within 72 hours.
+You will receive a response within 72 hours. This is a best-effort project; the maintainer is a single individual, and coordinated disclosure timelines will be negotiated in good faith.
 
 ## Known limitations (not vulnerabilities)
 
 The following are documented behaviour, not defects:
 
-- `Invoke-WebRequest` in `scripts/WinRE.ps1` uses `-UseBasicParsing` and a static User-Agent. This is intentional — the script does not need a full browser engine and the User-Agent is used to bypass CDN blocks on some vendor sites.
+- `Invoke-WebRequest` in `scripts/WinRE.ps1` uses `-UseBasicParsing` and a static User-Agent. This is intentional — the script does not need a full browser engine, and the User-Agent is used to bypass CDN blocks on some vendor sites.
 - The fallback copy to `C:\Recovery\WindowsRE\winre.wim` is attempted even if the primary deployment succeeded. An ACL denial is logged and treated as non-fatal.
 - Driver packs are downloaded from the OEM's own CDN. The project does not redistribute them.
 - The GitHub-hosted driver manifest and OEM maps are community-maintained. Do not trust them for anything beyond this project's scope.
