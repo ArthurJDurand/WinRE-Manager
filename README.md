@@ -21,7 +21,7 @@ Windows ships a working recovery environment out of the box. It stops working wh
 
 - A Windows Update replaces the recovery partition's `winre.wim` with a newer one, but the partition is too small to hold it or the OS-side fallback copy drifts out of sync.
 - BitLocker auto-encrypts a freshly created recovery partition, and `reagentc /enable` refuses to activate it.
-- **Device Encryption is mid-encryption** on a Windows 11 24H2+ machine (`VolumeStatus=EncryptionInProgress` while `ProtectionStatus` reads `Off`). In that state the encryption service claims any new partition the script creates, before the recovery type GUID can be applied, and `reagentc /enable` refuses. This is the failure mode fixed in v43 patch 5 — see [troubleshooting.md](docs/troubleshooting.md) for the full explanation and recovery procedure.
+- **Device Encryption is mid-encryption** on a Windows 11 24H2+ machine (`VolumeStatus=EncryptionInProgress` while `ProtectionStatus` reads `Off`). Without the v43 patch 5 guard, the encryption service would claim any new partition the script creates, before the recovery type GUID could be applied, and `reagentc /enable` would refuse. This is the failure mode fixed in v43 patch 5; the script now refuses the destructive partition work in that state and exits with `EXIT_WARNING` — see [troubleshooting.md](docs/troubleshooting.md) for the full explanation and recovery procedure.
 - The OEM's WinPE driver pack is missing or stale, so the recovery environment cannot see the storage controller (especially Intel VMD).
 - A disk migration or clone leaves the reagentc registration pointing at a partition that no longer exists.
 - A recovery partition ends up on a **secondary** disk, where it can confuse the boot loader and cause Startup Repair to fail.
@@ -64,7 +64,7 @@ Recommended deployment method is a scheduled task running as `SYSTEM`, triggered
 |------|------|---------|
 | `0` | `EXIT_SUCCESS` | WinRE enabled, dedicated recovery partition healthy, state file written. |
 | `1` | `EXIT_REBOOT_REQUIRED` | Deployment succeeded; a reboot is required to complete registration. |
-| `2` | `EXIT_WARNING` | WinRE functional but degraded (OS-fallback, incomplete injection, geometry restore, cleanup failure, or v43 patch 5 Device Encryption guard deferral) — or nothing to do but a warning was raised. |
+| `2` | `EXIT_WARNING` | WinRE functional but degraded (OS-fallback, incomplete injection, geometry restore, cleanup failure), **or** the run made no changes to the machine and deferred work (v43 patch 5 Device Encryption guard), **or** nothing to do but a warning was raised. |
 | `3` | `EXIT_FATAL` | Deployment aborted. No state written. Investigate the log. |
 
 `EXIT_REBOOT_REQUIRED` has priority over `EXIT_WARNING`. `EXIT_FATAL` always wins.
@@ -79,7 +79,7 @@ See [`docs/exit-codes.md`](docs/exit-codes.md) for the full matrix.
 - **7-Zip** at `C:\Program Files\7-Zip\7z.exe`. `WinRE.ps1` will attempt to install it via `winget` if missing.
 - **Internet access** to: `gist.github.com`, `api.github.com`, `downloads.dell.com`, `ftp.ext.hp.com`, `download.lenovo.com`, `support.lenovo.com`.
 - **`reagentc.exe`** in `PATH` (present on all supported SKUs).
-- **Stable BitLocker state.** `manage-bde -status C:` must read `Fully Decrypted` or `Fully Encrypted`. The script defers destructive partition work if the state is `Encryption In Progress` or `Encryption Paused` (v43 patch 5). See [`docs/deployment.md`](docs/deployment.md) for the Device Encryption precondition.
+- **Stable BitLocker state.** `manage-bde -status C:` must read `Fully Decrypted` or `Fully Encrypted`. The script defers destructive partition work if the conversion status is one of the four mid-operation states (`Encryption In Progress`, `Decryption In Progress`, `Encryption Paused`, `Decryption Paused`), including the Device Encryption in-progress state where `ProtectionStatus` reads `Off` but `VolumeStatus` is one of the four (v43 patch 5). See [`docs/deployment.md`](docs/deployment.md) for the Device Encryption precondition.
 
 ## Repository layout
 
@@ -126,9 +126,11 @@ The production script has been through 43 versions and 5 patches within v43. Ful
 | HP | ProBook 450 15.6 inch G10 (i7-1355U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
 | Lenovo | 21L1 (ThinkPad) | Win11 | DEDICATED |
 | Dell | Latitude 3550 (Core Ultra 5 125U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
+| Dell | Pro Slim QCS1250 (Core Ultra 5 235) | Win11 26200 | v43 patch 5 (revised) — guard fired correctly, machine left unchanged |
+| Dell | Vostro 16 5640 (Intel Core 7 150U) | Win11 26200 | v43 patch 5 (revised) — guard fired correctly, machine left unchanged |
 | (VM) | Hyper-V Windows 10 MBR | Win10 | DEDICATED |
 
-The two Device Encryption failures are documented in [`docs/troubleshooting.md`](docs/troubleshooting.md) with the recovery procedure. v43 patch 5 prevents them from recurring.
+The two Device Encryption failures pre-patch-5 are documented in [`docs/troubleshooting.md`](docs/troubleshooting.md) with the recovery procedure. v43 patch 5 prevents them from recurring. The two Dell machines logged under "v43 patch 5 (revised)" ran against a machine mid-encryption; the guard refused the destructive path, no partition was touched, no state file was written, and the run exited with `EXIT_WARNING`. Both machines will complete the dedicated-partition deployment automatically on the next run after their encryption state stabilises.
 
 ## Contributing
 
