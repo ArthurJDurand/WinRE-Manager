@@ -99,3 +99,41 @@ See [state-and-idempotency.md](state-and-idempotency.md) for the schemas and the
 ## The idempotency key
 
 `DesiredStateId` is a SHA256 over a deterministic set of inputs:
+HW=<Manufacturer>|<Model>|<MachineType>
+OS=<Build>
+MANIFEST=<manifest.version>
+OEMPACK=<resolved OEM pack version or NONE>
+SCRIPT=<ScriptVersion>
+
+text
+
+Any change to any of those five fields changes the ID. When the ID differs from the stored state file's ID, the state file is treated as stale and the script rebuilds. When the ID matches, the fast path can fire.
+
+The design deliberately excludes things that change frequently but should not trigger a rebuild: the current date, the current WIM hash at the registered location (that's a separate check), and the machine's serial number.
+
+## Control-flow invariants
+
+These are the invariants the script maintains. Each one has a real field failure behind it; the `.NOTES` block in `scripts/WinRE.ps1` names them as "CRITICAL LESSONS LEARNED."
+
+1. **Exactly one recovery partition exists, on the OS disk, correctly type-coded.** Enforced on the fast path, the enable-only path, both pending-reboot exits, and Step 7 of the full-update path. A type-coded recovery partition on any non-OS disk is deleted unconditionally. The invariant is absolute.
+2. **No failure path leaves C: permanently shrunken.** Every post-shrink failure calls either `Remove-OrphanPartition` (which absorbs freed space back) or `Restore-OSPartitionSize`. Every failure of `Restore-OSPartitionSize` sets `$Script:GeometryRestoreFailed` so the state file is deleted and the next run retries from clean.
+3. **The state-write gate is never relaxed.** `Write-WinREState` is only called when `$Script:ImageInjectionComplete` is `$true` and a WIM hash was computed. A failed injection never leaves a state file behind. The one exception is the pending-reboot path, which re-writes the existing state file with an updated `PendingReboot` flag but does not update the hash.
+4. **BitLocker is never assumed Off.** All protection-state checks are tri-state (`$true` protected, `$false` unprotected, `$null` unknown). Any code path that would delete, resize, or format a partition refuses to proceed when the state is `$null`.
+5. **Recovery partition attributes are set before drive-letter assignment.** A freshly-formatted NTFS partition with a normal data type and a drive letter is a candidate for Device Encryption auto-encryption. Setting the recovery type GUID and `0x8000000000000001` (PLATFORM_REQUIRED + NO_DRIVE_LETTER) first closes that window.
+6. **Self-referential file operations are guarded.** Any block that deletes a file and then writes to the same path (or copies another file onto it) checks first that the source and destination are not the same file (by `[System.IO.Path]::GetFullPath`). This guards against the v42 "fallback copy ate its own source" bug.
+7. **Checkpoint advancement requires injection success.** A checkpoint that says "step 3 completed" is only written when image injection actually completed. This is v43 patch 4's fix.
+
+## Where the design choices bite
+
+The two most consequential decisions in the whole script are:
+
+- **Dedicated recovery partition is the primary objective; OS-fallback is the failure outcome.** The script will attempt the destructive repartitioning path even when the pre-check suggests the OS cannot shrink enough. If the attempt fails, the OS is restored and OS-fallback is used with exit code 2. This is a deliberate trade: try hard for the good outcome, fall back honestly when the attempt fails. The alternative — never try if the arithmetic is pessimistic — was tried in v37 and rejected because `SizeMin` is a hint, not a floor.
+
+- **The `DesiredStateId`-scoped retry policy.** A machine in OS-fallback with a matching state file stays in OS-fallback indefinitely, without re-attempting the destructive path. A state change (script version bump, manifest update, hardware change, or a Windows build update changing the OS value) naturally re-arms the retry. This avoids re-shrinking the OS on every run of a machine that cannot shrink.
+
+## Related documents
+
+- [state-and-idempotency.md](state-and-idempotency.md) — details on the state file, checkpoint file, and how they interact.
+- [recovery-partition.md](recovery-partition.md) — the partition lifecycle in depth.
+- [driver-injection.md](driver-injection.md) — injection and the success gate.
+- [exit-codes.md](exit-codes.md) — every exit path.
