@@ -29,6 +29,3 @@
 *.ps1  diff=powershell
 *.psm1 diff=powershell
 *.psd1 diff=powershell
-
-# Linguist: mark the map builders as PowerShell, not JSON
-*.json linguist-language=JSON

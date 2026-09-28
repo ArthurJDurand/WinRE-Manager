@@ -939,10 +939,11 @@ function Show-SystemDiagnostic {
             # state that a suspended machine will never reach on its own.
             $vs = [string]$blv.VolumeStatus
             $hazardous = $false
+            $ambiguous = $false
             if ($blv.ProtectionStatus -ne 'On' -and $vs) {
                 switch ($vs) {
                     'FullyDecrypted'       { $hazardous = $false }
-                    'FullyEncrypted'       { $hazardous = $false }
+                    'FullyEncrypted'       { $ambiguous = $true }   # v43 patch 5 (further revision)
                     'EncryptionInProgress' { $hazardous = $true }
                     'DecryptionInProgress' { $hazardous = $true }
                     'EncryptionPaused'     { $hazardous = $true }
@@ -955,7 +956,15 @@ function Show-SystemDiagnostic {
                 Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) but VolumeStatus=$vs." -Level WARN
                 Say "           Device Encryption is actively encrypting or decrypting the OS volume." -Level WARN
                 Say "           Production v43 patch 5 will refuse destructive partition work in this state." -Level WARN
-                Say "           Wait until VolumeStatus=FullyDecrypted or VolumeStatus=FullyEncrypted before running WinRE.ps1." -Level WARN
+                Say "           Wait until VolumeStatus=FullyDecrypted, or VolumeStatus=FullyEncrypted with ProtectionStatus=On." -Level WARN
+            }
+            if ($ambiguous) {
+                Say ""
+                Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) with VolumeStatus=$vs." -Level WARN
+                Say "           This state is ambiguous: legitimate suspension, OR Device Encryption" -Level WARN
+                Say "           Waiting-for-Activation. Production v43 patch 5 refuses destructive" -Level WARN
+                Say "           partition work in this state. Resolve by waiting for either" -Level WARN
+                Say "           ProtectionStatus=On (protection re-armed) or VolumeStatus=FullyDecrypted." -Level WARN
             }
         } else {
             Say "  Get-BitLockerVolume returned null (module not loaded, cmdlet failed, or requires elevation)"

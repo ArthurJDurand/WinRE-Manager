@@ -65,6 +65,12 @@ This is the honest outcome. A recovery partition that cannot meet the servicing 
 
 When the script needs to create a new partition, it performs this sequence.
 
+### 0. Startup BitLocker gate
+
+Before any of the steps below run, the main flow has already performed a startup BitLocker gate. Immediately after `Get-WinREState` and before the pending-reboot block, the script queries `Get-BitLockerVolume` on C:. If the volume is `ProtectionStatus=Off` with a `VolumeStatus` other than `FullyDecrypted` (including `FullyEncrypted`), or if `ProtectionStatus` is neither `On` nor `Off`, the run logs the reason, removes the checkpoint file, and exits with `EXIT_WARNING`. No partition is touched; no state file is written; `reagentc` state is unchanged. Under `-DryRun` the gate is skipped (the DryRun branch of `Suspend-BitLockerForWinRE` reports the hazard instead).
+
+The consequence for this document is that the resize sequence below is only entered on machines whose BitLocker state was confirmed safe at startup. The mid-run checks in step 2 and step 6 of the sequence are backstops for the narrow window where the machine's BitLocker state changes between the startup query and the destructive work.
+
 ### 1. Pre-checks
 
 Read the current OS partition size `S`, the required bucket size `B`, and the OS partition's `SizeMin` `M`. Compute the reclaimable recovery space `R`.
@@ -84,23 +90,43 @@ Since v38, the pre-check is **advisory**. The script proceeds with the destructi
 |---|---|---|---|
 | `On` | any | Protected | `Suspend-BitLocker -RebootCount 1`, verify, proceed |
 | `Off` | `FullyDecrypted` | Confirmed unprotected | No suspension needed, proceed |
-| `Off` | `FullyEncrypted` | Confirmed unprotected (suspended) | No suspension needed, proceed |
 | `Off` | empty | Confirmed unprotected (some builds report empty for never-touched volumes) | No suspension needed, proceed |
-| `Off` | `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused` | Hazardous — Device Encryption mid-operation | `Suspend-BitLockerForWinRE` returns `$false` immediately; abort the destructive attempt |
+| `Off` | `FullyEncrypted` | Ambiguous — could be a legitimate suspension, could be Device Encryption *Waiting for Activation* (recovery key not yet escrowed). The two-field local view cannot distinguish them. | `Suspend-BitLockerForWinRE` returns `$false`; the destructive attempt is deferred. **Do not proceed.** |
+| `Off` | `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused` | Hazardous — Device Encryption is actively encrypting or decrypting the volume | `Suspend-BitLockerForWinRE` returns `$false` immediately; abort the destructive attempt |
 
-`FullyEncrypted` with `ProtectionStatus=Off` is the standard suspended-BitLocker state — what every machine enters after `Suspend-BitLocker` or a Windows Update suspension that has not yet been lifted — and is safe for destructive partition work. The initial v43 patch 5 only whitelisted `FullyDecrypted` (plus empty) and incorrectly rejected `FullyEncrypted`, which would have refused the destructive path on any machine whose BitLocker was already suspended.
+Two rows cause a refusal, for different reasons.
 
-The hazardous row is the v43 patch 5 fix. Before patch 5, only `ProtectionStatus` was consulted, and a volume mid-encryption (`VolumeStatus=EncryptionInProgress` with `ProtectionStatus=Off`) was treated as confirmed unprotected. The Device Encryption service then claimed the newly created recovery partition before the recovery type GUID could be applied, and `reagentc /enable` refused. Two machines hit this in the same day; see [troubleshooting.md](troubleshooting.md) for the recovery procedure.
+**The ambiguous row** (`FullyEncrypted+Off`) is the further-revision change. It is the state every machine enters after a legitimate `Suspend-BitLocker` or a Windows Update suspension that has not yet been lifted — but it is also indistinguishable from a Device Encryption volume in the *Waiting for Activation* state, where the volume has been encrypted with a clear key but protection has not been armed because the recovery key has not yet been escrowed. On a *Waiting for Activation* volume, servicing WinRE risks a recovery prompt on the next boot if the boot environment change trips TPM measurements, and the key has not been escrowed anywhere the user can retrieve. The script cannot tell the two cases apart from the local two-field view, so it defers both. An extra pipeline run later is cheaper than an unrepairable machine.
 
-When the guard refuses, it logs:
+The initial v43 patch 5 implementation whitelisted `FullyEncrypted+Off` as safe, based on the observation that it is the standard post-`Suspend-BitLocker` state. That was correct in the narrow case, but it was wrong in the *Waiting for Activation* case. The further revision treats the state as ambiguous. `FullyDecrypted` and empty remain the only confirmed-safe states.
+
+**The hazardous rows** (`EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`) are the original patch 5 fix. Before patch 5, only `ProtectionStatus` was consulted, and a volume mid-encryption (`VolumeStatus=EncryptionInProgress` with `ProtectionStatus=Off`) was treated as confirmed unprotected. The Device Encryption service then claimed the newly created recovery partition before the recovery type GUID could be applied, and `reagentc /enable` refused. Two machines hit this in the same day; see [troubleshooting.md](troubleshooting.md) for the recovery procedure.
+
+**Ownership guard.** The ambiguous classification above would otherwise have broken the healthy path: after the script itself suspended BitLocker (`ProtectionStatus=On` → `Suspend-BitLocker` → `ProtectionStatus=Off, VolumeStatus=FullyEncrypted`), a later call in the same run would see the state the script had just created, classify it as ambiguous, and refuse. `Suspend-BitLockerForWinRE` therefore short-circuits with `return $true` at the top of its non-DryRun body if `$Script:BitLockerSuspended` is set. That flag means "this run suspended BitLocker and owns the resume." The ambiguous-state classification applies only to states observed at the start of the run, not to states the script itself produced. Without this guard, Step 5's pre-deploy gate would skip deployment on a machine the script was already committed to modifying — worse than the behaviour the ambiguous classification was introduced to replace.
+
+**Refusal log messages.** When the guard refuses, it logs one of two distinct messages, depending on which row fired.
+
+Ambiguous state:
+
+```
+BitLocker on C:: ProtectionStatus=Off with VolumeStatus=FullyEncrypted - this state is ambiguous (could be a legitimate suspension, or Device Encryption in Waiting-for-Activation). Refusing to proceed with destructive partition work until the state is resolved to FullyDecrypted or ProtectionStatus=On.
+```
+
+Hazardous state:
 
 ```
 BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
 ```
 
-and returns `$false`. `Ensure-AdequateRecoveryPartition` interprets this as a failure of the destructive attempt and returns `$null` without having touched the disk. The main flow falls through to OS-fallback, or exits cleanly if the machine was not yet scheduled for a destructive rebuild.
+Both return `$false`. `Ensure-AdequateRecoveryPartition` interprets the refusal via the `$Script:BitLockerGuardDeferred` flag and returns `$null` without having touched the disk. The main flow exits with `EXIT_WARNING` and a single deferral line:
 
-If `Get-BitLockerVolume` returns `$null`, the fallback path parses `manage-bde -status` text output for `Protection On` / `Protection Off`. The text-parse fallback does not have access to `VolumeStatus` and can therefore miss the mid-encryption case; it is present for compatibility with machines where the BitLocker module is not loaded, and it is not the primary path on modern hardware.
+```
+BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run after VolumeStatus on C: stabilises to FullyDecrypted or FullyEncrypted. Exit code will be 2.
+```
+
+No partition is deleted, no WIM is deployed, WinRE is not disabled, and no state file is written.
+
+If `Get-BitLockerVolume` returns `$null`, the fallback path parses `manage-bde -status` text output. The v43 patch 5 (further revision) tightened this fallback so that `Protection Off` alone is no longer sufficient evidence of safety: only a confirmed `Conversion Status: Fully Decrypted` makes the fallback return confirmed-unprotected; anything else returns unknown. The fallback cannot detect the ambiguous `FullyEncrypted+Off` case any better than the primary API can, so it also returns unknown for that state and the guard refuses. The fallback is present for compatibility with machines where the BitLocker module is not loaded, and it is not the primary path on modern hardware.
 
 **Ordering (v43 patch 5, revised).** The BitLocker safety check runs **before** the WinRE disable in `Ensure-AdequateRecoveryPartition`. The original patch 5 implementation disabled WinRE first and then refused, which left the machine with WinRE disabled and no way to re-enable it until encryption finished — the exact damaged state the patch was written to prevent. With the reordering, the guard fires while WinRE is still registered and functional, so a refusal leaves the machine unchanged.
 
@@ -189,7 +215,7 @@ If it is **still** encrypted after the retry, `Remove-OrphanPartition` deletes i
 
 If the state is **unknown** (`$null`), the script proceeds with a warning and lets `reagentc /enable` surface any issue.
 
-**Note on the retry:** the delete-and-recreate retry was the reactive fallback the pre-patch-5 code relied on. On a machine mid-Device-Encryption, the retry failed as well because the encryption service re-grabbed the second partition. With v43 patch 5, the step-2 guard prevents the destructive attempt from starting in that state, so the retry only fires when the partition was encrypted by some other mechanism (e.g. a BitLocker policy that auto-encrypts new partitions on a machine where C: is fully encrypted and protected). In that case the retry's second `Suspend-BitLockerForWinRE` call will suspend C: and the recreate should succeed.
+**Note on the retry:** the delete-and-recreate retry was the reactive fallback the pre-patch-5 code relied on. On a machine mid-Device-Encryption, the retry failed as well because the encryption service re-grabbed the second partition. With v43 patch 5, the startup gate and the step-2 guard prevent the destructive attempt from starting in that state, so the retry only fires when the partition was encrypted by some other mechanism (e.g. a BitLocker policy that auto-encrypts new partitions on a machine where C: is fully encrypted and protected). In that case the retry's second `Suspend-BitLockerForWinRE` call will suspend C: and the recreate should succeed — and because of the ownership guard, if this same run already suspended BitLocker for the first partition, the second call returns `$true` immediately without re-querying.
 
 ### 11. Success
 

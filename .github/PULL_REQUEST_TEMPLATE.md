@@ -21,7 +21,8 @@
 
 - [ ] `Get-Command -Syntax .\scripts\WinRE.ps1` succeeds
 - [ ] `.\scripts\WinRE.ps1 -DryRun` completes
-- [ ] `.\scripts\Test-WinRE.ps1` completes
+- [ ] `.\scripts\Test-WinRE.ps1 -NonInteractive` completes
+- [ ] `.\scripts\Test-WinRE.ps1` completes interactively (menu path exercised)
 - [ ] Field-tested on a GPT machine
 - [ ] Field-tested on an MBR machine
 - [ ] If the shrink path is touched: tested on hardware with OS partition at `SizeMin`

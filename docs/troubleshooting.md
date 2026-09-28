@@ -12,7 +12,7 @@ The first line is `========== WinRE Manager Started (v<version>) ==========`. Th
 
 ## The machine has no recovery partition and WinRE is disabled
 
-**This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 or later, this failure mode no longer occurs.**
+**This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 or later, this failure mode no longer occurs.** The v43 patch 5 (further revision) startup gate prevents a machine whose BitLocker state is unsafe at startup from reaching the destructive path at all, so even a machine mid-encryption will be deferred before any partition is touched.
 
 **Symptom.** After a run that exited with code 3 (`EXIT_FATAL`), the machine has:
 
@@ -57,7 +57,8 @@ manage-bde -status C:
 Read the `Conversion Status:` line.
 
 - If it says `Fully Decrypted` — encryption was never active or was already aborted. Continue to step 2.
-- If it says `Fully Encrypted` and `Protection Status: Protection On` — encryption completed and the key was escrowed. Continue to step 2.
+- If it says `Fully Encrypted` with `Protection On` — encryption completed and the key was escrowed. Continue to step 2.
+- If it says `Fully Encrypted` with `Protection Off` — the machine is in the ambiguous suspended/Waiting-for-Activation state (see the "`Suspend-BitLockerForWinRE` reports ambiguous state" section below). Wait for it to resolve to either `Protection On` (activation completed and key escrowed) or `Fully Decrypted`. Do not proceed until then.
 - If it says `Encryption In Progress` or `Encryption Paused` — the encryption service is still active. Wait for it to complete (typically 30 minutes to a few hours on a 256 GB SSD, longer on HDD), or abort it:
 
   ```powershell
@@ -66,20 +67,24 @@ Read the `Conversion Status:` line.
 
   This starts decryption. On a machine mid-encryption, decryption is usually faster than encryption. Wait until `Conversion Status:` reads `Fully Decrypted` before continuing.
 
-**Step 2 — confirm the state is now stable.** Re-run the status command. It must show either `Fully Decrypted` (with `Protection Off`) or `Fully Encrypted` (with `Protection On`). The `Encryption In Progress`, `Decryption In Progress`, `Encryption Paused`, and `Decryption Paused` states are all hazardous.
+**Step 2 — confirm the state is now safe.** Re-run the status command. It must show either:
+- `Protection On` (any conversion status), or
+- `Protection Off` with `Fully Decrypted`.
+
+The states `Encryption In Progress`, `Decryption In Progress`, `Encryption Paused`, and `Decryption Paused` are hazardous. `Protection Off` with `Fully Encrypted` is ambiguous and also deferred by the script.
 
 **Step 3 — update `WinRE.ps1` to v43 patch 5 or later.** Check the `.NOTES` block at the top of the file for a `v43 patch 5` entry. If it is missing, apply the patch before proceeding.
 
-**Step 4 — re-run `WinRE.ps1`.** With v43 patch 5 and a stable BitLocker state, the script will:
+**Step 4 — re-run `WinRE.ps1`.** With v43 patch 5 and a confirmed-safe BitLocker state, the script will:
 
-1. Detect the BitLocker state correctly (either `FullyDecrypted` or `FullyEncrypted`, both safe).
+1. Pass the startup BitLocker gate.
 2. Suspend BitLocker if needed.
 3. Create the recovery partition with the recovery type GUID applied at creation.
 4. Deploy the WIM, register, and enable WinRE.
 
 The machine returns to a `DEDICATED` end state.
 
-**Immediate interim fix.** If the machine must be returned to service before you can update the script, `reagentc /enable` will succeed against the OS-fallback location once C: is in a stable BitLocker state:
+**Immediate interim fix.** If the machine must be returned to service before you can update the script, `reagentc /enable` will succeed against the OS-fallback location once C: is in a confirmed-safe BitLocker state:
 
 ```powershell
 reagentc /setreimage /path C:\Recovery\WindowsRE
@@ -103,11 +108,13 @@ reagentc /enable failed because the target volume is BitLocker-protected
 
 **Cause.** The target recovery partition or volume is BitLocker-managed. Two scenarios produce this.
 
-**Scenario 1 — v43 patch 5 and later.** This should not happen on a healthy machine. If you are seeing this on patch 5, the hazard state (Section 1 above) is present despite the guard, which means either the script was not updated or the encryption started between the guard's check and the partition creation. Investigate:
+**Scenario 1 — v43 patch 5 (further revision) and later.** This should not happen. The startup BitLocker gate and the two mid-run gates are fail-closed, and the `blunsafe` result from `Invoke-ReagentcEnable` prevents the call from even being attempted when BitLocker on C: is not confirmed unprotected. If you are seeing this on the further revision despite all of that, the most likely explanations are:
 
-1. Confirm `.NOTES Version : 43` at the top of the script and that the `v43 patch 5` changelog block is present.
-2. Check `manage-bde -status C:` — the state must be stable (`Fully Decrypted` or `Fully Encrypted`), never `Encryption In Progress`.
-3. If both are correct, file a bug with the full log.
+1. The script was not updated. Confirm `.NOTES Version : 43` and that both the `v43 patch 5` and `v43 patch 5 (further revision)` entries are present.
+2. The target volume is a **recovery partition** that a BitLocker policy has auto-encrypted despite the recovery type GUID and attributes being set. This is the case the reactive delete-and-recreate retry handles (see Scenario 2 below). The recovery partition encryption is independent of C:'s protection state.
+3. The C: state transitioned to unsafe between the last `Test-BitLockerProtected` check and the `reagentc /enable` call — a genuinely narrow window.
+
+For case 1, update the script. For case 2, the reactive retry runs automatically. For case 3, file a bug with the full log and the `manage-bde -status C:` output at the time of the failure.
 
 **Scenario 2 — v43 patch 4 and earlier.** The pre-patch-5 behaviour is the reactive fallback described below. This is the failure mode patch 5 was designed to prevent.
 
@@ -115,7 +122,7 @@ reagentc /enable failed because the target volume is BitLocker-protected
 
 1. Suspends BitLocker on C:.
 2. Deletes the encrypted recovery partition.
-3. Recreates it (with attributes set before drive-letter assignment, per v35).
+3. Recreates it (with attributes set before drive-letter assignment, per v35; recovery type GUID applied at creation, per v43 patch 5).
 4. Redeploys the WIM.
 5. Retries `reagentc /enable`.
 
@@ -243,11 +250,15 @@ BitLocker Get-BitLockerVolume on C: returned null - falling back to manage-bde -
 
 **Cause.** The BitLocker module is not loaded, the cmdlet failed, or the machine lacks the BitLocker feature. This is common on client SKUs where BitLocker is not enabled or on Windows Home.
 
-**Resolution.** Automatic. The fallback path parses `manage-bde -status` output for `Protection On` or `Protection Off`. If the parse succeeds, the script proceeds normally. If the parse fails (neither string present), `$protectionState` remains `$null` and `Suspend-BitLockerForWinRE` refuses to proceed.
+**Resolution.** Automatic. The fallback path parses `manage-bde -status` output. As of v43 patch 5 (further revision), the fallback is tightened: `Protection Off` alone is no longer sufficient evidence of safety. Only a confirmed `Conversion Status: Fully Decrypted` makes the fallback return confirmed-unprotected; anything else returns unknown, and the guard refuses. The fallback also cannot detect the ambiguous `Fully Encrypted + Protection Off` case any better than the primary API can, so it returns unknown for that state as well.
 
-The refusal is deliberate: the script will not assume BitLocker is off when it cannot confirm. The destructive paths abort and the main flow falls back to OS-fallback.
+The refusal is deliberate: the script will not assume BitLocker is safe when it cannot confirm. The destructive paths abort and the main flow defers with `EXIT_WARNING`.
 
-## `Suspend-BitLockerForWinRE` reports "ProtectionStatus=Off but VolumeStatus=..."
+## `Suspend-BitLockerForWinRE` reports a BitLocker refusal
+
+There are two distinct refusal signatures from `Suspend-BitLockerForWinRE`, for two different reasons. Both cause the same deferral outcome: the machine is unchanged and the run exits with `EXIT_WARNING`. The message text is the only way to tell them apart in the log, and the distinction matters for what you do next.
+
+### Signature A — hazardous (mid-operation)
 
 **Symptom.** The log shows this specific message from `Suspend-BitLockerForWinRE`:
 
@@ -255,17 +266,62 @@ The refusal is deliberate: the script will not assume BitLocker is off when it c
 BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
 ```
 
+(the `VolumeStatus` value will be one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`)
+
 followed by a single deferral line:
 
 ```
 BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run after VolumeStatus on C: stabilises to FullyDecrypted or FullyEncrypted. Exit code will be 2.
 ```
 
-**Cause.** This is the v43 patch 5 (revised) guard firing correctly. Device Encryption is active on C:, and the `VolumeStatus` is one of the four hazardous mid-operation states (`EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`). The script refuses to run the destructive partition path.
+**Cause.** This is the v43 patch 5 guard firing correctly. Device Encryption is actively encrypting or decrypting the OS volume. The script refuses to run the destructive partition path because the encryption service would claim any new partition before the recovery type GUID could be applied.
 
-The two lines shown above together are the **deferral signature**. The first is the guard refusal from `Suspend-BitLockerForWinRE`; the second is the main flow recognizing the refusal via the `$Script:BitLockerGuardDeferred` flag and exiting early with `EXIT_WARNING`. When you see both lines, the machine is unchanged: no partition was deleted, no WIM was deployed, WinRE was not disabled, and no state file was written.
+**Resolution.** Wait for the state to stabilise. From an elevated PowerShell:
 
-Note that this signature is **different** from a genuine partition-creation failure. A real failure logs the four-line banner:
+```powershell
+manage-bde -status C:
+```
+
+Wait until the `Conversion Status:` line reads either `Fully Decrypted` or (if `Protection Status: Protection On`) `Fully Encrypted`. Then re-run `WinRE.ps1`.
+
+Do **not** delete the state file or force the script past this check. The guard exists because the destructive path will damage the machine in this state — see the Section 1 recovery procedure for what happens when the guard is bypassed.
+
+### Signature B — ambiguous (Waiting-for-Activation)
+
+**Symptom.** The log shows this specific message from `Suspend-BitLockerForWinRE`:
+
+```
+BitLocker on C:: ProtectionStatus=Off with VolumeStatus=FullyEncrypted - this state is ambiguous (could be a legitimate suspension, or Device Encryption in Waiting-for-Activation). Refusing to proceed with destructive partition work until the state is resolved to FullyDecrypted or ProtectionStatus=On.
+```
+
+followed by the same single deferral line as Signature A:
+
+```
+BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run after VolumeStatus on C: stabilises to FullyDecrypted or FullyEncrypted. Exit code will be 2.
+```
+
+**Cause.** The OS volume is `ProtectionStatus=Off` with `VolumeStatus=FullyEncrypted`. This is the standard suspended-BitLocker state — what every machine enters after a legitimate `Suspend-BitLocker` or a Windows Update suspension that has not yet been lifted — but it is also indistinguishable from a Device Encryption volume in the *Waiting for Activation* state. In that state the volume has been encrypted with a clear key, but protection has not been armed because the recovery key has not yet been escrowed.
+
+The two-field local view (`ProtectionStatus` + `VolumeStatus`) cannot tell a legitimate suspension from a Waiting-for-Activation volume. The script defers both. On a legitimate suspension, this costs one extra pipeline run. On a Waiting-for-Activation volume, it avoids a potential unrepairable state: servicing WinRE risks a boot-environment change that trips TPM measurements and forces a recovery prompt, and the key has not been escrowed anywhere the user can retrieve it.
+
+**Resolution.** Wait for the state to resolve. From an elevated PowerShell:
+
+```powershell
+manage-bde -status C:
+```
+
+- If the machine is legitimately suspended by an operator or by Windows Update, protection will re-arm on the next reboot or when the suspension is lifted. Then `Protection Status:` reads `Protection On`.
+- If the machine is in Waiting-for-Activation, sign in with the Microsoft account or complete activation through Control Panel → BitLocker Drive Encryption → Resume protection. Once the recovery key is escrowed and protection is armed, `Protection Status:` reads `Protection On`.
+
+Wait until `Protection Status: Protection On` (any conversion status) or `Protection Status: Protection Off` with `Conversion Status: Fully Decrypted`. Then re-run `WinRE.ps1`.
+
+**Do not** attempt to defeat the guard by editing the state file. The guard is the mechanism that prevents the Waiting-for-Activation case from becoming an unrepairable failure. The cost of waiting is one pipeline run; the cost of proceeding is potentially the loss of the machine.
+
+### Distinguishing a deferral from a failure
+
+The two lines shown in both signatures together are the **deferral signature**. The first is the guard refusal from `Suspend-BitLockerForWinRE`; the second is the main flow recognizing the refusal via the `$Script:BitLockerGuardDeferred` flag and exiting early with `EXIT_WARNING`. When you see both lines, the machine is unchanged: no partition was deleted, no WIM was deployed, WinRE was not disabled, and no state file was written.
+
+This signature is **different** from a genuine partition-creation failure. A real failure logs the six-line banner:
 
 ```
 [WARN] ================================================================================
@@ -278,19 +334,21 @@ Note that this signature is **different** from a genuine partition-creation fail
 
 and then proceeds into Step 5 as OS-fallback. A deferral logs none of that banner — it exits before Step 5 with the single deferral line. If you see the banner, the destructive attempt ran and failed; if you see the single deferral line instead, the guard fired before anything was attempted.
 
-Also note that `ProtectionStatus=Off` combined with `VolumeStatus=FullyEncrypted` is **not** this state — it is a normal suspended-BitLocker volume, and the revised guard allows it. Only the four hazardous mid-operation states trigger the refusal.
+### Startup gate vs mid-run gate
 
-**Resolution.** Wait for the state to stabilise. From an elevated PowerShell:
+The startup gate (runs before the pending-reboot block, before any control-flow path is chosen) logs a different message:
 
-```powershell
-manage-bde -status C:
+```
+Deferring WinRE Manager: BitLocker on C: ProtectionStatus=Off with VolumeStatus=EncryptionInProgress - Device Encryption may be actively encrypting or decrypting. No WinRE or partition changes will be made.
 ```
 
-Wait until the `Conversion Status:` line reads either `Fully Decrypted` or `Fully Encrypted`. Then re-run `WinRE.ps1`.
+or, for the ambiguous case:
 
-**Do not** delete the state file or force the script past this check. The guard exists because the destructive path will damage the machine in this state — see the Section 1 recovery procedure for what happens when the guard is bypassed.
+```
+Deferring WinRE Manager: BitLocker on C: ProtectionStatus=Off with VolumeStatus=FullyEncrypted - ambiguous (legitimate suspension, or Device Encryption Waiting-for-Activation). No WinRE or partition changes will be made.
+```
 
-**Do not** mistake the deferral for a failure. The deferral is the guard working correctly. The machine is in the same state it was before the run; the next run, once the encryption state has stabilised, will perform the dedicated-partition work.
+The startup gate fires **before** the control-flow path is chosen, so the deferral happens before `Ensure-AdequateRecoveryPartition` or Step 5 are even reached. On most machines this is the log signature you will see, not the mid-run `BitLocker guard deferred …` line. Both have the same effect: machine unchanged, `EXIT_WARNING`, no state file written.
 
 ## VMD hardware present but no driver matches
 
@@ -339,6 +397,8 @@ BitLocker protection state on C: could not be determined - refusing to treat as 
 3. Update the regexes in `scripts/WinRE.ps1` and mirror them in `scripts/Test-WinRE.ps1`.
 4. File an issue with the raw output and the Windows build number.
 
+**Note.** A `$null` result is not always a bug. As of v43 patch 5 (further revision), `Test-BitLockerProtected` returns `$null` deliberately for the ambiguous `FullyEncrypted+Off` state, and `Suspend-BitLockerForWinRE` returns `$false` for the same state — by design. If the parser self-test passes checks 3 and 4 but the script logs an ambiguous-state deferral, the parser is working correctly. The `$null` return is the guard, not a parser failure.
+
 ## `reagentc /info` location regex fails
 
 **Symptom.** The parser self-test check 2 fails, or the script cannot resolve the WinRE location.
@@ -366,7 +426,7 @@ If the state file is repeatedly disappearing, check:
 1. Whether `Restore-OSPartitionSize` is failing. If it is, `$Script:GeometryRestoreFailed` is set and `Write-WinREState` deletes the state file on purpose. The log will show `Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file`. Investigate why the geometry restore is failing.
 2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
 
-**Not to be confused with the Device Encryption deferral.** If the run exits with `EXIT_WARNING` because the BitLocker guard refused to proceed, the state file will also be unchanged — but that is not a problem with the state file. The two are distinguishable: the deferral leaves the prior state file intact (or leaves it absent if it was absent before); it does not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
+**Not to be confused with the BitLocker deferral.** If the run exits with `EXIT_WARNING` because a BitLocker gate deferred the work, the state file will also be unchanged — but that is not a problem with the state file. The two are distinguishable: the deferral leaves the prior state file intact (or leaves it absent if it was absent before); it does not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
 
 ## The machine is in OS-fallback and stays there
 
@@ -383,6 +443,8 @@ If the state file is repeatedly disappearing, check:
 Do not edit the state file's `UsedOSFallback` field and leave the rest in place; that will not change the `DesiredStateId` and the fast path will continue to fire.
 
 **Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
+
+**Not to be confused with a deferral.** A machine on which a BitLocker gate fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged. See the `Suspend-BitLockerForWinRE` reports a BitLocker refusal section for the distinguishing log signatures.
 
 ## The script is running but nothing is happening
 
@@ -411,9 +473,14 @@ Use it to:
 - Verify that the resolved OEM pack and VMD drivers are what you expect.
 - Verify that the classifier verdict matches what you believe the machine's state to be.
 
-The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, or WinRE registration.
+The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, or WinRE registration. The startup BitLocker gate is also disabled under `-DryRun`.
 
-**One exception:** the v43 patch 5 BitLocker guard runs before the partition work, so a dry run on a machine in a hazardous Device Encryption state (one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`) will still report the hazard and refuse to log the destructive actions. This is intentional. It is a read-only check, not a modification.
+**One exception:** the DryRun branch of `Suspend-BitLockerForWinRE` runs a read-only BitLocker query so that a pre-flight of a machine in an unsafe state reports the hazard rather than logging destructive actions. The check is read-only — no `Suspend-BitLocker` call is made, and `$Script:BitLockerSuspended` is not set — but it will return `$false` and log the refusal for the same set of states the live guard refuses on:
+
+- **Hazardous:** `ProtectionStatus=Off` with `VolumeStatus` one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`.
+- **Ambiguous:** `ProtectionStatus=Off` with `VolumeStatus=FullyEncrypted`.
+
+A dry run that reports either hazard is telling you the machine would be deferred on the next live run. Wait for the state to stabilise (see the two refusal sections above) before running the script for real.
 
 ## Reporting a bug
 
@@ -423,10 +490,10 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - Windows build.
 - Vendor, model, Lenovo machine type.
 - Partition style (GPT or MBR).
-- BitLocker state — **both** `ProtectionStatus` and `VolumeStatus` from `manage-bde -status C:`.
+- BitLocker state — **both** `Protection Status:` and `Conversion Status:` from `manage-bde -status C:`. The `Conversion Status` value matters: `Fully Encrypted` with `Protection Off` is the ambiguous state that the further revision defers on, and `Fully Encrypted` with `Protection On` is a safe state. Omitting the conversion status makes the report impossible to diagnose.
 - Exit code.
 - The relevant slice of the log — not the whole file unless asked.
-- The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine.
+- The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes both BitLocker fields.
 
 ## Related documents
 
