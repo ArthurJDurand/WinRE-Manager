@@ -8,6 +8,7 @@ An interactive PowerShell script that:
 
 - Exercises the download and extraction paths of the production script against live sources.
 - Runs a parser self-test against the local Windows tooling to verify that every regex and API dependency the production script relies on still produces the expected shape.
+- Reports the state of the machine from the same vantage point the production script uses, including a Device Encryption hazard check.
 - Reports results as PASS / FAIL / SKIP.
 - Modifies nothing. Does not touch partitions, BitLocker, WinRE registration, drive letters, or the state file. Does not require elevation.
 
@@ -63,10 +64,26 @@ Read-only information gathering. Dumps:
 - Recovery partitions per `Get-RecoveryPartitions`, with `isTyped`, `isLabel`, and `onOsDisk` annotations.
 - The OS partition's `SizeMin`, `SizeMax`, shrinkable bytes, extendable bytes, and `S == M` status.
 - The bucket sizing preview: for the active WIM's size, what bucket the production script would compute.
-- BitLocker on C: (`ProtectionStatus`, `VolumeStatus`, `EncryptionMethod`, `EncryptionPercentage`).
+- BitLocker on C: (`ProtectionStatus`, `VolumeStatus`, `EncryptionMethod`, `EncryptionPercentage`), **plus a hazard warning when the machine is mid-Device-Encryption** (v12).
 - VMD hardware presence per manifest.
 
 Then it runs the parser self-test (below).
+
+#### Device Encryption hazard warning (v12)
+
+When the BitLocker section reports `ProtectionStatus: Off` together with a `VolumeStatus` of anything other than `FullyDecrypted`, the harness prints an additional warning block:
+
+```
+  WARNING: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress.
+           Device Encryption is actively encrypting the OS volume.
+           Production v43 patch 5 will refuse destructive partition work in this state.
+           Wait until VolumeStatus=FullyDecrypted (encryption aborted) or VolumeStatus=FullyEncrypted
+           with ProtectionStatus=On (encryption completed and key escrowed), then run WinRE.ps1.
+```
+
+This warning exists because two machines were damaged by the pre-v43-patch-5 code on the same day, both on Windows 11 build 26200 mid-Device-Encryption. The production script now refuses to run destructive partition work in this state; the harness makes the hazard visible before the field engineer runs the production script. See [troubleshooting.md](troubleshooting.md) for the full failure mode and recovery procedure.
+
+The warning is a diagnostic, not a test result. It does not produce a PASS/FAIL/SKIP record. It appears in the diagnostic output above the parser self-test.
 
 ### Options 2 through 9 and A/B
 
@@ -133,6 +150,8 @@ The legacy `-Ok` boolean is still supported: when `-State` is not supplied, the 
 Passed 8, failed 1, skipped 1 (of 10)
 ```
 
+The Device Encryption hazard warning is a diagnostic, not a test record. It does not appear in `Show-Summary`.
+
 ## Non-interactive mode
 
 ```powershell
@@ -140,6 +159,8 @@ Passed 8, failed 1, skipped 1 (of 10)
 ```
 
 Runs `Invoke-AllRelevant`, prints the summary, exits.
+
+`-NonInteractive` runs the download and extraction tests. It does not run the System Diagnostic (Option 1), so the Device Encryption hazard warning is not printed in this mode. If you need the hazard check, run the harness interactively and choose Option 1.
 
 The exit code is always 0, regardless of results. The summary is the source of truth. If a pipeline consumer is added later, the minimal change to make the exit code reflect pass/fail is to count FAIL records in `$Script:Results` and exit non-zero when any exist. This is documented in the v11 changelog but not implemented, on the grounds that no consumer currently needs it.
 
@@ -159,10 +180,11 @@ Those paths are covered by field testing on representative hardware. See the "Fi
 
 The harness shares code paths with production in the download, extraction, and CPU-generation helpers. It is documented in the file's own docstring which functions are "based on" the production versions and which are harness-specific.
 
-Two known differences:
+Three known differences:
 
 - **`Get-ThisMachineProfile` is harness-specific.** It uses `BuildNumber -ge 22000` to detect Windows 11; production uses `$os.Caption -like "*Windows 11*"`. The two agree on every Windows 11 client SKU but diverge on Server SKUs with build ≥ 22000. Neither the harness nor production is expected to run on Server.
 - **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test.
+- **The harness does not run `Test-BitLockerProtected`, `Suspend-BitLockerForWinRE`, or any production function that would block destructive work.** The Device Encryption hazard check in the diagnostic is a direct query of `Get-BitLockerVolume` and a comparison of the returned `ProtectionStatus` and `VolumeStatus`, not a call into the production guard. This is intentional: the harness does not exercise production's BitLocker guard logic, and a change to that guard does not require a harness update. The v43 patch 5 change to `Test-BitLockerProtected` and `Suspend-BitLockerForWinRE` therefore does not affect the harness.
 
 ## Adding a test
 
@@ -177,5 +199,6 @@ Do not add tests that modify the machine's state. The harness's contract with th
 
 ## Related documents
 
-- [troubleshooting.md](troubleshooting.md) — how to use the diagnostic output to diagnose a failure.
+- [troubleshooting.md](troubleshooting.md) — how to use the diagnostic output to diagnose a failure, including the Device Encryption recovery procedure.
 - [driver-injection.md](driver-injection.md) — what the injection tests are actually testing.
+- [deployment.md](deployment.md) — the Device Encryption precondition for production deployment.
