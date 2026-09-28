@@ -255,9 +255,30 @@ The refusal is deliberate: the script will not assume BitLocker is off when it c
 BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
 ```
 
+followed by a single deferral line:
+
+```
+BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run after VolumeStatus on C: stabilises to FullyDecrypted or FullyEncrypted. Exit code will be 2.
+```
+
 **Cause.** This is the v43 patch 5 (revised) guard firing correctly. Device Encryption is active on C:, and the `VolumeStatus` is one of the four hazardous mid-operation states (`EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`). The script refuses to run the destructive partition path.
 
-Note that `ProtectionStatus=Off` combined with `VolumeStatus=FullyEncrypted` is **not** this state — it is a normal suspended-BitLocker volume, and the revised guard allows it. Only the four hazardous mid-operation states trigger the refusal.
+The two lines shown above together are the **deferral signature**. The first is the guard refusal from `Suspend-BitLockerForWinRE`; the second is the main flow recognizing the refusal via the `$Script:BitLockerGuardDeferred` flag and exiting early with `EXIT_WARNING`. When you see both lines, the machine is unchanged: no partition was deleted, no WIM was deployed, WinRE was not disabled, and no state file was written.
+
+Note that this signature is **different** from a genuine partition-creation failure. A real failure logs the four-line banner:
+
+```
+[WARN] ================================================================================
+[WARN] Dedicated recovery partition creation failed after all attempts.
+[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
+[WARN] This is NOT equivalent to a dedicated recovery partition.
+[WARN] WinRE will function but with reduced resilience. Exit code will be 2.
+[WARN] ================================================================================
+```
+
+and then proceeds into Step 5 as OS-fallback. A deferral logs none of that banner — it exits before Step 5 with the single deferral line. If you see the banner, the destructive attempt ran and failed; if you see the single deferral line instead, the guard fired before anything was attempted.
+
+Also note that `ProtectionStatus=Off` combined with `VolumeStatus=FullyEncrypted` is **not** this state — it is a normal suspended-BitLocker volume, and the revised guard allows it. Only the four hazardous mid-operation states trigger the refusal.
 
 **Resolution.** Wait for the state to stabilise. From an elevated PowerShell:
 
@@ -268,6 +289,8 @@ manage-bde -status C:
 Wait until the `Conversion Status:` line reads either `Fully Decrypted` or `Fully Encrypted`. Then re-run `WinRE.ps1`.
 
 **Do not** delete the state file or force the script past this check. The guard exists because the destructive path will damage the machine in this state — see the Section 1 recovery procedure for what happens when the guard is bypassed.
+
+**Do not** mistake the deferral for a failure. The deferral is the guard working correctly. The machine is in the same state it was before the run; the next run, once the encryption state has stabilised, will perform the dedicated-partition work.
 
 ## VMD hardware present but no driver matches
 
@@ -342,6 +365,8 @@ If the state file is repeatedly disappearing, check:
 
 1. Whether `Restore-OSPartitionSize` is failing. If it is, `$Script:GeometryRestoreFailed` is set and `Write-WinREState` deletes the state file on purpose. The log will show `Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file`. Investigate why the geometry restore is failing.
 2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
+
+**Not to be confused with the Device Encryption deferral.** If the run exits with `EXIT_WARNING` because the BitLocker guard refused to proceed, the state file will also be unchanged — but that is not a problem with the state file. The two are distinguishable: the deferral leaves the prior state file intact (or leaves it absent if it was absent before); it does not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
 
 ## The machine is in OS-fallback and stays there
 

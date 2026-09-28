@@ -1230,6 +1230,7 @@ $Script:nonFatalWarning = $false
 $Script:ImageInjectionComplete = $true
 $Script:UsedOSFallback = $false
 $Script:GeometryRestoreFailed = $false
+$Script:BitLockerGuardDeferred = $false
 $Script:CachedHardware = $null
 $Script:LenovoWinPEMap = $null
 $Script:HPWinPEMap     = $null
@@ -2191,7 +2192,9 @@ function Ensure-AdequateRecoveryPartition {
     if (-not $suspendResult) {
         $blState = Test-BitLockerProtected -MountPoint "C:"
         if ($blState -ne $false) {
-            Write-Log "Cannot confirm BitLocker is unprotected on C: (state=$blState) - refusing destructive partition operations" -Level ERROR
+            $blStateText = if ($null -eq $blState) { 'unknown' } else { "$blState" }
+            Write-Log "Cannot confirm BitLocker is unprotected on C: (state=$blStateText) - refusing destructive partition operations" -Level ERROR
+            $Script:BitLockerGuardDeferred = $true
             return $null
         }
         Write-Log "Suspend returned false but BitLocker is confirmed Off - proceeding" -Level WARN
@@ -4266,9 +4269,14 @@ try {
 
     if (-not $recoveryPartition) {
         Write-Log "No suitable existing recovery partition - attempting to create one"
+        $Script:BitLockerGuardDeferred = $false
         $created = Ensure-AdequateRecoveryPartition -RequiredWimSizeMB $finalSizeMB
         if ($created) {
             $recoveryPartition = @{ DriveLetter = $created.DriveLetter; DiskNumber = $created.DiskNumber; PartitionNumber = $created.PartitionNumber; Partition = $null }
+        } elseif ($Script:BitLockerGuardDeferred) {
+            Write-Log "BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run after VolumeStatus on C: stabilises to FullyDecrypted or FullyEncrypted. Exit code will be 2." -Level WARN
+            Remove-ItemIfExist $CheckpointFile
+            exit $EXIT_WARNING
         } else {
             Write-Log "================================================================================" -Level WARN
             Write-Log "Dedicated recovery partition creation failed after all attempts." -Level WARN
@@ -4312,7 +4320,8 @@ try {
     if (-not $preDeploySuspend) {
         $preDeployBl = Test-BitLockerProtected -MountPoint "C:"
         if ($preDeployBl -ne $false) {
-            Write-Log "Cannot confirm BitLocker is unprotected on C: (state=$preDeployBl) - skipping deployment to preserve current WinRE state" -Level ERROR
+            $preDeployBlText = if ($null -eq $preDeployBl) { 'unknown' } else { "$preDeployBl" }
+            Write-Log "Cannot confirm BitLocker is unprotected on C: (state=$preDeployBlText) - skipping deployment to preserve current WinRE state" -Level ERROR
             Write-Log "Re-run after the encryption state stabilises (VolumeStatus=FullyDecrypted or FullyEncrypted)." -Level WARN
             $Script:nonFatalWarning = $true
             Remove-ItemIfExist $CheckpointFile

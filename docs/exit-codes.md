@@ -47,7 +47,7 @@ Also returned by the pending-reboot path when the retry `reagentc /enable` still
 Reached when any of the following is true at exit time:
 
 - **OS-fallback.** The dedicated recovery partition could not be created and WinRE is deployed to `C:\Recovery\WindowsRE`.
-- **Device Encryption guard deferral (v43 patch 5, revised).** The machine was mid-Device-Encryption (`ProtectionStatus=Off` with `VolumeStatus` one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`) and the script refused to run the destructive partition path. The guard fires in `Ensure-AdequateRecoveryPartition` before `reagentc /disable` and again in Step 5 before the deployment-path disable; both refuse on the hazardous `VolumeStatus` values and return early. The machine's WinRE state and recovery partition are left intact, and no new state file is written. The next run, once `VolumeStatus` reads `FullyDecrypted` or `FullyEncrypted`, can complete the dedicated-partition work. See [troubleshooting.md](troubleshooting.md) for the recovery procedure and [deployment.md](deployment.md) for the precondition.
+- **Device Encryption guard deferral (v43 patch 5, revised).** The machine was mid-Device-Encryption (`ProtectionStatus=Off` with `VolumeStatus` one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`) and the script refused to run the destructive partition path. The guard fires in `Ensure-AdequateRecoveryPartition` before `reagentc /disable`; when that gate refuses, the main flow exits with `EXIT_WARNING` immediately — it logs a single deferral message, does not log a partition-creation failure, does not set `UsedOSFallback`, does not disable WinRE, and does not fall through to OS-fallback. A second gate in Step 5 covers the routes that do not reach `Ensure-AdequateRecoveryPartition` directly (a machine whose existing recovery partition was already insufficient on this pass, or an enable-only escalation); that gate exits the same way. In both cases the machine's WinRE state and recovery partition are left intact, and no new state file is written. The next run, once `VolumeStatus` reads `FullyDecrypted` or `FullyEncrypted`, can complete the dedicated-partition work. See [troubleshooting.md](troubleshooting.md) for the recovery procedure and [deployment.md](deployment.md) for the precondition.
 - **`$Script:nonFatalWarning = $true`.** Set by: BitLocker suspension failure, BitLocker resume failure, cleanup failure in `Remove-StrayRecoveryPartitions`, fallback copy denial (ACL), recovery-attribute application failure, and OEM map resolution failure for a supported vendor.
 - **`$Script:UsedOSFallback = $true`.** Distinct from `nonFatalWarning`; can be true without any warning-level event, and is the deliberate outcome of the shrink-fails path.
 
@@ -58,7 +58,7 @@ The warning code is returned on the fast path, the enable-only path, the pending
 - If the state file's `LastUpdated` field is newer than the run's start time, the run reached the state-write step and the machine ended up in OS-fallback. `UsedOSFallback = true` will be recorded.
 - If the state file's `LastUpdated` field is unchanged (or no state file exists), the run deferred the work before the state-write step. No new state was committed and the machine's WinRE state is unchanged. Re-check on the next scheduled run once the encryption state has stabilised.
 
-The distinguishing log entry for the deferral case is the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`).
+The distinguishing log entry for the deferral case is the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`) followed by a single deferral line. A partition-creation failure — with its `Dedicated recovery partition creation failed after all attempts.` banner — is only logged when the destructive attempt actually ran and failed; a deferral is not that.
 
 ### `EXIT_FATAL` (3)
 
@@ -85,7 +85,7 @@ Fatal exits do not write a state file. If a state file was written earlier in th
 - **Which recovery partition was used.** The log records the disk and partition number.
 - **Whether the run was a fast path or a full update.** The log records the control-flow path.
 - **Whether BitLocker was suspended and successfully resumed.** The log records both.
-- **Whether the Device Encryption guard fired.** The log records the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`). The state file's `LastUpdated` timestamp distinguishes deferral (unchanged, or absent) from OS-fallback (newer than the run start).
+- **Whether the Device Encryption guard fired.** The log records the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`) followed by a single deferral line. The state file's `LastUpdated` timestamp distinguishes deferral (unchanged, or absent) from OS-fallback (newer than the run start).
 - **How long the run took.** The log lines have timestamps; the first and last line bound the duration.
 
 For any of those details, read the log. See [troubleshooting.md](troubleshooting.md).
@@ -111,7 +111,7 @@ Recommended orchestration policy:
 |---|---|
 | 0 | Record success. No further action. |
 | 1 | Schedule a reboot at the next maintenance window. The next run will finish the registration. |
-| 2 | Investigate the log. Check the state file's `LastUpdated` timestamp. If the log shows the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`) and the state file was not updated during this run, the script deferred the work; defer the retry to the next scheduled run once `manage-bde -status C:` reads `Fully Decrypted` or `Fully Encrypted`. Do not reboot or intervene while encryption is in progress. |
+| 2 | Investigate the log. Check the state file's `LastUpdated` timestamp. If the log shows the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`) followed by a single deferral line, and the state file was not updated during this run, the script deferred the work; defer the retry to the next scheduled run once `manage-bde -status C:` reads `Fully Decrypted` or `Fully Encrypted`. If instead the log shows the `Dedicated recovery partition creation failed after all attempts.` banner and the state file was updated, the machine ended up in OS-fallback. Do not reboot or intervene while encryption is in progress. |
 | 3 | Do not retry automatically. Investigate the log immediately. If the log shows `FATAL: WinRE is not enabled at exit` on a machine that no longer has a recovery partition, follow the [troubleshooting.md](troubleshooting.md) recovery procedure before retrying. |
 
 Do **not** use exit code 0 as the sole health signal. A machine that reached OS-fallback exits with 2, which is a legitimate "the machine is functional but the design goal was not achieved" signal. If your deployment policy requires dedicated recovery partitions, treat 2 as a soft failure and route it to a queue.
