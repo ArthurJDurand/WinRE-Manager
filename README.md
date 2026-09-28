@@ -7,6 +7,8 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ArthurJDurand)
 
+📖 **[Full documentation](https://arthujdurand.github.io/WinRE-Manager/)**
+
 WinRE Manager deploys the correct WinRE (Windows Recovery Environment) image to a dedicated recovery partition on the OS disk of every machine in a managed fleet. It fetches the current base WIM from a versioned repository, injects OEM WinPE driver packs (Dell / HP / Lenovo) and Intel VMD storage drivers from live manifests, and maintains a `DesiredStateId`-scoped state file so re-runs are no-ops when nothing has changed.
 
 It is designed to run unattended as `NT AUTHORITY\SYSTEM` via scheduled task or MDM, on Dell, HP, Lenovo and ASUS hardware, GPT or MBR, with or without BitLocker.
