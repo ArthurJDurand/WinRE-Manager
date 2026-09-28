@@ -1,0 +1,43 @@
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# PowerShell
+*.ps1xml
+*.pssc
+*.psd1.bak
+*.psm1.bak
+*.clixml
+
+# Test artifacts (the harness writes here)
+C:\Temp\WinRETest/
+TestResults/
+Pester*.xml
+*.trx
+
+# Local build outputs of the map builders
+DellWinPEMap.json
+HPWinPEMap.json
+LenovoWinPEMap.json
+*.tmp
+*.bak
+*.old
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Secrets / environment
+.env
+.env.*
+secrets.local.*
