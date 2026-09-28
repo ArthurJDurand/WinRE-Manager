@@ -37,12 +37,16 @@
     additional enforcement sites for the "no type-coded recovery
     partition on any non-OS disk" invariant: the enable-only path, the
     pending-reboot success exit, and the pending-reboot reboot-required
-    exit), and the v43 patch 4 changes (the three checkpoint writes
+    exit), the v43 patch 4 changes (the three checkpoint writes
     gated on $Script:ImageInjectionComplete, and the migration guard
     that resets $step when a checkpoint at step 4 or later coincides
-    with a required rebuild) do not change any of the functions the
-    harness exercises, so the harness remains valid against the current
-    production file without modification. The harness does NOT exercise the
+    with a required rebuild), and the v43 patch 5 changes (BitLocker
+    protection-state checks now consider VolumeStatus as well as
+    ProtectionStatus, and New-Partition sets the recovery type GUID at
+    creation time to close the Device Encryption auto-encryption
+    window) do not change any of the functions the harness exercises,
+    so the harness remains valid against the current production file
+    without modification. The harness does NOT exercise the
     partition-recreation, BitLocker-recovery, or state-write code paths
     touched by v42/v43; those are covered by field testing.
 
@@ -59,7 +63,25 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 11
+    Version : 12
+
+    v12 changes vs v11:
+    1. Show-SystemDiagnostic now flags the Device Encryption in-progress
+       hazard in the BitLocker (C:) section. When ProtectionStatus reads
+       Off but VolumeStatus is anything other than FullyDecrypted (or
+       empty), Device Encryption is actively encrypting the volume. In
+       that state, new partitions created on the same disk are
+       auto-encrypted by the Device Encryption service before their
+       recovery type GUID can be applied, and reagentc /enable refuses
+       with "Windows RE cannot be enabled on a volume with BitLocker
+       Drive Encryption enabled." Production v43 patch 5 now refuses to
+       run the destructive partition paths in this state; the warning
+       here makes the hazard visible to a field engineer before they run
+       WinRE.ps1. Triggered by two field failures in the same 24-hour
+       window (Dell Latitude 3550 with Core Ultra 5 125U, HP ProBook 450
+       G10 with i7-1355U), both on Windows 11 build 26200 mid-Device-
+       Encryption.
+    2. Menu and entry banners updated to "v12".
 
     v11 changes vs v10:
     1. Test-GitHubBaseWim now records FAIL when Get-WindowsImage cannot
@@ -1564,7 +1586,7 @@ function Show-Summary {
 # =========================== MENU ===========================
 function Show-Menu {
     Clear-Host
-    Write-Host "WinRE Manager Test Harness (v11)"
+    Write-Host "WinRE Manager Test Harness (v12)"
     Write-Host ("Working directory: {0}" -f $TestDir)
     $p = Get-ThisMachineProfile
     Write-Host ("Detected: OS={0}  Vendor={1}  MT={2}  CPUVendor={3}  CPUGen={4}" -f $p.OS, $p.Vendor, $p.MachineType, $p.CPUVendor, $p.CPUGeneration)
@@ -1587,7 +1609,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v11"
+Rule "WinRE Manager test harness v12"
 Say "Working dir: $TestDir"
 if (-not (Test-Path $7Zip)) { Say "7-Zip not found at $7Zip - extraction tests will fail" -Level WARN }
 

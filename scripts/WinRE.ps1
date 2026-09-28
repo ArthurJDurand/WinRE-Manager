@@ -5,6 +5,38 @@
 .NOTES
     Version : 43
 
+    v43 patch 5 (same ScriptVersion, no DesiredStateId change):
+    1. BitLocker state checks now consider VolumeStatus, not just
+       ProtectionStatus. On Windows 11 24H2+ with Device Encryption, a
+       volume can be actively encrypting (VolumeStatus=EncryptionInProgress)
+       while ProtectionStatus reads Off. In that state, Suspend-BitLockerForWinRE
+       previously logged "already Off - no suspension needed" and returned
+       $true, and Test-BitLockerProtected previously returned $false
+       (confirmed unprotected). Both were wrong: Device Encryption's
+       auto-encryption service is active, new partitions created on the
+       same disk get auto-encrypted before their recovery type GUID can be
+       applied, and reagentc /enable refuses with "Windows RE cannot be
+       enabled on a volume with BitLocker Drive Encryption enabled." The
+       two functions now treat any VolumeStatus other than FullyDecrypted
+       (or an empty VolumeStatus) as unknown, so the destructive partition
+       paths refuse to run. Real case: Dell Latitude 3550, Intel Core Ultra
+       5 125U, Windows 11 build 26200, Device Encryption mid-encryption at
+       73.6%. The original recovery partition was deleted and could not be
+       replaced across three consecutive runs, leaving the machine with no
+       dedicated recovery partition and WinRE disabled.
+
+    2. New-Partition now sets the recovery type GUID (GPT) or type code
+       (MBR) at partition creation, closing the window between New-Partition
+       and Set-RecoveryPartitionAttributes during which the partition looked
+       like a Basic Data partition and could be claimed by the Device
+       Encryption service. Combined with change 1, this makes the destructive
+       partition path safe to run on machines where BitLocker has ever been
+       active. Machines where VolumeStatus is FullyDecrypted see no
+       behaviour change.
+
+    3. ScriptVersion is deliberately left at 43: this change does not
+       modify the deployed WIM or force a DesiredStateId rebuild.
+
     v43 patch 4 (same ScriptVersion, no DesiredStateId change):
     1. The step 3, step 4, and step 6 checkpoint writes are now gated
        on $Script:ImageInjectionComplete. Previously all three wrote
@@ -1393,8 +1425,24 @@ function Test-BitLockerProtected {
     $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
     if ($blv) {
         $status = $blv.ProtectionStatus
+        $vs     = [string]$blv.VolumeStatus
         if ($status -eq 'On' -or $status -eq 'ProtectionOn' -or $status -eq 1) { return $true }
-        if ($status -eq 'Off' -or $status -eq 'ProtectionOff' -or $status -eq 0) { return $false }
+        if ($status -eq 'Off' -or $status -eq 'ProtectionOff' -or $status -eq 0) {
+            # v43 patch 5: ProtectionStatus=Off is not sufficient evidence that
+            # the volume is safe to perform destructive partition operations
+            # on. On Windows 11 24H2+ with Device Encryption, a volume can be
+            # actively encrypting (VolumeStatus=EncryptionInProgress) while
+            # ProtectionStatus reads Off. In that state, new partitions created
+            # on the same disk are auto-encrypted by the Device Encryption
+            # service before the recovery type GUID can be applied, and
+            # reagentc /enable refuses with "Windows RE cannot be enabled on a
+            # volume with BitLocker Drive Encryption enabled." Only
+            # FullyDecrypted (or an empty VolumeStatus, which some builds
+            # report for volumes that BitLocker has never touched) is a
+            # confirmed-safe state.
+            if ($vs -eq 'FullyDecrypted' -or -not $vs) { return $false }
+            return $null
+        }
         return $null
     }
     # v34: text parsing fallback. The -protectionaserrorlevel flag is a
@@ -1508,11 +1556,24 @@ function Suspend-BitLockerForWinRE {
     $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
     if ($blv) {
         $protectionStatus = $blv.ProtectionStatus
-        $volumeStatus     = $blv.VolumeStatus
+        $volumeStatus     = [string]$blv.VolumeStatus
         if ($protectionStatus -eq 'On' -or $protectionStatus -eq 'ProtectionOn' -or $protectionStatus -eq 1) {
             $protectionState = $true
         } elseif ($protectionStatus -eq 'Off' -or $protectionStatus -eq 'ProtectionOff' -or $protectionStatus -eq 0) {
-            $protectionState = $false
+            # v43 patch 5: ProtectionStatus=Off alone is not sufficient. On
+            # Windows 11 24H2+ Device Encryption, a volume can be actively
+            # encrypting (VolumeStatus=EncryptionInProgress) with protection
+            # Off. During that window new partitions created on the same disk
+            # are auto-encrypted by the Device Encryption service before their
+            # recovery type GUID can be applied, and reagentc /enable will
+            # refuse. Only FullyDecrypted (or an empty VolumeStatus) is a
+            # confirmed-safe state.
+            if ($volumeStatus -eq 'FullyDecrypted' -or -not $volumeStatus) {
+                $protectionState = $false
+            } else {
+                Write-Log "BitLocker on ${MountPoint}: ProtectionStatus=Off but VolumeStatus=$volumeStatus - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected." -Level WARN
+                $protectionState = $null
+            }
         }
         Write-Log "BitLocker Get-BitLockerVolume on ${MountPoint}: ProtectionStatus=$protectionStatus, VolumeStatus=$volumeStatus"
     } else {
@@ -2213,11 +2274,23 @@ function Ensure-AdequateRecoveryPartition {
         return $null
     }
 
+    # v43 patch 5: create the partition with the recovery type GUID/type code
+    # already applied. This closes the window between New-Partition and
+    # Set-RecoveryPartitionAttributes during which the partition looks like a
+    # Basic Data partition. On Windows 11 24H2+ with Device Encryption
+    # actively encrypting, the encryption service can grab a plain partition
+    # in that window and start encrypting it; reagentc /enable then refuses.
+    $gptRecoveryType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
+    $style = ($osDisk.PartitionStyle)
     $newPart = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            $newPart = New-Partition -DiskNumber $osPart.DiskNumber -Offset $newOffset -Size $newSize -ErrorAction Stop
-            Write-Log "New-Partition succeeded (PartitionNumber=$($newPart.PartitionNumber))"
+            if ($style -eq 'GPT') {
+                $newPart = New-Partition -DiskNumber $osPart.DiskNumber -Offset $newOffset -Size $newSize -GptType $gptRecoveryType -ErrorAction Stop
+            } else {
+                $newPart = New-Partition -DiskNumber $osPart.DiskNumber -Offset $newOffset -Size $newSize -MbrType 0x27 -ErrorAction Stop
+            }
+            Write-Log "New-Partition succeeded (PartitionNumber=$($newPart.PartitionNumber), type set at creation)"
             break
         } catch {
             Write-Log "New-Partition attempt $attempt failed: $_" -Level WARN
@@ -2312,8 +2385,13 @@ function Ensure-AdequateRecoveryPartition {
         $newPart = $null
         for ($attempt = 1; $attempt -le 3; $attempt++) {
             try {
-                $newPart = New-Partition -DiskNumber $osPart.DiskNumber -Offset $newOffset -Size $newSize -ErrorAction Stop
-                Write-Log "New-Partition retry succeeded (PartitionNumber=$($newPart.PartitionNumber))"
+                # v43 patch 5: same recovery-type-at-creation guard as the main path.
+                if ($style -eq 'GPT') {
+                    $newPart = New-Partition -DiskNumber $osPart.DiskNumber -Offset $newOffset -Size $newSize -GptType $gptRecoveryType -ErrorAction Stop
+                } else {
+                    $newPart = New-Partition -DiskNumber $osPart.DiskNumber -Offset $newOffset -Size $newSize -MbrType 0x27 -ErrorAction Stop
+                }
+                Write-Log "New-Partition retry succeeded (PartitionNumber=$($newPart.PartitionNumber), type set at creation)"
                 break
             } catch {
                 Write-Log "New-Partition retry attempt $attempt failed: $_" -Level WARN
