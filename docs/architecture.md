@@ -99,13 +99,14 @@ See [state-and-idempotency.md](state-and-idempotency.md) for the schemas and the
 ## The idempotency key
 
 `DesiredStateId` is a SHA256 over a deterministic set of inputs:
+
+```
 HW=<Manufacturer>|<Model>|<MachineType>
 OS=<Build>
 MANIFEST=<manifest.version>
 OEMPACK=<resolved OEM pack version or NONE>
 SCRIPT=<ScriptVersion>
-
-text
+```
 
 Any change to any of those five fields changes the ID. When the ID differs from the stored state file's ID, the state file is treated as stale and the script rebuilds. When the ID matches, the fast path can fire.
 
