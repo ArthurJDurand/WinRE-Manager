@@ -10,6 +10,86 @@ Every line is `yyyy-MM-dd HH:mm:ss [LEVEL] message`. Levels are `INFO`, `WARN`, 
 
 The first line is `========== WinRE Manager Started (v<version>) ==========`. The last line names the outcome and, if applicable, the exit code.
 
+## The machine has no recovery partition and WinRE is disabled
+
+**This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 or later, this failure mode no longer occurs.**
+
+**Symptom.** After a run that exited with code 3 (`EXIT_FATAL`), the machine has:
+
+- No recovery partition on the OS disk (`Get-Partition` shows only the EFI, MSR, and Windows partitions).
+- WinRE reported as disabled (`reagentc /info` shows `Windows RE status: Disabled`).
+- The fallback WIM still present at `C:\Recovery\WindowsRE\winre.wim`.
+
+**Log signature.** Two log entries together:
+
+```
+[WARN] Newly created recovery partition is BitLocker-encrypted - attempting delete and recreate after suspend
+[ERROR] Recovery partition is STILL BitLocker-encrypted after recreate - aborting
+```
+
+followed by:
+
+```
+[ERROR] reagentc /enable failed because the target volume is BitLocker-protected
+```
+
+and finally:
+
+```
+[ERROR] FATAL: WinRE is not enabled at exit
+```
+
+**Cause.** The machine was mid-Device-Encryption when the script ran. `ProtectionStatus` read `Off` while `VolumeStatus` read `EncryptionInProgress`. The pre-patch-5 code treated `ProtectionStatus=Off` as sufficient evidence that BitLocker was not a factor, deleted the existing recovery partition, and created a new one. The Device Encryption service claimed the new partition and started encrypting it before the recovery type GUID could be applied. The delete-and-recreate retry hit the same problem. The script fell back to OS-fallback and then `reagentc /enable` refused because C: was actively encrypting.
+
+Two field failures, both on Windows 11 build 26200:
+
+- **Dell Latitude 3550** (Intel Core Ultra 5 125U) — 2026-09-28, `VolumeStatus=EncryptionInProgress` at 73.6%.
+- **HP ProBook 450 15.6 inch G10** (Intel Core i7-1355U) — 2026-09-28, same state.
+
+**Recovery procedure.** Wait for the encryption to finish or abort it, then re-run with patch 5.
+
+**Step 1 — resolve the encryption state.** Open an elevated PowerShell:
+
+```powershell
+manage-bde -status C:
+```
+
+Read the `Conversion Status:` line.
+
+- If it says `Fully Decrypted` — encryption was never active or was already aborted. Continue to step 2.
+- If it says `Fully Encrypted` and `Protection Status: Protection On` — encryption completed and the key was escrowed. Continue to step 2.
+- If it says `Encryption In Progress` or `Encryption Paused` — the encryption service is still active. Wait for it to complete (typically 30 minutes to a few hours on a 256 GB SSD, longer on HDD), or abort it:
+
+  ```powershell
+  manage-bde -off C:
+  ```
+
+  This starts decryption. On a machine mid-encryption, decryption is usually faster than encryption. Wait until `Conversion Status:` reads `Fully Decrypted` before continuing.
+
+**Step 2 — confirm the state is now stable.** Re-run the status command. It must show either `Fully Decrypted` (with `Protection Off`) or `Fully Encrypted` (with `Protection On`). The `Encryption In Progress`, `Decryption In Progress`, `Encryption Paused`, and `Decryption Paused` states are all hazardous.
+
+**Step 3 — update `WinRE.ps1` to v43 patch 5 or later.** Check the `.NOTES` block at the top of the file for a `v43 patch 5` entry. If it is missing, apply the patch before proceeding.
+
+**Step 4 — re-run `WinRE.ps1`.** With v43 patch 5 and a stable BitLocker state, the script will:
+
+1. Detect the BitLocker state correctly (either `FullyDecrypted` or `FullyEncrypted`, both safe).
+2. Suspend BitLocker if needed.
+3. Create the recovery partition with the recovery type GUID applied at creation.
+4. Deploy the WIM, register, and enable WinRE.
+
+The machine returns to a `DEDICATED` end state.
+
+**Immediate interim fix.** If the machine must be returned to service before you can update the script, `reagentc /enable` will succeed against the OS-fallback location once C: is in a stable BitLocker state:
+
+```powershell
+reagentc /setreimage /path C:\Recovery\WindowsRE
+reagentc /enable
+```
+
+This gives you OS-fallback WinRE — functional but not the design goal. The dedicated recovery partition can be recreated later by a run of the patched script.
+
+**Do NOT re-run the pre-patch-5 script on this machine.** It will fail the same way and delete the recovery partition again.
+
 ## `reagentc /enable` fails with "cannot be enabled on a volume with BitLocker Drive Encryption enabled"
 
 **Symptom.** `reagentc /enable` returns non-zero, output contains the phrase above.
@@ -21,9 +101,17 @@ reagentc /enable (exit 2): ...
 reagentc /enable failed because the target volume is BitLocker-protected
 ```
 
-**Cause.** The target recovery partition is BitLocker-encrypted. This happens on Windows 11 24H2+ with TPM 2.0 and Secure Boot, where Device Encryption auto-encrypts newly created partitions.
+**Cause.** The target recovery partition or volume is BitLocker-managed. Two scenarios produce this.
 
-**Resolution.** Automatic. The production script detects this specific error, returns `"bitlocker"` from `Invoke-ReagentcEnable`, and the caller:
+**Scenario 1 — v43 patch 5 and later.** This should not happen on a healthy machine. If you are seeing this on patch 5, the hazard state (Section 1 above) is present despite the guard, which means either the script was not updated or the encryption started between the guard's check and the partition creation. Investigate:
+
+1. Confirm `.NOTES Version : 43` at the top of the script and that the `v43 patch 5` changelog block is present.
+2. Check `manage-bde -status C:` — the state must be stable (`Fully Decrypted` or `Fully Encrypted`), never `Encryption In Progress`.
+3. If both are correct, file a bug with the full log.
+
+**Scenario 2 — v43 patch 4 and earlier.** The pre-patch-5 behaviour is the reactive fallback described below. This is the failure mode patch 5 was designed to prevent.
+
+**Resolution (Scenario 2).** Automatic. The production script detects this specific error, returns `"bitlocker"` from `Invoke-ReagentcEnable`, and the caller:
 
 1. Suspends BitLocker on C:.
 2. Deletes the encrypted recovery partition.
@@ -33,7 +121,7 @@ reagentc /enable failed because the target volume is BitLocker-protected
 
 If the retry also fails, the script logs `reagentc /enable still failed after partition recreation` and continues with the remaining pipeline. The run exits with `EXIT_WARNING`.
 
-If the script cannot suspend BitLocker (see below), it aborts the recovery attempt and continues with the WIM already deployed, which may or may not be usable.
+If the script cannot suspend BitLocker (see below), it aborts the recovery attempt and continues with the WIM already deployed, which may or may not be usable. **On a machine where the encryption service is active, this escalates into the Section 1 failure mode. Update to patch 5 before retrying.**
 
 ## `reagentc /disable` fails at Step 5
 
@@ -159,6 +247,26 @@ BitLocker Get-BitLockerVolume on C: returned null - falling back to manage-bde -
 
 The refusal is deliberate: the script will not assume BitLocker is off when it cannot confirm. The destructive paths abort and the main flow falls back to OS-fallback.
 
+## `Suspend-BitLockerForWinRE` reports "ProtectionStatus=Off but VolumeStatus=..."
+
+**Symptom.** The log shows this specific message from `Suspend-BitLockerForWinRE`:
+
+```
+BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
+```
+
+**Cause.** This is the v43 patch 5 guard firing correctly. Device Encryption is active on C: (`VolumeStatus` is not `FullyDecrypted`). The script refuses to run the destructive partition path.
+
+**Resolution.** Wait for the state to stabilise. From an elevated PowerShell:
+
+```powershell
+manage-bde -status C:
+```
+
+Wait until the `Conversion Status:` line reads either `Fully Decrypted` or `Fully Encrypted`. Then re-run `WinRE.ps1`.
+
+**Do not** delete the state file or force the script past this check. The guard exists because the destructive path will damage the machine in this state — see the Section 1 recovery procedure for what happens when the guard is bypassed.
+
 ## VMD hardware present but no driver matches
 
 **Symptom.** A machine with a VMD controller (Intel 12th gen and later typically) does not get VMD drivers injected.
@@ -247,6 +355,8 @@ If the state file is repeatedly disappearing, check:
 
 Do not edit the state file's `UsedOSFallback` field and leave the rest in place; that will not change the `DesiredStateId` and the fast path will continue to fire.
 
+**Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
+
 ## The script is running but nothing is happening
 
 **Symptom.** The script runs, exits 0, and does nothing.
@@ -276,6 +386,8 @@ Use it to:
 
 The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, or WinRE registration.
 
+**One exception:** the v43 patch 5 BitLocker guard runs before the partition work, so a dry run on a machine in the `VolumeStatus=EncryptionInProgress` state will still report the hazard. This is intentional. It is a read-only warning, not a modification.
+
 ## Reporting a bug
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
@@ -284,7 +396,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - Windows build.
 - Vendor, model, Lenovo machine type.
 - Partition style (GPT or MBR).
-- BitLocker state.
+- BitLocker state — **both** `ProtectionStatus` and `VolumeStatus` from `manage-bde -status C:`.
 - Exit code.
 - The relevant slice of the log — not the whole file unless asked.
 - The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine.
