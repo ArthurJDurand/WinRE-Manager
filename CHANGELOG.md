@@ -6,6 +6,26 @@ The production script's `.NOTES` block contains the complete engineering changel
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to a `ScriptVersion` + patch-generation scheme rather than strict SemVer — see [docs/state-and-idempotency.md](docs/state-and-idempotency.md) for why.
 
+## [v43 patch 5] — 2026-09-28
+
+### Fixed
+
+- **BitLocker protection-state checks now consider `VolumeStatus`, not just `ProtectionStatus`.** On Windows 11 24H2+ with Device Encryption, a volume can be actively encrypting (`VolumeStatus=EncryptionInProgress`) while `ProtectionStatus` reads `Off`. In that state, the previous code logged *"already Off - no suspension needed"* and proceeded with the destructive partition path. The Device Encryption service then auto-encrypted any new partition before its recovery type GUID could be applied, and `reagentc /enable` refused with *"Windows RE cannot be enabled on a volume with BitLocker Drive Encryption enabled."* `Test-BitLockerProtected` and `Suspend-BitLockerForWinRE` now treat any `VolumeStatus` other than `FullyDecrypted` (or an empty value) as unknown, so the destructive paths refuse to run.
+- **New partitions are created with the recovery type GUID already applied.** `New-Partition` now passes `-GptType {de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (GPT) or `-MbrType 0x27` (MBR) at creation. This closes the window between `New-Partition` and `Set-RecoveryPartitionAttributes` during which a plain Basic Data partition could be claimed by the Device Encryption service.
+
+### Field reports
+
+Two machines hit this bug in the same 24-hour window, both on Windows 11 build 26200 mid-Device-Encryption:
+
+- **Dell Latitude 3550** (Intel Core Ultra 5 125U) — `VolumeStatus=EncryptionInProgress` at 73.6% when the script ran.
+- **HP ProBook 450 15.6 inch G10** (Intel Core i7-1355U) — same state, same failure sequence.
+
+Both machines lost their dedicated recovery partition and had WinRE disabled by the pre-patch-5 code. Recovery procedure: see [docs/troubleshooting.md](docs/troubleshooting.md).
+
+### Unchanged
+
+`ScriptVersion` remains 43. `DesiredStateId` is unchanged. Healthy machines do not rebuild.
+
 ## [v43 patch 4] — 2026-09-27
 
 ### Fixed
