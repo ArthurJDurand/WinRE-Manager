@@ -47,16 +47,18 @@ Also returned by the pending-reboot path when the retry `reagentc /enable` still
 Reached when any of the following is true at exit time:
 
 - **OS-fallback.** The dedicated recovery partition could not be created and WinRE is deployed to `C:\Recovery\WindowsRE`.
-- **Device Encryption guard deferral (v43 patch 5).** The machine was mid-Device-Encryption (`ProtectionStatus=Off` with `VolumeStatus` anything other than `FullyDecrypted`) and the script refused to run the destructive partition path. If the machine was scheduled for a destructive rebuild, the run falls through to OS-fallback and exits with `EXIT_WARNING`. If the machine did not need a rebuild, the run exits with `EXIT_SUCCESS` and no partition work is attempted. See [troubleshooting.md](troubleshooting.md) for the recovery procedure and [deployment.md](deployment.md) for the precondition.
+- **Device Encryption guard deferral (v43 patch 5, revised).** The machine was mid-Device-Encryption (`ProtectionStatus=Off` with `VolumeStatus` one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`) and the script refused to run the destructive partition path. The guard fires in `Ensure-AdequateRecoveryPartition` before `reagentc /disable` and again in Step 5 before the deployment-path disable; both refuse on the hazardous `VolumeStatus` values and return early. The machine's WinRE state and recovery partition are left intact, and no new state file is written. The next run, once `VolumeStatus` reads `FullyDecrypted` or `FullyEncrypted`, can complete the dedicated-partition work. See [troubleshooting.md](troubleshooting.md) for the recovery procedure and [deployment.md](deployment.md) for the precondition.
 - **`$Script:nonFatalWarning = $true`.** Set by: BitLocker suspension failure, BitLocker resume failure, cleanup failure in `Remove-StrayRecoveryPartitions`, fallback copy denial (ACL), recovery-attribute application failure, and OEM map resolution failure for a supported vendor.
 - **`$Script:UsedOSFallback = $true`.** Distinct from `nonFatalWarning`; can be true without any warning-level event, and is the deliberate outcome of the shrink-fails path.
 
 The warning code is returned on the fast path, the enable-only path, the pending-reboot success path, and the full-update path — anywhere a warning flag can be set. In every case the state file is still written (or left in place) if the run reached a state-write point.
 
-**Important for orchestration:** on a machine in the Device Encryption hazard state, exit code 2 can mean either "the machine ended up in OS-fallback" or "the script deferred the work to the next run". The two cases are distinguished by the state file:
+**Important for orchestration:** on a machine in the Device Encryption hazard state, exit code 2 can mean either "the machine ended up in OS-fallback" or "the script deferred the work to the next run". The two cases are distinguished by the state-file timestamp:
 
-- `UsedOSFallback = true` — the machine ended up in OS-fallback.
-- `UsedOSFallback = false` with a log entry naming the guard (`ProtectionStatus=Off but VolumeStatus=...`) — the script deferred the work. Re-check on the next scheduled run once the encryption state has stabilised.
+- If the state file's `LastUpdated` field is newer than the run's start time, the run reached the state-write step and the machine ended up in OS-fallback. `UsedOSFallback = true` will be recorded.
+- If the state file's `LastUpdated` field is unchanged (or no state file exists), the run deferred the work before the state-write step. No new state was committed and the machine's WinRE state is unchanged. Re-check on the next scheduled run once the encryption state has stabilised.
+
+The distinguishing log entry for the deferral case is the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`).
 
 ### `EXIT_FATAL` (3)
 
@@ -83,7 +85,7 @@ Fatal exits do not write a state file. If a state file was written earlier in th
 - **Which recovery partition was used.** The log records the disk and partition number.
 - **Whether the run was a fast path or a full update.** The log records the control-flow path.
 - **Whether BitLocker was suspended and successfully resumed.** The log records both.
-- **Whether the Device Encryption guard fired.** The log records the guard message (`ProtectionStatus=Off but VolumeStatus=...`). The state file's `UsedOSFallback` field distinguishes deferral from OS-fallback.
+- **Whether the Device Encryption guard fired.** The log records the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`). The state file's `LastUpdated` timestamp distinguishes deferral (unchanged, or absent) from OS-fallback (newer than the run start).
 - **How long the run took.** The log lines have timestamps; the first and last line bound the duration.
 
 For any of those details, read the log. See [troubleshooting.md](troubleshooting.md).
@@ -109,7 +111,7 @@ Recommended orchestration policy:
 |---|---|
 | 0 | Record success. No further action. |
 | 1 | Schedule a reboot at the next maintenance window. The next run will finish the registration. |
-| 2 | Investigate the log. Check the state file for `UsedOSFallback`. If the guard fired (`ProtectionStatus=Off but VolumeStatus=...` in the log) and the machine is expected to be running Device Encryption, defer the retry to the next scheduled run. Do not reboot or intervene while encryption is in progress. |
+| 2 | Investigate the log. Check the state file's `LastUpdated` timestamp. If the log shows the guard message (`ProtectionStatus=Off but VolumeStatus=... Refusing to treat as unprotected`) and the state file was not updated during this run, the script deferred the work; defer the retry to the next scheduled run once `manage-bde -status C:` reads `Fully Decrypted` or `Fully Encrypted`. Do not reboot or intervene while encryption is in progress. |
 | 3 | Do not retry automatically. Investigate the log immediately. If the log shows `FATAL: WinRE is not enabled at exit` on a machine that no longer has a recovery partition, follow the [troubleshooting.md](troubleshooting.md) recovery procedure before retrying. |
 
 Do **not** use exit code 0 as the sole health signal. A machine that reached OS-fallback exits with 2, which is a legitimate "the machine is functional but the design goal was not achieved" signal. If your deployment policy requires dedicated recovery partitions, treat 2 as a soft failure and route it to a queue.

@@ -255,7 +255,9 @@ The refusal is deliberate: the script will not assume BitLocker is off when it c
 BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
 ```
 
-**Cause.** This is the v43 patch 5 guard firing correctly. Device Encryption is active on C: (`VolumeStatus` is not `FullyDecrypted`). The script refuses to run the destructive partition path.
+**Cause.** This is the v43 patch 5 (revised) guard firing correctly. Device Encryption is active on C:, and the `VolumeStatus` is one of the four hazardous mid-operation states (`EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`). The script refuses to run the destructive partition path.
+
+Note that `ProtectionStatus=Off` combined with `VolumeStatus=FullyEncrypted` is **not** this state — it is a normal suspended-BitLocker volume, and the revised guard allows it. Only the four hazardous mid-operation states trigger the refusal.
 
 **Resolution.** Wait for the state to stabilise. From an elevated PowerShell:
 
@@ -386,7 +388,7 @@ Use it to:
 
 The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, or WinRE registration.
 
-**One exception:** the v43 patch 5 BitLocker guard runs before the partition work, so a dry run on a machine in the `VolumeStatus=EncryptionInProgress` state will still report the hazard. This is intentional. It is a read-only warning, not a modification.
+**One exception:** the v43 patch 5 BitLocker guard runs before the partition work, so a dry run on a machine in a hazardous Device Encryption state (one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`) will still report the hazard and refuse to log the destructive actions. This is intentional. It is a read-only check, not a modification.
 
 ## Reporting a bug
 

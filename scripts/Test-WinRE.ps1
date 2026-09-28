@@ -68,19 +68,34 @@
     v12 changes vs v11:
     1. Show-SystemDiagnostic now flags the Device Encryption in-progress
        hazard in the BitLocker (C:) section. When ProtectionStatus reads
-       Off but VolumeStatus is anything other than FullyDecrypted (or
-       empty), Device Encryption is actively encrypting the volume. In
-       that state, new partitions created on the same disk are
-       auto-encrypted by the Device Encryption service before their
-       recovery type GUID can be applied, and reagentc /enable refuses
-       with "Windows RE cannot be enabled on a volume with BitLocker
-       Drive Encryption enabled." Production v43 patch 5 now refuses to
-       run the destructive partition paths in this state; the warning
-       here makes the hazard visible to a field engineer before they run
-       WinRE.ps1. Triggered by two field failures in the same 24-hour
-       window (Dell Latitude 3550 with Core Ultra 5 125U, HP ProBook 450
-       G10 with i7-1355U), both on Windows 11 build 26200 mid-Device-
-       Encryption.
+       Off but VolumeStatus is one of the hazardous mid-operation states
+       (EncryptionInProgress, DecryptionInProgress, EncryptionPaused,
+       DecryptionPaused), Device Encryption is actively encrypting or
+       decrypting the volume. In that state, new partitions created on
+       the same disk are auto-encrypted by the Device Encryption service
+       before their recovery type GUID can be applied, and reagentc
+       /enable refuses with "Windows RE cannot be enabled on a volume
+       with BitLocker Drive Encryption enabled." Production v43 patch 5
+       now refuses to run the destructive partition paths in this state;
+       the warning here makes the hazard visible to a field engineer
+       before they run WinRE.ps1. Triggered by two field failures in the
+       same 24-hour window (Dell Latitude 3550 with Core Ultra 5 125U,
+       HP ProBook 450 G10 with i7-1355U), both on Windows 11 build 26200
+       mid-Device-Encryption.
+
+    1a. (v12, same release) The hazard predicate is now aligned with
+        production v43 patch 5 (revised) semantics. A volume with
+        ProtectionStatus=Off and VolumeStatus=FullyEncrypted is the
+        standard suspended-BitLocker state (e.g. after
+        Suspend-BitLocker or a Windows Update suspension that has not
+        yet been lifted) and is NOT hazardous. The initial v12 predicate
+        treated it as hazardous, which produced a false-positive warning
+        on every machine with suspended BitLocker and told the operator
+        to wait for a state a suspended machine will never reach on its
+        own. Only the four mid-operation states are hazardous. The
+        warning message was also corrected: it no longer claims the
+        BitLocker key must be escrowed, because Get-BitLockerVolume's
+        local output cannot verify escrow.
     2. Menu and entry banners updated to "v12".
 
     v11 changes vs v10:
@@ -908,24 +923,39 @@ function Show-SystemDiagnostic {
             Say "  EncryptionMethod: $($blv.EncryptionMethod)"
             Say "  EncryptionPct:    $($blv.EncryptionPercentage)"
 
-            # v12: flag the Device Encryption in-progress hazard. When
-            # ProtectionStatus reads Off but VolumeStatus is anything other
-            # than FullyDecrypted, Device Encryption is actively encrypting
-            # the volume. In that state, new partitions created on the same
-            # disk are auto-encrypted by the Device Encryption service before
-            # their recovery type GUID can be applied, and reagentc /enable
-            # refuses with "Windows RE cannot be enabled on a volume with
-            # BitLocker Drive Encryption enabled." Production's v43 patch 5
-            # now refuses to run the destructive partition paths in this
-            # state. The warning here makes the hazard visible to a field
-            # engineer before they run WinRE.ps1.
-            if ($blv.ProtectionStatus -ne 'On' -and $blv.VolumeStatus -ne 'FullyDecrypted' -and $blv.VolumeStatus) {
+            # v12: flag the Device Encryption in-progress hazard. The
+            # hazard check must match production's
+            # post-patch-5 semantics. The confirmed-safe VolumeStatus
+            # values, when ProtectionStatus is Off, are FullyDecrypted
+            # (never encrypted, or decryption finished) and FullyEncrypted
+            # (volume is fully encrypted but protection is Off - the normal
+            # suspended state after Suspend-BitLocker or a Windows Update
+            # suspension that has not yet been lifted). Only the
+            # mid-operation states - EncryptionInProgress,
+            # DecryptionInProgress, EncryptionPaused, DecryptionPaused -
+            # are hazardous. The previous check treated FullyEncrypted as
+            # a hazard, which produced a false positive on every machine
+            # with suspended BitLocker and told the operator to wait for a
+            # state that a suspended machine will never reach on its own.
+            $vs = [string]$blv.VolumeStatus
+            $hazardous = $false
+            if ($blv.ProtectionStatus -ne 'On' -and $vs) {
+                switch ($vs) {
+                    'FullyDecrypted'       { $hazardous = $false }
+                    'FullyEncrypted'       { $hazardous = $false }
+                    'EncryptionInProgress' { $hazardous = $true }
+                    'DecryptionInProgress' { $hazardous = $true }
+                    'EncryptionPaused'     { $hazardous = $true }
+                    'DecryptionPaused'     { $hazardous = $true }
+                    default                { $hazardous = $false }
+                }
+            }
+            if ($hazardous) {
                 Say ""
-                Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) but VolumeStatus=$($blv.VolumeStatus)." -Level WARN
-                Say "           Device Encryption is actively encrypting the OS volume." -Level WARN
+                Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) but VolumeStatus=$vs." -Level WARN
+                Say "           Device Encryption is actively encrypting or decrypting the OS volume." -Level WARN
                 Say "           Production v43 patch 5 will refuse destructive partition work in this state." -Level WARN
-                Say "           Wait until VolumeStatus=FullyDecrypted (encryption aborted) or VolumeStatus=FullyEncrypted" -Level WARN
-                Say "           with ProtectionStatus=On (encryption completed and key escrowed), then run WinRE.ps1." -Level WARN
+                Say "           Wait until VolumeStatus=FullyDecrypted or VolumeStatus=FullyEncrypted before running WinRE.ps1." -Level WARN
             }
         } else {
             Say "  Get-BitLockerVolume returned null (module not loaded, cmdlet failed, or requires elevation)"

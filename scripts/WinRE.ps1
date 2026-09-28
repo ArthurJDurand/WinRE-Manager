@@ -17,13 +17,88 @@
        same disk get auto-encrypted before their recovery type GUID can be
        applied, and reagentc /enable refuses with "Windows RE cannot be
        enabled on a volume with BitLocker Drive Encryption enabled." The
-       two functions now treat any VolumeStatus other than FullyDecrypted
-       (or an empty VolumeStatus) as unknown, so the destructive partition
-       paths refuse to run. Real case: Dell Latitude 3550, Intel Core Ultra
-       5 125U, Windows 11 build 26200, Device Encryption mid-encryption at
-       73.6%. The original recovery partition was deleted and could not be
-       replaced across three consecutive runs, leaving the machine with no
-       dedicated recovery partition and WinRE disabled.
+       two functions now treat a ProtectionStatus=Off volume as
+       confirmed-safe only when VolumeStatus is one of:
+         - FullyDecrypted (never encrypted, or decryption finished);
+         - FullyEncrypted (volume encrypted but protection Off - the
+           normal suspended state, e.g. after Suspend-BitLocker or a
+           Windows Update suspension that has not yet been lifted);
+         - empty (some builds report empty for volumes BitLocker has
+           never touched).
+       Any other VolumeStatus - EncryptionInProgress, DecryptionInProgress,
+       EncryptionPaused, DecryptionPaused - is the hazardous Device
+       Encryption in-progress state, and the destructive partition paths
+       refuse to run. Real case: Dell Latitude 3550, Intel Core Ultra 5
+       125U, Windows 11 build 26200, Device Encryption mid-encryption at
+       73.6%. The original recovery partition was deleted and could not
+       be replaced across three consecutive runs, leaving the machine
+       with no dedicated recovery partition and WinRE disabled.
+
+       Follow-up (same patch, same day): the unsafe-VolumeStatus branch
+       in Suspend-BitLockerForWinRE originally set $protectionState =
+       $null and allowed the generic manage-bde -status fallback to run.
+       That fallback parses "Protection Off" from the output - which is
+       present on a mid-encryption volume, because ProtectionStatus
+       really is Off; the encryption is in progress, not the protection -
+       reclassified the state as $false (confirmed unprotected), and let
+       the function return $true. That re-opened the exact fail-open path
+       the patch was written to close. The branch now returns $false
+       immediately, before the fallback can run. Test-BitLockerProtected
+       was already correct: it returns $null (not $false) for the same
+       condition. Identified by independent review of the patch; the
+       fallback path is only reachable when Get-BitLockerVolume returns
+       an object with ProtectionStatus=Off and an unsafe VolumeStatus,
+       which is exactly the state this patch detects, so the fallback
+       correction is required for the patch's stated guarantee to hold.
+
+       Follow-up (same patch, further revision): three additional changes
+       were required to close the failure completely.
+
+       First, the confirmed-safe VolumeStatus whitelist in both
+       Test-BitLockerProtected and Suspend-BitLockerForWinRE now also
+       includes FullyEncrypted. The initial patch only whitelisted
+       FullyDecrypted (plus empty). That rejected the standard post-
+       Suspend-BitLocker state - ProtectionStatus=Off, VolumeStatus=
+       FullyEncrypted - as if it were hazardous, which would refuse to
+       run the destructive partition path on any machine whose BitLocker
+       was already suspended. FullyEncrypted with protection Off is a
+       safe, common state and must be treated as unprotected.
+
+       Second, the BitLocker safety check in
+       Ensure-AdequateRecoveryPartition now runs BEFORE reagentc
+       /disable, not after. The original patch placed the check after
+       the WinRE disable, so on a machine mid-Device-Encryption the
+       function would disable WinRE, then refuse the destructive work,
+       leaving the machine with WinRE disabled and no way to re-enable
+       it until encryption completed - the exact damaged state the
+       patch was written to prevent. Reordering means the guard fires
+       while WinRE is still registered and functional, so a refusal
+       leaves the machine unchanged rather than damaged.
+
+       Third, the deployment step (Step 5) now performs the same
+       BitLocker safety check before disabling WinRE. Even with the
+       first two fixes, the main flow could reach Step 5 (via the
+       OS-fallback path or an enable-only escalation) and disable WinRE
+       before trying to enable it against a mid-encryption volume.
+       reagentc /enable then refused, leaving the machine with WinRE
+       disabled. Step 5 now refuses to disable WinRE unless BitLocker
+       is confirmed safe, exits with EXIT_WARNING, and leaves the
+       machine's WinRE state untouched for the next run after
+       encryption stabilises.
+
+       Fourth, Suspend-BitLockerForWinRE now evaluates the BitLocker
+       safety check even under -DryRun. Previously the DryRun branch
+       short-circuited before any BitLocker query, so a dry run of a
+       mid-Device-Encryption machine returned $true from the guard,
+       bypassed the refusal check in Ensure-AdequateRecoveryPartition,
+       and logged "Would delete recovery partition N" lines while the
+       real destructive path is exactly what must not run in that
+       state. A field engineer pre-flighting with -DryRun would see a
+       clean dry run and conclude the machine was safe. The DryRun
+       branch now queries Get-BitLockerVolume and returns $false on the
+       hazardous VolumeStatus values before proceeding to the
+       "[DRY RUN] Would check and suspend BitLocker" log line. The
+       check is read-only; no state-modifying call is made in DryRun.
 
     2. New-Partition now sets the recovery type GUID (GPT) or type code
        (MBR) at partition creation, closing the window between New-Partition
@@ -75,12 +150,24 @@
 
     2. A migration guard resets $step to 2 when the checkpoint claims
        $step >= 4 and $needInject has been determined to be true. That
-       combination is the signature of an interrupted failed-injection
+       combination means the checkpoint cannot be trusted: a high
+       checkpoint is present while a rebuild is still required. Two
+       situations produce it. First, an interrupted failed-injection
        run under v43 patch 3 or earlier - a run that advanced the
        checkpoint but did not commit new state - and it can occur even
        when a valid (pre-existing) state file with an old hash remains
        on disk, because the failed-injection branch skips the state
-       write without deleting the prior state. Without the guard the
+       write without deleting the prior state. Second, an interruption
+       after a successful step-4 checkpoint but before the new state
+       was committed - the injection succeeded, the optimized WIM
+       exists, and the run was killed before the state write. The guard
+       cannot distinguish these two cases using the checkpoint data
+       alone, and the conservative response is the same for both: reset
+       to step 2 and re-run the injection. In the second case this is a
+       safe replay of work that had already succeeded, not a recovery
+       from a defect; it costs one extra pipeline run of step 3 on the
+       narrow interruption. That is preferable to trusting a checkpoint
+       that might be bypassing required injection. Without the guard the
        machine would not self-heal: the step guards skip step 3 for
        $step >= 4, so the new run initializes a fresh
        $Script:ImageInjectionComplete = $true, deploys the un-injected
@@ -1428,19 +1515,29 @@ function Test-BitLockerProtected {
         $vs     = [string]$blv.VolumeStatus
         if ($status -eq 'On' -or $status -eq 'ProtectionOn' -or $status -eq 1) { return $true }
         if ($status -eq 'Off' -or $status -eq 'ProtectionOff' -or $status -eq 0) {
-            # v43 patch 5: ProtectionStatus=Off is not sufficient evidence that
-            # the volume is safe to perform destructive partition operations
-            # on. On Windows 11 24H2+ with Device Encryption, a volume can be
-            # actively encrypting (VolumeStatus=EncryptionInProgress) while
-            # ProtectionStatus reads Off. In that state, new partitions created
-            # on the same disk are auto-encrypted by the Device Encryption
-            # service before the recovery type GUID can be applied, and
-            # reagentc /enable refuses with "Windows RE cannot be enabled on a
-            # volume with BitLocker Drive Encryption enabled." Only
-            # FullyDecrypted (or an empty VolumeStatus, which some builds
-            # report for volumes that BitLocker has never touched) is a
-            # confirmed-safe state.
-            if ($vs -eq 'FullyDecrypted' -or -not $vs) { return $false }
+            # v43 patch 5 (revised): ProtectionStatus=Off is not sufficient
+            # evidence that the volume is safe to perform destructive
+            # partition operations on. On Windows 11 24H2+ with Device
+            # Encryption, a volume can be actively encrypting
+            # (VolumeStatus=EncryptionInProgress) while ProtectionStatus
+            # reads Off. In that state, new partitions created on the same
+            # disk are auto-encrypted by the Device Encryption service
+            # before the recovery type GUID can be applied, and
+            # reagentc /enable refuses with "Windows RE cannot be enabled
+            # on a volume with BitLocker Drive Encryption enabled."
+            #
+            # The confirmed-safe VolumeStatus values are:
+            #   - FullyDecrypted: never encrypted, or decryption finished.
+            #   - FullyEncrypted: volume is fully encrypted but protection
+            #     is Off (a normal suspended state, e.g. after
+            #     Suspend-BitLocker or a Windows Update suspension that has
+            #     not yet been lifted). Destructive partition work is safe.
+            #   - empty VolumeStatus: some builds report empty for volumes
+            #     BitLocker has never touched.
+            # Any other VolumeStatus (EncryptionInProgress,
+            # DecryptionInProgress, EncryptionPaused, DecryptionPaused) is
+            # the hazardous Device Encryption in-progress state.
+            if ($vs -eq 'FullyDecrypted' -or $vs -eq 'FullyEncrypted' -or -not $vs) { return $false }
             return $null
         }
         return $null
@@ -1536,7 +1633,26 @@ function Test-VolumeEncrypted {
 function Suspend-BitLockerForWinRE {
     param([string]$MountPoint = "C:")
 
+    # v43 patch 5 (revised): the BitLocker state query runs even in DryRun
+    # mode. Its purpose is to detect the Device Encryption in-progress
+    # state, which is a property of the machine, not of the operation. A
+    # dry run on a mid-encryption machine must report the hazard so the
+    # field engineer does not run the real script and damage the machine.
+    # The state queries are read-only; the DryRun branch below returns
+    # before any state-modifying operation.
     if ($Script:DryRun) {
+        $blvDry = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
+        if ($blvDry) {
+            $dryProt = $blvDry.ProtectionStatus
+            $dryVs   = [string]$blvDry.VolumeStatus
+            if (($dryProt -eq 'Off' -or $dryProt -eq 'ProtectionOff' -or $dryProt -eq 0) -and
+                $dryVs -and
+                $dryVs -ne 'FullyDecrypted' -and
+                $dryVs -ne 'FullyEncrypted') {
+                Write-Log "BitLocker on ${MountPoint}: ProtectionStatus=Off but VolumeStatus=$dryVs - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected." -Level ERROR
+                return $false
+            }
+        }
         Write-Log "[DRY RUN] Would check and suspend BitLocker on $MountPoint"
         $Script:BitLockerSuspended = $true
         return $true
@@ -1560,19 +1676,36 @@ function Suspend-BitLockerForWinRE {
         if ($protectionStatus -eq 'On' -or $protectionStatus -eq 'ProtectionOn' -or $protectionStatus -eq 1) {
             $protectionState = $true
         } elseif ($protectionStatus -eq 'Off' -or $protectionStatus -eq 'ProtectionOff' -or $protectionStatus -eq 0) {
-            # v43 patch 5: ProtectionStatus=Off alone is not sufficient. On
-            # Windows 11 24H2+ Device Encryption, a volume can be actively
-            # encrypting (VolumeStatus=EncryptionInProgress) with protection
-            # Off. During that window new partitions created on the same disk
-            # are auto-encrypted by the Device Encryption service before their
-            # recovery type GUID can be applied, and reagentc /enable will
-            # refuse. Only FullyDecrypted (or an empty VolumeStatus) is a
-            # confirmed-safe state.
-            if ($volumeStatus -eq 'FullyDecrypted' -or -not $volumeStatus) {
+            # v43 patch 5 (revised): ProtectionStatus=Off alone is not
+            # sufficient. On Windows 11 24H2+ Device Encryption, a volume can
+            # be actively encrypting (VolumeStatus=EncryptionInProgress) with
+            # protection Off. During that window new partitions created on the
+            # same disk are auto-encrypted by the Device Encryption service
+            # before their recovery type GUID can be applied, and reagentc
+            # /enable will refuse. The confirmed-safe VolumeStatus values are
+            # FullyDecrypted (never encrypted or decryption finished),
+            # FullyEncrypted (volume encrypted but protection Off - a normal
+            # suspended state), and empty.
+            if ($volumeStatus -eq 'FullyDecrypted' -or $volumeStatus -eq 'FullyEncrypted' -or -not $volumeStatus) {
                 $protectionState = $false
             } else {
-                Write-Log "BitLocker on ${MountPoint}: ProtectionStatus=Off but VolumeStatus=$volumeStatus - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected." -Level WARN
-                $protectionState = $null
+                # v43 patch 5 (revised): return $false immediately. The generic
+                # manage-bde fallback further down runs whenever
+                # $protectionState is $null, and on a mid-encryption volume
+                # manage-bde -status reports "Protection Off" (because
+                # ProtectionStatus really is Off; the encryption is in
+                # progress, not the protection). The fallback would parse
+                # that as $false, overwrite the unknown state, and let this
+                # function return $true - re-creating the same fail-open
+                # path the patch was written to close. Refusing here, before
+                # the fallback can run, is the only safe outcome for a state
+                # this function has positively identified as hazardous.
+                # Test-BitLockerProtected was already correct: it returns
+                # $null (not $false) for the same condition, so the caller's
+                # follow-up check in Ensure-AdequateRecoveryPartition will
+                # also refuse to proceed.
+                Write-Log "BitLocker on ${MountPoint}: ProtectionStatus=Off but VolumeStatus=$volumeStatus - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected." -Level ERROR
+                return $false
             }
         }
         Write-Log "BitLocker Get-BitLockerVolume on ${MountPoint}: ProtectionStatus=$protectionStatus, VolumeStatus=$volumeStatus"
@@ -2045,6 +2178,25 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "WARNING: If the OS shrink fails, recovery partitions will have been deleted and cannot be restored. No rollback." -Level WARN
     }
 
+    # v43 patch 5 (revised): the BitLocker safety check runs BEFORE the
+    # WinRE disable. If the BitLocker check refuses (Device Encryption
+    # in-progress), the function returns without having disabled WinRE,
+    # so the machine retains its current recovery environment while the
+    # encryption state stabilises. The original patch 5 implementation
+    # disabled WinRE first and then refused, which left the machine with
+    # WinRE disabled and no way to re-enable it until encryption
+    # finished - the exact damaged state that patch 5 was written to
+    # prevent.
+    $suspendResult = Suspend-BitLockerForWinRE
+    if (-not $suspendResult) {
+        $blState = Test-BitLockerProtected -MountPoint "C:"
+        if ($blState -ne $false) {
+            Write-Log "Cannot confirm BitLocker is unprotected on C: (state=$blState) - refusing destructive partition operations" -Level ERROR
+            return $null
+        }
+        Write-Log "Suspend returned false but BitLocker is confirmed Off - proceeding" -Level WARN
+    }
+
     $stateBefore = Get-WinREState
     if ($stateBefore.Status -eq "Enabled") {
         Write-Log "Disabling WinRE before partition recreation"
@@ -2062,16 +2214,6 @@ function Ensure-AdequateRecoveryPartition {
             return $null
         }
         Write-Log "WinRE disable verified"
-    }
-
-    $suspendResult = Suspend-BitLockerForWinRE
-    if (-not $suspendResult) {
-        $blState = Test-BitLockerProtected -MountPoint "C:"
-        if ($blState -ne $false) {
-            Write-Log "Cannot confirm BitLocker is unprotected on C: (state=$blState) - refusing destructive partition operations" -Level ERROR
-            return $null
-        }
-        Write-Log "Suspend returned false but BitLocker is confirmed Off - proceeding" -Level WARN
     }
 
     Write-Log "Pre-deletion inventory:"
@@ -4158,6 +4300,27 @@ try {
         exit $EXIT_SUCCESS
     }
 
+    # v43 patch 5 (revised): check BitLocker safety BEFORE disabling WinRE.
+    # If BitLocker is in the hazardous Device Encryption in-progress state,
+    # reagentc /enable will refuse regardless of which target we deploy to.
+    # Disabling WinRE and then failing to re-enable it leaves the machine
+    # worse off than it started: WinRE disabled, no registered recovery
+    # location. Bail out now with a warning so the machine keeps whatever
+    # WinRE registration it has, and the next run after encryption
+    # stabilises can complete the work.
+    $preDeploySuspend = Suspend-BitLockerForWinRE
+    if (-not $preDeploySuspend) {
+        $preDeployBl = Test-BitLockerProtected -MountPoint "C:"
+        if ($preDeployBl -ne $false) {
+            Write-Log "Cannot confirm BitLocker is unprotected on C: (state=$preDeployBl) - skipping deployment to preserve current WinRE state" -Level ERROR
+            Write-Log "Re-run after the encryption state stabilises (VolumeStatus=FullyDecrypted or FullyEncrypted)." -Level WARN
+            $Script:nonFatalWarning = $true
+            Remove-ItemIfExist $CheckpointFile
+            exit $EXIT_WARNING
+        }
+        Write-Log "Suspend returned false but BitLocker is confirmed Off - proceeding" -Level WARN
+    }
+
     $CurrentWinREState = Get-WinREState
     if ($CurrentWinREState.Status -eq "Enabled") {
         Write-Log "Disabling WinRE before deployment"
@@ -4180,9 +4343,6 @@ try {
             exit $EXIT_FATAL
         }
     }
-
-    $suspended = Suspend-BitLockerForWinRE
-    if (-not $suspended) { $Script:nonFatalWarning = $true }
 
     $deployOk = $false
     if ($recoveryPartition) {

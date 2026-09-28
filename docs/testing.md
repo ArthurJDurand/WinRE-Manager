@@ -71,15 +71,18 @@ Then it runs the parser self-test (below).
 
 #### Device Encryption hazard warning (v12)
 
-When the BitLocker section reports `ProtectionStatus: Off` together with a `VolumeStatus` of anything other than `FullyDecrypted`, the harness prints an additional warning block:
+When the BitLocker section reports `ProtectionStatus: Off` together with a `VolumeStatus` of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, or `DecryptionPaused`, the harness prints an additional warning block:
 
 ```
   WARNING: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress.
-           Device Encryption is actively encrypting the OS volume.
+           Device Encryption is actively encrypting or decrypting the OS volume.
            Production v43 patch 5 will refuse destructive partition work in this state.
-           Wait until VolumeStatus=FullyDecrypted (encryption aborted) or VolumeStatus=FullyEncrypted
-           with ProtectionStatus=On (encryption completed and key escrowed), then run WinRE.ps1.
+           Wait until VolumeStatus=FullyDecrypted or VolumeStatus=FullyEncrypted before running WinRE.ps1.
 ```
+
+A `VolumeStatus` of `FullyDecrypted`, `FullyEncrypted`, or empty is treated as safe and does not trigger the warning. `FullyEncrypted` with `ProtectionStatus=Off` is the standard suspended-BitLocker state and is a valid deployment target.
+
+The predicate is deliberately aligned with the production v43 patch 5 (revised) `Suspend-BitLockerForWinRE` guard. The harness does not call into that guard — it queries `Get-BitLockerVolume` directly and applies the same set of hazardous states — but a diagnostic that disagreed with production about which states are safe would be worse than no diagnostic at all.
 
 This warning exists because two machines were damaged by the pre-v43-patch-5 code on the same day, both on Windows 11 build 26200 mid-Device-Encryption. The production script now refuses to run destructive partition work in this state; the harness makes the hazard visible before the field engineer runs the production script. See [troubleshooting.md](troubleshooting.md) for the full failure mode and recovery procedure.
 
@@ -184,7 +187,7 @@ Three known differences:
 
 - **`Get-ThisMachineProfile` is harness-specific.** It uses `BuildNumber -ge 22000` to detect Windows 11; production uses `$os.Caption -like "*Windows 11*"`. The two agree on every Windows 11 client SKU but diverge on Server SKUs with build ≥ 22000. Neither the harness nor production is expected to run on Server.
 - **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test.
-- **The harness does not run `Test-BitLockerProtected`, `Suspend-BitLockerForWinRE`, or any production function that would block destructive work.** The Device Encryption hazard check in the diagnostic is a direct query of `Get-BitLockerVolume` and a comparison of the returned `ProtectionStatus` and `VolumeStatus`, not a call into the production guard. This is intentional: the harness does not exercise production's BitLocker guard logic, and a change to that guard does not require a harness update. The v43 patch 5 change to `Test-BitLockerProtected` and `Suspend-BitLockerForWinRE` therefore does not affect the harness.
+- **The harness does not run `Test-BitLockerProtected`, `Suspend-BitLockerForWinRE`, or any production function that would block destructive work.** The Device Encryption hazard check in the diagnostic is a direct query of `Get-BitLockerVolume` and a comparison of the returned `ProtectionStatus` and `VolumeStatus` against the same hazardous-state set that production uses, but it does not call into the production guard. This is intentional: the harness does not exercise production's BitLocker control flow, and a change to that control flow does not require a harness update. The v43 patch 5 change to `Test-BitLockerProtected` and `Suspend-BitLockerForWinRE` therefore does not affect the harness — but the v12 (revised) hazard predicate was aligned with it manually so the two agree on which states are hazardous.
 
 ## Adding a test
 
