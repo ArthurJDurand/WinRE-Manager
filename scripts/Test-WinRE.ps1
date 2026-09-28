@@ -885,6 +885,26 @@ function Show-SystemDiagnostic {
             Say "  VolumeStatus:     $($blv.VolumeStatus)"
             Say "  EncryptionMethod: $($blv.EncryptionMethod)"
             Say "  EncryptionPct:    $($blv.EncryptionPercentage)"
+
+            # v12: flag the Device Encryption in-progress hazard. When
+            # ProtectionStatus reads Off but VolumeStatus is anything other
+            # than FullyDecrypted, Device Encryption is actively encrypting
+            # the volume. In that state, new partitions created on the same
+            # disk are auto-encrypted by the Device Encryption service before
+            # their recovery type GUID can be applied, and reagentc /enable
+            # refuses with "Windows RE cannot be enabled on a volume with
+            # BitLocker Drive Encryption enabled." Production's v43 patch 5
+            # now refuses to run the destructive partition paths in this
+            # state. The warning here makes the hazard visible to a field
+            # engineer before they run WinRE.ps1.
+            if ($blv.ProtectionStatus -ne 'On' -and $blv.VolumeStatus -ne 'FullyDecrypted' -and $blv.VolumeStatus) {
+                Say ""
+                Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) but VolumeStatus=$($blv.VolumeStatus)." -Level WARN
+                Say "           Device Encryption is actively encrypting the OS volume." -Level WARN
+                Say "           Production v43 patch 5 will refuse destructive partition work in this state." -Level WARN
+                Say "           Wait until VolumeStatus=FullyDecrypted (encryption aborted) or VolumeStatus=FullyEncrypted" -Level WARN
+                Say "           with ProtectionStatus=On (encryption completed and key escrowed), then run WinRE.ps1." -Level WARN
+            }
         } else {
             Say "  Get-BitLockerVolume returned null (module not loaded, cmdlet failed, or requires elevation)"
         }
