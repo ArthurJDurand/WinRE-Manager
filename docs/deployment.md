@@ -8,6 +8,17 @@ Run `WinRE.ps1` as `NT AUTHORITY\SYSTEM` from a scheduled task, triggered **at b
 
 Do **not** run it from a user logon script. It modifies partition tables and BitLocker state; those operations require SYSTEM.
 
+## Preconditions
+
+Before the first run on any machine, confirm:
+
+- **Windows build**: 19041+ for Windows 10, 22000+ for Windows 11.
+- **7-Zip** present at `C:\Program Files\7-Zip\7z.exe`, or `winget` available so the script can install it.
+- **Internet access** to the driver manifest, the three OEM maps, and the base WIM repository. The script tolerates a missing network gracefully, but the first run on a fresh machine needs it.
+- **BitLocker state is stable.** This is the v43 patch 5 precondition and it matters. Run `manage-bde -status C:` and read the `Conversion Status:` line. It must read either `Fully Decrypted` or `Fully Encrypted`. Any state that contains the word `In Progress` or `Paused` is a hazard: on Windows 11 24H2+ with Device Encryption, a volume mid-encryption will auto-encrypt any new partition the script creates, defeating the deployment. See the Device Encryption section below for the full explanation.
+
+The harness's System Diagnostic (`scripts\Test-WinRE.ps1` Option 1) reports both `ProtectionStatus` and `VolumeStatus` and warns explicitly when the hazard state is detected.
+
 ## Scheduled task
 
 Create the task with `schtasks.exe`, or as an XML payload via Group Policy / Intune.
@@ -99,6 +110,31 @@ Place `WinRE.ps1` in a directory that:
 
 The script writes to `C:\ProgramData\OEM\Logs\` for the log and checkpoint file. `SYSTEM` can write there by default.
 
+## Device Encryption (v43 patch 5)
+
+Windows 11 24H2+ enables Device Encryption by default on hardware meeting TPM 2.0 and Secure Boot requirements. A freshly imaged machine will be in one of these encryption states when the scheduled task first fires:
+
+| `manage-bde -status C:` shows | Meaning | Is it safe to run? |
+|---|---|---|
+| `Fully Decrypted` + `Protection Off` | BitLocker never activated, or was turned off | Yes |
+| `Fully Encrypted` + `Protection On` | Encryption complete, key escrowed | Yes |
+| `Encryption In Progress` + `Protection Off` | Device Encryption is actively working | **No** |
+| `Encryption Paused` + `Protection Off` | Device Encryption was paused mid-work | **No** |
+| `Decryption In Progress` + `Protection Off` | Decryption is actively working | **No** |
+
+The middle row is the hazard. Before v43 patch 5, the script treated `Protection Off` as sufficient evidence that BitLocker was not a factor. On a machine in the `Encryption In Progress` state, the Device Encryption service claims any new partition the script creates — the partition is briefly a Basic Data partition, the encryption service sees it, and starts encrypting it before the script can apply the recovery type GUID. The subsequent delete-and-recreate retry hits the same problem, and the machine ends up with no recovery partition and WinRE disabled. Two machines failed this way on the same day before patch 5 shipped.
+
+**v43 patch 5 behaviour.** The script now refuses to run the destructive partition path when it sees `ProtectionStatus=Off` with any `VolumeStatus` other than `FullyDecrypted`. On such a machine the run either:
+
+- Exits cleanly without touching anything (if the machine did not need a destructive rebuild), or
+- Falls through to OS-fallback and exits with `EXIT_WARNING` (if the machine was mid-rebuild).
+
+In both cases the machine is left intact. The next run, after the encryption state stabilises, will perform the dedicated-partition work.
+
+**What this means for you.** The scheduled task does not need to be aware of the encryption state. The script handles it. But if you are deploying to a fresh fleet and want the first run to succeed rather than defer, wait until `manage-bde -status C:` shows `Fully Encrypted` (or `Fully Decrypted`) before pushing the task. On a modern SSD that is typically 30–90 minutes after OOBE.
+
+**If you are already on v43 patch 4 or earlier**, update before deploying to a fleet that contains any Windows 11 24H2+ machine. The pre-patch-5 code has a real, demonstrated failure mode. See the recovery procedure in [troubleshooting.md](troubleshooting.md) if a machine has already been damaged.
+
 ## Exit code handling
 
 The script's exit codes carry meaning. See [exit-codes.md](exit-codes.md) for the full matrix.
@@ -175,9 +211,10 @@ The script is destructive on the recovery partition and non-destructive on the O
 
 Watch for:
 
-- Exit code 2 with `UsedOSFallback = true` in the state file — the machine cannot shrink. Re-check on your next deployment cycle, not immediately.
-- Exit code 3 with `dism /Export-Image failed` in the log — 7-Zip or DISM problem.
-- Exit code 3 with `cannot deploy a new WinRE image while WinRE is still Enabled` — `reagentc /disable` returned nonzero. Investigate before retrying.
+- **Exit code 2 with `UsedOSFallback = true` in the state file** — the machine cannot shrink, or the v43 patch 5 Device Encryption guard fired. Check the log for the guard message `ProtectionStatus=Off but VolumeStatus=...`; if present, the machine was mid-encryption and the dedicated partition was deferred. Re-check on your next deployment cycle, not immediately.
+- **Exit code 3 with `dism /Export-Image failed` in the log** — 7-Zip or DISM problem.
+- **Exit code 3 with `cannot deploy a new WinRE image while WinRE is still Enabled`** — `reagentc /disable` returned nonzero. Investigate before retrying.
+- **Exit code 3 with `FATAL: WinRE is not enabled at exit`** — the machine lost its recovery partition. This is the pre-patch-5 Device Encryption failure mode. Follow the recovery procedure in [troubleshooting.md](troubleshooting.md).
 
 ## Rolling back
 
