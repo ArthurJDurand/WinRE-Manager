@@ -12,8 +12,8 @@ $RECYCLE.BIN/
 *.psm1.bak
 *.clixml
 
-# Test artifacts (the harness writes here)
-C:\Temp\WinRETest/
+# Test artifacts (in case the harness working directory is ever inside the repo)
+WinRETest/
 TestResults/
 Pester*.xml
 *.trx
