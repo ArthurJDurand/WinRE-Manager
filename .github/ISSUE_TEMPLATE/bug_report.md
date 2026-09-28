@@ -39,3 +39,22 @@ labels: ['bug', 'needs-triage']
 
 <details>
 <summary>C:\ProgramData\OEM\Logs\WinRE-Manager.log (relevant slice)</summary>
+
+```
+paste here
+```
+
+</details>
+
+<details>
+<summary>Test-WinRE.ps1 output</summary>
+
+```
+paste here
+```
+
+</details>
+
+## Additional context
+
+<!-- Screenshots, hardware quirks, anything unusual. -->
