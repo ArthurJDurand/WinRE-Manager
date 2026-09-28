@@ -15,6 +15,7 @@ The first line is `========== WinRE Manager Started (v<version>) ==========`. Th
 **Symptom.** `reagentc /enable` returns non-zero, output contains the phrase above.
 
 **Log lines.**
+
 ```
 reagentc /enable (exit 2): ...
 reagentc /enable failed because the target volume is BitLocker-protected
@@ -39,6 +40,7 @@ If the script cannot suspend BitLocker (see below), it aborts the recovery attem
 **Symptom.** The script has already created a new recovery partition, deployed the WIM, and now cannot disable the existing WinRE registration.
 
 **Log lines.**
+
 ```
 reagentc /disable: exit=<n>, output=<output>
 reagentc /disable failed (exit <n>): <output>
@@ -58,6 +60,7 @@ FATAL: cannot deploy a new WinRE image while WinRE is still Enabled - aborting
 **Symptom.** Step 4 of the full-update path.
 
 **Log lines.**
+
 ```
 dism /Export-Image failed with exit code <n>
 ```
@@ -82,11 +85,13 @@ dism /Export-Image reported success but <path> does not exist
 **Symptom.** Step 2 of the full-update path, only reached when there is no usable WIM at the reagentc-registered location or via fallback.
 
 **Log lines.**
+
 ```
 No active or fallback WinRE image found - forcing rebuild
 Step 2: Obtaining base WIM
 7-Zip required
 ```
+
 followed by a download error or a `FATAL` exit.
 
 **Cause.** The GitHub repository hosting the base WIM is unreachable, the parts are missing, or 7-Zip is not installed and could not be installed via `winget`.
@@ -102,6 +107,7 @@ followed by a download error or a `FATAL` exit.
 **Symptom.** The OS partition has been shrunk, the recovery partitions have been deleted, and the script cannot create the new partition.
 
 **Log lines.**
+
 ```
 New-Partition attempt 1 failed: ...
 New-Partition attempt 2 failed: ...
@@ -120,10 +126,13 @@ If `Restore-OSPartitionSize` also fails, `$Script:GeometryRestoreFailed` is set 
 **Symptom.** The script cannot assign a drive letter to the newly created recovery partition.
 
 **Log lines.**
+
 ```
 No drive letter available
 ```
+
 or
+
 ```
 Exhausted all candidate letters for disk <n> part <m>
 ```
@@ -139,6 +148,7 @@ Before retrying, free a drive letter. Check `Get-PSDrive -PSProvider FileSystem`
 **Symptom.** `Suspend-BitLockerForWinRE` falls back to parsing `manage-bde -status`.
 
 **Log lines.**
+
 ```
 BitLocker Get-BitLockerVolume on C: returned null - falling back to manage-bde -status text parsing
 ```
@@ -154,11 +164,14 @@ The refusal is deliberate: the script will not assume BitLocker is off when it c
 **Symptom.** A machine with a VMD controller (Intel 12th gen and later typically) does not get VMD drivers injected.
 
 **Log lines.**
+
 ```
 VMD hardware present: True
 Required drivers (VMD): 0
 ```
+
 or
+
 ```
 Skipping <name>: CPU gen <n> outside <min>-<max>
 ```
@@ -179,6 +192,7 @@ The harness (Option 9, VMD drivers) also logs a warning with the raw CPU string 
 **Symptom.** `Test-BitLockerProtected`, `Test-BitLockerSuspended`, or `Test-VolumeEncrypted` returns `$null` on a machine where BitLocker is clearly in one state or the other.
 
 **Log lines.**
+
 ```
 BitLocker protection state on C: could not be determined - refusing to treat as unprotected
 ```
@@ -197,6 +211,7 @@ BitLocker protection state on C: could not be determined - refusing to treat as 
 **Symptom.** The parser self-test check 2 fails, or the script cannot resolve the WinRE location.
 
 **Log lines.**
+
 ```
 Parser: reagentc location  [FAIL] ...did not match any line
 ```
