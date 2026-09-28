@@ -4,14 +4,15 @@ WinRE Manager is a single-file production script plus a read-only harness and th
 
 ## What problem it solves
 
-Windows' recovery environment is fragile. The four common failure modes are:
+Windows' recovery environment is fragile. The five common failure modes are:
 
 1. **Partition too small.** A Windows Update replaces `winre.wim` with a newer, larger one; the recovery partition no longer has room for it plus the Microsoft-documented servicing margin.
 2. **BitLocker auto-encryption.** On Windows 11 24H2+ with TPM 2.0 and Secure Boot, `Device Encryption` auto-encrypts newly created partitions, including recovery partitions. `reagentc /enable` then refuses with *"Windows RE cannot be enabled on a volume with BitLocker Drive Encryption enabled."*
-3. **Missing storage drivers.** OEM WinPE driver packs and Intel VMD storage drivers are required for the recovery image to see the storage controller. Without them, recovery cannot find the OS.
-4. **Stale registration.** A disk migration, clone, or manual `reagentc` operation leaves the registration pointing at a partition that no longer exists. Windows might silently fall back to `C:\Recovery\WindowsRE` (OS-fallback) — a functional but degraded state.
+3. **Device Encryption in progress.** A subtler variant of the above. A volume can be actively encrypting (`VolumeStatus=EncryptionInProgress`) while `ProtectionStatus` reads `Off`. In that state the encryption service is running and will claim any new partition created on the disk, before the recovery type GUID can be applied. This is the failure mode fixed in v43 patch 5; it defeated the earlier reactive BitLocker handling because `ProtectionStatus=Off` was treated as sufficient evidence that BitLocker was not a factor.
+4. **Missing storage drivers.** OEM WinPE driver packs and Intel VMD storage drivers are required for the recovery image to see the storage controller. Without them, recovery cannot find the OS.
+5. **Stale registration.** A disk migration, clone, or manual `reagentc` operation leaves the registration pointing at a partition that no longer exists. Windows might silently fall back to `C:\Recovery\WindowsRE` (OS-fallback) — a functional but degraded state.
 
-WinRE Manager addresses all four idempotently. The two hard requirements are:
+WinRE Manager addresses all five idempotently. The two hard requirements are:
 
 - **Correct end state**: a single dedicated recovery partition, on the OS disk, correctly typed, containing the right WIM, with `reagentc` registered to it.
 - **Do not disturb a healthy machine.** Running the script on a machine already in the correct end state must be a no-op.
@@ -72,7 +73,7 @@ Two-step decision:
    - Its effective free space (current free + existing WIM size) is at least `WIM + 250 MiB`.
    - Its encryption state is not confirmed encrypted.
 
-2. If no candidate passes, `Ensure-AdequateRecoveryPartition` performs the destructive path: disable WinRE, suspend BitLocker, delete every recovery partition on the OS disk, extend the OS partition to its `SizeMax`, shrink it by `(bucketSizeMiB + 1) MiB`, create a new partition at the aligned offset, format as NTFS with label `Recovery`, set the recovery type GUID and GPT attributes **before** assigning a drive letter, verify no auto-encryption occurred, and return.
+2. If no candidate passes, `Ensure-AdequateRecoveryPartition` performs the destructive path: disable WinRE, suspend BitLocker (refusing to proceed if `VolumeStatus` is anything other than `FullyDecrypted` — see the v43 patch 5 note below), delete every recovery partition on the OS disk, extend the OS partition to its `SizeMax`, shrink it by `(bucketSizeMiB + 1) MiB`, create a new partition at the aligned offset with the recovery type GUID or type code already applied, format as NTFS with label `Recovery`, verify no auto-encryption occurred, and return.
 
    If the shrink fails after three attempts (immediate, after 10s sleep, after `defrag C: /x`), the OS partition size is restored via `Restore-OSPartitionSize`, the destructive attempt is abandoned, and the script falls through to OS-fallback — WinRE deployed to `C:\Recovery\WindowsRE` instead of a dedicated partition, with exit code 2.
 
@@ -119,8 +120,8 @@ These are the invariants the script maintains. Each one has a real field failure
 1. **Exactly one recovery partition exists, on the OS disk, correctly type-coded.** Enforced on the fast path, the enable-only path, both pending-reboot exits, and Step 7 of the full-update path. A type-coded recovery partition on any non-OS disk is deleted unconditionally. The invariant is absolute.
 2. **No failure path leaves C: permanently shrunken.** Every post-shrink failure calls either `Remove-OrphanPartition` (which absorbs freed space back) or `Restore-OSPartitionSize`. Every failure of `Restore-OSPartitionSize` sets `$Script:GeometryRestoreFailed` so the state file is deleted and the next run retries from clean.
 3. **The state-write gate is never relaxed.** `Write-WinREState` is only called when `$Script:ImageInjectionComplete` is `$true` and a WIM hash was computed. A failed injection never leaves a state file behind. The one exception is the pending-reboot path, which re-writes the existing state file with an updated `PendingReboot` flag but does not update the hash.
-4. **BitLocker is never assumed Off.** All protection-state checks are tri-state (`$true` protected, `$false` unprotected, `$null` unknown). Any code path that would delete, resize, or format a partition refuses to proceed when the state is `$null`.
-5. **Recovery partition attributes are set before drive-letter assignment.** A freshly-formatted NTFS partition with a normal data type and a drive letter is a candidate for Device Encryption auto-encryption. Setting the recovery type GUID and `0x8000000000000001` (PLATFORM_REQUIRED + NO_DRIVE_LETTER) first closes that window.
+4. **BitLocker is never assumed Off.** All protection-state checks are tri-state (`$true` protected, `$false` unprotected, `$null` unknown). Additionally (v43 patch 5), a volume with `ProtectionStatus=Off` is confirmed-safe **only if** `VolumeStatus=FullyDecrypted` (or empty). Any other `VolumeStatus` — `FullyEncrypted`, `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused` — is treated as unknown. Any code path that would delete, resize, or format a partition refuses to proceed when the state is not confirmed-safe. The reason for this is subtle and was learned from field failure: on Windows 11 24H2+ with Device Encryption, a volume can be actively encrypting while `ProtectionStatus` reads `Off`, and in that state the encryption service claims any new partition before its recovery type GUID can be applied.
+5. **New recovery partitions are created with the recovery type code already applied.** `New-Partition` passes `-GptType {de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (GPT) or `-MbrType 0x27` (MBR) at creation time (v43 patch 5). This closes the window between `New-Partition` and `Set-RecoveryPartitionAttributes` during which the partition is a plain Basic Data partition. `Set-RecoveryPartitionAttributes` still runs after format to apply the GPT attributes (`0x8000000000000001` — PLATFORM_REQUIRED + NO_DRIVE_LETTER); it is idempotent on the type code. The attribute step still runs before any drive letter is assigned.
 6. **Self-referential file operations are guarded.** Any block that deletes a file and then writes to the same path (or copies another file onto it) checks first that the source and destination are not the same file (by `[System.IO.Path]::GetFullPath`). This guards against the v42 "fallback copy ate its own source" bug.
 7. **Checkpoint advancement requires injection success.** A checkpoint that says "step 3 completed" is only written when image injection actually completed. This is v43 patch 4's fix.
 
@@ -131,6 +132,23 @@ The two most consequential decisions in the whole script are:
 - **Dedicated recovery partition is the primary objective; OS-fallback is the failure outcome.** The script will attempt the destructive repartitioning path even when the pre-check suggests the OS cannot shrink enough. If the attempt fails, the OS is restored and OS-fallback is used with exit code 2. This is a deliberate trade: try hard for the good outcome, fall back honestly when the attempt fails. The alternative — never try if the arithmetic is pessimistic — was tried in v37 and rejected because `SizeMin` is a hint, not a floor.
 
 - **The `DesiredStateId`-scoped retry policy.** A machine in OS-fallback with a matching state file stays in OS-fallback indefinitely, without re-attempting the destructive path. A state change (script version bump, manifest update, hardware change, or a Windows build update changing the OS value) naturally re-arms the retry. This avoids re-shrinking the OS on every run of a machine that cannot shrink.
+
+The v43 patch 5 change adds a third, smaller decision that nonetheless had outsized consequences in the field:
+
+- **The BitLocker safety guard takes priority over the dedicated-partition objective.** When the machine is mid-Device-Encryption, the script refuses to run the destructive partition path even though the dedicated-partition path is the primary objective. This is a deliberate inversion of the primary-objective rule for a specific hazardous state: damaging the machine is worse than deferring the dedicated-partition work to the next run. The guard logs a diagnostic and returns `$false`, which causes `Ensure-AdequateRecoveryPartition` to abort the destructive attempt and the main flow to fall through to OS-fallback — or, if the machine is not yet in a rebuild state, to exit cleanly without doing anything. The next run, once `VolumeStatus` is stable, will attempt the dedicated partition. This is the correct trade: an extra pipeline run later is cheaper than an unusable machine now.
+
+## A note on the v43 patch 5 field failures
+
+The v43 patch 5 change was driven by two field failures on the same day, both on Windows 11 build 26200 with Device Encryption mid-encryption:
+
+- **Dell Latitude 3550** (Intel Core Ultra 5 125U) — `VolumeStatus=EncryptionInProgress` at 73.6% when the script ran.
+- **HP ProBook 450 15.6 inch G10** (Intel Core i7-1355U) — same state, same failure sequence.
+
+Both machines lost their dedicated recovery partition and had WinRE disabled. The recovery procedure is documented in [troubleshooting.md](troubleshooting.md).
+
+The failure is instructive because it was invisible to each function in isolation. `Test-BitLockerProtected` was correctly implementing the tri-state contract for the state it observed (`ProtectionStatus=Off`). `Suspend-BitLockerForWinRE` was correctly taking the "already off, no suspension needed" branch. `New-Partition` was correctly creating a partition. `Set-RecoveryPartitionAttributes` was correctly applying the recovery type GUID. Each function did exactly what it was written to do. The bug was in the composition: the two BitLocker functions queried a subset of the protection state that was insufficient evidence for the decision the downstream code made with the answer.
+
+This is the class of failure that is hard to find in code review because no single function is wrong. It is found by watching the pipeline do something the operator knows is incorrect and tracing why each step thought it was fine.
 
 ## Related documents
 
