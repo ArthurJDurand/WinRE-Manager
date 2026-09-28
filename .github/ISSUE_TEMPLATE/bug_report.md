@@ -1,0 +1,41 @@
+---
+name: Bug report
+about: Something is broken. Something is behaving unexpectedly.
+labels: ['bug', 'needs-triage']
+---
+
+## Summary
+
+<!-- One or two sentences. What happened? What did you expect? -->
+
+## Environment
+
+- **WinRE.ps1 version:** <!-- e.g. v43 patch 4, from the .NOTES block -->
+- **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
+- **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
+- **Partition style:** <!-- GPT or MBR -->
+- **BitLocker state on C::** <!-- On, Off, Suspended, Unknown -->
+- **Elevation:** <!-- Running as SYSTEM, as admin, unelevated -->
+- **7-Zip present:** <!-- yes/no -->
+
+## Reproduction
+
+1. <!-- exact command line -->
+2. <!-- what happened -->
+
+## Expected
+
+<!-- what should have happened -->
+
+## Actual
+
+<!-- what happened instead -->
+
+## Exit code
+
+<!-- 0 / 1 / 2 / 3 -->
+
+## Log
+
+<details>
+<summary>C:\ProgramData\OEM\Logs\WinRE-Manager.log (relevant slice)</summary>
