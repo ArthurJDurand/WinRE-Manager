@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ArthurJDurand/WinRE-Manager/security/advisories/new
+    about: Report a security issue privately. Do not file a public issue.
+  - name: Sponsor the project
+    url: https://github.com/sponsors/ArthurJDurand
+    about: Support ongoing maintenance.
+  - name: Documentation
+    url: https://github.com/ArthurJDurand/WinRE-Manager/tree/main/docs
+    about: Read the docs before filing a bug.
