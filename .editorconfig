@@ -9,14 +9,17 @@ indent_style = space
 indent_size = 4
 
 [*.ps1]
+charset = utf-8-bom
 end_of_line = crlf
 indent_size = 4
 
 [*.psm1]
+charset = utf-8-bom
 end_of_line = crlf
 indent_size = 4
 
 [*.psd1]
+charset = utf-8-bom
 end_of_line = crlf
 indent_size = 4
 

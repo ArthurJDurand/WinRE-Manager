@@ -63,7 +63,21 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 12
+    Version : 13
+
+    v13 changes vs v12:
+    1. Show-SystemDiagnostic now reads
+       HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State
+       -> ImageState and warns when the value is present and not
+       IMAGE_STATE_COMPLETE. Production v43 patch 5 (further
+       revision) refuses to run in that state, because reagentc
+       /enable is blocked with 0x4c7 during Audit Mode, OOBE, and
+       the sysprep generalize/specialize phases. Without this
+       check the diagnostic would report every other subsystem
+       healthy while production would defer, which is misleading
+       on a machine whose only problem is that it has not finished
+       OOBE.
+    2. Menu and entry banners updated to "v13".
 
     v12 changes vs v11:
     1. Show-SystemDiagnostic now flags the Device Encryption in-progress
@@ -912,6 +926,39 @@ function Show-SystemDiagnostic {
         Say "  (could not read active WIM at the reagentc-registered location)"
     }
 
+    # ---- Windows Setup state (Audit Mode / OOBE guard) ----
+    # v13: mirrors the production v43 patch 5 (further revision)
+    # startup guard. During Audit Mode, OOBE, and the sysprep
+    # generalize/specialize phases, Windows blocks reagentc /enable
+    # with ERROR_CANCELLED (0x4c7, 1223) regardless of WIM
+    # correctness. Production refuses to run destructive partition
+    # work in those states. A diagnostic that reported every other
+    # subsystem as healthy while production would defer would be
+    # misleading on a machine whose only problem is that it has not
+    # finished OOBE.
+    Say ""
+    Say "--- Windows Setup state ---"
+    $setupStatePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State"
+    $imageState = $null
+    try {
+        $imageState = (Get-ItemProperty -Path $setupStatePath -Name ImageState -ErrorAction SilentlyContinue).ImageState
+    } catch { }
+    if ($imageState) {
+        Say "  ImageState: $imageState"
+        if ($imageState -ne "IMAGE_STATE_COMPLETE") {
+            Say ""
+            Say "  WARNING: ImageState=$imageState." -Level WARN
+            Say "           Windows is not in a normal-running state. Production v43 patch 5" -Level WARN
+            Say "           (further revision) refuses to run destructive partition work in" -Level WARN
+            Say "           this state, because reagentc /enable is blocked with 0x4c7 during" -Level WARN
+            Say "           Audit Mode, OOBE, and the sysprep generalize/specialize phases." -Level WARN
+            Say "           Complete OOBE, sign in to a normal desktop session, then re-run." -Level WARN
+        }
+    } else {
+        Say "  ImageState: (not present)"
+        Say "  Some SKUs omit the Setup\State key. Production treats this as safe."
+    }
+
     # ---- BitLocker on C: ----
     Say ""
     Say "--- BitLocker (C:) ---"
@@ -1625,7 +1672,7 @@ function Show-Summary {
 # =========================== MENU ===========================
 function Show-Menu {
     Clear-Host
-    Write-Host "WinRE Manager Test Harness (v12)"
+    Write-Host "WinRE Manager Test Harness (v13)"
     Write-Host ("Working directory: {0}" -f $TestDir)
     $p = Get-ThisMachineProfile
     Write-Host ("Detected: OS={0}  Vendor={1}  MT={2}  CPUVendor={3}  CPUGen={4}" -f $p.OS, $p.Vendor, $p.MachineType, $p.CPUVendor, $p.CPUGeneration)
@@ -1648,7 +1695,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v12"
+Rule "WinRE Manager test harness v13"
 Say "Working dir: $TestDir"
 if (-not (Test-Path $7Zip)) { Say "7-Zip not found at $7Zip - extraction tests will fail" -Level WARN }
 

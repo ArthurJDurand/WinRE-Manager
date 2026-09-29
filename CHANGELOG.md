@@ -6,6 +6,26 @@ The production script's `.NOTES` block contains the complete engineering changel
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to a `ScriptVersion` + patch-generation scheme rather than strict SemVer — see [docs/state-and-idempotency.md](docs/state-and-idempotency.md) for why.
 
+## [v43 patch 5 (further revision)] — 2026-09-29
+
+### Fixed
+
+- **Audit Mode / OOBE / sysprep guard.** The script now refuses to run before any state-modifying action when Windows is not in a normal-running state. During Audit Mode, OOBE, and the sysprep generalize/specialize phases, `reagentc /enable` fails with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM or the state of the recovery partition. The previous code deployed successfully, failed at `/enable`, wrote a state file recording the deployment as complete, and then looped on every subsequent run — the state file matched, no rebuild was triggered, and the enable-only path retried `/enable` forever. The guard reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` at startup, immediately after the log directory is ensured and before the hardware check. It proceeds only when `ImageState` is absent (some SKUs omit the key) or exactly `IMAGE_STATE_COMPLETE`; any other value defers with `EXIT_WARNING`, logs a clear message, and makes no WinRE or partition changes. Runs under `-DryRun` in the same read-only form (logs `Would defer` and continues). Field case: Dell Latitude 5530 (12th Gen Intel i7-1265U, Windows 11 build 26200) — the machine was in Audit Mode when the script first ran, `/enable` failed with `0x4c7` on two consecutive runs, and after the user completed OOBE and ran `reagentc /enable` manually it succeeded on the first attempt with the same WIM.
+- **Enable-failure counter and loop-breaker.** The state file now records `LastEnableResult` (string: `"ok"`/`"reboot"`/`"failed"`/`"blunsafe"`/`"bitlocker"`) and `EnableFailureAttempts` (integer). Previously, a failed `reagentc /enable` did not affect the state-write gate: the run continued through Step 6 and Step 7, wrote the state file as if the deployment had completed, and exited `EXIT_FATAL` at the final-verification block. The next run accepted the state file, took the fast or enable-only path, and failed the same way — a permanent loop for any cause of `/enable` failure, not just Audit Mode. Three changes close this:
+  - **The enable-only path no longer falls through to full update on `"failed"`.** A failed enable on the enable-only path increments the counter, writes the state file with the new counter value, and exits `EXIT_WARNING`. The deployment is already current; rebuilding it would not change the outcome. `"bitlocker"` still falls through to the suspend + delete + recreate recovery path, and `"blunsafe"` still exits `EXIT_WARNING` without writing state.
+  - **A loop-breaker exits `EXIT_FATAL` after 3 consecutive failed enables.** When the state file records `EnableFailureAttempts >= 3`, `LastEnableResult == "failed"`, and WinRE is still `Disabled`, the script logs a clear "manual intervention required" message, names the state file path, and exits without attempting anything else. The operator resolves the underlying cause and deletes the state file to reset the counter.
+  - **The fast path clears stale counters.** When the idempotent fast path fires on a machine whose state file carries a non-zero `EnableFailureAttempts` or a `LastEnableResult` other than `"ok"`, the state file is rewritten with the counters reset. A healthy machine's counters are cleared on the first fast-path run after the underlying cause is resolved. The enable-only success path does not itself write state, so on a machine where the enable succeeds after a run of failures, the counter clears one run later via the fast path.
+
+  Both new fields default to `"ok"` / `0` when read from state files written by earlier versions, so no rebuild is triggered by adding them.
+
+### Field reports
+
+**Dell Latitude 5530** (12th Gen Intel i7-1265U, Windows 11 build 26200). Machine was in Audit Mode when `WinRE.ps1` was first run. The deployment completed successfully through Step 5, `reagentc /enable` failed with `0x4c7` on two consecutive runs, and the state file recorded the deployment as complete. After the user completed OOBE and ran `reagentc /enable` manually it succeeded on the first attempt with the same WIM. This is the case that motivated the Audit Mode guard.
+
+### Unchanged
+
+`ScriptVersion` remains 43. `DesiredStateId` is unchanged. Healthy machines do not rebuild.
+
 ## [v43 patch 5] — 2026-09-28
 
 ### Fixed

@@ -59,11 +59,15 @@ Path: `C:\Recovery\OEM\winre_state.json`.
     "UsedOSFallback":           false,
     "RepairAttempts":           0,
     "DeployedDiskNumber":       4,
-    "DeployedPartitionNumber":  4
+    "DeployedPartitionNumber":  4,
+    "LastEnableResult":         "ok",
+    "EnableFailureAttempts":    0
 }
 ```
 
 `DeployedDiskNumber` and `DeployedPartitionNumber` are present only when the deployment reached a dedicated recovery partition or the OS-fallback path. They are used by the pending-reboot path to re-point `reagentc /setreimage` at the correct location after a reboot.
+
+`LastEnableResult` records the outcome of the last `reagentc /enable` attempt that reached a state-write point. Its values are `"ok"` (exit 0 and status confirmed `Enabled`), `"reboot"` (registration succeeded but a reboot is required), `"failed"` (generic hard failure), `"blunsafe"` (BitLocker on C: was not confirmed unprotected), and `"bitlocker"` (the recovery partition was BitLocker-protected). `EnableFailureAttempts` counts *consecutive* `"failed"` outcomes. Both fields default to `"ok"` / `0` when absent, so a state file written by an earlier version of the script is accepted without triggering a rebuild.
 
 ### Read semantics
 
@@ -76,14 +80,18 @@ Path: `C:\Recovery\OEM\winre_state.json`.
 
 Note: the stale file is left in place. If the next run also fails to reach a state-write point, the stale file stays. The next successful run overwrites it.
 
+`LastEnableResult` and `EnableFailureAttempts` are read with defaults of `"ok"` and `0`. A state file written by an earlier version of the script that does not contain those fields is accepted without triggering a rebuild; the fast path treats it as a healthy machine on the counters dimension.
+
 ### Write semantics
 
 `Write-WinREState` is called from:
 
-- The fast path when `PendingReboot` or `RepairAttempts` was carried in from a previous run and needs clearing.
-- The enable-only path, to record the registration result.
-- The pending-reboot path, to update the `PendingReboot` and `RepairAttempts` flags.
-- The full-update path, after step 6 succeeds.
+- The fast path when `PendingReboot`, `RepairAttempts`, `EnableFailureAttempts`, or a non-`"ok"` `LastEnableResult` was carried in from a previous run and needs clearing.
+- The enable-only path, to record the registration result. On `"failed"` the counter is incremented and the new value is written; on `"ok"` and `"reboot"` the state file is not touched by the enable-only path (a successful `"reboot"` writes `PendingReboot = $true` with the counter reset to 0).
+- The pending-reboot path, to update the `PendingReboot` and `RepairAttempts` flags. A successful pending-reboot repair resets the enable-failure counter to 0.
+- The full-update path, after step 6 succeeds. If the run's `$enableResult` is `"failed"`, the counter is incremented; on any other outcome it resets to 0. The loop-breaker checks the incremented value on the next run.
+
+The enable-failure counter is deliberately *not* incremented on `"bitlocker"` and `"blunsafe"` outcomes. Those are distinct failure modes with their own recovery paths and their own exit behaviour; the counter exists specifically for the generic `/enable` failure that would otherwise loop without any state change to break the cycle.
 
 Before writing, the function checks `$Script:GeometryRestoreFailed`. If that flag is set — meaning a post-shrink failure left C: shrunken and `Restore-OSPartitionSize` could not verify the geometry was restored — the function **deletes** the state file (if it exists) and returns without writing.
 
@@ -101,9 +109,25 @@ The fast path fires when:
 - The currently-registered partition is on the OS disk and is a recovery partition, AND
 - The deployed WIM hash at the registered location matches `CurrentImageHash`.
 
-If all five conditions hold, the machine is in the correct end state. The fast path runs `Remove-StrayRecoveryPartitions` (a read-only scan when there are no strays), optionally clears stale `PendingReboot`/`RepairAttempts` flags, and exits with `EXIT_SUCCESS`.
+If all five conditions hold, the machine is in the correct end state. The fast path runs `Remove-StrayRecoveryPartitions` (a read-only scan when there are no strays), optionally clears stale `PendingReboot`/`RepairAttempts`/`EnableFailureAttempts` flags and a stale `LastEnableResult`, and exits with `EXIT_SUCCESS`.
 
 If any condition fails, the script forces a full rebuild. The conditions above are also the fast-path `elseif` branches — the log records which one failed.
+
+### The loop-breaker
+
+The enable-failure counter is checked near the top of the main flow, after the pending-reboot block and before the classifier runs:
+
+```powershell
+if ($state.EnableFailureAttempts -ge 3 -and $state.LastEnableResult -eq "failed" -and $WinREState.Status -ne "Enabled") {
+    # log "manual intervention required", remove the checkpoint file, exit EXIT_FATAL
+}
+```
+
+This fires when `reagentc /enable` has failed on 3 or more consecutive runs and WinRE is still `Disabled`. The purpose is to prevent a machine from silently retrying `/enable` forever when no amount of retrying will resolve the underlying cause — Audit Mode (before the Audit Mode guard was added), a broken ReAgent registration, or a Windows component problem. The `LastEnableResult -eq "failed"` condition means the loop-breaker only fires for the generic `/enable` failure; `"blunsafe"` and `"bitlocker"` are excluded, because those are distinct failure modes with their own recovery paths and their own exit behaviour.
+
+The state file is left in place when the loop-breaker fires. The log message names the state file path and instructs the operator to delete it to reset the counter, once the underlying cause has been resolved.
+
+Under `-DryRun` the loop-breaker logs `Would refuse to retry …` and continues rather than exiting, matching the pattern used by the BitLocker and Audit Mode gates.
 
 ## The checkpoint file
 

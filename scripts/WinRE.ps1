@@ -3054,6 +3054,7 @@ function Read-WinREState {
         CurrentImageHash = $null; InjectedDriverSetVersion = $null; DesiredStateId = $null
         PendingReboot = $false; DeployedDiskNumber = $null; DeployedPartitionNumber = $null
         UsedOSFallback = $false; RepairAttempts = 0
+        LastEnableResult = "ok"; EnableFailureAttempts = 0
     }
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
     if (-not (Test-Path $path)) { return $empty }
@@ -3070,6 +3071,8 @@ function Read-WinREState {
                 DeployedPartitionNumber  = $state.DeployedPartitionNumber
                 UsedOSFallback           = if ($state.UsedOSFallback) { [bool]$state.UsedOSFallback } else { $false }
                 RepairAttempts           = if ($state.RepairAttempts) { [int]$state.RepairAttempts } else { 0 }
+                LastEnableResult         = if ($state.LastEnableResult) { [string]$state.LastEnableResult } else { "ok" }
+                EnableFailureAttempts    = if ($state.EnableFailureAttempts) { [int]$state.EnableFailureAttempts } else { 0 }
             }
         }
         Write-Log "State file DesiredStateId mismatch - stale" -Level WARN
@@ -3089,7 +3092,9 @@ function Write-WinREState {
         [int]$DeployedDiskNumber = -1,
         [int]$DeployedPartitionNumber = -1,
         [bool]$UsedOSFallback = $false,
-        [int]$RepairAttempts = 0
+        [int]$RepairAttempts = 0,
+        [string]$LastEnableResult = "ok",
+        [int]$EnableFailureAttempts = 0
     )
     $state = @{
         DesiredStateId           = $DesiredStateId
@@ -3099,6 +3104,8 @@ function Write-WinREState {
         PendingReboot            = $PendingReboot
         UsedOSFallback           = $UsedOSFallback
         RepairAttempts           = $RepairAttempts
+        LastEnableResult         = $LastEnableResult
+        EnableFailureAttempts    = $EnableFailureAttempts
     }
     if ($DeployedDiskNumber -ge 0) { $state.DeployedDiskNumber = $DeployedDiskNumber }
     if ($DeployedPartitionNumber -ge 0) { $state.DeployedPartitionNumber = $DeployedPartitionNumber }
@@ -3710,6 +3717,43 @@ try {
     Write-Log "========== WinRE Manager Started (v$ScriptVersion) =========="
     if ($Script:DryRun) { Write-Log "*** DRY RUN MODE ***" }
 
+    # v43 patch 5 (Audit Mode guard, enable-failure counter): Audit Mode /
+    # OOBE / specialize / generalize guard. In these transitional Windows
+    # states, reagentc /enable fails with ERROR_CANCELLED (0x4c7, 1223)
+    # regardless of the correctness of the deployed WIM or the state of the
+    # recovery partition. Confirmed field case: a Dell Latitude 5530 running
+    # in Audit Mode. After the user completed OOBE, reagentc /enable
+    # succeeded on the first attempt with the same WIM. Without this guard,
+    # the script deploys successfully, fails at /enable, writes a state file
+    # recording the deployment as complete, and then loops on every
+    # subsequent run (the state file matches, no rebuild is triggered, and
+    # the enable-only path retries /enable forever).
+    #
+    # Predicate: read
+    #   HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State
+    #     -> ImageState (string)
+    # Proceed only when ImageState is absent (some SKUs may not have the
+    # key) or exactly IMAGE_STATE_COMPLETE. Any other value defers. The
+    # predicate is deliberately conservative: it does not depend on knowing
+    # the exact value that Audit Mode writes. If a legitimate running state
+    # reports a value other than IMAGE_STATE_COMPLETE, add it to the
+    # whitelist below.
+    #
+    # Runs under -DryRun: logs "Would defer" and continues.
+    $imageStatePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State"
+    $imageState = $null
+    try {
+        $imageState = (Get-ItemProperty -Path $imageStatePath -Name ImageState -ErrorAction SilentlyContinue).ImageState
+    } catch { }
+    if ($imageState -and $imageState -ne "IMAGE_STATE_COMPLETE") {
+        $auditVerb = if ($Script:DryRun) { "Would defer" } else { "Deferring" }
+        Write-Log "$auditVerb WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=$imageState). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made." -Level WARN
+        Write-Log "Complete OOBE, sign in to a normal desktop session, and re-run this script." -Level WARN
+        if (-not $Script:DryRun) {
+            exit $EXIT_WARNING
+        }
+    }
+
     $Hardware = Get-HardwareObject
     Write-Log "System: $($Hardware.Manufacturer) $($Hardware.Model), MT=$($Hardware.MachineType), OS=$($Hardware.WinPE) (build $($Hardware.Build))"
 
@@ -3978,6 +4022,28 @@ try {
             Remove-ItemIfExist $CheckpointFile
             Write-Log "========== WinRE Manager completed - reboot still required =========="
             exit $EXIT_REBOOT_REQUIRED
+        }
+    }
+
+    # v43 patch 5 (enable-failure counter): loop breaker. When the
+    # deployment is current but reagentc /enable has failed on the last 3
+    # or more runs and WinRE is still Disabled, do not keep retrying
+    # silently. Exit EXIT_FATAL with an actionable message. The state file
+    # is left in place so the operator can inspect it; the message tells
+    # them how to clear the counter if the underlying cause has been
+    # resolved. Classic cause: a machine stuck in Audit Mode, where
+    # /enable returns 0x4c7 regardless of WIM correctness. The Audit Mode
+    # startup guard above now defers before any work is attempted, but
+    # this counter protects against the same failure mode arising from
+    # any other source.
+    if ($state.EnableFailureAttempts -ge 3 -and $state.LastEnableResult -eq "failed" -and $WinREState.Status -ne "Enabled") {
+        $loopVerb = if ($Script:DryRun) { "Would refuse to retry" } else { "Refusing to retry" }
+        $loopStatePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+        Write-Log "$loopVerb reagentc /enable: it has failed on the last $($state.EnableFailureAttempts) consecutive runs and WinRE is still Disabled. Manual intervention is required." -Level ERROR
+        Write-Log "Verify the machine has completed OOBE and is not in Audit Mode. To reset the failure counter, delete ${loopStatePath} and re-run." -Level ERROR
+        if (-not $Script:DryRun) {
+            Remove-ItemIfExist $CheckpointFile
+            exit $EXIT_FATAL
         }
     }
 
@@ -4264,8 +4330,8 @@ try {
             Remove-StrayRecoveryPartitions -OSDiskNumber $osDisk.Number | Out-Null
         }
 
-        if ($state.PendingReboot -eq $true -or $state.RepairAttempts -gt 0) {
-            Write-Log "Clearing stale PendingReboot / RepairAttempts in state file"
+        if ($state.PendingReboot -eq $true -or $state.RepairAttempts -gt 0 -or $state.EnableFailureAttempts -gt 0 -or $state.LastEnableResult -ne "ok") {
+            Write-Log "Clearing stale PendingReboot / RepairAttempts / enable-failure counters in state file"
             Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
                              -PendingReboot $false -UsedOSFallback $Script:UsedOSFallback `
                              -DeployedDiskNumber $state.DeployedDiskNumber -DeployedPartitionNumber $state.DeployedPartitionNumber `
@@ -4380,7 +4446,18 @@ try {
             exit $EXIT_SUCCESS
         }
         if ($needEnableOnly -and $enableResult -eq "failed") {
-            Write-Log "Enable-only failed - falling through to full update" -Level WARN
+            $newEnableAttempts = [int]$state.EnableFailureAttempts + 1
+            Write-Log "Enable-only /enable failed (attempt $newEnableAttempts of 3). Not falling through to full update - the deployment is current and only the enable step failed, so a rebuild would not change the outcome. Will retry on next run." -Level WARN
+            Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
+                             -PendingReboot $false `
+                             -DeployedDiskNumber $state.DeployedDiskNumber `
+                             -DeployedPartitionNumber $state.DeployedPartitionNumber `
+                             -UsedOSFallback $false `
+                             -RepairAttempts 0 `
+                             -LastEnableResult "failed" `
+                             -EnableFailureAttempts $newEnableAttempts
+            Remove-ItemIfExist $CheckpointFile
+            exit $EXIT_WARNING
         }
         if ($needEnableOnly -and $enableResult -eq "bitlocker") {
             Write-Log "Enable-only path hit BitLocker-protected recovery partition - falling through to full update for suspend + delete + recreate" -Level WARN
@@ -4708,7 +4785,7 @@ try {
         if ($created) {
             $recoveryPartition = @{ DriveLetter = $created.DriveLetter; DiskNumber = $created.DiskNumber; PartitionNumber = $created.PartitionNumber; Partition = $null }
         } elseif ($Script:BitLockerGuardDeferred) {
-            Write-Log "BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run after VolumeStatus on C: stabilises to FullyDecrypted or FullyEncrypted. Exit code will be 2." -Level WARN
+            Write-Log "BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run once manage-bde -status C: shows Protection Status: Protection On (any conversion status), or Protection Status: Protection Off with Conversion Status: Fully Decrypted. Exit code will be 2." -Level WARN
             Remove-ItemIfExist $CheckpointFile
             exit $EXIT_WARNING
         } else {
@@ -4975,12 +5052,15 @@ try {
     if ($Script:ImageInjectionComplete -and $finalHash) {
         $deployedDisk = if ($recoveryPartition) { $recoveryPartition.DiskNumber } else { -1 }
         $deployedPart = if ($recoveryPartition) { $recoveryPartition.PartitionNumber } else { -1 }
+        $newEnableAttempts = if ($enableResult -eq "failed") { [int]$state.EnableFailureAttempts + 1 } else { 0 }
         Write-WinREState -Hash $finalHash -DriverVersion $ExpectedDriverSetVersion -DesiredStateId $DesiredStateId `
                          -PendingReboot $Script:rebootRequired `
                          -DeployedDiskNumber $deployedDisk `
                          -DeployedPartitionNumber $deployedPart `
                          -UsedOSFallback $Script:UsedOSFallback `
-                         -RepairAttempts 0
+                         -RepairAttempts 0 `
+                         -LastEnableResult $enableResult `
+                         -EnableFailureAttempts $newEnableAttempts
     } else {
         if (-not $Script:ImageInjectionComplete) {
             Write-Log "State file NOT updated - requested driver injection did not complete successfully" -Level WARN

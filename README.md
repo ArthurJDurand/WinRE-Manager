@@ -11,7 +11,7 @@
 
 WinRE Manager deploys the correct WinRE (Windows Recovery Environment) image to a dedicated recovery partition on the OS disk of every machine in a managed fleet. It fetches the current base WIM from a versioned repository, injects OEM WinPE driver packs (Dell / HP / Lenovo) and Intel VMD storage drivers from live manifests, and maintains a `DesiredStateId`-scoped state file so re-runs are no-ops when nothing has changed.
 
-It is designed to run unattended as `NT AUTHORITY\SYSTEM` via scheduled task or MDM, on Dell, HP, Lenovo and ASUS hardware, GPT or MBR, with or without BitLocker.
+It is designed to run unattended as `NT AUTHORITY\SYSTEM` via scheduled task or MDM, on Dell, HP, Lenovo and ASUS hardware, GPT or MBR, with or without BitLocker. OEM driver injection is available for Dell, HP, and Lenovo; ASUS machines run with the base WIM plus Intel VMD.
 
 ---
 
@@ -25,6 +25,7 @@ Windows ships a working recovery environment out of the box. It stops working wh
 - The OEM's WinPE driver pack is missing or stale, so the recovery environment cannot see the storage controller (especially Intel VMD).
 - A disk migration or clone leaves the reagentc registration pointing at a partition that no longer exists.
 - A recovery partition ends up on a **secondary** disk, where it can confuse the boot loader and cause Startup Repair to fail.
+- A freshly imaged machine has not yet completed OOBE. `reagentc /enable` is blocked by the OS in Audit Mode, OOBE, and the sysprep phases regardless of WIM correctness; the script now detects this and defers — see [troubleshooting.md](docs/troubleshooting.md#the-machine-is-in-audit-mode--oobe--sysprep).
 
 WinRE Manager addresses all of these idempotently. Running it twice in a row on a healthy machine is a no-op. Running it on a broken machine repairs what it can and reports a warning exit code when full remediation is not possible — never a silent success.
 
@@ -44,11 +45,10 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design and [`doc
 ## Quick start
 
 ```powershell
-# Read-only diagnostic. Reports what the production script would see.
-.\scripts\Test-WinRE.ps1
-
-# Interactive harness. Downloads and extracts every OEM pack, every VMD pack,
-# and the GitHub base WIM, without touching WinRE or any partition.
+# Read-only harness. No elevation needed. Run it and choose a menu option:
+#   Option 1 = System diagnostic (what the production script would see)
+#   Option A = All relevant for this machine (download + extraction validation)
+#   Option B = All of the above
 .\scripts\Test-WinRE.ps1
 
 # Production deploy. Requires elevation.
@@ -64,7 +64,7 @@ Recommended deployment method is a scheduled task running as `SYSTEM`, triggered
 |------|------|---------|
 | `0` | `EXIT_SUCCESS` | WinRE enabled, dedicated recovery partition healthy, state file written. |
 | `1` | `EXIT_REBOOT_REQUIRED` | Deployment succeeded; a reboot is required to complete registration. |
-| `2` | `EXIT_WARNING` | WinRE functional but degraded (OS-fallback, incomplete injection, geometry restore, cleanup failure), **or** the run made no changes to the machine and deferred work (v43 patch 5 Device Encryption guard), **or** nothing to do but a warning was raised. |
+| `2` | `EXIT_WARNING` | WinRE functional but degraded (OS-fallback, incomplete injection, geometry restore, cleanup failure), **or** the run made no changes to the machine and deferred work (Audit Mode / OOBE guard, v43 patch 5 Device Encryption guard), **or** a generic `reagentc /enable` failure on the enable-only path. |
 | `3` | `EXIT_FATAL` | Deployment aborted. No state written. Investigate the log. |
 
 `EXIT_REBOOT_REQUIRED` has priority over `EXIT_WARNING`. `EXIT_FATAL` always wins.
@@ -77,9 +77,14 @@ See [`docs/exit-codes.md`](docs/exit-codes.md) for the full matrix.
 - **PowerShell 5.1** (Windows PowerShell) or **PowerShell 7.x**.
 - **Elevation** for production. `Test-WinRE.ps1` runs unelevated.
 - **7-Zip** at `C:\Program Files\7-Zip\7z.exe`. `WinRE.ps1` will attempt to install it via `winget` if missing.
-- **Internet access** to: `gist.github.com`, `api.github.com`, `downloads.dell.com`, `ftp.ext.hp.com`, `download.lenovo.com`, `support.lenovo.com`.
+- **Internet access** to: `gist.github.com`, `api.github.com`, `downloads.dell.com`, `ftp.ext.hp.com`, `download.lenovo.com`, `support.lenovo.com`. The `support.lenovo.com` endpoint is only used by `Build-LenovoWinPEMap.ps1`, not by the production script.
 - **`reagentc.exe`** in `PATH` (present on all supported SKUs).
-- **Stable BitLocker state.** `manage-bde -status C:` must read `Fully Decrypted` or `Fully Encrypted`. The script defers destructive partition work if the conversion status is one of the four mid-operation states (`Encryption In Progress`, `Decryption In Progress`, `Encryption Paused`, `Decryption Paused`), including the Device Encryption in-progress state where `ProtectionStatus` reads `Off` but `VolumeStatus` is one of the four (v43 patch 5). See [`docs/deployment.md`](docs/deployment.md) for the Device Encryption precondition.
+- **Windows is in a normal-running state.** The script refuses to run before any state-modifying action on a machine that has not yet completed OOBE. This is the v43 patch 5 (further revision) Audit Mode guard, and it reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState`. It affects freshly imaged machines only. See [`docs/deployment.md`](docs/deployment.md#audit-mode-and-oobe-v43-patch-5-further-revision) for the precondition and the fleet timing notes.
+- **Stable BitLocker state.** `manage-bde -status C:` must read **either**:
+  - **`Protection Status: Protection On`** (any conversion status), **or**
+  - **`Protection Status: Protection Off` with `Conversion Status: Fully Decrypted`**.
+
+  Everything else is deferred. The four mid-operation states (`Encryption In Progress`, `Decryption In Progress`, `Encryption Paused`, `Decryption Paused`) are hazardous — Device Encryption is actively encrypting or decrypting, and the encryption service would claim any new partition before the recovery type GUID could be applied. `Protection Off` with `Fully Encrypted` is ambiguous — it is the standard suspended-BitLocker state, but it is also indistinguishable from a Device Encryption volume in the *Waiting for Activation* state where the recovery key has not yet been escrowed. See [`docs/deployment.md`](docs/deployment.md#device-encryption-v43-patch-5) for the full explanation.
 
 ## Repository layout
 
@@ -100,22 +105,22 @@ See [`docs/exit-codes.md`](docs/exit-codes.md) for the full matrix.
 | Document | What it covers |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Overall design, why each decision was made, invariants. |
-| [`docs/deployment.md`](docs/deployment.md) | Scheduled task, MDM, CI/CD integration, Device Encryption precondition. |
+| [`docs/deployment.md`](docs/deployment.md) | Scheduled task, MDM, CI/CD integration, Audit Mode and BitLocker preconditions. |
 | [`docs/exit-codes.md`](docs/exit-codes.md) | Every exit path and its semantics. |
-| [`docs/state-and-idempotency.md`](docs/state-and-idempotency.md) | `DesiredStateId`, state file, checkpoint resume. |
+| [`docs/state-and-idempotency.md`](docs/state-and-idempotency.md) | `DesiredStateId`, state file, checkpoint resume, the loop-breaker. |
 | [`docs/recovery-partition.md`](docs/recovery-partition.md) | Sizing policy, geometry, GPT/MBR attributes. |
 | [`docs/driver-injection.md`](docs/driver-injection.md) | OEM pack + VMD injection, INF cross-reference success gate. |
 | [`docs/testing.md`](docs/testing.md) | Using the harness, writing new tests. |
-| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Known failure modes, per-symptom playbook, and the recovery procedure for machines damaged by pre-v43-patch-5 code. |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Known failure modes, per-symptom playbook, and recovery procedures. |
 
 ## Version
 
-**Production:** `WinRE.ps1` v43 patch 5.
-**Harness:** `Test-WinRE.ps1` v12.
+**Production:** `WinRE.ps1` v43 patch 5 (further revision).
+**Harness:** `Test-WinRE.ps1` v13.
 
-The production script has been through 43 versions and 5 patches within v43. Full changelog is in the `.NOTES` block at the top of `scripts/WinRE.ps1`. A user-facing changelog is in [`CHANGELOG.md`](CHANGELOG.md).
+The production script has been through 43 versions and 5 patches within v43, with several further revisions to patch 5 that added the Audit Mode / OOBE guard and the enable-failure counter. Full changelog is in the `.NOTES` block at the top of `scripts/WinRE.ps1`. A user-facing changelog is in [`CHANGELOG.md`](CHANGELOG.md).
 
-`ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM ship under the same `ScriptVersion` and the same `DesiredStateId`, so healthy machines do not rebuild unnecessarily. v43 patches 2, 3, 4, and 5 all shipped under `ScriptVersion = 43`.
+`ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM ship under the same `ScriptVersion` and the same `DesiredStateId`, so healthy machines do not rebuild unnecessarily. v43 patches 2, 3, 4, and 5 — and the further revisions to patch 5 — all shipped under `ScriptVersion = 43`.
 
 ## Field-tested hardware
 
@@ -124,13 +129,17 @@ The production script has been through 43 versions and 5 patches within v43. Ful
 | ASUS | 11th-gen desktop (i5-11400) | Win11 26100/26200 | DEDICATED |
 | HP | ProBook 445 14 inch G10 (Ryzen 5 7530U) | Win11 26200 | DEDICATED after v28 fix |
 | HP | ProBook 450 15.6 inch G10 (i7-1355U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
+| HP | ProBook 455 15.6 inch G10 (Ryzen 5 7530U) | Win11 26200 | DEDICATED — full update 2026-09-29 (190 drivers injected, dedicated partition created at 1200 MiB); second run fast path |
 | Lenovo | 21L1 (ThinkPad) | Win11 | DEDICATED |
 | Dell | Latitude 3550 (Core Ultra 5 125U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
-| Dell | Pro Slim QCS1250 (Core Ultra 5 235) | Win11 26200 | v43 patch 5 (revised) — guard fired correctly, machine left unchanged |
-| Dell | Vostro 16 5640 (Intel Core 7 150U) | Win11 26200 | v43 patch 5 (revised) — guard fired correctly, machine left unchanged |
+| Dell | Pro Slim QCS1250 (Core Ultra 5 235) | Win11 26200 | v43 patch 5 (revised) — BitLocker guard fired correctly, machine left unchanged |
+| Dell | Vostro 16 5640 (Intel Core 7 150U) | Win11 26200 | v43 patch 5 (revised) — BitLocker guard fired correctly, machine left unchanged |
+| Dell | Latitude 5530 (i7-1265U) | Win11 26200 | v43 patch 5 (further revision) — Audit Mode guard case; script deferred pre-OOBE, `reagentc /enable` succeeded after OOBE with the same WIM |
 | (VM) | Hyper-V Windows 10 MBR | Win10 | DEDICATED |
 
 The two Device Encryption failures pre-patch-5 are documented in [`docs/troubleshooting.md`](docs/troubleshooting.md) with the recovery procedure. v43 patch 5 prevents them from recurring. The two Dell machines logged under "v43 patch 5 (revised)" ran against a machine mid-encryption; the guard refused the destructive path, no partition was touched, no state file was written, and the run exited with `EXIT_WARNING`. Both machines will complete the dedicated-partition deployment automatically on the next run after their encryption state stabilises.
+
+The Dell Latitude 5530 under "v43 patch 5 (further revision)" is the Audit Mode case. The script's predecessor had no Audit Mode guard; it deployed successfully through Step 5, failed at `reagentc /enable` with `0x4c7` on two consecutive runs, and wrote a state file recording the deployment as complete. After the user completed OOBE, `reagentc /enable` succeeded on the first attempt with the same WIM. The Audit Mode guard added in the further revision prevents this failure mode by deferring before any state-modifying action.
 
 ## Contributing
 

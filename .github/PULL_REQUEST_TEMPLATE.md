@@ -19,7 +19,7 @@
 
 ## Testing
 
-- [ ] `Get-Command -Syntax .\scripts\WinRE.ps1` succeeds
+- [ ] Parser check passes: `Get-Command .\scripts\WinRE.ps1 -ErrorAction Stop | Out-Null`
 - [ ] `.\scripts\WinRE.ps1 -DryRun` completes
 - [ ] `.\scripts\Test-WinRE.ps1 -NonInteractive` completes
 - [ ] `.\scripts\Test-WinRE.ps1` completes interactively (menu path exercised)

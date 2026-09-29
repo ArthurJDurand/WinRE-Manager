@@ -17,6 +17,7 @@ Use the issue template. Include:
 - Windows build (`[Environment]::OSVersion.Version`).
 - Vendor, model, Lenovo machine type if applicable.
 - Whether BitLocker is On, Off, or Suspended.
+- The `ImageState` value from `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` if the machine may be in Audit Mode or OOBE.
 - The exit code.
 - The relevant slice of the log — not the whole file unless requested.
 
@@ -35,7 +36,7 @@ Before you write code:
 
 - PowerShell 5.1-compatible syntax. Do not use operators or cmdlets introduced in 7.x without a fallback.
 - 4-space indentation (see `.editorconfig`).
-- CRLF line endings for `.ps1`.
+- CRLF line endings for `.ps1`. UTF-8 with BOM for `.ps1`, `.psm1`, and `.psd1`.
 - Functions are verb-first (`Get-`, `Set-`, `Test-`, `Invoke-`, `Remove-`, `Resolve-`).
 - `[CmdletBinding()]` on any function with parameters that benefit from pipeline input.
 - Parameter blocks in `[Parameter(Mandatory)]` form for required parameters.
@@ -47,8 +48,8 @@ Before you write code:
 Before you submit:
 
 ```powershell
-# 1. Parser check
-Get-Command -Syntax .\scripts\WinRE.ps1
+# 1. Parser check — throws on any syntax error
+Get-Command .\scripts\WinRE.ps1 -ErrorAction Stop | Out-Null
 
 # 2. Dry run on a real machine (VM preferred)
 .\scripts\WinRE.ps1 -DryRun

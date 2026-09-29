@@ -65,11 +65,15 @@ This is the honest outcome. A recovery partition that cannot meet the servicing 
 
 When the script needs to create a new partition, it performs this sequence.
 
-### 0. Startup BitLocker gate
+### 0. Startup gates
 
-Before any of the steps below run, the main flow has already performed a startup BitLocker gate. Immediately after `Get-WinREState` and before the pending-reboot block, the script queries `Get-BitLockerVolume` on C:. If the volume is `ProtectionStatus=Off` with a `VolumeStatus` other than `FullyDecrypted` (including `FullyEncrypted`), or if `ProtectionStatus` is neither `On` nor `Off`, the run logs the reason, removes the checkpoint file, and exits with `EXIT_WARNING`. No partition is touched; no state file is written; `reagentc` state is unchanged. Under `-DryRun` the gate is skipped (the DryRun branch of `Suspend-BitLockerForWinRE` reports the hazard instead).
+Two read-only startup checks run before any of the steps below.
 
-The consequence for this document is that the resize sequence below is only entered on machines whose BitLocker state was confirmed safe at startup. The mid-run checks in step 2 and step 6 of the sequence are backstops for the narrow window where the machine's BitLocker state changes between the startup query and the destructive work.
+**Audit Mode guard.** The highest-priority startup check reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and defers with `EXIT_WARNING` when the value is present and is not `IMAGE_STATE_COMPLETE`. During Audit Mode, OOBE, sysprep generalize, and sysprep specialize, `reagentc /enable` is blocked by the OS with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM. The script defers before touching any partition. This guard runs before the hardware check, the manifest fetch, the OEM pack resolution, the `DesiredStateId` computation, and the BitLocker gate. Under `-DryRun` the guard logs `Would defer …` and continues.
+
+**Startup BitLocker gate.** Immediately after `Get-WinREState` and before the pending-reboot block, the script queries `Get-BitLockerVolume` on C:. If the volume is `ProtectionStatus=Off` with a `VolumeStatus` other than `FullyDecrypted` (including `FullyEncrypted`), or if `ProtectionStatus` is neither `On` nor `Off`, the run logs the reason and exits with `EXIT_WARNING`. No partition is touched; no state file is written; `reagentc` state is unchanged. Under `-DryRun` the gate is skipped at the top level (the DryRun branch of `Suspend-BitLockerForWinRE` reports the hazard instead).
+
+The consequence for this document is that the resize sequence below is only entered on machines whose `ImageState` is `IMAGE_STATE_COMPLETE` (or absent) AND whose BitLocker state was confirmed safe at startup. The mid-run checks in step 2 and step 6 of the sequence are backstops for the narrow window where the machine's BitLocker state changes between the startup query and the destructive work.
 
 ### 1. Pre-checks
 
@@ -121,7 +125,7 @@ BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - th
 Both return `$false`. `Ensure-AdequateRecoveryPartition` interprets the refusal via the `$Script:BitLockerGuardDeferred` flag and returns `$null` without having touched the disk. The main flow exits with `EXIT_WARNING` and a single deferral line:
 
 ```
-BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run after VolumeStatus on C: stabilises to FullyDecrypted or FullyEncrypted. Exit code will be 2.
+BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run once manage-bde -status C: shows Protection Status: Protection On (any conversion status), or Protection Status: Protection Off with Conversion Status: Fully Decrypted. Exit code will be 2.
 ```
 
 No partition is deleted, no WIM is deployed, WinRE is not disabled, and no state file is written.
