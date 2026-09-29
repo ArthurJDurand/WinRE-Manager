@@ -16,7 +16,7 @@ Use the issue template. Include:
 - `WinRE.ps1` version (from the top of the `.NOTES` block).
 - Windows build (`[Environment]::OSVersion.Version`).
 - Vendor, model, Lenovo machine type if applicable.
-- Whether BitLocker is On, Off, or Suspended.
+- The BitLocker state of C: — both fields, not just one: `ProtectionStatus` and `VolumeStatus` from `Get-BitLockerVolume -MountPoint "C:"`, or the raw `manage-bde -status C:` output. Under the target-volume policy the field that matters for the OS-fallback path is `VolumeStatus`, because a machine can be actively encrypting (`EncryptionInProgress`) while `ProtectionStatus` reads `Off`. If the machine's WinRE is registered to a dedicated recovery partition, also include the same two fields for that partition (query `manage-bde -status` against its drive letter if it has one, or its `UniqueId` if it does not).
 - The `ImageState` value from `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` if the machine may be in Audit Mode or OOBE.
 - The exit code.
 - The relevant slice of the log — not the whole file unless requested.
@@ -27,8 +27,8 @@ Before you write code:
 
 1. **Read the invariants.** The `.NOTES` block at the top of `scripts/WinRE.ps1` contains a "CRITICAL LESSONS LEARNED (do not regress)" section. Every one of those exists because a real machine failed. Do not weaken them without a field case.
 2. **Check the exit-code semantics.** [docs/exit-codes.md](docs/exit-codes.md) documents priority and precedence. Changes that alter exit paths almost always need a changelog entry.
-3. **`ScriptVersion` discipline.** The version bumps only when the deployed WIM or the partition layout changes. Cosmetic fixes ship under the same version and the same `DesiredStateId`. If your PR would force a rebuild on healthy machines, say so explicitly and explain why.
-4. **Changelog.** Every functional change gets a numbered entry in the `.NOTES` block with the real field case that motivated it, in the style of the existing entries.
+3. **`ScriptVersion` discipline.** The version bumps when a change modifies the deployed WIM bytes, the partition layout that gets created, or the `DesiredStateId` inputs. A `DesiredStateId` input change (the v44 patch 1 pattern) does not change the WIM bytes on a machine whose driver set is already correct, but it forces every managed machine to rebuild once because the state file's stored ID no longer matches — that counts, and such a change must ship with a `Migration note` section in `CHANGELOG.md` describing the expected fleet behaviour and the rollback procedure. Cosmetic fixes ship under the same version and the same `DesiredStateId`. If your PR would force a rebuild on healthy machines by any of those three mechanisms, say so explicitly in the PR and explain why.
+4. **Changelog.** Every functional change gets an entry in `CHANGELOG.md` with the real field case that motivated it, in the style of the existing entries. The `.NOTES` block records the current design invariants and the CRITICAL LESSONS LEARNED list; update it only when your change modifies an invariant or adds a new lesson. The two files serve different readers and both are part of the complete record.
 5. **No silent catch blocks.** Every `try/catch` either logs, sets a state flag, or both.
 6. **No unverified destructive operations.** Any code path that deletes, resizes, or formats a partition must either verify its preconditions and restore geometry on failure, or set `$Script:GeometryRestoreFailed`.
 

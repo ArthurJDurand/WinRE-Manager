@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v43 patch 5 (further revision), from the .NOTES block -->
+- **WinRE.ps1 version:** <!-- e.g. v44 patch 1, from the .NOTES block -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
@@ -19,8 +19,13 @@ labels: ['bug', 'needs-triage']
 - **BitLocker state on C::** <!-- paste both fields from: manage-bde -status C: -->
   - **Protection Status:** <!-- Protection On / Protection Off -->
   - **Conversion Status:** <!-- Fully Decrypted / Fully Encrypted / Encryption In Progress / Decryption In Progress / Encryption Paused / Decryption Paused -->
-- **State file fields:** <!-- if C:\Recovery\OEM\winre_state.json exists, paste: LastEnableResult and EnableFailureAttempts -->
-  <!-- Both are optional in the JSON and default to "ok" / 0 if absent. -->
+  <!-- C:'s state matters only on the OS-fallback route. On the enable-only and dedicated-partition routes, production targets the recovery partition directly and does not depend on C:'s state. -->
+- **Target recovery partition state:** <!-- run: .\scripts\Test-WinRE.ps1 and choose Option 1. Copy the "Target recovery partition state" block. -->
+  <!-- This is the partition reagentc is registered to. It is what production prepares via Set-RecoveryPartitionReadyForWinRE. If the block says "BitLocker-managed", production will run manage-bde -off against it before calling reagentc /enable. -->
+- **VMD hardware present:** <!-- output of the harness Option 1 "VMD hardware presence" block, or "yes/no" from BIOS if the harness cannot be run. VMD presence is one of the DesiredStateId inputs. -->
+- **State file fields:** <!-- if C:\Recovery\OEM\winre_state.json exists, paste: DesiredStateId, LastEnableResult, and EnableFailureAttempts -->
+  <!-- LastEnableResult and EnableFailureAttempts are optional in the JSON and default to "ok" / 0 if absent. DesiredStateId is required for the maintainer to check whether the state file would be accepted on this machine. -->
+  <!-- If you can run the harness, Option S "State file parity check" reports whether the on-disk state file matches the ID production would compute right now. -->
 - **Elevation:** <!-- Running as SYSTEM, as admin, unelevated -->
 - **7-Zip present:** <!-- yes/no -->
 

@@ -65,15 +65,13 @@ This is the honest outcome. A recovery partition that cannot meet the servicing 
 
 When the script needs to create a new partition, it performs this sequence.
 
-### 0. Startup gates
+### 0. Audit Mode startup guard
 
-Two read-only startup checks run before any of the steps below.
+One read-only startup check runs before any of the steps below: the Audit Mode guard. It reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and defers with `EXIT_WARNING` when the value is present and is not `IMAGE_STATE_COMPLETE`. During Audit Mode, OOBE, sysprep generalize, and sysprep specialize, `reagentc /enable` is blocked by the OS with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM. The script defers before touching any partition. This guard runs before the hardware check, the manifest fetch, the OEM pack resolution, the `DesiredStateId` computation, and any other gate or operation. Under `-DryRun` the guard logs `Would defer …` and continues.
 
-**Audit Mode guard.** The highest-priority startup check reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and defers with `EXIT_WARNING` when the value is present and is not `IMAGE_STATE_COMPLETE`. During Audit Mode, OOBE, sysprep generalize, and sysprep specialize, `reagentc /enable` is blocked by the OS with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM. The script defers before touching any partition. This guard runs before the hardware check, the manifest fetch, the OEM pack resolution, the `DesiredStateId` computation, and the BitLocker gate. Under `-DryRun` the guard logs `Would defer …` and continues.
+Under the v43 patch 5 (further revision 5) policy there is **no startup BitLocker gate**. The BitLocker decision is made where the action is taken, not at startup: the target volume is not known until the classifier has resolved the reagentc-registered location, and the OS volume's BitLocker state is irrelevant to the enable-only and dedicated-partition paths.
 
-**Startup BitLocker gate.** Immediately after `Get-WinREState` and before the pending-reboot block, the script queries `Get-BitLockerVolume` on C:. If the volume is `ProtectionStatus=Off` with a `VolumeStatus` other than `FullyDecrypted` (including `FullyEncrypted`), or if `ProtectionStatus` is neither `On` nor `Off`, the run logs the reason and exits with `EXIT_WARNING`. No partition is touched; no state file is written; `reagentc` state is unchanged. Under `-DryRun` the gate is skipped at the top level (the DryRun branch of `Suspend-BitLockerForWinRE` reports the hazard instead).
-
-The consequence for this document is that the resize sequence below is only entered on machines whose `ImageState` is `IMAGE_STATE_COMPLETE` (or absent) AND whose BitLocker state was confirmed safe at startup. The mid-run checks in step 2 and step 6 of the sequence are backstops for the narrow window where the machine's BitLocker state changes between the startup query and the destructive work.
+The consequence for this document is that the resize sequence below is only entered on machines whose `ImageState` is `IMAGE_STATE_COMPLETE` (or absent). No other startup check gates the destructive partition path.
 
 ### 1. Pre-checks
 
@@ -86,71 +84,23 @@ Two arithmetic checks are logged:
 
 Since v38, the pre-check is **advisory**. The script proceeds with the destructive repartitioning attempt regardless of the arithmetic. Rationale: `SizeMin` is a conservative hint and can be wrong; `defrag /x` may free enough space. The trade is: try hard for the dedicated partition, fall back honestly if the attempt fails.
 
-### 2. Suspend BitLocker
+### 2. Disable WinRE
 
-`Suspend-BitLockerForWinRE -MountPoint "C:"`. This is the v43 patch 5-guarded step, and — since the v43 patch 5 (revised) reordering — it runs **before** the WinRE disable. The function queries both `ProtectionStatus` and `VolumeStatus` from `Get-BitLockerVolume` and applies this decision table:
+`reagentc /disable` if WinRE is currently enabled. If it returns non-zero, abort the destructive attempt (return `$null` from `Ensure-AdequateRecoveryPartition`) and the main flow falls through to OS-fallback.
 
-| `ProtectionStatus` | `VolumeStatus` | Verdict | Action |
-|---|---|---|---|
-| `On` | any | Protected | `Suspend-BitLocker -RebootCount 1`, verify, proceed |
-| `Off` | `FullyDecrypted` | Confirmed unprotected | No suspension needed, proceed |
-| `Off` | empty | Confirmed unprotected (some builds report empty for never-touched volumes) | No suspension needed, proceed |
-| `Off` | `FullyEncrypted` | Ambiguous — could be a legitimate suspension, could be Device Encryption *Waiting for Activation* (recovery key not yet escrowed). The two-field local view cannot distinguish them. | `Suspend-BitLockerForWinRE` returns `$false`; the destructive attempt is deferred. **Do not proceed.** |
-| `Off` | `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused` | Hazardous — Device Encryption is actively encrypting or decrypting the volume | `Suspend-BitLockerForWinRE` returns `$false` immediately; abort the destructive attempt |
+This step runs **before** any partition is deleted. If it fails, no partition work is attempted.
 
-Two rows cause a refusal, for different reasons.
-
-**The ambiguous row** (`FullyEncrypted+Off`) is the further-revision change. It is the state every machine enters after a legitimate `Suspend-BitLocker` or a Windows Update suspension that has not yet been lifted — but it is also indistinguishable from a Device Encryption volume in the *Waiting for Activation* state, where the volume has been encrypted with a clear key but protection has not been armed because the recovery key has not yet been escrowed. On a *Waiting for Activation* volume, servicing WinRE risks a recovery prompt on the next boot if the boot environment change trips TPM measurements, and the key has not been escrowed anywhere the user can retrieve. The script cannot tell the two cases apart from the local two-field view, so it defers both. An extra pipeline run later is cheaper than an unrepairable machine.
-
-The initial v43 patch 5 implementation whitelisted `FullyEncrypted+Off` as safe, based on the observation that it is the standard post-`Suspend-BitLocker` state. That was correct in the narrow case, but it was wrong in the *Waiting for Activation* case. The further revision treats the state as ambiguous. `FullyDecrypted` and empty remain the only confirmed-safe states.
-
-**The hazardous rows** (`EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`) are the original patch 5 fix. Before patch 5, only `ProtectionStatus` was consulted, and a volume mid-encryption (`VolumeStatus=EncryptionInProgress` with `ProtectionStatus=Off`) was treated as confirmed unprotected. The Device Encryption service then claimed the newly created recovery partition before the recovery type GUID could be applied, and `reagentc /enable` refused. Two machines hit this in the same day; see [troubleshooting.md](troubleshooting.md) for the recovery procedure.
-
-**Ownership guard.** The ambiguous classification above would otherwise have broken the healthy path: after the script itself suspended BitLocker (`ProtectionStatus=On` → `Suspend-BitLocker` → `ProtectionStatus=Off, VolumeStatus=FullyEncrypted`), a later call in the same run would see the state the script had just created, classify it as ambiguous, and refuse. `Suspend-BitLockerForWinRE` therefore short-circuits with `return $true` at the top of its non-DryRun body if `$Script:BitLockerSuspended` is set. That flag means "this run suspended BitLocker and owns the resume." The ambiguous-state classification applies only to states observed at the start of the run, not to states the script itself produced. Without this guard, Step 5's pre-deploy gate would skip deployment on a machine the script was already committed to modifying — worse than the behaviour the ambiguous classification was introduced to replace.
-
-**Refusal log messages.** When the guard refuses, it logs one of two distinct messages, depending on which row fired.
-
-Ambiguous state:
-
-```
-BitLocker on C:: ProtectionStatus=Off with VolumeStatus=FullyEncrypted - this state is ambiguous (could be a legitimate suspension, or Device Encryption in Waiting-for-Activation). Refusing to proceed with destructive partition work until the state is resolved to FullyDecrypted or ProtectionStatus=On.
-```
-
-Hazardous state:
-
-```
-BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
-```
-
-Both return `$false`. `Ensure-AdequateRecoveryPartition` interprets the refusal via the `$Script:BitLockerGuardDeferred` flag and returns `$null` without having touched the disk. The main flow exits with `EXIT_WARNING` and a single deferral line:
-
-```
-BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run once manage-bde -status C: shows Protection Status: Protection On (any conversion status), or Protection Status: Protection Off with Conversion Status: Fully Decrypted. Exit code will be 2.
-```
-
-No partition is deleted, no WIM is deployed, WinRE is not disabled, and no state file is written.
-
-If `Get-BitLockerVolume` returns `$null`, the fallback path parses `manage-bde -status` text output. The v43 patch 5 (further revision) tightened this fallback so that `Protection Off` alone is no longer sufficient evidence of safety: only a confirmed `Conversion Status: Fully Decrypted` makes the fallback return confirmed-unprotected; anything else returns unknown. The fallback cannot detect the ambiguous `FullyEncrypted+Off` case any better than the primary API can, so it also returns unknown for that state and the guard refuses. The fallback is present for compatibility with machines where the BitLocker module is not loaded, and it is not the primary path on modern hardware.
-
-**Ordering (v43 patch 5, revised).** The BitLocker safety check runs **before** the WinRE disable in `Ensure-AdequateRecoveryPartition`. The original patch 5 implementation disabled WinRE first and then refused, which left the machine with WinRE disabled and no way to re-enable it until encryption finished — the exact damaged state the patch was written to prevent. With the reordering, the guard fires while WinRE is still registered and functional, so a refusal leaves the machine unchanged.
-
-### 3. Disable WinRE
-
-`reagentc /disable`. If it returns non-zero, abort the destructive attempt (return `$null` from `Ensure-AdequateRecoveryPartition`). The main flow then falls through to OS-fallback.
-
-### 4. Delete existing recovery partitions
+### 3. Delete existing recovery partitions
 
 For each recovery partition on the OS disk, `Remove-Partition`. If that fails, retry with `diskpart delete partition override`. If the partition survives both attempts, abort with `FATAL`.
 
 **Note: this is a point of no return.** The script logs this explicitly before the first delete. If a subsequent step fails and the script falls back to OS-fallback, the deleted partitions are gone. The script does not attempt to restore them; the OS-fallback path deploys the WIM to `C:\Recovery\WindowsRE` instead.
 
-This step only runs after step 2 has confirmed the BitLocker state is safe.
-
-### 5. Extend the OS partition
+### 4. Extend the OS partition
 
 Read `SizeMax` for the OS partition. If it is larger than the current size, resize to `SizeMax`. This absorbs any unallocated space that was between the OS partition and the last recovery partition.
 
-### 6. Shrink the OS partition
+### 5. Shrink the OS partition
 
 This is the critical step. The script attempts the shrink in three stages:
 
@@ -164,7 +114,7 @@ The `+ 1 MiB` is alignment slack. The new partition's offset is rounded UP to th
 
 The SizeMin is logged before attempt 1, after the sleep, and after the defrag, so that field data can establish empirically which step (if either) is what makes the shrink succeed. See the v39 changelog entry for the measurement rationale.
 
-### 7. Handle shrink failure
+### 6. Handle shrink failure
 
 If all three attempts fail, the script:
 
@@ -180,15 +130,15 @@ If `Restore-OSPartitionSize` itself fails (either the resize or the post-resize 
 - `Write-WinREState` will **delete** the state file rather than write it, forcing the next run to treat the state as absent.
 - The next run's `$needInject` computation will be `$true` because there is no valid state, which forces a full rebuild. The rebuild re-attempts the destructive repartitioning.
 
-### 8. Create the new partition
+### 7. Create the new partition
 
 The new partition is created at an offset rounded up from the (new) OS partition end to the next 1 MiB boundary. Size is `bucketSizeMiB * 1MB`. If there is not enough space at that offset, restore the OS partition and abort.
 
-**v43 patch 5: the recovery type code is applied at creation time.** `New-Partition` is called with `-GptType {de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (GPT) or `-MbrType 0x27` (MBR). Before patch 5, the partition was created as a Basic Data partition and its type was changed minutes later by `Set-RecoveryPartitionAttributes`. On a machine with Device Encryption actively encrypting, the encryption service could claim that Basic Data partition during the window and start encrypting it. Applying the recovery type at creation makes that window zero-width: there is no moment when the partition is a plain data partition.
+**The recovery type code is applied at creation time.** `New-Partition` is called with `-GptType {de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (GPT) or `-MbrType 0x27` (MBR). Before v43 patch 5, the partition was created as a Basic Data partition and its type was changed minutes later by `Set-RecoveryPartitionAttributes`. On a machine with Device Encryption actively encrypting, the encryption service could claim that Basic Data partition during the window and start encrypting it. Applying the recovery type at creation makes that window zero-width: there is no moment when the partition is a plain data partition.
 
 The `New-Partition` call is retried up to 3 times with offset recalculation between attempts, matching the pre-patch-5 behaviour.
 
-### 9. Format and attribute
+### 8. Format and attribute
 
 `Format-Volume -FileSystem NTFS -NewFileSystemLabel 'Recovery'`.
 
@@ -201,25 +151,23 @@ The type code is idempotent on this call; the attribute step is what actually ad
 
 The v35 change introduced the attribute-before-letter ordering. The v43 patch 5 change introduced type-GUID-at-creation. Together they close the auto-encryption window from both sides: the type GUID is present from the moment the partition exists, and the attributes are present before any drive letter is assigned.
 
-### 10. Drive letter and encryption verification
+### 9. Drive letter assignment
 
 A drive letter is assigned via `Invoke-DriveLetterAssignment`, which tries the preferred letter, then every other candidate, using three methods per letter (`Set-Partition`, `Add-PartitionAccessPath`, `diskpart assign`).
 
+**Preferred letter reuse.** If the current run has already held a drive letter on a recovery partition earlier in this run (tracked in `$Script:tempDriveLetters`), the helper prefers that letter over a fresh one from `Get-AvailableDriveLetter`. Windows caches letter-to-volume mappings in `MountedDevices`; reusing a letter the script held earlier is more likely to succeed cleanly than picking a fresh one, and it avoids the assign-remove-reassign churn that can leave stale entries. The fallback chain is unchanged: if the preferred letter fails, the helper moves on.
+
+### 10. Verify encryption state (early check)
+
 After assignment, `Test-VolumeEncrypted` verifies the new partition is not encrypted.
 
-If it **is** encrypted (state `$true`), the script:
+- If it **is** encrypted (`$true`), the script calls `Set-RecoveryPartitionReadyForWinRE` on the partition, which decrypts it in place with `manage-bde -off` and polls for completion, up to a 300-second timeout. If the helper succeeds, the partition is now unencrypted and usable; the run continues. If the helper fails (timeout or unrecoverable error), `Remove-OrphanPartition` deletes the partition and the function returns `$null`; the main flow falls through to OS-fallback.
+- If the state is **unknown** (`$null`), the script proceeds with a warning and lets the deploy step's `Set-RecoveryPartitionReadyForWinRE` call surface any issue.
+- If it is **confirmed unencrypted** (`$false`), nothing further is needed.
 
-1. Calls `Suspend-BitLockerForWinRE -MountPoint "C:"` again.
-2. Deletes the encrypted partition.
-3. Recreates it with a fresh offset (geometry may have changed), and with the recovery type GUID applied at creation (v43 patch 5).
-4. Re-formats and re-applies attributes.
-5. Re-verifies.
+This early check is defensive: the deploy step (Step 5 in the main flow) calls `Set-RecoveryPartitionReadyForWinRE` on the recovery partition again regardless, so this is not the last opportunity to prepare the partition. It exists so that a newly created partition claimed by the Device Encryption service is cleaned up before the function returns, rather than leaving the caller with a partition that will fail later.
 
-If it is **still** encrypted after the retry, `Remove-OrphanPartition` deletes it and the function returns `$null`. The main flow falls through to OS-fallback.
-
-If the state is **unknown** (`$null`), the script proceeds with a warning and lets `reagentc /enable` surface any issue.
-
-**Note on the retry:** the delete-and-recreate retry was the reactive fallback the pre-patch-5 code relied on. On a machine mid-Device-Encryption, the retry failed as well because the encryption service re-grabbed the second partition. With v43 patch 5, the startup gate and the step-2 guard prevent the destructive attempt from starting in that state, so the retry only fires when the partition was encrypted by some other mechanism (e.g. a BitLocker policy that auto-encrypts new partitions on a machine where C: is fully encrypted and protected). In that case the retry's second `Suspend-BitLockerForWinRE` call will suspend C: and the recreate should succeed — and because of the ownership guard, if this same run already suspended BitLocker for the first partition, the second call returns `$true` immediately without re-querying.
+**The delete-and-recreate retry is gone.** Under the pre-v43-patch-5-further-revision-5 policy, if the new partition was encrypted the script suspended BitLocker, deleted the partition, and recreated it. That approach was correct in isolation but was based on the wrong premise — suspension does not prevent the encryption service from claiming the new partition, and deletion is unnecessary when the partition can be decrypted in place. The 2026-09-29 field test confirmed that a partition claimed by Device Encryption does not re-encrypt after `manage-bde -off` completes, which makes decrypt-in-place safe and simpler.
 
 ### 11. Success
 
@@ -228,6 +176,25 @@ If the state is **unknown** (`$null`), the script proceeds with a warning and le
 Return `@{ DriveLetter = $assignedLetter; DiskNumber = $osDisk.Number; PartitionNumber = $newPart.PartitionNumber }`.
 
 The main flow adds the assigned drive letter to `$Script:tempDriveLetters` so it can be removed at exit.
+
+## Where the target partition is prepared for reagentc
+
+The destructive sequence above is only one of the paths that reaches `reagentc /enable`. The full-update path with an existing recovery partition, the enable-only path, and the pending-reboot repair path also call reagentc. Under the v43 patch 5 (further revision 5) policy, all of them prepare the target partition through the same helper: `Set-RecoveryPartitionReadyForWinRE`.
+
+The helper is called at these sites:
+
+- The enable-only path, on the target recovery partition resolved from the reagentc location.
+- The full-update path, on the recovery partition returned by `Find-SuitableRecoveryPartition` or `Ensure-AdequateRecoveryPartition`.
+- The pending-reboot repair path, on the partition recorded in the state file's `DeployedDiskNumber` / `DeployedPartitionNumber`.
+- Inside `Ensure-AdequateRecoveryPartition`, as a defensive early check described in section 10 above.
+
+Each call is the same: if the target is unencrypted, return immediately; otherwise run `manage-bde -off` against the target and poll for completion, up to 300 seconds.
+
+**The helper targets the recovery partition, not C:.** This is the v43 patch 5 (further revision 5) change. reagentc's BitLocker check is on the volume it is being asked to enable WinRE on, and that volume is the recovery partition on the dedicated-partition path and on the enable-only path. The script therefore prepares the recovery partition.
+
+**The OS-fallback route is different.** On the OS-fallback route, the target volume *is* C:, and the script does not prepare C: — it never runs `manage-bde -off` against the OS volume. Instead, the OS-fallback gate checks C:'s `VolumeStatus` and defers unless it is `FullyDecrypted`. C:'s BitLocker state is the operator's responsibility: sign in with a Microsoft account to complete Device Encryption activation, add a key protector manually, or wait for decryption to finish.
+
+See [architecture.md](architecture.md) for the full policy and [deployment.md](deployment.md) for the operator-facing preconditions.
 
 ## `Restore-OSPartitionSize`
 
@@ -248,7 +215,7 @@ The three failure paths are: OS partition not found, post-resize verification fa
 
 ## `Remove-OrphanPartition`
 
-A helper that deletes a partition the script created but could not complete. Used when `Format-Volume` fails, when drive-letter assignment fails after creating a partition, and when a partition survives a delete-and-recreate.
+A helper that deletes a partition the script created but could not complete. Used when `Format-Volume` fails, when drive-letter assignment fails after creating a partition, when the helper could not make a newly created partition unencrypted, and when a partition survives a delete-and-recreate (no longer occurs on the recovery path but still possible in edge cases).
 
 ```
 Remove-OrphanPartition -DiskNumber <n> -PartitionNumber <m> -Reason "<description>"

@@ -10,11 +10,11 @@ Every line is `yyyy-MM-dd HH:mm:ss [LEVEL] message`. Levels are `INFO`, `WARN`, 
 
 The first line is `========== WinRE Manager Started (v<version>) ==========`. The last line names the outcome and, if applicable, the exit code.
 
-Two startup gates run before any state-modifying action: the Audit Mode guard and the BitLocker gate. Each logs a distinct deferral message, and the BitLocker gate fires at three sites — one at startup and two as mid-run backstops. If the script exits with code 2 and no partition was touched, one of the gates fired — see the corresponding section below.
+One startup guard runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. The two BitLocker deferrals that remain are on the enable-only path (target preparation) and the OS-fallback path (C: check). Each logs a distinct message; see the corresponding sections below.
 
 ## The machine has no recovery partition and WinRE is disabled
 
-**This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 or later, this failure mode no longer occurs.** The v43 patch 5 (further revision) startup gate prevents a machine whose BitLocker state is unsafe at startup from reaching the destructive path at all, so even a machine mid-encryption will be deferred before any partition is touched.
+**This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 or later, this failure mode no longer occurs on the dedicated-partition route.** The pre-patch-5 code deleted the recovery partition on a machine mid-Device-Encryption and could not recreate it. The current code prevents that by applying the recovery type GUID at partition creation and by decrypting in place if the Device Encryption service claims the partition anyway.
 
 **Symptom.** After a run that exited with code 3 (`EXIT_FATAL`), the machine has:
 
@@ -48,7 +48,7 @@ Two field failures, both on Windows 11 build 26200:
 - **Dell Latitude 3550** (Intel Core Ultra 5 125U) — 2026-09-28, `VolumeStatus=EncryptionInProgress` at 73.6%.
 - **HP ProBook 450 15.6 inch G10** (Intel Core i7-1355U) — 2026-09-28, same state.
 
-**Recovery procedure.** Wait for the encryption to finish or abort it, then re-run with patch 5.
+**Recovery procedure.** Wait for the encryption to finish or abort it, then re-run with patch 5 or later.
 
 **Step 1 — resolve the encryption state.** Open an elevated PowerShell:
 
@@ -60,7 +60,7 @@ Read the `Conversion Status:` line.
 
 - If it says `Fully Decrypted` — encryption was never active or was already aborted. Continue to step 2.
 - If it says `Fully Encrypted` with `Protection On` — encryption completed and the key was escrowed. Continue to step 2.
-- If it says `Fully Encrypted` with `Protection Off` — the machine is in the ambiguous suspended/Waiting-for-Activation state (see the "`Suspend-BitLockerForWinRE` reports a BitLocker refusal" section below). Wait for it to resolve to either `Protection On` (activation completed and key escrowed) or `Fully Decrypted`. Do not proceed until then.
+- If it says `Fully Encrypted` with `Protection Off` — the machine is in the ambiguous suspended/Waiting-for-Activation state. On the OS-fallback route, production will defer this state; on the dedicated-partition route it does not matter, because the target is the recovery partition, not C:. If the dedicated-partition route is what you want, continue to step 2. If you specifically want the OS-fallback route, wait for the state to resolve to either `Protection On` (activation completed and key escrowed) or `Fully Decrypted`.
 - If it says `Encryption In Progress` or `Encryption Paused` — the encryption service is still active. Wait for it to complete (typically 30 minutes to a few hours on a 256 GB SSD, longer on HDD), or abort it:
 
   ```powershell
@@ -69,31 +69,25 @@ Read the `Conversion Status:` line.
 
   This starts decryption. On a machine mid-encryption, decryption is usually faster than encryption. Wait until `Conversion Status:` reads `Fully Decrypted` before continuing.
 
-**Step 2 — confirm the state is now safe.** Re-run the status command. It must show either:
-- `Protection On` (any conversion status), or
-- `Protection Off` with `Fully Decrypted`.
+**Step 2 — update `WinRE.ps1` to v44 patch 1 or later.** Check the `.NOTES` block at the top of the file for a `Version : 44` line. If the file is still v43, apply the v44 update before proceeding.
 
-The states `Encryption In Progress`, `Decryption In Progress`, `Encryption Paused`, and `Decryption Paused` are hazardous. `Protection Off` with `Fully Encrypted` is ambiguous and also deferred by the script.
+**Step 3 — re-run `WinRE.ps1`.** With the current policy, the script will:
 
-**Step 3 — update `WinRE.ps1` to v43 patch 5 or later.** Check the `.NOTES` block at the top of the file for a `v43 patch 5` entry. If it is missing, apply the patch before proceeding.
-
-**Step 4 — re-run `WinRE.ps1`.** With v43 patch 5 and a confirmed-safe BitLocker state, the script will:
-
-1. Pass the startup BitLocker gate.
-2. Suspend BitLocker if needed.
-3. Create the recovery partition with the recovery type GUID applied at creation.
-4. Deploy the WIM, register, and enable WinRE.
+1. Pass the Audit Mode guard.
+2. Choose the enable-only or full-update path.
+3. Prepare the target recovery partition via `Set-RecoveryPartitionReadyForWinRE`. If the target is encrypted, the helper decrypts it in place with `manage-bde -off` and polls for completion, up to 300 seconds.
+4. Call `reagentc /setreimage` and `reagentc /enable` on the prepared target.
 
 The machine returns to a `DEDICATED` end state.
 
-**Immediate interim fix.** If the machine must be returned to service before you can update the script, `reagentc /enable` will succeed against the OS-fallback location once C: is in a confirmed-safe BitLocker state:
+**Immediate interim fix.** If the machine must be returned to service before you can update the script, `reagentc /enable` will succeed against the OS-fallback location once C: is `FullyDecrypted`:
 
 ```powershell
 reagentc /setreimage /path C:\Recovery\WindowsRE
 reagentc /enable
 ```
 
-This gives you OS-fallback WinRE — functional but not the design goal. The dedicated recovery partition can be recreated later by a run of the patched script.
+This gives you OS-fallback WinRE — functional but not the design goal. The dedicated recovery partition can be recreated later by a run of the current script.
 
 **Do NOT re-run the pre-patch-5 script on this machine.** It will fail the same way and delete the recovery partition again.
 
@@ -101,7 +95,7 @@ This gives you OS-fallback WinRE — functional but not the design goal. The ded
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v43) ==========` banner and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v44) ==========` banner and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -130,9 +124,173 @@ Field case: **Dell Latitude 5530** (12th Gen Intel i7-1265U, Windows 11 build 26
 
 Do **not** attempt to defeat the guard by editing the registry or by manually calling `reagentc /enable` while still in Audit Mode. The OS will reject it, and the script's state file may or may not record the attempt depending on which code path you used to invoke reagentc. Wait for OOBE to complete.
 
-**Distinguishing an Audit Mode deferral from a BitLocker deferral.** Both exit with `EXIT_WARNING` and both leave the machine unchanged, but they are logged differently. The Audit Mode gate logs `Setup\State\ImageState=…`. The BitLocker gates log `BitLocker on C: ProtectionStatus=…`. The Audit Mode gate runs first; if it fires, the BitLocker gate is never reached.
-
 **What if `ImageState` is a value other than `IMAGE_STATE_COMPLETE` but the machine is clearly in a normal desktop?** File a bug. The guard's whitelist is currently `IMAGE_STATE_COMPLETE` or the key being absent. If a legitimate running state reports a different value, add it to the whitelist in the startup guard and re-run. The log line names the exact value that triggered the deferral.
+
+## OEM or VMD injection failed (Step 3 → Step 4 pipeline gate)
+
+**Symptom.** The script exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no partition work, no WIM deployment, no `reagentc` calls, and the state file is unchanged (or absent). The difference from the Audit Mode deferral is that the run got much further — the WIM was downloaded or copied to `WorkDir`, mounted, and an OEM or VMD injection attempt was made against it.
+
+**Log signature.** The last lines of the run before exit:
+
+```
+[WARN] OEM extraction FAILED for <vendor>
+```
+
+or
+
+```
+[WARN] OEM injection failed - package INFs not found in image after injection
+```
+
+or
+
+```
+[WARN] VMD driver injection failed - VMD package INFs not found in image after injection
+```
+
+or (in the failure-branch form when the OEM or VMD download itself failed):
+
+```
+[WARN] OEM download failed
+```
+
+or
+
+```
+[WARN] VMD download failed for <name>: <message>
+```
+
+Followed by:
+
+```
+[WARN] Checkpoint NOT advanced to step 3 - image injection did not complete; next run will retry step 3
+[WARN] Image injection did not complete. Stopping before Step 4 and before any deployment. The recovery partition and WinRE registration are unchanged. Next run will retry from step 2.
+```
+
+The pipeline then exits without running `dism /Export-Image`, without touching any partition, without disabling WinRE, and without writing a state file.
+
+**Cause.** One of the driver-injection steps in Step 3 could not demonstrate success:
+
+- The OEM pack download failed (network error, 404, hash mismatch on a manifest that carries a hash, or a zero-byte download that the length check rejected).
+- The OEM pack extracted but produced zero INF files (the known Lenovo SCCM Package case, or a packaging error for Dell/HP).
+- The OEM pack extracted and contained INF files, but `Add-WindowsDriver` produced no delta and no INF-basename match — the package's INFs are not present in the image after injection.
+- A VMD driver download failed (same failure modes as the OEM download).
+- A VMD driver archive extracted to a directory with zero INF files.
+- A VMD `Add-WindowsDriver` produced no delta and no INF-basename match.
+
+In every case, `$Script:ImageInjectionComplete` was set to `$false` and the pipeline gate stopped the run before Step 4.
+
+**Why the run stops.** A WIM with no OEM or VMD drivers is broken on hardware whose storage controller requires those drivers. On a VMD-based system the resulting WinRE cannot see the OS disk at all, and the deployed recovery environment is worse than useless — it is actively misleading. The v44 patch 1 gate prevents this class of broken deployment, where the earlier pipeline would have exported, deployed, and registered a non-functional WIM. The gate is a protective failure, not a degraded-success: the run stops before anything is committed.
+
+**Resolution.**
+
+1. **Read the log line above the failure.** The specific vendor, package name, or download URL is named. The most common causes are vendor-side (a moved download URL, a changed packaging format), network-side (a proxy blocking the vendor CDN), or manifest-side (a stale `driverUrl`).
+2. **For an OEM pack failure**, re-run `scripts\Test-WinRE.ps1` and select Option 6 (HP), 7 (Dell), or 8 (Lenovo) depending on the vendor. The harness downloads and extracts the same pack the production script uses, against live sources, and reports the INF count. If the harness succeeds where production failed, the difference is likely transient (a network hiccup during the production run). If the harness also fails, the pack is genuinely broken or the map is stale.
+3. **For a VMD driver failure**, select Option 9 in the harness. This exercises every VMD package the manifest resolves for the machine's CPU generation. A failure here means the manifest's `driverUrl` is stale or the archive format changed.
+4. **If the failure is `Add-WindowsDriver produced no error output (silent rejection or no applicable drivers)`**, the package's INFs do not match any device on the image. This is the least common case and usually means the manifest is resolving a package intended for different hardware. Check the manifest entry's `match.cpuGenMin` / `cpuGenMax` against the machine's actual CPU generation. The harness's Option 1 diagnostic reports the generation and the VMD hardware presence.
+5. **Fix the underlying cause** — update the manifest or map gist, correct the download URL, install a missing dependency (7-Zip, `curl-impersonate` for the Lenovo builder), or resolve the network/proxy problem.
+6. **Re-run `WinRE.ps1`.** The checkpoint is already at step 2 and the `WorkDir` was cleaned by the gate; the next run re-acquires the base WIM and re-runs injection from a clean image.
+
+**What NOT to do.** Do not attempt to force the pipeline past the gate by editing the script. The gate is the mechanism that prevents a broken WIM from reaching the recovery partition. A machine in this state has a functional existing WinRE or a functional existing state file — whatever it had before the run is still in place. The cost of waiting is one pipeline run after the injection failure is resolved; the cost of bypassing the gate is a recovery environment that cannot see the OS disk.
+
+**Not to be confused with the Audit Mode or OS-fallback BitLocker deferrals.** All three exit with code 2 and leave the state file unchanged, but the log signature is distinct: the Audit Mode deferral logs `Deferring WinRE Manager: Windows is not in a normal-running state`, the OS-fallback BitLocker deferral logs `OS-fallback deferred: C: VolumeStatus=…`, and the pipeline gate logs `Image injection did not complete. Stopping before Step 4 and before any deployment.` The first two fire before any download or mount; the pipeline gate fires after both. A field engineer reading the log will see the difference immediately.
+
+## The OS-fallback route deferred because C: is encrypted
+
+**Symptom.** The script chose the OS-fallback route — dedicated-partition creation failed and the script fell back to `C:\Recovery\WindowsRE` — and then exited with code 2 (`EXIT_WARNING`) without deploying the WIM. The machine is unchanged: no new WIM at `C:\Recovery\WindowsRE`, no `reagentc` call made, and the state file is unchanged (or absent).
+
+**Log signature.**
+
+```
+[WARN] OS-fallback deferred: C: VolumeStatus=<value>. reagentc will refuse to enable WinRE on the encrypted OS volume. To resolve: sign in with a Microsoft account to complete Device Encryption activation, or add a key protector manually (Add-BitLockerKeyProtector -MountPoint C: -RecoveryPasswordProtector) and enable protection, or wait for decryption to finish. The script will not modify C:'s BitLocker state.
+```
+
+**Cause.** On the OS-fallback route the target volume *is* the OS volume. reagentc refuses to enable WinRE on an encrypted OS volume, always — this is a hard OS check, not something the script can work around. The gate exists to prevent the script from deploying a WIM it cannot register.
+
+The `<value>` in the log line is C:'s `VolumeStatus` at the moment the gate fired. It is one of `FullyEncrypted`, `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, or `DecryptionPaused`. `FullyEncrypted` is the ambiguous suspended/Waiting-for-Activation state; the four mid-operation states mean the Device Encryption service is actively working.
+
+**Why the script does not decrypt C:.** Decrypting the OS volume is hours of I/O, changes the recovery key relationship, and the OS volume is the user's data. Removing encryption from the OS volume as a side effect of a WinRE repair is not a change the script is authorised to make. The operator resolves the state.
+
+**Resolution.** From an elevated PowerShell:
+
+```powershell
+manage-bde -status C:
+```
+
+Read the `Conversion Status:` line and act accordingly:
+
+- **`Fully Encrypted` with `Protection Off`** — the machine is in a suspended or Waiting-for-Activation state. Two options: sign in with a Microsoft account on this machine to complete Device Encryption activation (which arms protection and escrows the recovery key), or add a key protector manually and enable protection:
+
+  ```powershell
+  Add-BitLockerKeyProtector -MountPoint "C:" -RecoveryPasswordProtector
+  ```
+
+  Then wait for `Protection Status:` to read `Protection On`.
+
+- **`Encryption In Progress` or `Encryption Paused`** — the Device Encryption service is still working. Wait for it to finish, or abort it:
+
+  ```powershell
+  manage-bde -off C:
+  ```
+
+  Then wait for `Conversion Status:` to read `Fully Decrypted`.
+
+- **`Decryption In Progress` or `Decryption Paused`** — the encryption service is already stopping. Wait for it to finish.
+
+Once `manage-bde -status C:` reads either `Protection On` (any conversion status) or `Protection Off` with `Fully Decrypted`, re-run `WinRE.ps1`.
+
+**Do not** attempt to defeat the gate by editing the state file. The gate is the mechanism that prevents the script from deploying a WIM to a target it cannot register. The cost of waiting is one pipeline run; the cost of bypassing the gate is a machine with an unreachable WinRE registration.
+
+**Note.** This gate is only reached on the OS-fallback route. The enable-only and dedicated-partition routes never depend on C:'s BitLocker state, because their target volume is the recovery partition. If you are seeing a related deferral on the enable-only or dedicated-partition route, see the "Target recovery partition could not be made unencrypted" section below.
+
+## Target recovery partition could not be made unencrypted
+
+**Symptom.** The script prepared the target recovery partition via `Set-RecoveryPartitionReadyForWinRE` and the helper reported that the partition could not be made unencrypted. On the **enable-only** path the run exits with code 2 (`EXIT_WARNING`) and the state file is updated with `LastEnableResult = "failed"`. On the **full-update** path the run exits with code 3 (`EXIT_FATAL`) and no state file is written.
+
+**Log signature (enable-only path).**
+
+```
+[ERROR] Enable-only path: target recovery partition could not be made unencrypted - deferring without further changes
+[WARN] Re-run after the target volume is decrypted, or after the Device Encryption service has stabilised.
+```
+
+**Log signature (full-update path).**
+
+```
+[ERROR] FATAL: Could not make target recovery partition unencrypted
+```
+
+**Cause.** `Set-RecoveryPartitionReadyForWinRE` runs `manage-bde -off` against the target partition and polls `Test-VolumeEncrypted` at 5-second intervals up to a 300-second timeout. The failure means one of:
+
+- The `manage-bde -off` call itself failed. The log line above the failure records the exact `manage-bde` output.
+- The partition did not report confirmed-unencrypted within the 300-second timeout.
+- A drive letter could not be assigned to the target partition, so the helper could not query it.
+- `Get-Partition` could not find the target partition (rare; usually a transient `Storage` module issue).
+
+**Resolution.** Investigate the target partition directly. From an elevated PowerShell, determine the target partition (the log line above the failure records the disk number and partition number), then:
+
+```powershell
+manage-bde -status <X>:
+```
+
+where `<X>` is the drive letter assigned to the target partition. Read the `Conversion Status:` line.
+
+- **`Fully Decrypted`** — the partition is already clean. The helper's query may have hit a transient state; re-run `WinRE.ps1`.
+- **`Fully Encrypted`, `Used Space Only Encrypted`, `Encryption In Progress`, `Encryption Paused`** — the partition is BitLocker-managed. Manually decrypt it:
+
+  ```powershell
+  manage-bde -off <X>:
+  ```
+
+  Wait for the status to report `Fully Decrypted`. Then re-run `WinRE.ps1`.
+- **`The volume could not be opened by BitLocker`** — the partition is not managed by BitLocker. This is the expected state for a recovery partition. The helper's query may have hit a transient state; re-run `WinRE.ps1`.
+- **`Decryption In Progress`, `Decryption Paused`** — wait for the decryption to finish, then re-run.
+
+If the drive letter cannot be assigned (the helper logs `Set-RecoveryPartitionReadyForWinRE: could not assign a drive letter to X/Y`), free a drive letter: check `Get-PSDrive -PSProvider FileSystem` and `net use` for mapped drives that can be removed.
+
+If a `manage-bde` call is being blocked (unusual, but antivirus and endpoint protection have been observed to do this), the log will show the `manage-bde` output. Resolve the block with the AV vendor's tooling, or add the recovery partition to the exclusion list, then re-run.
+
+**When the counter reaches 3.** The enable-only path's failure increments `EnableFailureAttempts` in the state file. After three consecutive failures, the next run's loop-breaker fires (see "reagentc /enable keeps failing on the enable-only path" below).
 
 ## `reagentc /enable` fails with "cannot be enabled on a volume with BitLocker Drive Encryption enabled"
 
@@ -145,29 +303,25 @@ reagentc /enable (exit 2): ...
 reagentc /enable failed because the target volume is BitLocker-protected
 ```
 
-**Cause.** The target recovery partition or volume is BitLocker-managed. Two scenarios produce this.
+**Cause.** reagentc's BitLocker check is on the **target** volume — the volume reagentc is being asked to enable WinRE on — not on C:. Under the v43 patch 5 (further revision 5) policy, the script prepares the target volume with `Set-RecoveryPartitionReadyForWinRE` before calling `reagentc /enable`. If this error still appears after preparation, one of the following is true.
 
-**Scenario 1 — v43 patch 5 (further revision) and later.** This should not happen. The startup BitLocker gate and the two mid-run gates are fail-closed, and the `blunsafe` result from `Invoke-ReagentcEnable` prevents the call from even being attempted when BitLocker on C: is not confirmed unprotected. If you are seeing this on the further revision despite all of that, the most likely explanations are:
+**Case 1 — the Device Encryption service re-claimed the target.** Between the helper's successful preparation and the `reagentc /enable` call, the Device Encryption service started encrypting the target partition again. This is rare on a recovery partition, because recovery-typed partitions carry the recovery type GUID and `0x8000000000000001` attributes that tell BitLocker to refuse them. It is more likely on a machine with an unusual BitLocker policy that auto-encrypts new partitions regardless of type. The log line preceding the failure records the partition's state at the time of preparation; check whether the state changed between preparation and `/enable` by comparing timestamps.
 
-1. The script was not updated. Confirm `.NOTES Version : 43` and that both the `v43 patch 5` and `v43 patch 5 (further revision)` entries are present.
-2. The target volume is a **recovery partition** that a BitLocker policy has auto-encrypted despite the recovery type GUID and attributes being set. This is the case the reactive delete-and-recreate retry handles (see Scenario 2 below). The recovery partition encryption is independent of C:'s protection state.
-3. The C: state transitioned to unsafe between the last `Test-BitLockerProtected` check and the `reagentc /enable` call — a genuinely narrow window.
+**Case 2 — the target reagentc checks is not the partition the helper prepared.** On the OS-fallback route, the target *is* C:, and C: is not prepared by the helper (the script never decrypts C:). The OS-fallback gate should have deferred the run before reaching this point, but a race is possible if C:'s state changed between the gate check and the `reagentc /enable` call. The log line immediately before the `reagentc /enable` call records C:'s `VolumeStatus`; if it is not `FullyDecrypted`, this is what happened.
 
-For case 1, update the script. For case 2, the reactive retry runs automatically. For case 3, file a bug with the full log and the `manage-bde -status C:` output at the time of the failure.
+**Resolution.** The script records the failure and the counter increments. There is no automatic recovery under the current policy; the failure is treated the same as a generic enable failure.
 
-**Scenario 2 — v43 patch 4 and earlier.** The pre-patch-5 behaviour is the reactive fallback described below. This is the failure mode patch 5 was designed to prevent.
+1. Determine which case applies. Grep the log for the last `Target partition` line before the failure and the last `OS-fallback deferred` line, if any.
+2. **Case 1:** re-run the script. The next run will re-prepare the target partition and retry. If the Device Encryption service is actively re-claiming the partition every time, the failure will repeat, and the loop-breaker will fire after three attempts — see "reagentc /enable keeps failing on the enable-only path" below for the next steps.
+3. **Case 2:** check C:'s state:
 
-**Resolution (Scenario 2).** Automatic. The production script detects this specific error, returns `"bitlocker"` from `Invoke-ReagentcEnable`, and the caller:
+   ```powershell
+   manage-bde -status C:
+   ```
 
-1. Suspends BitLocker on C:.
-2. Deletes the encrypted recovery partition.
-3. Recreates it (with attributes set before drive-letter assignment, per v35; recovery type GUID applied at creation, per v43 patch 5).
-4. Redeploys the WIM.
-5. Retries `reagentc /enable`.
+   If `Conversion Status:` is not `Fully Decrypted`, wait for the state to resolve, then re-run the script.
 
-If the retry also fails, the script logs `reagentc /enable still failed after partition recreation` and continues with the remaining pipeline. The run exits with `EXIT_WARNING`.
-
-If the script cannot suspend BitLocker (see below), it aborts the recovery attempt and continues with the WIM already deployed, which may or may not be usable. **On a machine where the encryption service is active, this escalates into the Section 1 failure mode. Update to patch 5 before retrying.**
+**Do NOT attempt to force `reagentc /enable` manually against an encrypted target.** The OS check will refuse the call regardless of how the target was reached. The only fix is to make the target unencrypted.
 
 ## `reagentc /enable` keeps failing on the enable-only path
 
@@ -189,17 +343,25 @@ The second case — the loop-breaker has fired. The counter reached 3, and the n
 [WARN] Enable-only /enable failed (attempt 1 of 3). Not falling through to full update - the deployment is current and only the enable step failed, so a rebuild would not change the outcome. Will retry on next run.
 ```
 
-Subsequent runs show `(attempt 2 of 3)` and `(attempt 3 of 3)`.
+Or, for the BitLocker-refusal variant:
 
-**Cause.** `reagentc /enable` returned a generic hard failure. Unlike `"bitlocker"` and `"blunsafe"`, this is not a BitLocker problem. The most likely causes:
+```
+[ERROR] reagentc /enable failed because the target volume is BitLocker-protected
+[WARN] Enable-only /enable refused with the BitLocker error after the target partition was confirmed unencrypted (attempt 1 of 3). The Device Encryption service may have re-claimed the volume. Not falling through to full update.
+```
+
+Subsequent runs show `(attempt 2 of 3)` and `(attempt 3 of 3)`. Both variants increment the same counter.
+
+**Cause.** `reagentc /enable` returned a terminal failure. The most likely causes:
 
 - `ReAgent.xml` is corrupt or inconsistent. The registration path exists but the XML describes a location that no longer matches reality.
 - The WIM at the reagentc-registered location is unusable. The `setreimage` call succeeded but the enable refused because the WIM could not be validated.
 - A `Windows\System32\Recovery\` file is locked or ACL-denied.
 - A `Windows\System32\Recovery\WinreAgent` component is in a bad state.
 - Antivirus or endpoint protection is holding the recovery partition or the deployed `winre.wim` open.
+- For the BitLocker variant: the target partition's recovery type GUID and attributes were not applied correctly, so the Device Encryption service re-claimed it before `/enable`. This is a configuration problem on the partition, not on the deployment.
 
-**Resolution.** This is a "investigate the enable failure itself" case, not a "re-run the script" case. The deployment is already correct; nothing the script can do will change the outcome of the enable step.
+**Resolution.** This is an "investigate the enable failure itself" case, not a "re-run the script" case. The deployment is already correct; nothing the script can do will change the outcome of the enable step.
 
 1. Inspect the WIM at the reagentc-registered location:
 
@@ -234,7 +396,15 @@ Subsequent runs show `(attempt 2 of 3)` and `(attempt 3 of 3)`.
 
 4. If `/enable` still fails, run `Get-WinEvent -LogName "Microsoft-Windows-WinRE-Agent/Operational"` for the corresponding entries. The WinRE-Agent operational log is the authoritative source for the specific reason `/enable` refused.
 
-5. If the enable now succeeds, delete the state file so the counter resets on the next run:
+5. For the BitLocker variant: verify the target partition's type and attributes:
+
+   ```powershell
+   Get-Partition -DiskNumber <X> -PartitionNumber <Y> | Select-Object GptType, MbrType
+   ```
+
+   For GPT, the `GptType` should be `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}`. For MBR, `MbrType` should be `0x27`. If the type is wrong, use `Set-RecoveryPartitionAttributes` (or `diskpart set id=...`) to fix it, then re-run the script.
+
+6. If the enable now succeeds, delete the state file so the counter resets on the next run:
 
    ```powershell
    Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force
@@ -255,13 +425,14 @@ If the enable never succeeds after the manual investigation above, the machine h
 
 The run exits with code 3 (`EXIT_FATAL`).
 
-**Cause.** The enable-failure counter reached 3 and the state file still records `LastEnableResult = "failed"` with WinRE `Disabled`. The loop-breaker fires to prevent the machine from silently cycling through the same failing path indefinitely.
+**Cause.** The enable-failure counter reached 3 and the state file still records a non-`"ok"` `LastEnableResult` with WinRE `Disabled`. The loop-breaker fires to prevent the machine from silently cycling through the same failing path indefinitely.
 
 The Audit Mode guard runs first, so on v43 patch 5 (further revision) this case cannot be caused by Audit Mode. The most likely causes are the same as Case 1, plus:
 
 - The recovery partition is being held open by another process.
 - The recovery partition itself has filesystem corruption.
 - The WIM at the registered location is not a valid WinRE image (e.g. it was replaced by something else).
+- For the BitLocker variant: the partition cannot hold the recovery type GUID (e.g. disk corruption in the partition table), so every recreation ends up auto-encrypted.
 
 **Resolution.**
 
@@ -276,7 +447,7 @@ The Audit Mode guard runs first, so on v43 patch 5 (further revision) this case 
 
 Do **not** retry the script without first resolving the underlying cause. The loop-breaker will fire again on the next run because the state file still records the counter value.
 
-**Under `-DryRun`** the loop-breaker logs `Would refuse to retry reagentc /enable: …` and continues, matching the pattern used by the BitLocker and Audit Mode gates. A dry run does not modify the state file or reset the counter.
+**Under `-DryRun`** the loop-breaker logs `Would refuse to retry reagentc /enable: …` and continues, matching the pattern used by the Audit Mode guard. A dry run does not modify the state file or reset the counter.
 
 ## `reagentc /disable` fails at Step 5
 
@@ -388,117 +559,88 @@ Before retrying, free a drive letter. Check `Get-PSDrive -PSProvider FileSystem`
 
 ## `Get-BitLockerVolume` returns null
 
-**Symptom.** `Suspend-BitLockerForWinRE` falls back to parsing `manage-bde -status`.
+**Symptom.** `Test-VolumeEncrypted` or `Set-RecoveryPartitionReadyForWinRE` falls back to parsing `manage-bde -status`.
+
+**Log lines.** The fallback path is silent by default in production; the harness (`Test-WinRE.ps1`) logs it. Under production, if the target volume is queried and the fallback fires, the behaviour is transparent — the helper proceeds with `manage-bde` text parsing.
+
+**Cause.** The BitLocker module is not loaded, the cmdlet failed, or the machine lacks the BitLocker feature. This is common on client SKUs where BitLocker is not enabled or on Windows Home.
+
+**Resolution.** Automatic. The fallback path parses `manage-bde -status` output. The fallback is tightened: `Protection Off` alone is not sufficient evidence of safety. Only a confirmed `Conversion Status: Fully Decrypted` (or the `could not be opened by BitLocker` classification) makes the fallback return confirmed-unprotected; anything else returns unknown, and the helper's caller treats unknown as "not safe to proceed."
+
+The refusal is deliberate: the script will not assume BitLocker is safe when it cannot confirm. The target partition is then deferred to the next run.
+
+## `manage-bde -status` output cannot be parsed
+
+**Symptom.** `Test-VolumeEncrypted` returns `$null` on a machine where BitLocker is clearly in one state or the other.
+
+**Log lines.** The failure surfaces as an indeterminate result from `Test-VolumeEncrypted`. The first caller to observe it, `Set-RecoveryPartitionReadyForWinRE`, logs:
+
+```
+[WARN] Target partition X/Y (Z:) encryption state indeterminate - sleeping 5s and re-checking
+```
+
+and sleeps 5 seconds to give the BitLocker service a chance to report a clean state. If the re-check is still indeterminate, the helper proceeds to run `manage-bde -off` against the target anyway — a partition that might be encrypted is treated as if it is. The `manage-bde -off` output recorded in the log is where you diagnose the format change: on a clean partition it reports `ERROR: An error occurred (code 0x80070057): The parameter is incorrect`, and on an encrypted one it reports `Decryption is now in progress`.
+
+**Cause.** A Windows build changed `manage-bde -status` output format. The regexes for `Protection On` / `Protection Off` / `Conversion Status:` no longer match.
+
+**Resolution.** Manual.
+
+1. Run `manage-bde -status C:` from an elevated shell and capture the output.
+2. Run `scripts\Test-WinRE.ps1`, Option 1. The parser self-test checks 3 and 4 will FAIL, and the raw `manage-bde -status` output is dumped to the diagnostic. Compare the format to the regex in `Test-VolumeEncrypted`.
+3. Update the regex in `scripts/WinRE.ps1` and mirror it in `scripts/Test-WinRE.ps1`.
+4. File an issue with the raw output and the Windows build number.
+
+## `reagentc /info` location regex fails
+
+**Symptom.** The parser self-test check 2 fails, or the script cannot resolve the WinRE location.
 
 **Log lines.**
 
 ```
-BitLocker Get-BitLockerVolume on C: returned null - falling back to manage-bde -status text parsing
+Parser: reagentc location  [FAIL] ...did not match any line
 ```
 
-**Cause.** The BitLocker module is not loaded, the cmdlet failed, or the machine lacks the BitLocker feature. This is common on client SKUs where BitLocker is not enabled or on Windows Home.
+**Cause.** `reagentc /info` output format changed. The expected pattern is `\\?\GLOBALROOT\device\harddiskX\partitionY\` or `\\?\Volume{GUID}\`.
 
-**Resolution.** Automatic. The fallback path parses `manage-bde -status` output. As of v43 patch 5 (further revision), the fallback is tightened: `Protection Off` alone is no longer sufficient evidence of safety. Only a confirmed `Conversion Status: Fully Decrypted` makes the fallback return confirmed-unprotected; anything else returns unknown, and the guard refuses. The fallback also cannot detect the ambiguous `Fully Encrypted + Protection Off` case any better than the primary API can, so it returns unknown for that state as well.
+**Resolution.** Manual. Run `reagentc /info` and inspect the Location line. Update the regex in `Get-WinREState` in both `scripts/WinRE.ps1` and `scripts/Test-WinRE.ps1`.
 
-The refusal is deliberate: the script will not assume BitLocker is safe when it cannot confirm. The destructive paths abort and the main flow defers with `EXIT_WARNING`.
+## The state file is missing or empty
 
-## `Suspend-BitLockerForWinRE` reports a BitLocker refusal
+**Symptom.** The log shows `No valid state (missing or stale) - rebuilding` when you expected the fast path.
 
-There are two distinct refusal signatures from `Suspend-BitLockerForWinRE`, for two different reasons. Both cause the same deferral outcome: the machine is unchanged and the run exits with `EXIT_WARNING`. The message text is the only way to tell them apart in the log, and the distinction matters for what you do next.
+**Cause.** The state file at `C:\Recovery\OEM\winre_state.json` is absent, unparseable, or has a `DesiredStateId` that does not match the current one.
 
-### Signature A — hazardous (mid-operation)
+**Resolution.** Automatic. The script falls through to the full-update path. A rebuild on a healthy machine is a no-op for the partition layout; it copies the current WIM, verifies it, and rewrites the state file.
 
-**Symptom.** The log shows this specific message from `Suspend-BitLockerForWinRE`:
+**Expected during the v44 patch 1 rollout.** The v44 patch 1 revision added CPU vendor/generation and VMD presence to the `DesiredStateId`. Every managed machine's stored state file, written under v43, no longer matches the ID computed under v44. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after the update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
 
-```
-BitLocker on C:: ProtectionStatus=Off but VolumeStatus=EncryptionInProgress - the volume is encrypted or actively encrypting. Device Encryption will auto-encrypt new partitions on this disk and reagentc /enable will fail. Refusing to treat as unprotected.
-```
+If the state file is repeatedly disappearing on a machine that has already taken one full-update pass under v44, check:
 
-(the `VolumeStatus` value will be one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`)
+1. Whether `Restore-OSPartitionSize` is failing. If it is, `$Script:GeometryRestoreFailed` is set and `Write-WinREState` deletes the state file on purpose. The log will show `Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file`. Investigate why the geometry restore is failing.
+2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
+3. Whether the loop-breaker is firing because the enable-failure counter reached 3. The state file is deliberately left in place in that case (the operator deletes it manually to reset the counter), but if a cleanup tool is configured to remove anything in `C:\Recovery\OEM\` on a schedule, it will also remove the state file for this reason.
 
-followed by a single deferral line:
+**Not to be confused with the Audit Mode, OS-fallback BitLocker, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The three are distinguishable: the deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
 
-```
-BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run once manage-bde -status C: shows Protection Status: Protection On (any conversion status), or Protection Status: Protection Off with Conversion Status: Fully Decrypted. Exit code will be 2.
-```
+**Not to be confused with the enable-only failure path either.** The enable-only failure path **writes** the state file with a non-`"ok"` `LastEnableResult` and an incremented counter. The state file's `LastUpdated` timestamp will be newer than the run start, and its `EnableFailureAttempts` will be non-zero. If you were expecting the state file to be absent, this is what happened.
 
-**Cause.** This is the v43 patch 5 guard firing correctly. Device Encryption is actively encrypting or decrypting the OS volume. The script refuses to run the destructive partition path because the encryption service would claim any new partition before the recovery type GUID could be applied.
+## The machine is in OS-fallback and stays there
 
-**Resolution.** Wait for the state to stabilise. From an elevated PowerShell:
+**Symptom.** The state file records `UsedOSFallback: true` and the script keeps exiting with code 2 without re-attempting the dedicated partition.
 
-```powershell
-manage-bde -status C:
-```
+**Cause.** This is deliberate. The `DesiredStateId`-scoped retry policy (v41) preserves the OS-fallback outcome for the current state so that a machine that cannot shrink the OS does not re-run the destructive path on every run.
 
-Wait until the `Conversion Status:` line reads either `Fully Decrypted` or (if `Protection Status: Protection On`) `Fully Encrypted`. Then re-run `WinRE.ps1`.
+**Resolution.** If you want the machine to retry:
 
-Do **not** delete the state file or force the script past this check. The guard exists because the destructive path will damage the machine in this state — see the Section 1 recovery procedure for what happens when the guard is bypassed.
+1. The most common reason to re-arm the retry is a `ScriptVersion` bump, a manifest `version` change, a change in CPU generation, or a change in VMD presence — any of which changes the `DesiredStateId`. Ship one of those, or wait for the next one.
+2. Alternatively, delete `C:\Recovery\OEM\winre_state.json` manually. The next run will treat the state as absent and re-run the full-update path.
+3. Or change the hardware in a way that changes `Manufacturer` / `Model` / `MachineType`. Not recommended.
 
-### Signature B — ambiguous (Waiting-for-Activation)
+Do not edit the state file's `UsedOSFallback` field and leave the rest in place; that will not change the `DesiredStateId` and the fast path will continue to fire.
 
-**Symptom.** The log shows this specific message from `Suspend-BitLockerForWinRE`:
+**Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
 
-```
-BitLocker on C:: ProtectionStatus=Off with VolumeStatus=FullyEncrypted - this state is ambiguous (could be a legitimate suspension, or Device Encryption in Waiting-for-Activation). Refusing to proceed with destructive partition work until the state is resolved to FullyDecrypted or ProtectionStatus=On.
-```
-
-followed by the same single deferral line as Signature A:
-
-```
-BitLocker guard deferred destructive partition work. No changes were made to the machine. Re-run once manage-bde -status C: shows Protection Status: Protection On (any conversion status), or Protection Status: Protection Off with Conversion Status: Fully Decrypted. Exit code will be 2.
-```
-
-**Cause.** The OS volume is `ProtectionStatus=Off` with `VolumeStatus=FullyEncrypted`. This is the standard suspended-BitLocker state — what every machine enters after a legitimate `Suspend-BitLocker` or a Windows Update suspension that has not yet been lifted — but it is also indistinguishable from a Device Encryption volume in the *Waiting for Activation* state. In that state the volume has been encrypted with a clear key, but protection has not been armed because the recovery key has not yet been escrowed.
-
-The two-field local view (`ProtectionStatus` + `VolumeStatus`) cannot tell a legitimate suspension from a Waiting-for-Activation volume. The script defers both. On a legitimate suspension, this costs one extra pipeline run. On a Waiting-for-Activation volume, it avoids a potential unrepairable state: servicing WinRE risks a boot-environment change that trips TPM measurements and forces a recovery prompt, and the key has not been escrowed anywhere the user can retrieve it.
-
-**Resolution.** Wait for the state to resolve. From an elevated PowerShell:
-
-```powershell
-manage-bde -status C:
-```
-
-- If the machine is legitimately suspended by an operator or by Windows Update, protection will re-arm on the next reboot or when the suspension is lifted. Then `Protection Status:` reads `Protection On`.
-- If the machine is in Waiting-for-Activation, sign in with the Microsoft account or complete activation through Control Panel → BitLocker Drive Encryption → Resume protection. Once the recovery key is escrowed and protection is armed, `Protection Status:` reads `Protection On`.
-
-Wait until `Protection Status: Protection On` (any conversion status) or `Protection Status: Protection Off` with `Conversion Status: Fully Decrypted`. Then re-run `WinRE.ps1`.
-
-**Do not** attempt to defeat the guard by editing the state file. The guard is the mechanism that prevents the Waiting-for-Activation case from becoming an unrepairable failure. The cost of waiting is one pipeline run; the cost of proceeding is potentially the loss of the machine.
-
-### Distinguishing a deferral from a failure
-
-The two lines shown in both signatures together are the **deferral signature**. The first is the guard refusal from `Suspend-BitLockerForWinRE`; the second is the main flow recognizing the refusal via the `$Script:BitLockerGuardDeferred` flag and exiting early with `EXIT_WARNING`. When you see both lines, the machine is unchanged: no partition was deleted, no WIM was deployed, WinRE was not disabled, and no state file was written.
-
-This signature is **different** from a genuine partition-creation failure. A real failure logs the six-line banner:
-
-```
-[WARN] ================================================================================
-[WARN] Dedicated recovery partition creation failed after all attempts.
-[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
-[WARN] This is NOT equivalent to a dedicated recovery partition.
-[WARN] WinRE will function but with reduced resilience. Exit code will be 2.
-[WARN] ================================================================================
-```
-
-and then proceeds into Step 5 as OS-fallback. A deferral logs none of that banner — it exits before Step 5 with the single deferral line. If you see the banner, the destructive attempt ran and failed; if you see the single deferral line instead, the guard fired before anything was attempted.
-
-### Startup gate vs mid-run gate
-
-The startup gate (runs before the pending-reboot block, before any control-flow path is chosen) logs a different message:
-
-```
-Deferring WinRE Manager: BitLocker on C: ProtectionStatus=Off with VolumeStatus=EncryptionInProgress - Device Encryption may be actively encrypting or decrypting the OS volume. No WinRE or partition changes will be made.
-```
-
-or, for the ambiguous case:
-
-```
-Deferring WinRE Manager: BitLocker on C: ProtectionStatus=Off with VolumeStatus=FullyEncrypted - this state is ambiguous (could be a legitimate suspension, or Device Encryption in Waiting-for-Activation). Only FullyDecrypted or an empty VolumeStatus is confirmed-safe. No WinRE or partition changes will be made.
-```
-
-The startup gate fires **before** the control-flow path is chosen, so the deferral happens before `Ensure-AdequateRecoveryPartition` or Step 5 are even reached. On most machines this is the log signature you will see, not the mid-run `BitLocker guard deferred …` line. Both have the same effect: machine unchanged, `EXIT_WARNING`, no state file written.
-
-The Audit Mode gate runs even earlier. If the log shows `Setup\State\ImageState=…` instead, see the Audit Mode section above.
+**Not to be confused with a deferral.** A machine on which an Audit Mode, OS-fallback BitLocker, or injection-failure deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
 
 ## VMD hardware present but no driver matches
 
@@ -528,84 +670,13 @@ Skipping <name>: CPU gen <n> outside <min>-<max>
 
 The harness (Option 9, VMD drivers) also logs a warning with the raw CPU string when an Intel CPU is detected but its generation cannot be parsed, which makes this failure mode visible.
 
-## `manage-bde -status` output cannot be parsed
-
-**Symptom.** `Test-BitLockerProtected`, `Test-BitLockerSuspended`, or `Test-VolumeEncrypted` returns `$null` on a machine where BitLocker is clearly in one state or the other.
-
-**Log lines.**
-
-```
-BitLocker protection state on C: could not be determined - refusing to treat as unprotected
-```
-
-**Cause.** A Windows build changed `manage-bde -status` output format. The regexes for `Protection On` / `Protection Off` / `Conversion Status:` no longer match.
-
-**Resolution.** Manual.
-
-1. Run `manage-bde -status C:` from an elevated shell and capture the output.
-2. Run `scripts\Test-WinRE.ps1`, Option 1. The parser self-test checks 3 and 4 will FAIL, and the raw `manage-bde -status` output is dumped to the diagnostic. Compare the format to the regexes in `Test-BitLockerProtected`, `Test-BitLockerSuspended`, and `Test-VolumeEncrypted`.
-3. Update the regexes in `scripts/WinRE.ps1` and mirror them in `scripts/Test-WinRE.ps1`.
-4. File an issue with the raw output and the Windows build number.
-
-**Note.** A `$null` result is not always a bug. As of v43 patch 5 (further revision), `Test-BitLockerProtected` returns `$null` deliberately for the ambiguous `FullyEncrypted+Off` state, and `Suspend-BitLockerForWinRE` returns `$false` for the same state — by design. If the parser self-test passes checks 3 and 4 but the script logs an ambiguous-state deferral, the parser is working correctly. The `$null` return is the guard, not a parser failure.
-
-## `reagentc /info` location regex fails
-
-**Symptom.** The parser self-test check 2 fails, or the script cannot resolve the WinRE location.
-
-**Log lines.**
-
-```
-Parser: reagentc location  [FAIL] ...did not match any line
-```
-
-**Cause.** `reagentc /info` output format changed. The expected pattern is `\\?\GLOBALROOT\device\harddiskX\partitionY\` or `\\?\Volume{GUID}\`.
-
-**Resolution.** Manual. Run `reagentc /info` and inspect the Location line. Update the regex in `Get-WinREState` in both `scripts/WinRE.ps1` and `scripts/Test-WinRE.ps1`.
-
-## The state file is missing or empty
-
-**Symptom.** The log shows `No valid state (missing or stale) - rebuilding` when you expected the fast path.
-
-**Cause.** The state file at `C:\Recovery\OEM\winre_state.json` is absent, unparseable, or has a `DesiredStateId` that does not match the current one.
-
-**Resolution.** Automatic. The script falls through to the full-update path. A rebuild on a healthy machine is a no-op for the partition layout; it copies the current WIM, verifies it, and rewrites the state file.
-
-If the state file is repeatedly disappearing, check:
-
-1. Whether `Restore-OSPartitionSize` is failing. If it is, `$Script:GeometryRestoreFailed` is set and `Write-WinREState` deletes the state file on purpose. The log will show `Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file`. Investigate why the geometry restore is failing.
-2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
-3. Whether the loop-breaker is firing because the enable-failure counter reached 3. The state file is deliberately left in place in that case (the operator deletes it manually to reset the counter), but if a cleanup tool is configured to remove anything in `C:\Recovery\OEM\` on a schedule, it will also remove the state file for this reason.
-
-**Not to be confused with the Audit Mode or BitLocker deferrals.** If the run exits with `EXIT_WARNING` because a startup gate deferred the work, the state file will also be unchanged — but that is not a problem with the state file. The two are distinguishable: the deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
-
-**Not to be confused with the enable-only failure path either.** The enable-only failure path **writes** the state file with `LastEnableResult = "failed"` and an incremented counter. The state file's `LastUpdated` timestamp will be newer than the run start, and its `EnableFailureAttempts` will be non-zero. If you were expecting the state file to be absent, this is what happened.
-
-## The machine is in OS-fallback and stays there
-
-**Symptom.** The state file records `UsedOSFallback: true` and the script keeps exiting with code 2 without re-attempting the dedicated partition.
-
-**Cause.** This is deliberate. The `DesiredStateId`-scoped retry policy (v41) preserves the OS-fallback outcome for the current state so that a machine that cannot shrink the OS does not re-run the destructive path on every run.
-
-**Resolution.** If you want the machine to retry:
-
-1. The most common reason to re-arm the retry is a `ScriptVersion` bump or a manifest `version` change, either of which changes the `DesiredStateId`. Ship one of those.
-2. Alternatively, delete `C:\Recovery\OEM\winre_state.json` manually. The next run will treat the state as absent and re-run the full-update path.
-3. Or change the hardware in a way that changes `Manufacturer` / `Model` / `MachineType`. Not recommended.
-
-Do not edit the state file's `UsedOSFallback` field and leave the rest in place; that will not change the `DesiredStateId` and the fast path will continue to fire.
-
-**Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
-
-**Not to be confused with a deferral.** A machine on which an Audit Mode or BitLocker gate fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged. See the `Suspend-BitLockerForWinRE` reports a BitLocker refusal and the Audit Mode sections for the distinguishing log signatures.
-
 ## The script is running but nothing is happening
 
 **Symptom.** The script runs, exits 0, and does nothing.
 
 **Cause.** This is the fast path. The machine is already in the correct end state.
 
-**Resolution.** None needed. If you want to see what the fast path observed, run `scripts\Test-WinRE.ps1` Option 1. It reports the machine's state from the same vantage point the production script uses.
+**Resolution.** None needed. If you want to see what the fast path observed, run `scripts\Test-WinRE.ps1` Option 1. It reports the machine's state from the same vantage point the production script uses. Option S reports whether the state file's `DesiredStateId` matches the ID production would compute right now.
 
 ## The script runs on every boot
 
@@ -625,22 +696,24 @@ Use it to:
 - Verify the `DesiredStateId` computation.
 - Verify that the resolved OEM pack and VMD drivers are what you expect.
 - Verify that the classifier verdict matches what you believe the machine's state to be.
-- Verify that no startup gate would defer a live run.
+- Verify that the Audit Mode guard would not defer a live run.
 
-The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step: the destructive path in `Ensure-AdequateRecoveryPartition` terminates at a single choke point immediately after the read-only pre-checks, and every state-modifying helper (`Invoke-ReagentcEnable`, `Write-WinREState`, `Remove-StrayRecoveryPartitions`, `Remove-ItemIfExist`, `Restore-OSPartitionSize`, `Remove-OrphanPartition`, `Set-RecoveryPartitionAttributes`, `Invoke-DriveLetterAssignment`, `Invoke-DriveLetterRemoval`, `Invoke-VendorExtraction`, `Invoke-CabExtraction`, `Invoke-OemPackDownload`, `Invoke-DismMount`, `Set-Checkpoint`, `New-DirectoryIfNotExists`) handles DryRun internally. Adding new state-modifying code to `Ensure-AdequateRecoveryPartition` cannot violate the guarantee without first overriding the early return; adding new callers of the state-modifying helpers cannot violate it at all, because the guard is inside each helper.
+The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step:
 
-Three checks run under `-DryRun` in read-only form and log a `Would defer …` or `Would refuse …` line when the live run would not proceed:
+- The Audit Mode guard is read-only and logs `Would defer …` when the live run would defer.
+- The drive-letter assignment is skipped under DryRun; the caller works with the original `\\?\GLOBALROOT` path.
+- The **full-update pipeline** terminates at a single choke point at the top of the full-update path. It logs a plan for Steps 1 through 7 and exits cleanly without running `dism`, 7-Zip, or any file I/O in WorkDir.
+- The **destructive partition path** in `Ensure-AdequateRecoveryPartition` terminates at a single choke point immediately after the read-only pre-checks and pre-deletion inventory. It logs a plan for the delete, extend, shrink, create, format, and attribute steps.
+- Every state-modifying helper handles DryRun internally: `Set-RecoveryPartitionReadyForWinRE`, `Invoke-ReagentcEnable`, `Write-WinREState`, `Remove-StrayRecoveryPartitions`, `Remove-ItemIfExist`, `Restore-OSPartitionSize`, `Remove-OrphanPartition`, `Set-RecoveryPartitionAttributes`, `Invoke-DriveLetterAssignment`, `Invoke-DriveLetterRemoval`, `Invoke-VendorExtraction`, `Invoke-CabExtraction`, `Invoke-OemPackDownload`, `Invoke-DismMount`, `Set-Checkpoint`, `New-DirectoryIfNotExists`.
 
-- **Audit Mode gate.** Reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState`. Logs `Would defer WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=…)` when the value is present and is not `IMAGE_STATE_COMPLETE`. Continues.
-- **BitLocker startup gate.** Classifies the BitLocker state and logs `Would defer WinRE Manager: BitLocker on C: …` when the state is unsafe. Continues.
+Two checks run under `-DryRun` in read-only form and log a `Would defer …` or `Would refuse …` line when the live run would not proceed:
+
+- **Audit Mode guard.** Reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState`. Logs `Would defer WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=…)` when the value is present and is not `IMAGE_STATE_COMPLETE`. Continues.
 - **Enable-failure loop-breaker.** Logs `Would refuse to retry reagentc /enable: …` when the live run would fire the loop-breaker. Continues.
 
-A dry run that reports any of these is telling you the machine would be deferred on the next live run. Address the underlying condition before running the script for real.
+A dry run that reports either of these is telling you the machine would be deferred on the next live run. Address the underlying condition before running the script for real.
 
-The DryRun branch of `Suspend-BitLockerForWinRE` runs a read-only BitLocker query so that a pre-flight of a machine in an unsafe state reports the hazard rather than logging destructive actions. The check is read-only — no `Suspend-BitLocker` call is made, and `$Script:BitLockerSuspended` is not set — but it will return `$false` and log the refusal for the same set of states the live guard refuses on:
-
-- **Hazardous:** `ProtectionStatus=Off` with `VolumeStatus` one of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, `DecryptionPaused`.
-- **Ambiguous:** `ProtectionStatus=Off` with `VolumeStatus=FullyEncrypted`.
+The DryRun contract for the OS-fallback BitLocker gate is that the gate is logged but does not short-circuit. If the OS-fallback route is reached under DryRun, the gate logs `OS-fallback deferred: C: VolumeStatus=…` and continues — but the deployed WIM plan downstream is not evaluated against C:'s state, because no WIM is deployed under DryRun.
 
 Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable …` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
 
@@ -652,11 +725,12 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - Windows build.
 - Vendor, model, Lenovo machine type.
 - Partition style (GPT or MBR).
-- BitLocker state — **both** `Protection Status:` and `Conversion Status:` from `manage-bde -status C:`. The `Conversion Status` value matters: `Fully Encrypted` with `Protection Off` is the ambiguous state that the further revision defers on, and `Fully Encrypted` with `Protection On` is a safe state. Omitting the conversion status makes the report impossible to diagnose.
+- BitLocker state — **both** `Protection Status:` and `Conversion Status:` from `manage-bde -status C:`. The `Conversion Status` value matters: on the OS-fallback route, `Fully Encrypted` with `Protection Off` is the ambiguous state that the script defers on, and on the dedicated-partition route, the target partition's conversion status is what determines whether `Set-RecoveryPartitionReadyForWinRE` will need to run `manage-bde -off`. Omitting the conversion status makes the report impossible to diagnose.
+- The target recovery partition's BitLocker state — the `manage-bde -status` output for the partition reagentc is registered to. The harness's `Test-WinRE.ps1` Option 1 reports this automatically.
 - `ImageState` from `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` if the machine may be in Audit Mode or OOBE.
 - Exit code.
 - The relevant slice of the log — not the whole file unless asked.
-- The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes the BitLocker, Windows Setup state, and classifier verdicts.
+- The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes the BitLocker, Windows Setup state, target-partition state, and classifier verdicts. If the report is about the fast path or the state file, also include the output of Option S.
 
 ## Related documents
 

@@ -21,34 +21,40 @@
     Get-HardwareObject: the two use different OS-detection logic
     (build-number vs caption) and the Lenovo machine-type fallback
     chain is not identical. The harness does not execute any production
-    main-flow logic (partition recreation, BitLocker recovery,
-    state-file handling, checkpoint writes), so the v43 patch 4 changes
-    do not require a functional harness change. The harness exercises
-    the same download, extraction, and CPU-generation code paths as
-    production within the scope of those shared helpers.
+    main-flow logic (partition recreation, BitLocker preparation,
+    state-file handling, checkpoint writes), so the v43 patch 4 and
+    v43 patch 5 changes do not require a functional harness change.
+    The harness exercises the same download, extraction, and CPU-
+    generation code paths as production within the scope of those
+    shared helpers.
 
-    Validated against v43. The v42 additions (Get-OSDisk and the OS-disk-anchored
-    boot-disk lookup), the v43 additions (the fallback-source guard and
-    the force-rebuild-when-no-WIM check in the main flow), the v43
-    patch 2 changes (the classifier OS-disk gate, the WIM-hash gate on
-    ActiveLocationWimPresent, the geometry-restore flag, the count=0
-    exemption gate, and the state-file deletion), the v43 patch 3
-    changes (the orphan-deletion-failure geometry flag, and the three
-    additional enforcement sites for the "no type-coded recovery
-    partition on any non-OS disk" invariant: the enable-only path, the
-    pending-reboot success exit, and the pending-reboot reboot-required
-    exit), the v43 patch 4 changes (the three checkpoint writes
+    Validated against v44 patch 1. The v42
+    additions (Get-OSDisk and the OS-disk-anchored boot-disk lookup),
+    the v43 additions (the fallback-source guard and the force-rebuild-
+    when-no-WIM check in the main flow), the v43 patch 2 changes (the
+    classifier OS-disk gate, the WIM-hash gate on ActiveLocationWimPresent,
+    the geometry-restore flag, the count=0 exemption gate, and the
+    state-file deletion), the v43 patch 3 changes (the orphan-deletion-
+    failure geometry flag, and the three additional enforcement sites
+    for the "no type-coded recovery partition on any non-OS disk"
+    invariant), the v43 patch 4 changes (the three checkpoint writes
     gated on $Script:ImageInjectionComplete, and the migration guard
     that resets $step when a checkpoint at step 4 or later coincides
-    with a required rebuild), and the v43 patch 5 changes (BitLocker
-    protection-state checks now consider VolumeStatus as well as
-    ProtectionStatus, and New-Partition sets the recovery type GUID at
-    creation time to close the Device Encryption auto-encryption
-    window) do not change any of the functions the harness exercises,
-    so the harness remains valid against the current production file
-    without modification. The harness does NOT exercise the
-    partition-recreation, BitLocker-recovery, or state-write code paths
-    touched by v42/v43; those are covered by field testing.
+    with a required rebuild), the v43 patch 5 changes (New-Partition
+    sets the recovery type GUID at creation time to close the Device
+    Encryption auto-encryption window), and the v43 patch 5 further
+    revision 5 changes (the BitLocker policy is now target-volume-based:
+    reagentc's BitLocker check is on the partition being enabled, not
+    on C:, and a partition claimed by Device Encryption is decrypted
+    in place by Set-RecoveryPartitionReadyForWinRE instead of being
+    deleted and recreated) do not change any of the functions the
+    harness exercises. The harness does NOT exercise the partition-
+    recreation, target-volume preparation, or state-write code paths
+    touched by v42/v43; those are covered by field testing. The v44
+    DesiredStateId change (CPU vendor/generation and VMD presence
+    added to the ID inputs) is exercised by menu option S, which
+    recomputes the ID from the same inputs production uses and
+    compares it to the on-disk state file.
 
     Does NOT modify WinRE, partitions, BitLocker, drive letters, or the
     state file. No admin required. All work is confined to $TestDir.
@@ -63,7 +69,80 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 13
+    Version : 15
+
+    v15 changes vs v14:
+    1. Get-ThisMachineProfile aligned with production v44's
+       Get-HardwareObject. Manufacturer normalization now matches
+       production exactly (LENOVO uppercase, HP canonicalization,
+       raw fallback for unrecognised manufacturers). The previous
+       title-case Lenovo and null-fallback behaviour would produce
+       a different DesiredStateId than production for any Lenovo
+       and for any machine whose manufacturer string is not in the
+       known list. Model is returned because the HW component of
+       the DesiredStateId includes it, and OS detection now uses
+       the Caption string (matching production) rather than the
+       build number.
+    2. New Get-DesiredStateId: a mirror of production v44's
+       function. Accepts an optional ProductionScriptVersion
+       parameter so the harness can compute the ID under either
+       the v43 or v44 input set for comparison.
+    3. New Show-StateFileParity (menu option S). Computes the
+       DesiredStateId production would compute on this machine
+       right now, reads the on-disk state file, and reports
+       whether production would accept the state file (fast path)
+       or treat it as stale (full-update path). Read-only; does
+       not modify the state file.
+    4. Test-OemMaps' Lenovo null-return handling now mirrors
+       production v44's caller. Previously any Lenovo null-return
+       was reported as a FAIL; now the two permanent-skip cases
+       (MT=UNKN, and map-loaded-no-entry) are logged at INFO and
+       counted as pass, and only a failed map load is counted as
+       a failure. The non-Lenovo else branch is logged at INFO
+       instead of WARN.
+    5. Docstring's production-compatibility paragraph now notes
+       that the v44 DesiredStateId change is exercised by the new
+       S menu option. Section-header comments referencing
+       "v43 dependency verification" retained because the parser
+       self-test still validates the same regexes and API shapes;
+       no new parser dependencies were added in v44.
+    6. Menu and entry banners updated to "v15".
+
+    v14 changes vs v13:
+    1. The BitLocker (C:) warning text has been rewritten to reflect
+       the v43 patch 5 (further revision 5) target-volume policy.
+       The previous text told the field engineer that production
+       "will refuse destructive partition work" in the hazardous and
+       ambiguous states. That is no longer accurate. Under the new
+       policy, the enable-only path and the dedicated-partition path
+       do not depend on C:'s BitLocker state at all - production
+       prepares the target recovery partition directly via
+       Set-RecoveryPartitionReadyForWinRE. Only the OS-fallback path
+       depends on C:'s VolumeStatus, because there the target volume
+       IS the OS volume and reagentc refuses to enable WinRE on an
+       encrypted OS volume. The warnings now say exactly that, and
+       distinguish the OS-fallback case from the other paths.
+
+    2. New diagnostic block: "Target recovery partition state". The
+       production v43 patch 5 (further revision 5) policy is target-
+       volume-based, so the state of the partition reagentc is
+       registered to is what determines whether production will need
+       to run manage-bde -off before calling reagentc /enable, and
+       whether reagentc's own BitLocker check will succeed. The new
+       block reports that state - unmanaged by BitLocker, fully
+       decrypted, BitLocker-managed (with the conversion status), or
+       unresolved - and states plainly what production will do with
+       it. The harness remains read-only: it does not assign a drive
+       letter. If the partition already carries a drive letter, it is
+       used for the query; otherwise manage-bde -status is invoked
+       against the volume's UniqueId.
+
+    3. The docstring's production-compatibility paragraph now names
+       the v43 patch 5 (further revision 5) changes alongside the
+       earlier patch generations. The harness is validated against
+       the current production file. Purely documentary.
+
+    4. Menu and entry banners updated to "v14".
 
     v13 changes vs v12:
     1. Show-SystemDiagnostic now reads
@@ -85,31 +164,24 @@
        Off but VolumeStatus is one of the hazardous mid-operation states
        (EncryptionInProgress, DecryptionInProgress, EncryptionPaused,
        DecryptionPaused), Device Encryption is actively encrypting or
-       decrypting the volume. In that state, new partitions created on
-       the same disk are auto-encrypted by the Device Encryption service
-       before their recovery type GUID can be applied, and reagentc
-       /enable refuses with "Windows RE cannot be enabled on a volume
-       with BitLocker Drive Encryption enabled." Production v43 patch 5
-       now refuses to run the destructive partition paths in this state;
-       the warning here makes the hazard visible to a field engineer
-       before they run WinRE.ps1. Triggered by two field failures in the
-       same 24-hour window (Dell Latitude 3550 with Core Ultra 5 125U,
-       HP ProBook 450 G10 with i7-1355U), both on Windows 11 build 26200
+       decrypting the volume. Production v43 patch 5 now refuses to run
+       the destructive partition paths in this state; the warning here
+       makes the hazard visible to a field engineer before they run
+       WinRE.ps1. Triggered by two field failures in the same 24-hour
+       window (Dell Latitude 3550 with Core Ultra 5 125U, HP ProBook
+       450 G10 with i7-1355U), both on Windows 11 build 26200
        mid-Device-Encryption.
 
-    1a. (v12, same release) The hazard predicate is now aligned with
+    1a. (v12, same release) The hazard predicate is aligned with
         production v43 patch 5 (revised) semantics. A volume with
-        ProtectionStatus=Off and VolumeStatus=FullyEncrypted is the
-        standard suspended-BitLocker state (e.g. after
-        Suspend-BitLocker or a Windows Update suspension that has not
-        yet been lifted) and is NOT hazardous. The initial v12 predicate
-        treated it as hazardous, which produced a false-positive warning
-        on every machine with suspended BitLocker and told the operator
-        to wait for a state a suspended machine will never reach on its
-        own. Only the four mid-operation states are hazardous. The
-        warning message was also corrected: it no longer claims the
-        BitLocker key must be escrowed, because Get-BitLockerVolume's
-        local output cannot verify escrow.
+        ProtectionStatus=Off and VolumeStatus=FullyEncrypted was
+        treated by v12 as the standard suspended-BitLocker state.
+        [Superseded by harness v14: production v43 patch 5 (further
+        revision 5) no longer relies on C:'s VolumeStatus for the
+        dedicated-partition or enable-only paths. The v14 BitLocker
+        (C:) warnings and the new Target recovery partition state
+        block describe the current policy. See the v14 changes
+        above.]
     2. Menu and entry banners updated to "v12".
 
     v11 changes vs v10:
@@ -627,32 +699,90 @@ function Get-IntelProcessorGeneration {
     }
 }
 
+function Get-DesiredStateId {
+    # Mirror of production v44's Get-DesiredStateId. Requires the same
+    # inputs production resolves at startup: the hardware profile, the
+    # OEM package (or $null for NONE), the manifest version, and VMD
+    # presence. Defaults to production v44's ScriptVersion.
+    param(
+        [Parameter(Mandatory)]$Hardware,
+        $OEMPackage,
+        [Parameter(Mandatory)][string]$ExpectedDriverSetVersion,
+        [bool]$VMDPresent = $false,
+        [int]$ProductionScriptVersion = 44
+    )
+    $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
+    $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
+    $parts = @(
+        "HW=$($Hardware.Manufacturer)|$($Hardware.Model)|$($Hardware.MachineType)",
+        "OS=$($Hardware.Build)",
+        "CPU=$($Hardware.CPUVendor)|$cpuGen",
+        "VMD=$VMDPresent",
+        "MANIFEST=$ExpectedDriverSetVersion",
+        "OEMPACK=$oemVersion",
+        "SCRIPT=$ProductionScriptVersion"
+    )
+    $joined = $parts -join ';;'
+    $bytes  = [System.Text.Encoding]::UTF8.GetBytes($joined)
+    $sha    = [System.Security.Cryptography.SHA256]::Create()
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+}
+
 function Get-ThisMachineProfile {
-    $build = (Get-CimInstance Win32_OperatingSystem).BuildNumber
-    $os = if ([int]$build -ge 22000) { "Win11" } else { "Win10" }
-    $cs = Get-CimInstance Win32_ComputerSystem
-    $cpu = Get-CimInstance Win32_Processor
-    $mfg = $cs.Manufacturer.Trim()
-    $vendor = switch -Regex ($mfg) {
-        'Dell'            { 'Dell' }
-        'HP'              { 'HP' }
-        'Hewlett-Packard' { 'HP' }
-        'Lenovo'          { 'Lenovo' }
-        default           { $null }
+    # v15: aligned with production v44's Get-HardwareObject.
+    #
+    # Manufacturer normalization now matches production exactly
+    # (LENOVO uppercase, HP canonicalization, raw fallback for
+    # unrecognised manufacturers). The previous title-case Lenovo and
+    # null-fallback behaviour would produce a different DesiredStateId
+    # than production for any Lenovo and for any machine whose
+    # manufacturer string is not in the known list.
+    #
+    # Model is returned because the HW component of the DesiredStateId
+    # includes it. OS detection now uses the Caption string, matching
+    # production, rather than the build number.
+    $os      = Get-CimInstance Win32_OperatingSystem
+    $cs      = Get-CimInstance Win32_ComputerSystem
+    $cpu     = Get-CimInstance Win32_Processor
+    $product = Get-CimInstance Win32_ComputerSystemProduct
+    $board   = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
+
+    $isWin11 = $os.Caption -like "*Windows 11*"
+    $osLabel = if ($isWin11) { "Win11" } else { "Win10" }
+
+    $manufacturerRaw = if ($cs.Manufacturer) { $cs.Manufacturer.Trim() } else { "" }
+    $manufacturer = switch -Regex ($manufacturerRaw) {
+        "Dell"              { "Dell" }
+        "HP"                { "HP" }
+        "Hewlett-Packard"   { "HP" }
+        "Lenovo"            { "LENOVO" }
+        default             { $manufacturerRaw }
     }
-    $mt = $null
-    if ($vendor -eq 'Lenovo') {
-        if ($cs.Model -match '^([A-Z0-9]{4})') { $mt = $Matches[1] }
-        elseif ((Get-CimInstance Win32_ComputerSystemProduct).Name -match '^([A-Z0-9]{4})') { $mt = $Matches[1] }
+
+    $model   = if ($cs.Model) { $cs.Model.Trim() } else { "" }
+    $version = $product.Version
+    $machineType = "UNKN"
+    if ($manufacturer -eq "LENOVO") {
+        if ($model -match '^([A-Z0-9]{4})')                          { $machineType = $Matches[1] }
+        elseif ($product.Name -match '^([A-Z0-9]{4})')               { $machineType = $Matches[1] }
+        elseif ($board -and $board.Product -match '^([A-Z0-9]{4})')  { $machineType = $Matches[1] }
+        elseif ($version -and $version.Length -ge 4)                 { $machineType = $version.Substring(0,4) }
+    } else {
+        if ($version -and $version.Length -ge 4) { $machineType = $version.Substring(0,4) }
     }
+
     $cpuVendor = if ($cpu.Manufacturer -like "*Intel*") { "Intel" } else { "AMD" }
     $gen = Get-IntelProcessorGeneration -CPUName $cpu.Name
+
     return [PSCustomObject]@{
-        OS          = $os
-        Vendor      = $vendor
-        MachineType = $mt
-        Build       = $build
-        CPUVendor   = $cpuVendor
+        OS            = $osLabel
+        IsWin11       = $isWin11
+        Vendor        = $manufacturer
+        Manufacturer  = $manufacturer
+        Model         = $model
+        MachineType   = $machineType
+        Build         = $os.BuildNumber
+        CPUVendor     = $cpuVendor
         CPUGeneration = $gen
     }
 }
@@ -789,14 +919,12 @@ function Show-SystemDiagnostic {
         # v7: mirror the v43 patch 2 production classifier. DEDICATED is
         # only the healthy end state when the reagentc-registered
         # recovery partition is on the OS disk. A recovery partition on
-        # a non-OS disk (historically produced by Windows updates, disk
-        # migrations, or manual reagentc operations) does not take the
-        # idempotent fast path under v43 patch 2 - the production script
-        # runs the full-update path, redeploys the WIM to the OS disk,
-        # re-registers reagentc there, and only then lets Step 7 remove
-        # the stray secondary-disk partition. Reporting DEDICATED for
-        # that state would mislead a field tech into thinking no work is
-        # needed.
+        # a non-OS disk does not take the idempotent fast path under
+        # v43 patch 2 - the production script runs the full-update path,
+        # redeploys the WIM to the OS disk, re-registers reagentc there,
+        # and only then lets Step 7 remove the stray secondary-disk
+        # partition. Reporting DEDICATED for that state would mislead a
+        # field tech into thinking no work is needed.
         $isActiveOSDisk = ($osPart -and $activePart.DiskNumber -eq $osPart.DiskNumber)
         if ($isActiveOSPart) {
             Say "  Classification: OS-fallback (WinRE is on the OS partition)"
@@ -960,6 +1088,18 @@ function Show-SystemDiagnostic {
     }
 
     # ---- BitLocker on C: ----
+    # v14: rewritten for the v43 patch 5 (further revision 5) target-
+    # volume policy. The policy no longer gates the dedicated-partition
+    # or enable-only paths on C:'s BitLocker state. Only the OS-fallback
+    # path does, because there the target volume IS the OS volume and
+    # reagentc refuses to enable WinRE on an encrypted OS volume. The
+    # warnings below say exactly which paths are affected by which
+    # state.
+    #
+    # The classification predicate itself is unchanged from v12: the
+    # four mid-operation states are hazardous, FullyEncrypted+Off is
+    # ambiguous, and everything else is safe. What changed is the
+    # interpretation guidance in the warning text, not the predicate.
     Say ""
     Say "--- BitLocker (C:) ---"
     try {
@@ -970,27 +1110,13 @@ function Show-SystemDiagnostic {
             Say "  EncryptionMethod: $($blv.EncryptionMethod)"
             Say "  EncryptionPct:    $($blv.EncryptionPercentage)"
 
-            # v12: flag the Device Encryption in-progress hazard. The
-            # hazard check must match production's
-            # post-patch-5 semantics. The confirmed-safe VolumeStatus
-            # values, when ProtectionStatus is Off, are FullyDecrypted
-            # (never encrypted, or decryption finished) and FullyEncrypted
-            # (volume is fully encrypted but protection is Off - the normal
-            # suspended state after Suspend-BitLocker or a Windows Update
-            # suspension that has not yet been lifted). Only the
-            # mid-operation states - EncryptionInProgress,
-            # DecryptionInProgress, EncryptionPaused, DecryptionPaused -
-            # are hazardous. The previous check treated FullyEncrypted as
-            # a hazard, which produced a false positive on every machine
-            # with suspended BitLocker and told the operator to wait for a
-            # state that a suspended machine will never reach on its own.
             $vs = [string]$blv.VolumeStatus
             $hazardous = $false
             $ambiguous = $false
             if ($blv.ProtectionStatus -ne 'On' -and $vs) {
                 switch ($vs) {
                     'FullyDecrypted'       { $hazardous = $false }
-                    'FullyEncrypted'       { $ambiguous = $true }   # v43 patch 5 (further revision)
+                    'FullyEncrypted'       { $ambiguous = $true }
                     'EncryptionInProgress' { $hazardous = $true }
                     'DecryptionInProgress' { $hazardous = $true }
                     'EncryptionPaused'     { $hazardous = $true }
@@ -1002,22 +1128,85 @@ function Show-SystemDiagnostic {
                 Say ""
                 Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) but VolumeStatus=$vs." -Level WARN
                 Say "           Device Encryption is actively encrypting or decrypting the OS volume." -Level WARN
-                Say "           Production v43 patch 5 will refuse destructive partition work in this state." -Level WARN
-                Say "           Wait until VolumeStatus=FullyDecrypted, or VolumeStatus=FullyEncrypted with ProtectionStatus=On." -Level WARN
+                Say "           Production v43 patch 5 (further revision 5) refuses the OS-fallback" -Level WARN
+                Say "           path in this state, because reagentc will not enable WinRE on an" -Level WARN
+                Say "           encrypted OS volume. The enable-only and dedicated-partition paths" -Level WARN
+                Say "           are still available: production prepares the target recovery" -Level WARN
+                Say "           partition directly and does not depend on C:'s state." -Level WARN
+                Say "           To restore the OS-fallback path, wait until manage-bde -status C:" -Level WARN
+                Say "           reads Conversion Status: Fully Decrypted (or Protection On)." -Level WARN
             }
             if ($ambiguous) {
                 Say ""
                 Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) with VolumeStatus=$vs." -Level WARN
                 Say "           This state is ambiguous: legitimate suspension, OR Device Encryption" -Level WARN
-                Say "           Waiting-for-Activation. Production v43 patch 5 refuses destructive" -Level WARN
-                Say "           partition work in this state. Resolve by waiting for either" -Level WARN
-                Say "           ProtectionStatus=On (protection re-armed) or VolumeStatus=FullyDecrypted." -Level WARN
+                Say "           Waiting-for-Activation (recovery key not yet escrowed). The local" -Level WARN
+                Say "           two-field view cannot distinguish the two." -Level WARN
+                Say "           Production v43 patch 5 (further revision 5) refuses the OS-fallback" -Level WARN
+                Say "           path in this state, because reagentc will not enable WinRE on an" -Level WARN
+                Say "           encrypted OS volume. The enable-only and dedicated-partition paths" -Level WARN
+                Say "           are still available if the target recovery partition is unencrypted." -Level WARN
+                Say "           To restore the OS-fallback path, wait for either ProtectionStatus=On" -Level WARN
+                Say "           (activation completed) or VolumeStatus=FullyDecrypted." -Level WARN
             }
         } else {
             Say "  Get-BitLockerVolume returned null (module not loaded, cmdlet failed, or requires elevation)"
         }
     } catch {
         Say "  Get-BitLockerVolume failed: $_"
+    }
+
+    # ---- Target recovery partition state (v14) ----
+    # v14: reports the BitLocker state of the partition reagentc is
+    # registered to. Under the v43 patch 5 (further revision 5) target-
+    # volume policy this is the state that determines whether production
+    # will need to run manage-bde -off on the partition before calling
+    # reagentc /enable, and whether reagentc's own BitLocker check will
+    # succeed.
+    #
+    # The harness remains read-only: it does not assign a drive letter.
+    # If the partition already carries a drive letter, that is used for
+    # the query; otherwise manage-bde -status is invoked against the
+    # volume's UniqueId (which manage-bde accepts as a <volume>).
+    Say ""
+    Say "--- Target recovery partition state ---"
+    if ($activePart) {
+        Say "  Registered partition: Disk $($activePart.DiskNumber) Part $($activePart.PartitionNumber)"
+        $targetVol = Get-Volume -Partition $activePart -ErrorAction SilentlyContinue
+        if ($targetVol) {
+            $mountPoint = if ($targetVol.DriveLetter) { "$($targetVol.DriveLetter):" } else { $targetVol.UniqueId }
+            Say "  Querying manage-bde -status for: $mountPoint"
+            try {
+                $targetBde = & manage-bde.exe -status $mountPoint 2>&1
+                $targetBdeText = ($targetBde | Out-String)
+                if ($targetBdeText -match 'could not be opened by BitLocker') {
+                    Say "  Classification: unmanaged by BitLocker"
+                    Say "                  reagentc /enable will accept this partition as-is."
+                } elseif ($targetBdeText -match 'Conversion Status:\s*Fully Decrypted') {
+                    Say "  Classification: fully decrypted"
+                    Say "                  reagentc /enable will accept this partition as-is."
+                } elseif ($targetBdeText -match 'Conversion Status:\s*(Fully Encrypted|Used Space Only Encrypted|Encryption In Progress|Decryption In Progress|Encryption Paused|Decryption Paused)') {
+                    $convMatch = $targetBdeText | Select-String -Pattern 'Conversion Status:\s*(.+)' | Select-Object -First 1
+                    $conv = if ($convMatch) { $convMatch.Matches.Groups[1].Value.Trim() } else { "unknown" }
+                    Say "  Conversion Status: $conv"
+                    Say "  Classification: BitLocker-managed"
+                    Say "                  Production will run manage-bde -off against this partition and poll" -Level WARN
+                    Say "                  until it reports confirmed-unencrypted before calling reagentc /enable." -Level WARN
+                    Say "                  Expect up to 300s of additional runtime on the next production run." -Level WARN
+                } else {
+                    Say "  Classification: could not parse manage-bde output"
+                    Say "                  Production's Set-RecoveryPartitionReadyForWinRE will retry the query."
+                }
+            } catch {
+                Say "  manage-bde -status failed: $_"
+            }
+        } else {
+            Say "  Could not resolve the target partition to a volume."
+        }
+    } else {
+        Say "  WinRE is not registered to a partition on this machine (Disabled, or location unresolved)."
+        Say "  If the plan is OS-fallback, production checks C:'s VolumeStatus directly and defers"
+        Say "  unless it is FullyDecrypted. See the BitLocker (C:) section above."
     }
 
     # ---- VMD hardware presence ----
@@ -1048,15 +1237,8 @@ function Show-SystemDiagnostic {
     # state on this machine and must be adapted. A SKIP means the check
     # could not run in the current context (typically: not elevated, or
     # the state it inspects is absent) and does not indicate a defect.
-    #
-    # v7: none of the checks were affected by v43 patch 2 (classifier
-    # OS-disk gate, WIM hash gate, geometry-restore flag, count=0
-    # exemption gate, state-file deletion). Those patches are
-    # production-only logic; the harness does not exercise them. The
-    # banner is updated only so the diagnostic's version claim matches
-    # the harness's own docstring.
     Say ""
-    Say "--- Parser self-test (v43 dependency verification) ---"
+    Say "--- Parser self-test (production dependency verification) ---"
 
     # Check 1: reagentc /info status regex
     $statusPattern = '(Enabled|Disabled)'
@@ -1225,6 +1407,103 @@ function Show-SystemDiagnostic {
     Say "Diagnostic complete. Parser self-test results are in the summary."
 }
 
+function Show-StateFileParity {
+    Rule "State file parity check"
+    Say "Answers: would production v44 take the fast path on this machine now?"
+
+    # ---- Resolve the manifest ----
+    Say "Fetching driver manifest..."
+    $manifest = $null
+    try {
+        $manifest = Invoke-RestMethod -Uri $DriverManifestUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Say "Manifest fetch failed: $_" -Level ERROR
+        Record "State file parity" $false "manifest fetch failed"
+        return
+    }
+    if (-not $manifest -or -not $manifest.version) {
+        Say "Manifest missing version field" -Level ERROR
+        Record "State file parity" $false "manifest invalid"
+        return
+    }
+    Say "Manifest version: $($manifest.version)"
+
+    # ---- Hardware profile ----
+    $profile = Get-ThisMachineProfile
+    Say "Hardware: $($profile.Manufacturer) | $($profile.Model) | MT=$($profile.MachineType)"
+    Say "OS: $($profile.OS) (build $($profile.Build))"
+    Say "CPU: $($profile.CPUVendor) | gen $(if ($profile.CPUGeneration) { $profile.CPUGeneration } else { 'N' })"
+
+    # ---- OEM package (mirrors production's resolution) ----
+    $oemPackage = $null
+    switch ($profile.Manufacturer) {
+        "Dell"   { $oemPackage = Get-DellWinPEPack   -Hardware $profile }
+        "HP"     { $oemPackage = Get-HPWinPEPack     -Hardware $profile }
+        "LENOVO" { $oemPackage = Get-LenovoWinPEPack -Hardware $profile }
+    }
+    $oemVersion = if ($oemPackage -and $oemPackage.Version) { $oemPackage.Version } else { "NONE" }
+    Say "OEM package: $oemVersion"
+
+    # ---- VMD presence ----
+    $vmdIds = @($manifest.drivers | Where-Object { $_.match.requiredDevices } | ForEach-Object { $_.match.requiredDevices })
+    $vmdPresent = $false
+    if ($vmdIds.Count -gt 0) {
+        $pattern = ($vmdIds | ForEach-Object { [regex]::Escape($_) }) -join '|'
+        $vmdPresent = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+                        Where-Object { $_.InstanceId -match $pattern }).Count -gt 0
+    }
+    Say "VMD present: $vmdPresent"
+
+    # ---- Compute the DSI production would compute right now ----
+    $computedDsi = Get-DesiredStateId -Hardware $profile -OEMPackage $oemPackage `
+                                       -ExpectedDriverSetVersion $manifest.version `
+                                       -VMDPresent $vmdPresent
+    Say ""
+    Say "Computed DesiredStateId: $computedDsi"
+
+    # ---- Read the state file ----
+    $statePath = "$env:SystemDrive\Recovery\OEM\winre_state.json"
+    Say "State file: $statePath"
+    if (-not (Test-Path $statePath)) {
+        Say "  (does not exist - production will take the full-update path)" -Level WARN
+        Record "State file parity" $true "no state file (rebuild expected)"
+        return
+    }
+    try {
+        $state = Get-Content $statePath -Raw | ConvertFrom-Json
+    } catch {
+        Say "  (could not be parsed: $_)" -Level ERROR
+        Record "State file parity" $false "parse failed"
+        return
+    }
+
+    Say "  Stored DesiredStateId: $($state.DesiredStateId)"
+    Say "  CurrentImageHash:      $($state.CurrentImageHash)"
+    Say "  DriverSetVersion:      $($state.InjectedDriverSetVersion)"
+    Say "  LastUpdated:           $($state.LastUpdated)"
+    Say "  PendingReboot:         $($state.PendingReboot)"
+    Say "  UsedOSFallback:        $($state.UsedOSFallback)"
+    Say "  LastEnableResult:      $($state.LastEnableResult)"
+    Say "  EnableFailureAttempts: $($state.EnableFailureAttempts)"
+
+    Say ""
+    if ($state.DesiredStateId -eq $computedDsi) {
+        Say "Verdict: DSI MATCH - production will accept the state file." -Level INFO
+        Say "         Subject to the other fast-path gates: WinRE Enabled," -Level INFO
+        Say "         exactly one recovery partition on the OS disk, active" -Level INFO
+        Say "         WIM hash matching the stored CurrentImageHash." -Level INFO
+        Record "State file parity" $true "DSI matches"
+    } else {
+        Say "Verdict: DSI MISMATCH - production will treat the state file as" -Level WARN
+        Say "         stale and run the full-update path (rebuild + redeploy)." -Level WARN
+        Say "         This is expected on the first run after a DesiredStateId" -Level WARN
+        Say "         input change: ScriptVersion, MANIFEST, OEMPACK, CPU" -Level WARN
+        Say "         vendor/generation, or VMD presence. Subsequent runs take" -Level WARN
+        Say "         the fast path once the state file is rewritten." -Level WARN
+        Record "State file parity" $true "DSI mismatch (rebuild will run)"
+    }
+}
+
 # =========================== OEM PROVIDERS (based on WinRE.ps1) ===========================
 function Get-DellWinPEPack {
     param($Hardware)
@@ -1359,10 +1638,28 @@ function Test-OemMaps {
         Say "Lenovo: Name=$($l.Name) Version=$($l.Version) ArchiveType=$($l.ArchiveType)"
         Say "Lenovo: URL=$($l.DownloadUrl)"
         Say "Lenovo: SHA256=$($l.ExpectedSHA256)"
-    } elseif ($profile.Vendor -eq 'Lenovo') {
-        $ok = $false
+    } elseif ($profile.Vendor -eq 'LENOVO') {
+        # Production v44 treats two Lenovo null-return cases as
+        # legitimate completion rather than as failure:
+        #   1. The machine type could not be resolved (MT=UNKN). The
+        #      Lenovo map is not loaded in this case.
+        #   2. The map loaded successfully but has no entry for this MT.
+        # In both cases production records OEMPACK=NONE in the
+        # DesiredStateId and the fast path fires on subsequent runs.
+        # Only a failed map load is a genuine transient failure that
+        # defers the run. Mirror that classification so a field tech
+        # sees the same verdict production would produce.
+        $mtKnown = ($profile.MachineType -and $profile.MachineType -ne 'UNKN')
+        if (-not $mtKnown) {
+            Say "Lenovo: machine type could not be resolved (MT=UNKN) - production treats this as complete with OEMPACK=NONE" -Level INFO
+        } elseif (-not $Script:LenovoWinPEMap) {
+            Say "Lenovo: map could not be loaded - production would treat this as a transient failure and defer" -Level WARN
+            $ok = $false
+        } else {
+            Say "Lenovo: map loaded, no entry for MT $($profile.MachineType) - production treats this as complete with OEMPACK=NONE" -Level INFO
+        }
     } else {
-        Say "Lenovo map skipped (machine type not applicable)" -Level WARN
+        Say "Lenovo map skipped (machine type not applicable)" -Level INFO
     }
 
     Record "OEM maps" $ok
@@ -1631,7 +1928,7 @@ function Invoke-AllRelevant {
             $dellKey = if ($p.OS -eq 'Win11') { 'WinPE11' } else { 'WinPE10' }
             [void](Test-DellPack -Key $dellKey)
         }
-        'Lenovo' {
+        'LENOVO' {
             if ($p.MachineType) { [void](Test-LenovoPack -MachineType $p.MachineType) }
             else { Say "Lenovo but no MT detected" -Level WARN }
         }
@@ -1672,7 +1969,7 @@ function Show-Summary {
 # =========================== MENU ===========================
 function Show-Menu {
     Clear-Host
-    Write-Host "WinRE Manager Test Harness (v13)"
+    Write-Host "WinRE Manager Test Harness (v15)"
     Write-Host ("Working directory: {0}" -f $TestDir)
     $p = Get-ThisMachineProfile
     Write-Host ("Detected: OS={0}  Vendor={1}  MT={2}  CPUVendor={3}  CPUGen={4}" -f $p.OS, $p.Vendor, $p.MachineType, $p.CPUVendor, $p.CPUGeneration)
@@ -1686,6 +1983,7 @@ function Show-Menu {
     Write-Host "  7. Dell WinPE pack (prompts for OS)"
     Write-Host "  8. Lenovo WinPE pack (prompts for MT)"
     Write-Host "  9. VMD drivers (per manifest, filtered for this machine)"
+    Write-Host "  S. State file parity check (production DSI vs on-disk state file)"
     Write-Host "  A. All relevant for this machine"
     Write-Host "  B. All of the above"
     Write-Host "  R. Print results summary"
@@ -1695,7 +1993,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v13"
+Rule "WinRE Manager test harness v15"
 Say "Working dir: $TestDir"
 if (-not (Test-Path $7Zip)) { Say "7-Zip not found at $7Zip - extraction tests will fail" -Level WARN }
 
@@ -1735,6 +2033,7 @@ while (-not $quit) {
             if ($mt) { [void](Test-LenovoPack -MachineType $mt.Trim().ToUpper()) }
         }
         "9" { [void](Test-VmdDrivers) }
+        "S" { Show-StateFileParity }
         "A" { Invoke-AllRelevant }
         "B" { Invoke-All }
         "R" { Show-Summary }
