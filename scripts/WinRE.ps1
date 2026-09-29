@@ -211,8 +211,9 @@
        BitLocker fail-closed check: an unsafe BitLocker state still
        returns "blunsafe" under DryRun, and a safe state logs the
        intent and returns "ok" without calling reagentc. The
-       pending-reboot path's "ok" log line is conditioned on
-       $Script:DryRun so it does not claim success on a pass that
+       pending-reboot path's "ok" log line and the enable-only
+       path's clean-exit log line are both conditioned on
+       $Script:DryRun so neither claims success on a pass that
        attempted nothing.
 
        The result: the "dry runs modify nothing" guarantee is now
@@ -4306,7 +4307,11 @@ try {
                 Remove-ItemIfExist $CheckpointFile
                 exit $EXIT_WARNING
             }
-            Write-Log "Enable succeeded cleanly"
+            if ($Script:DryRun) {
+                Write-Log "[DRY RUN] Would report the enable-only path as succeeded and exit with EXIT_SUCCESS"
+            } else {
+                Write-Log "Enable succeeded cleanly"
+            }
             Remove-ItemIfExist $CheckpointFile
             exit $EXIT_SUCCESS
         }
