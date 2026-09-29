@@ -141,7 +141,88 @@
        ProtectionStatus=Off with a VolumeStatus other than
        FullyDecrypted (including FullyEncrypted), the run defers with
        EXIT_WARNING before touching any partition or the WinRE
-       registration. The gate is disabled under -DryRun.
+       registration.
+
+       Further revision 2 (same patch, same ScriptVersion). Three
+       changes to the startup gate.
+
+       First, the gate now handles a null Get-BitLockerVolume return.
+       Previously the entire gate block was skipped when the cmdlet
+       returned null, so a machine whose BitLocker state could not be
+       queried passed the gate silently. The gate now falls back to
+       Test-BitLockerProtected, which itself falls back to manage-bde
+       -status text parsing. A null result from that fallback causes
+       the gate to defer. To avoid a false positive on machines where
+       BitLocker is genuinely not present (Windows Home SKU, or the
+       feature not installed), the gate checks for manage-bde.exe
+       before treating a null return as unknown; when the tooling is
+       absent the gate is a no-op.
+
+       Second, the gate runs under -DryRun. Previously it was wrapped
+       in if (-not $Script:DryRun), so a preflight of an
+       idempotent-but-unsafe machine reported nothing. Under -DryRun
+       the gate now performs the same read-only classification and
+       logs "Would defer WinRE Manager: ..." when the state is unsafe.
+       It does not exit; the DryRun continues. This makes a preflight
+       report the state a live run would defer on, without modifying
+       BitLocker, WinRE, partitions, or drive letters.
+
+       Third, the gate no longer removes the checkpoint file on
+       deferral. Deferring on BitLocker state does not invalidate any
+       resumable step - steps 1-4 do not depend on BitLocker and the
+       existing step guards handle resumption once the state is safe.
+       Preserving the checkpoint lets the next run resume rather than
+       re-download and re-inject from scratch.
+
+       Further revision 3 (same patch, same ScriptVersion). The DryRun
+       contract is now structural rather than per-step: no code path
+       reachable under -DryRun modifies BitLocker, WinRE registration,
+       partitions, drive letters, or the state file.
+
+       Two leaks existed. First, Ensure-AdequateRecoveryPartition's
+       reagentc /disable call was not guarded. A DryRun on a machine
+       with no suitable recovery partition - the exact case in which
+       the function is invoked - actually disabled WinRE. The
+       per-step DryRun guards elsewhere in the function (the deletion
+       loop's continue, the OS extend's -and -not $Script:DryRun, the
+       final early return) were correct individually but did not cover
+       the disable call.
+
+       Second, Invoke-ReagentcEnable ran reagentc /enable
+       unconditionally. The enable-only caller was guarded at the call
+       site; the full-update post-deploy and final-verification callers
+       sit after the Step 5 DryRun early-return, so they were never
+       reached under DryRun; but the pending-reboot path called the
+       function unguarded, so a DryRun on a machine whose state file
+       recorded PendingReboot=true actually enabled WinRE.
+
+       Fixes. In Ensure-AdequateRecoveryPartition, the DryRun early
+       return is moved to just after the read-only pre-deletion
+       inventory and before the first state-modifying action. It logs
+       a comprehensive plan of what a real run would do (which
+       partitions would be deleted, the extend, the shrink, the
+       create, the format, the attributes, the drive-letter
+       assignment). The reagentc /disable block now has an explicit
+       DryRun branch that logs and skips. All previously scattered
+       per-step DryRun guards are removed because the consolidated
+       early return makes them unreachable - the choke point is now
+       the only place that has to be maintained. In
+       Invoke-ReagentcEnable, a DryRun branch is added after the
+       BitLocker fail-closed check: an unsafe BitLocker state still
+       returns "blunsafe" under DryRun, and a safe state logs the
+       intent and returns "ok" without calling reagentc. The
+       pending-reboot path's "ok" log line is conditioned on
+       $Script:DryRun so it does not claim success on a pass that
+       attempted nothing.
+
+       The result: the "dry runs modify nothing" guarantee is now
+       enforced at a single structural choke point per state-modifying
+       function, rather than at every call site. Adding new
+       state-modifying code below the Ensure-AdequateRecoveryPartition
+       choke point cannot violate the guarantee without first
+       overriding the DryRun early return; adding new callers of
+       Invoke-ReagentcEnable cannot violate it at all, because the
+       guard is inside the function.
 
        Fail-closed on suspension failure. Invoke-ReagentcEnable now
        returns "blunsafe" (a distinct result) when BitLocker on C:
@@ -2309,21 +2390,25 @@ function Ensure-AdequateRecoveryPartition {
 
     $stateBefore = Get-WinREState
     if ($stateBefore.Status -eq "Enabled") {
-        Write-Log "Disabling WinRE before partition recreation"
-        $disableOutput = cmd /c "reagentc /disable 2>&1"
-        $disableExit = $LASTEXITCODE
-        Write-Log "reagentc /disable: exit=$disableExit, output=$disableOutput"
-        if ($disableExit -ne 0) {
-            Write-Log "reagentc /disable failed (exit $disableExit): $disableOutput" -Level ERROR
-            return $null
+        if ($Script:DryRun) {
+            Write-Log "[DRY RUN] Would disable WinRE before partition recreation"
+        } else {
+            Write-Log "Disabling WinRE before partition recreation"
+            $disableOutput = cmd /c "reagentc /disable 2>&1"
+            $disableExit = $LASTEXITCODE
+            Write-Log "reagentc /disable: exit=$disableExit, output=$disableOutput"
+            if ($disableExit -ne 0) {
+                Write-Log "reagentc /disable failed (exit $disableExit): $disableOutput" -Level ERROR
+                return $null
+            }
+            Start-Sleep 2
+            $verifyDisabled = Get-WinREState
+            if ($verifyDisabled.Status -ne "Disabled") {
+                Write-Log "WinRE is still reported as $($verifyDisabled.Status) after reagentc /disable - aborting before partition deletion" -Level ERROR
+                return $null
+            }
+            Write-Log "WinRE disable verified"
         }
-        Start-Sleep 2
-        $verifyDisabled = Get-WinREState
-        if ($verifyDisabled.Status -ne "Disabled") {
-            Write-Log "WinRE is still reported as $($verifyDisabled.Status) after reagentc /disable - aborting before partition deletion" -Level ERROR
-            return $null
-        }
-        Write-Log "WinRE disable verified"
     }
 
     Write-Log "Pre-deletion inventory:"
@@ -2350,8 +2435,43 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "  Disk $($rp.DiskNumber) Part $($rp.PartitionNumber): size $([math]::Round($rp.Size/1MB,1)) MiB, label='$rpLabel', used=$rpUsedMiB MiB, isWinRELocation=$isWinRELocation"
     }
 
+    # v43 patch 5 (further revision 3): DryRun terminates here, after the
+    # read-only pre-checks and pre-deletion inventory and before any
+    # state-modifying action. Everything below this point modifies the
+    # machine: partition deletion, OS partition resize, partition
+    # creation, format, attribute application, drive-letter assignment,
+    # and directory creation. Under DryRun the plan is logged and the
+    # function returns without performing any of them.
+    #
+    # This replaces the previous per-step DryRun guards (a `continue`
+    # inside the deletion loop, `-and -not $Script:DryRun` on the OS
+    # extend, and a final early return before the shrink). Those guards
+    # worked except for one: the reagantc /disable call above was not
+    # guarded, so a DryRun pass on a machine with no suitable recovery
+    # partition - the exact case this function exists to handle -
+    # actually disabled WinRE. Consolidating the terminator here makes
+    # the DryRun guarantee structural rather than per-step: no future
+    # code inserted into this function can accidentally modify the
+    # machine under DryRun without first passing through this choke
+    # point.
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would delete $($deletableParts.Count) recovery partition(s) on the OS disk:"
+        foreach ($rp in $deletableParts) {
+            Write-Log "[DRY RUN]   - Disk $($rp.DiskNumber) Part $($rp.PartitionNumber) (size $([math]::Round($rp.Size/1MB,1)) MiB)"
+        }
+        if ($deletableParts.Count -gt 0) {
+            Write-Log "[DRY RUN] Would extend the OS partition to absorb the space freed by the deletion(s)"
+        } else {
+            Write-Log "[DRY RUN] No recovery partitions on the OS disk - the OS partition extend step would be a no-op"
+        }
+        Write-Log "[DRY RUN] Would shrink the OS partition by $($bucketSizeMiB + 1) MiB (bucket + 1 MiB alignment slack)"
+        Write-Log "[DRY RUN] Would create a new recovery partition of $bucketSizeMiB MiB with the recovery type GUID applied at creation"
+        $letter = Get-AvailableDriveLetter
+        Write-Log "[DRY RUN] Would assign drive letter ${letter}: to the new partition, format it NTFS label 'Recovery', apply the recovery GPT attributes, verify no auto-encryption occurred, and remove the drive letter before reagentc /enable"
+        return @{ DriveLetter = $letter; DiskNumber = $osDisk.Number; PartitionNumber = 999 }
+    }
+
     foreach ($rp in $deletableParts) {
-        if ($Script:DryRun) { continue }
         try {
             $rp | Remove-Partition -Confirm:$false -ErrorAction Stop
         } catch {
@@ -2371,7 +2491,7 @@ function Ensure-AdequateRecoveryPartition {
     if (-not $osPart) { Write-Log "OS partition lost after deletion - FATAL" -Level ERROR; return $null }
 
     $maxSize = [int64](Get-PartitionSupportedSize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber).SizeMax
-    if ($maxSize -gt $osPart.Size -and -not $Script:DryRun) {
+    if ($maxSize -gt $osPart.Size) {
         Write-Log "Extending OS partition from $([math]::Round($osPart.Size/1MB,1)) MiB to $([math]::Round($maxSize/1MB,1)) MiB"
         try {
             $osPart | Resize-Partition -Size $maxSize -ErrorAction Stop
@@ -2384,11 +2504,6 @@ function Ensure-AdequateRecoveryPartition {
             Write-Log "OS partition extend verification failed - aborting before shrink" -Level ERROR
             return $null
         }
-    }
-
-    if ($Script:DryRun) {
-        $letter = Get-AvailableDriveLetter
-        return @{ DriveLetter = $letter; DiskNumber = $osDisk.Number; PartitionNumber = 999 }
     }
 
     # v28: add 1 MiB of alignment slack. $newOffset below rounds the OS
@@ -3192,6 +3307,24 @@ function Invoke-ReagentcEnable {
         Write-Log "Suspend returned false but BitLocker is confirmed Off - proceeding with reagentc /enable" -Level WARN
     }
 
+    # v43 patch 5 (further revision 3): DryRun must not call reagentc
+    # /enable. This function previously ran it unconditionally; the
+    # enable-only caller was guarded at the call site, but the
+    # pending-reboot path was not, so a DryRun on a machine whose state
+    # file had PendingReboot=true actually enabled WinRE. The DryRun
+    # branch is placed after the BitLocker fail-closed check above so
+    # an unsafe BitLocker state still returns "blunsafe" under DryRun
+    # and the caller reports the deferral correctly. When BitLocker is
+    # safe, the function logs the intent and returns "ok" - the closest
+    # approximation of a successful live run that can be made without
+    # running reagentc. Every caller's "ok" branch is DryRun-safe:
+    # Remove-StrayRecoveryPartitions, Write-WinREState, and
+    # Remove-ItemIfExist all handle DryRun internally.
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would call reagentc /enable and evaluate the result (exit code, WinRE status, and the registration repair path if the status check does not confirm Enabled)"
+        return "ok"
+    }
+
     $output = cmd /c "reagentc /enable 2>&1"
     $exitCode = $LASTEXITCODE
     Write-Log "reagentc /enable (exit $exitCode): $output"
@@ -3593,44 +3726,92 @@ try {
     $WinREState = Get-WinREState
     Write-Log "WinRE status: $($WinREState.Status), Location: $($WinREState.Location)"
 
-    # v43 patch 5 (further revision): startup BitLocker gate. Defer BEFORE
-    # any state-modifying action when the OS volume is in a state we
-    # cannot distinguish from Device Encryption Waiting-for-Activation.
-    # Runs after Get-WinREState so the log records the WinRE state first,
-    # and before the pending-reboot block and the full-update path so no
-    # partition or registration is touched.
+    # v43 patch 5 (further revision 2): startup BitLocker gate. Defer
+    # BEFORE any state-modifying action when the OS volume is in a state
+    # we cannot confirm safe. Runs after Get-WinREState so the log records
+    # the WinRE state first, and before the pending-reboot block and the
+    # full-update path so no partition or registration is touched.
     #
-    # Not applied under -DryRun: DryRun makes no modifications, so there
-    # is nothing to defer. The DryRun path already logs the hazard via
-    # Suspend-BitLockerForWinRE's DryRun branch.
-    if (-not $Script:DryRun) {
-        $startupBlv = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
-        if ($startupBlv) {
-            $startupProt    = $startupBlv.ProtectionStatus
-            $startupVs      = [string]$startupBlv.VolumeStatus
-            $startupProtOn  = ($startupProt -eq 'On' -or $startupProt -eq 'ProtectionOn' -or $startupProt -eq 1)
-            $startupProtOff = ($startupProt -eq 'Off' -or $startupProt -eq 'ProtectionOff' -or $startupProt -eq 0)
-            $startupVsSafe  = (-not $startupVs -or $startupVs -eq 'FullyDecrypted')
-            $deferReason    = $null
-            if (-not $startupProtOn) {
-                if ($startupProtOff) {
-                    if (-not $startupVsSafe) {
-                        if ($startupVs -eq 'FullyEncrypted') {
-                            $deferReason = "ProtectionStatus=Off with VolumeStatus=FullyEncrypted - ambiguous (legitimate suspension, or Device Encryption Waiting-for-Activation)"
-                        } else {
-                            $deferReason = "ProtectionStatus=Off with VolumeStatus=$startupVs - Device Encryption may be actively encrypting or decrypting"
-                        }
+    # Changes in this revision:
+    #   - If Get-BitLockerVolume returns null, the gate now falls back to
+    #     Test-BitLockerProtected, which itself falls back to manage-bde
+    #     -status text parsing. An unknown state is deferred rather than
+    #     silently allowed through. Previously a null return caused the
+    #     entire gate to be skipped, so a healthy-looking fast path could
+    #     exit 0 on a machine whose BitLocker state was unknown.
+    #     To avoid a false positive on machines where BitLocker is not
+    #     present at all (Home SKU, or feature not installed), the gate
+    #     checks for the manage-bde tooling before treating a null as
+    #     "state unknown". If the tooling is absent, the gate is a no-op
+    #     and logs that fact.
+    #   - The gate now runs under -DryRun as well. In DryRun it logs the
+    #     hazard and continues; it does not exit. This makes a preflight
+    #     of an idempotent-but-unsafe machine report the state instead of
+    #     exiting 0 without a warning. The DryRun path modifies nothing.
+    #   - A valid checkpoint file is preserved on deferral. The gate no
+    #     longer removes it. Deferring on BitLocker state does not
+    #     invalidate any resumable step; steps 1-4 do not depend on
+    #     BitLocker and the existing step guards handle resumption
+    #     correctly. Removing the checkpoint would force a full
+    #     re-download and re-injection on the next run for no benefit.
+    #
+    # The gate deliberately does NOT defer on ProtectionStatus=On with a
+    # mid-operation VolumeStatus. That is a policy decision documented in
+    # docs/architecture.md: protection being On is the factor that
+    # matters, the script suspends protection before the destructive
+    # work, and New-Partition applies the recovery type GUID at creation
+    # so the encryption service has no window to claim the new partition.
+    # Only when the classifier cannot confirm protection On does this
+    # gate defer.
+    $startupDeferReason = $null
+    $startupDeferDetail = $null
+    $startupBlv = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+    if ($startupBlv) {
+        $startupProt    = $startupBlv.ProtectionStatus
+        $startupVs      = [string]$startupBlv.VolumeStatus
+        $startupProtOn  = ($startupProt -eq 'On' -or $startupProt -eq 'ProtectionOn' -or $startupProt -eq 1)
+        $startupProtOff = ($startupProt -eq 'Off' -or $startupProt -eq 'ProtectionOff' -or $startupProt -eq 0)
+        $startupVsSafe  = (-not $startupVs -or $startupVs -eq 'FullyDecrypted')
+        if (-not $startupProtOn) {
+            if ($startupProtOff) {
+                if (-not $startupVsSafe) {
+                    if ($startupVs -eq 'FullyEncrypted') {
+                        $startupDeferReason = "ProtectionStatus=Off with VolumeStatus=FullyEncrypted"
+                        $startupDeferDetail = "this state is ambiguous (could be a legitimate suspension, or Device Encryption in Waiting-for-Activation). Only FullyDecrypted or an empty VolumeStatus is confirmed-safe."
+                    } else {
+                        $startupDeferReason = "ProtectionStatus=Off with VolumeStatus=$startupVs"
+                        $startupDeferDetail = "Device Encryption may be actively encrypting or decrypting the OS volume."
                     }
-                } else {
-                    $deferReason = "ProtectionStatus=$startupProt is neither On nor Off - cannot confirm safe state"
                 }
+            } else {
+                $startupDeferReason = "ProtectionStatus=$startupProt is neither On nor Off"
+                $startupDeferDetail = "the protection state cannot be confirmed safe."
             }
-            if ($deferReason) {
-                Write-Log "Deferring WinRE Manager: BitLocker on C: $deferReason. No WinRE or partition changes will be made." -Level WARN
-                Write-Log "Wait until manage-bde -status C: shows Conversion Status Fully Decrypted, or Protection Status Protection On. Then re-run." -Level WARN
-                Remove-ItemIfExist $CheckpointFile
-                exit $EXIT_WARNING
+        }
+    } else {
+        # Get-BitLockerVolume returned null. Distinguish "BitLocker is not
+        # present on this machine" (nothing to check, proceed) from
+        # "BitLocker is present but the cmdlet returned null for C:"
+        # (cannot confirm safe, defer). The presence of manage-bde.exe is
+        # a reliable indicator of whether the BitLocker feature is
+        # installed at all.
+        $blPresent = Test-Path "$env:SystemRoot\System32\manage-bde.exe"
+        if ($blPresent) {
+            $startupClass = Test-BitLockerProtected -MountPoint "C:"
+            if ($null -eq $startupClass) {
+                $startupDeferReason = "state could not be determined"
+                $startupDeferDetail = "BitLocker is present but Get-BitLockerVolume returned null and the manage-bde fallback did not confirm a safe state."
             }
+        } else {
+            Write-Log "BitLocker tooling is not present on this machine - startup gate not applicable" -Level INFO
+        }
+    }
+    if ($startupDeferReason) {
+        $startupVerb = if ($Script:DryRun) { "Would defer" } else { "Deferring" }
+        Write-Log "$startupVerb WinRE Manager: BitLocker on C: $startupDeferReason - $startupDeferDetail No WinRE or partition changes will be made." -Level WARN
+        Write-Log "Resolve by ensuring manage-bde -status C: shows one of: Protection Status: Protection On (any conversion status), or Protection Status: Protection Off with Conversion Status: Fully Decrypted. Then re-run." -Level WARN
+        if (-not $Script:DryRun) {
+            exit $EXIT_WARNING
         }
     }
 
@@ -3679,7 +3860,11 @@ try {
                     exit $EXIT_WARNING
                 }
                 if ($pendingResult -eq "ok") {
-                    Write-Log "Registration repair succeeded after pending-reboot retry"
+                    if ($Script:DryRun) {
+                        Write-Log "[DRY RUN] Would report the pending-reboot repair as succeeded and exit with EXIT_SUCCESS"
+                    } else {
+                        Write-Log "Registration repair succeeded after pending-reboot retry"
+                    }
                     # v43 patch 3: enforce the invariant on the pending-reboot
                     # success exit. This path also bypasses Step 7. See the
                     # enable-only block for rationale.
