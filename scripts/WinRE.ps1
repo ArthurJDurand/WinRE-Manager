@@ -225,6 +225,36 @@
        Invoke-ReagentcEnable cannot violate it at all, because the
        guard is inside the function.
 
+       Further revision 4 (same patch, same ScriptVersion). The v42
+       OEM-pack resolution failure rule treated every supported-vendor
+       run with no resolved pack as incomplete and refused to write a
+       state file. That was correct for Dell and HP (single-pack maps
+       resolved by OS family or a fixed key; a $null return can only
+       mean the map failed to load - transient) and for a Lenovo map
+       that failed to download. It was wrong for the common Lenovo case
+       where the map loaded successfully and simply has no entry for
+       this machine type: many Lenovo models have no published WinPE
+       driver pack, and the absence is permanent, not transient.
+       Marking such a run incomplete prevented the state file from
+       ever being written, forcing the full-update path on every
+       scheduled run forever, with EXIT_WARNING on every run.
+
+       The fix distinguishes the two cases using information already
+       present: $Script:LenovoWinPEMap is non-null when the map loaded
+       successfully and $null when the map failed to download or when
+       the machine-type resolution short-circuited before the fetch.
+       For a Lenovo machine with a loaded map and no entry for its MT,
+       the run is treated as legitimately complete with OEMPACK=NONE
+       in the DesiredStateId; the state file is written and the fast
+       path fires on subsequent runs. If Lenovo publishes a pack for
+       that MT later, the DesiredStateId changes and the machine
+       rebuilds automatically. Dell, HP, and Lenovo-map-download-
+       failure runs keep the v42 behaviour: marked incomplete, retried.
+       The "no entry" log line in Get-LenovoWinPEPack is demoted from
+       WARN to INFO because the caller now decides the completion
+       state; the operator sees a single INFO line explaining the
+       situation, not a WARN that suggests action is needed.
+
        Fail-closed on suspension failure. Invoke-ReagentcEnable now
        returns "blunsafe" (a distinct result) when BitLocker on C:
        cannot be confirmed unprotected, instead of warning and
@@ -2971,7 +3001,14 @@ function Get-LenovoWinPEPack {
     }
     $entry = $Script:LenovoWinPEMap.Models.$mt
     if (-not $entry) {
-        Write-Log "No WinPE pack in Lenovo map for machine type $mt" -Level WARN
+        # v43 patch 5 (further revision 4): many Lenovo machine types have
+        # no published WinPE driver pack. A map that loaded successfully
+        # and simply does not contain this MT is the expected, permanent
+        # answer, not a transient failure. Logged at INFO, not WARN, so it
+        # does not appear in the operator's "something to look at" filter.
+        # The caller decides the run's completion state based on whether
+        # the map loaded, not on whether this specific MT was present.
+        Write-Log "No WinPE pack in Lenovo map for machine type $mt (expected for some Lenovo models)" -Level INFO
         return $null
     }
     $winpe = $entry.winpe
@@ -3688,17 +3725,44 @@ try {
     $OEMPackage = Get-OEMWinPEPack -Hardware $Hardware
 
     # v42: Get-OEMWinPEPack returns $null both for unsupported vendors
-    # and for supported vendors whose map fetch failed or whose map has
-    # no matching entry. Those are different situations. If the vendor
-    # is in the supported set but the pack did not resolve, mark the run
-    # as incomplete so state is not written as if OEM injection had
-    # been performed. The DesiredStateId will contain OEMPACK=NONE and
-    # the next successful map lookup will naturally trigger a rebuild.
+    # and for supported vendors whose pack did not resolve. The v42 fix
+    # marked every such run as incomplete so state was not written as if
+    # OEM injection had been performed. That was correct for Dell and HP
+    # (single-pack maps resolved by OS family or a fixed key; a $null
+    # return always means the map failed to load - transient) and for a
+    # Lenovo map that failed to download. It was wrong for the common
+    # Lenovo case where the map loaded successfully and simply has no
+    # entry for this machine type: many Lenovo models have no published
+    # WinPE driver pack, and the absence is permanent, not transient.
+    # Marking the run incomplete in that case prevented the state file
+    # from ever being written, forcing the full-update path (WIM
+    # download, mount, inject, export, deploy) on every scheduled run
+    # forever, with EXIT_WARNING on every run.
+    #
+    # v43 patch 5 (further revision 4): distinguish "map loaded, no entry
+    # for this model" (expected and permanent for Lenovo) from "map
+    # failed to load" (transient). For the expected case, proceed as if
+    # the OEM pack were legitimately resolved to NONE: the state file is
+    # written with OEMPACK=NONE in the DesiredStateId, and the fast path
+    # fires on subsequent runs. If Lenovo later publishes a pack for this
+    # MT, the DesiredStateId changes (OEMPACK goes from NONE to the
+    # version) and the machine rebuilds automatically.
+    #
+    # Dell and HP keep the v42 behaviour unconditionally. Their maps are
+    # single-pack (Dell resolved by WinPE family, HP by a fixed key), so
+    # a $null return can only mean the map failed to load or its entry is
+    # malformed. Both are transient; the run is marked incomplete and
+    # retried.
     $oemVendorSupported = $Hardware.Manufacturer -in @("Dell", "HP", "LENOVO")
     if ($oemVendorSupported -and -not $OEMPackage) {
-        Write-Log "$($Hardware.Manufacturer) is a supported vendor but no OEM WinPE pack could be resolved (map fetch failed or no matching entry) - OEM driver injection will be skipped" -Level WARN
-        $Script:nonFatalWarning = $true
-        $Script:ImageInjectionComplete = $false
+        $mapLoadedNoEntry = ($Hardware.Manufacturer -eq "LENOVO" -and $Script:LenovoWinPEMap)
+        if ($mapLoadedNoEntry) {
+            Write-Log "LENOVO machine type $($Hardware.MachineType) has no published WinPE driver pack in the loaded map - OEM driver injection will be skipped. The run is recorded as complete with OEMPACK=NONE; if Lenovo publishes a pack for this model later, the DesiredStateId will change and the machine will rebuild." -Level INFO
+        } else {
+            Write-Log "$($Hardware.Manufacturer) is a supported vendor but no OEM WinPE pack could be resolved (map fetch failed or no matching entry) - OEM driver injection will be skipped" -Level WARN
+            $Script:nonFatalWarning = $true
+            $Script:ImageInjectionComplete = $false
+        }
     }
 
     $DesiredStateId = Get-DesiredStateId -Hardware $Hardware -OEMPackage $OEMPackage -ExpectedDriverSetVersion $ExpectedDriverSetVersion
