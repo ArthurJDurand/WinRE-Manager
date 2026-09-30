@@ -41,7 +41,18 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 18
+    Version : 19
+
+    v19 changes vs v18:
+    1. Option S reports SKIP (not PASS) when the state file is absent
+       and the VMD query is indeterminate. Production defers with
+       EXIT_WARNING in that situation; the harness previously reported
+       "no state file (rebuild expected)" as a PASS, which disagreed
+       with what a live production run would do.
+    2. Option S wording clarified. The header and the DSI MATCH verdict
+       no longer imply that matching the DesiredStateId alone proves
+       production will take the fast path. The DSI comparison is a
+       component-level check, not a full-flow simulation.
 
     v18 changes vs v17:
     1. Mirrored production v44 patch 6's VMD detection: query failure
@@ -1644,7 +1655,7 @@ function Show-SystemDiagnostic {
 
 function Show-StateFileParity {
     Rule "State file parity check"
-    Write-Diag "  Answers: would production v44 take the fast path on this machine now?" "Gray"
+    Write-Diag "  Answers: does the stored DesiredStateId match current inputs? This is not a full-flow simulation." "Gray"
 
     # ---- Resolve the manifest ----
     Write-Diag ""
@@ -1721,8 +1732,17 @@ function Show-StateFileParity {
     Write-KV "State file" "$statePath" "DarkGray"
     if (-not (Test-Path $statePath)) {
         Write-Diag ""
-        Write-Diag "  (does not exist - production will take the full-update path)" "Yellow"
-        Record "State file parity" $true "no state file (rebuild expected)"
+
+        if (-not $vmdQueryOk) {
+            Write-Diag "  State file is absent, but VMD presence is indeterminate." "Yellow"
+            Write-Diag "  Production would defer with EXIT_WARNING before starting the" "DarkGray"
+            Write-Diag "  update; this is not a PASS or a rebuild-ready result." "DarkGray"
+            Record "State file parity" $false -State "SKIP" -Detail "No state file; VMD query indeterminate"
+        } else {
+            Write-Diag "  (does not exist - production will take the full-update path)" "Yellow"
+            Record "State file parity" $true "no state file (rebuild expected)"
+        }
+
         return
     }
     try {
@@ -1754,10 +1774,11 @@ function Show-StateFileParity {
     } elseif ($state.DesiredStateId -eq $computedDsi) {
         Write-Host "  Verdict: " -NoNewline -ForegroundColor DarkGray
         Write-Host "DSI MATCH" -NoNewline -ForegroundColor Green
-        Write-Host " - production will accept the state file." -ForegroundColor Gray
-        Write-Diag "           Subject to the other fast-path gates: WinRE Enabled," "DarkGray"
-        Write-Diag "           exactly one recovery partition on the OS disk, and the" "DarkGray"
-        Write-Diag "           active WIM hash matching the stored CurrentImageHash." "DarkGray"
+        Write-Host " - the stored deployment ID matches current inputs." -ForegroundColor Gray
+        Write-Diag "           This confirms DSI equality only; production separately" "DarkGray"
+        Write-Diag "           evaluates WinRE state/location, recovery-partition count," "DarkGray"
+        Write-Diag "           active WIM hash, pending-reboot/repair state, BitLocker," "DarkGray"
+        Write-Diag "           and other startup/flow gates before deciding what to do." "DarkGray"
         Record "State file parity" $true "DSI matches"
     } else {
         Write-Host "  Verdict: " -NoNewline -ForegroundColor DarkGray
@@ -2350,7 +2371,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    Write-Host "WinRE Manager Test Harness (v18)" -NoNewline -ForegroundColor Cyan
+    Write-Host "WinRE Manager Test Harness (v19)" -NoNewline -ForegroundColor Cyan
     Write-Host (" " * 33) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
@@ -2395,7 +2416,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v18"
+Rule "WinRE Manager test harness v19"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

@@ -1,79 +1,433 @@
-# WinRE Manager — Documentation
+# Testing
 
-> **Rebuild broken Windows recovery environments — on one machine, or ten thousand.** WinRE Manager is a PowerShell tool that repairs the Windows Recovery Environment (WinRE) on Windows 10 and Windows 11. It works on a single machine or a managed fleet, and it is safe to re-run: healthy machines exit in under a second.
+`Test-WinRE.ps1` is WinRE Manager's read-only test harness. It shows you what the production script would see on a machine, without changing anything, so you can confirm the machine is in a state production can work with before you deploy. This document explains how to run it, what each menu option does, and what the results mean.
 
-The [README](../README.md) is the entry point for a quick overview. This page is the documentation index — detailed design, deployment, and troubleshooting material for readers who want to understand how it works, deploy it to a fleet, or diagnose a failure.
+## When to run the harness
 
----
+Run `Test-WinRE.ps1` in any of the following situations:
 
-## What this is, and who it's for
+- **Before deploying to a machine you have not touched before.** A single read-only scan tells you whether the machine is healthy, what state WinRE is in, and whether production would take the fast path or rebuild. Takes a few seconds.
+- **Before deploying to a fleet.** Run it on one representative machine per vendor/model combination to confirm it agrees with your expectations, then push the scheduled task out. If a machine reports something unexpected, this is where you catch it.
+- **After a Windows Update that might change tooling output.** A new build can change `manage-bde`, `reagentc`, or `Get-Partition` output format, or the shape of a `Get-Disk` / `Get-Volume` object. The parser self-test catches the drift before production runs against it, with a specific PASS/FAIL per dependency.
+- **When production has exited with an unfamiliar error.** The diagnostic reproduces production's vantage point and reports each dependency check independently, so you can see exactly which step failed.
+- **When you are evaluating the project.** A read-only run gives you a complete picture of what the tool does and what it looks at, without touching anything.
 
-If you are here for the first time, the short version:
+The harness requires no elevation and modifies nothing. It is safe to run on any machine, at any time, including on a machine you are about to hand to a user.
 
-- **What it does.** Detects why Windows Recovery has stopped working on a machine and rebuilds it. The common causes are a missing or too-small recovery partition, a `reagentc` registration pointing at the wrong location, a BitLocker-encrypted recovery partition, missing OEM storage drivers, or a hardware change that invalidated the deployed recovery image. The tool handles all of them and reports a clear exit code when it cannot.
-- **Who it's for.** An IT professional or power user with a single broken machine (run it once, elevated, done). Or an IT team managing a fleet (deploy as a scheduled task running as `SYSTEM`, triggered at boot and weekly).
-- **What it will not do.** It will not touch the OS volume's BitLocker state. It will not repair a machine that has not yet completed OOBE — it defers instead. It will not act on a recovery-typed partition larger than the design's implicit assumptions without warning you first (see the 2 GiB ceiling note in the README).
+## What the harness is
 
-The read-only harness (`scripts/Test-WinRE.ps1`) is available in every case to inspect a machine before you change anything. It requires no elevation and modifies nothing.
+An interactive PowerShell script that:
 
-## Start here
+- Exercises the download and extraction paths of the production script against live sources.
+- Runs a parser self-test against the local Windows tooling to verify that every regex and API dependency the production script relies on still produces the expected shape.
+- Reports the state of the machine from the same vantage point the production script uses, including the BitLocker state of C:, the BitLocker state of the target recovery partition, and the Windows Setup `ImageState`.
+- Recomputes the `DesiredStateId` production would compute right now and compares it to the on-disk state file, so a field engineer can see whether production would take the fast path or rebuild (Option S).
+- Reports results as PASS / FAIL / SKIP.
+- Modifies nothing. Does not touch partitions, BitLocker, WinRE registration, drive letters, or the state file. Does not require elevation.
 
-### First time here
+It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-1. Read the [README](../README.md) for the overview and the "What this fixes" symptom table.
-2. Read [architecture.md](architecture.md) — the full design and the reasoning behind each decision.
-3. Read [deployment.md](deployment.md) — how to schedule it, how to interpret its exit codes, the Audit Mode precondition, and the one-instance-per-machine program lock.
-4. Run `scripts/Test-WinRE.ps1` on a representative machine. Option 1 is the system diagnostic; Option S is the state-file parity check; Option A is "all relevant for this machine".
+**Current version: v19.** The version history is:
 
-### If something is broken
+- **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
+- **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
+- **v17** aligned the harness's network behavior with production v44 patch 5: `$NetworkTimeoutSeconds = 15` on every network call, the zero-byte download check restored to match production's ordering, and a note added to `Test-VmdDrivers` explaining why the harness exercises drivers production would skip. The output format is unchanged from v16.
+- **v18** mirrored production v44 patch 6 and closed several harness-specific issues. See "v18 changes" below.
+- **v19** corrected two Option S issues. See "v19 changes" below.
 
-Start with [troubleshooting.md](troubleshooting.md). It is a per-symptom playbook — each section names the symptom, the log lines to look for, the likely causes, and the resolution. The first section covers the most severe failure mode the project has seen (dedicated recovery partition lost and WinRE disabled by pre-v43-patch-5 code on a machine mid-Device-Encryption). The second section covers the Audit Mode / OOBE deferral that no longer loops. The section on VMD hardware detection covers the fail-closed deferral added in v44 patch 6. The section on concurrent instances covers the file lock added in v44 patch 4 and the narrow non-contention lock-failure case. The section on the offline fallback covers the three outcomes of a manifest fetch failure on a machine with no network.
+See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
-### If you know what you are looking for
+### v19 changes
 
-Jump straight to the relevant reference document from the table below.
+v19 is confined to Option S. Production `WinRE.ps1` is unaffected; the `ScriptVersion` and `DesiredStateId` are unchanged, and no managed machine rebuilds as a result of the harness version move.
 
-## Reference
+1. **Option S reports SKIP (not PASS) when the state file is absent and the VMD query is indeterminate.** Before v19, `Show-StateFileParity` checked for the state file's existence before consulting the VMD query result, and returned `PASS` with detail `no state file (rebuild expected)` whenever the file was missing. That was correct when VMD presence was determinable, but wrong when the VMD query had failed: production defers the entire run with `EXIT_WARNING` in that case rather than taking the full-update path, and the harness's `PASS` disagreed with what a live run would do. The missing-state-file branch now checks `$vmdQueryOk` and records `SKIP` with detail `No state file; VMD query indeterminate`, printing a short explanation that production would defer rather than start the update.
+2. **Option S wording clarified.** The header now reads "does the stored DesiredStateId match current inputs? This is not a full-flow simulation." The DSI MATCH verdict now reads "the stored deployment ID matches current inputs" followed by a note that production separately evaluates WinRE state/location, recovery-partition count, active WIM hash, pending-reboot/repair state, BitLocker, and other startup/flow gates before deciding what to do. The prior wording — "production will accept the state file" — implied that DSI equality alone was sufficient, which overstated what the check proves.
 
-| Document | What it covers |
-|---|---|
-| [architecture.md](architecture.md) | Overall design, control-flow, state model, invariants, and the program lock's design reasoning. |
-| [state-and-idempotency.md](state-and-idempotency.md) | `DesiredStateId`, state file, checkpoint file, crash consistency, the loop-breaker, the offline fallback's residual risk, and the VMD-query-indeterminate deferral's effect on state. |
-| [recovery-partition.md](recovery-partition.md) | Sizing policy, geometry, GPT/MBR attributes, Step 7. |
-| [driver-injection.md](driver-injection.md) | OEM pack + VMD injection, the INF-basename success gate, the Lenovo five-state resolution, and the VMD fail-closed guard. |
-| [exit-codes.md](exit-codes.md) | Every exit path and its semantics, including the three new exit-code-2 cases from v44 patches 4, 5, and 6. |
-| [deployment.md](deployment.md) | Scheduled task, MDM, CI/CD integration, log collection, Audit Mode precondition, one-instance-per-machine policy, offline behavior. |
-| [testing.md](testing.md) | The harness, the parser self-test's fifteen checks, what it does not test, and the v18 changes. |
-| [troubleshooting.md](troubleshooting.md) | Known failure modes, per-symptom playbook, and recovery procedures. |
+The existing `INDETERMINATE`/`SKIP` handling for the state-file-present case (from v18) is unchanged.
 
-## The two scripts
+### v18 changes
 
-- **`scripts/WinRE.ps1`** — production. Runs as SYSTEM on managed machines, or elevated for a one-off repair. Modifies partition tables, the BitLocker state of the target recovery partition, and the WinRE registration. Never modifies the OS volume's BitLocker state. As of **v44 patch 4**, it holds an exclusive program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock` for its entire duration, so a second concurrent instance fails fast with `EXIT_WARNING` instead of colliding at Step 2. The lock is skipped under `-DryRun`. As of **v44 patch 6**, it removes the v44 patch 3 destructive-path C: guard (the destructive path no longer consults C:'s BitLocker state); distinguishes five Lenovo OEM-pack resolution states; makes VMD hardware presence detection fail-closed; and adds a Step 2 stale-file cleanup on the normal GitHub-download path.
-- **`scripts/Test-WinRE.ps1`** — read-only harness. Exercises the download and extraction paths against live sources; runs a parser self-test against the local Windows tooling; reports the machine's `ImageState`, the BitLocker state of C:, the BitLocker state of the target recovery partition, and — as of **v15** — the `DesiredStateId` production would compute right now compared to the on-disk state file. **v16** added colour-coded output, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers. **v17** added a 15-second timeout on every network call matching production, restored the zero-byte download check ordering, and added a note to `Test-VmdDrivers` explaining why the harness exercises drivers production would skip. **v18** mirrors production v44 patch 6 (VMD fail-closed handling in Options 1 and S, Lenovo five-state resolution) and closes several harness-specific issues (shared `Get-DriverManifest` helper, cleanup guard for a pre-existing `$TestDir`, stale-extraction-directory clearing, `Test-VmdDrivers` SKIP on unparsed Intel gen) and adds five new parser self-test checks. Requires no elevation and modifies nothing.
+v18 is a combined mirror of production v44 patch 6 and a set of harness-specific fixes. The mirror changes keep the harness's outputs in lockstep with production's actual behavior; the harness-specific fixes close issues that the harness's own review surfaced.
 
-## The three map builders
+Mirror of production v44 patch 6:
 
-- **`scripts/Build-DellWinPEMap.ps1`** — rebuilds the Dell map from `DriverPackCatalog.cab`.
-- **`scripts/Build-HPWinPEMap.ps1`** — rebuilds the HP map by scraping `ftp.ext.hp.com`.
-- **`scripts/Build-LenovoWinPEMap.ps1`** — rebuilds the Lenovo map from `recipecard.json` plus per-DS-ID support-page scrapes.
+1. **VMD query-failure handling.** Options 1 and S now treat a PnP enumeration error as an indeterminate result rather than absence. Option 1's VMD hardware presence section reports `INDETERMINATE` with the enumeration error message. Option S records `SKIP` in the results with reason `VMD query indeterminate` and prints an `INDETERMINATE` verdict instead of a DSI MATCH or DSI MISMATCH. Before v18, the harness could produce a "definitive" DSI that disagreed with what a live production run would compute, which is the opposite of what Option S is for.
+2. **Lenovo map resolution status machine.** `Get-LenovoWinPEPack` in the harness now sets `$Script:LenovoPackResolution` to the same five states as production. `Test-OemMaps` distinguishes `malformed-entry` (red, marks the test failed) from `no-entry` (gray, informational), and treats `map-unavailable` (yellow, marks the test failed) separately from both.
 
-These are maintenance scripts. You only run them if you are hosting your own maps (see [deployment.md §Hosting your own maps](deployment.md#hosting-your-own-maps)).
+Harness-specific fixes:
 
-## Versioning
+3. **`Get-DriverManifest` extracted as a shared helper.** Options 2, 9, and S now all use the same two-attempt / 2-second-sleep / WARN-log retry policy that production uses. Previously each option had its own fetch code, and they had drifted from each other and from production.
+4. **Cleanup footgun closed.** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. The pre-existing state is captured before any directory work. This prevents `Remove-Item $TestDir -Recurse -Force` from wiping a user-supplied path like `C:\Users\Me\Desktop`.
+5. **Stale extraction destinations are cleared before each extraction.** Applies to `Invoke-VendorExtraction`, `Invoke-CabExtraction`, and the GitHub base-WIM test's working directory. Before v18, a stale INF file left by an earlier run could satisfy a failed extraction's INF-count success check. The Lenovo "non-zero exit but INFs present" branch was the sharpest case: it treats an INF-count greater than zero as success regardless of the extractor's exit code, so a stale INF could mask a genuine extraction failure.
+6. **`Test-VmdDrivers` records SKIP (not PASS) when the Intel CPU generation cannot be parsed.** Driver applicability was not evaluated in that case, so a PASS would misrepresent what the harness actually checked. The raw CPU string is logged so the parser can be extended. The result detail reads `Intel CPU generation could not be parsed`.
 
-- Production script: **v44 patch 6** (`ScriptVersion = 44`).
-- Harness: **v18**.
+Five new parser self-test checks (see "The parser self-test" below):
 
-`ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM and do not change the `DesiredStateId` inputs ship under the same `ScriptVersion`, so healthy machines do not rebuild. See [state-and-idempotency.md](state-and-idempotency.md) for the reasoning.
+7. **DISM cmdlet availability.** Verifies `Mount-WindowsImage`, `Dismount-WindowsImage`, `Get-WindowsImage`, `Add-WindowsDriver`, and `Get-WindowsDriver` are all present. Production hard-depends on all five; a missing cmdlet would only be discovered at injection time.
+8. **`Get-Disk` shape.** Verifies `Number`, `FriendlyName`, `PartitionStyle`, `Size`, `BootFromDisk`, `IsSystem`, and `IsBoot` are present.
+9. **`Get-Volume` shape.** Verifies `DriveLetter`, `FileSystemLabel`, `FileSystem`, `Size`, `SizeRemaining`, `DriveType`, `HealthStatus`, and `UniqueId` are present.
+10. **CPU-generation parser regression table.** Fourteen cases spanning 11th, 12th, 13th Gen, Core, Core Ultra, AMD, Celeron, Pentium, Xeon, and Atom CPU strings. Catches a Windows update or firmware rename that changes `Win32_Processor.Name` in a way that would silently desynchronise `DesiredStateId`.
+11. **`DesiredStateId` determinism and input sensitivity.** Same inputs must hash identically; flipping VMD presence must change the hash; flipping `ProductionScriptVersion` must change the hash; the output must be 64 hex characters. A silent change to the DSI recipe would be caught before it desynchronised every deployed state file.
 
-The v43 generation shipped five sequential patch generations under `ScriptVersion = 43` (v43 patch, patch 2, patch 3, patch 4, patch 5), plus further revisions to patch 5 that added the Audit Mode guard, the enable-failure counter, and the target-volume BitLocker policy inversion. In parallel with the last of these, the read-only harness moved to v14 to keep its BitLocker diagnostic aligned with the production policy.
+Cosmetic fixes:
 
-The v44 patch 1 revision is the deliberate exception to the decoupling rule: it changes the `DesiredStateId` inputs — adding CPU vendor/generation and VMD presence — and therefore bumps `ScriptVersion` to 44. Every managed machine performs one full-update pass on the next scheduled run to rebuild the WIM against the new ID, then returns to the fast path permanently. The harness moved to v15 in the same window, adding the `DesiredStateId` mirror and the state-file parity check (Option S).
+12. **`Write-KV` overflow handling.** A key at or past `$KeyWidth` now gets a separating space before its value. Previously, `Manifest VMD device IDs` (23 chars, one over the 22-char key column) rendered flush against the value.
+13. **`.NOTES` block count.** The v18 future-proofing regression check count was corrected from "Four" to "Five" to match the number of bullets listed.
+14. **`.NOTES` block wording.** For the `Test-VmdDrivers` SKIP path, the phrase "in the detail" was corrected to "in the log line" (the raw CPU string is logged via `Say`, not recorded in `Record -Detail`).
 
-The five subsequent v44 patches ship under `ScriptVersion = 44` without changing the `DesiredStateId` inputs. **v44 patch 2** adds `dism /cleanup-image /StartComponentCleanup /ResetBase` to the full-update pipeline; the size reduction materialises on the next natural rebuild, not immediately. **v44 patch 3** adds the destructive-path C: encryption guard inside `Ensure-AdequateRecoveryPartition` (removed in v44 patch 6) and a `base.wim` cleanup on the injection-failure abort branch (retained). **v44 patch 4** adds the program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock`, so a second concurrent instance fails fast with `EXIT_WARNING` instead of colliding at Step 2. **v44 patch 5** adds the offline fallback for the driver manifest fetch and a 15-second timeout on every network call. **v44 patch 6** removes the v44 patch 3 destructive-path C: guard; makes Lenovo OEM-pack resolution distinguish five states; makes VMD hardware detection fail-closed; adds the Step 2 stale-file cleanup on the normal path; and corrects the OS-fallback remediation wording. Because none of these five patches changes `ScriptVersion` or the `DesiredStateId`, an already-completed machine will not rerun automatically; the deployment mechanism must invoke the script explicitly to pick the fixes up. The next natural rebuild (manifest bump, OEM pack version change, Windows build change, or CPU/VMD presence change) picks them up regardless. The harness moved from v15 to v16 (colour-coded output refresh), from v16 to v17 (network timeouts, zero-byte check ordering, VMD-presence note), and from v17 to v18 (mirror of production v44 patch 6 plus harness-specific fixes and five new parser checks) across these patches. See [testing.md](testing.md) for the harness change detail and [exit-codes.md](exit-codes.md) for the three new exit-code-2 cases that patches 4, 5, and 6 introduce.
+The output format is unchanged from v16.
 
-Full engineering changelog is in the `.NOTES` block at the top of `scripts/WinRE.ps1`; a user-facing summary is in [CHANGELOG.md](../CHANGELOG.md).
+## Running it
 
-## Sponsor
+```powershell
+# Interactive
+.\scripts\Test-WinRE.ps1
 
-If this project saves you time: **https://github.com/sponsors/ArthurJDurand**
+# Non-interactive: runs "all relevant for this machine" and exits
+.\scripts\Test-WinRE.ps1 -NonInteractive
+
+# Do not offer to delete the working directory on exit
+.\scripts\Test-WinRE.ps1 -Keep
+
+# Custom working directory
+.\scripts\Test-WinRE.ps1 -TestDir D:\WinRETest
+```
+
+The default working directory is `C:\Temp\WinRETest`. All downloads and extractions go there.
+
+**Cleanup guard (v18).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
+
+## Output style (v16; unchanged in v17, v18, and v19)
+
+As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, and v19 do not modify the output format.
+
+### Colour-coded values
+
+Diagnostic values are rendered with a colour that reflects their state:
+
+- **Free space on Fixed volumes.** Red when the free space is below 5% **or** below 3 GB. Yellow when it is below 15% **or** below 20 GB. Green otherwise. The rules apply to Fixed volumes only; CD-ROM volumes render DarkGray and Removable volumes render Cyan, because their free space is not a deployment constraint.
+- **PASS / FAIL / SKIP results.** Rendered in green, red, and dark gray respectively — in `Say` (via the `-Level` mapping), in the parser self-test's `[OK]` / `[FAIL]` / `[SKIP]` tags, and in `Show-Summary`'s per-result lines and totals.
+- **BitLocker state on C:.** The `VolumeStatus` value is green when it reads `FullyDecrypted` and yellow for every other reported value; the `ProtectionStatus` value is green when it reads `On` and gray otherwise. When the state is hazardous (the four mid-operation `VolumeStatus` values with `ProtectionStatus` not `On`) or ambiguous (`FullyEncrypted` with `ProtectionStatus` not `On`), the diagnostic prints an additional warning block below the values, in yellow. The warning blocks are the field engineer's cue that production's OS-fallback route will defer on this machine.
+- **OS volume free-space banner.** When the OS volume's free space falls into the Red or Yellow band, the harness draws a boxed warning banner above the disk tables. The Red banner's headline is `LOW DISK SPACE ON OS VOLUME`; the Yellow banner's headline is `OS VOLUME FREE SPACE IS LOW`. The banner body names the exact free/total figures and a short recommendation. The banner is yellow for the Yellow band and red for the Red band.
+- **VMD hardware presence (v18).** The line reads `VMD hardware present  True` or `VMD hardware present  False` on a successful enumeration, and `VMD presence  INDETERMINATE` with the enumeration error below it on a failed one. The indeterminate state renders in yellow.
+- **Option S verdict (v18).** DSI MATCH is green, DSI MISMATCH is yellow, and INDETERMINATE is yellow with a paragraph explaining that a live production run would defer rather than commit state.
+
+### Tables
+
+The **All disks**, **All partitions**, **All volumes**, and **Recovery partitions** sections of Option 1 render as aligned tables with fixed column headers. Each row is colour-coded by relevance: the OS partition and OS disk stand out in White, the reagentc-registered recovery partition stands out in Cyan, and other rows render Gray. Recovery-partition rows are further colour-coded green when the partition is both type-coded and on the OS disk, yellow when type-coded but on a secondary disk, and red when it is not type-coded at all.
+
+The remaining sections — hardware, reagentc raw output, WinRE parsed state, OS partition / OS disk, OS partition supported sizes, bucket sizing preview, Windows Setup state, BitLocker on C:, target recovery partition state, VMD hardware presence, and the parser self-test — render as aligned key/value pairs or as free-form diagnostic lines. The parser self-test in particular is line-per-check: one `[OK]` / `[FAIL]` / `[SKIP]` line per check, with the state tag colour-coded.
+
+### `Write-Diag` and `Write-KV`
+
+Diagnostic output in Option 1 and its sub-sections uses two helpers:
+
+- **`Write-Diag`** — writes a single line, with an optional `-Color` parameter. The caller chooses the colour; the function does not infer a colour from a severity level. Used for free-form diagnostic text and section headers.
+- **`Write-KV`** — writes an aligned key/value pair, with a `-KeyWidth` (default 22) and a `-ValueColor`. The key column renders DarkGray, the value column takes the caller's colour. As of v18, a key at or past `$KeyWidth` gets a separating space before its value rather than being rendered flush against it.
+
+These replace direct `Say` calls in the diagnostic output. Download and extraction tests, the menu, and top-level banners continue to use `Say` and `Rule`.
+
+`Say` colour-codes by `-Level`: `INFO` Gray, `WARN` Yellow, `ERROR` / `FATAL` Red, `PASS` / `OK` Green, `FAIL` Red, `SKIP` DarkGray, `HEAD` Cyan.
+
+## The menu
+
+```
+  1. System diagnostic (read-only info gathering)
+  2. Driver manifest fetch
+  3. OEM maps fetch + resolve (Dell, HP, Lenovo)
+  4. GitHub base WIM - Win10 (download + extract + build check)
+  5. GitHub base WIM - Win11 (download + extract + build check)
+  6. HP WinPE pack (download + extract)
+  7. Dell WinPE pack (prompts for OS)
+  8. Lenovo WinPE pack (prompts for MT)
+  9. VMD drivers (per manifest, filtered for this machine)
+  S. State file parity check (production DSI vs on-disk state file)
+  A. All relevant for this machine
+  B. All of the above
+  R. Print results summary
+  Q. Quit
+```
+
+The menu renders the shortcut letter in colour, defaulting to Cyan. The state-file parity check (`S`) renders in Magenta, the aggregate runs (`A`, `B`) in Green, the summary (`R`) in Yellow, and quit (`Q`) in Red. The colour choice is a visual hint, not a semantic change to the option.
+
+### Option 1 — System diagnostic
+
+Read-only information gathering. Dumps:
+
+- Hardware: manufacturer, model, product name/version, baseboard, CPU, OS build, Intel generation.
+- Raw `reagentc /info` output and the parsed status/location.
+- The WinRE classifier verdict: `DEDICATED`, `OS-fallback`, `RECOVERY-ON-SECONDARY`, or `UNEXPECTED`. Matches the v43 patch 2 production classifier.
+- OS partition and OS disk.
+- All disks with `BootFromDisk`, `IsSystem`, `IsBoot`.
+- All partitions with size, drive letter, label, GPT type, MBR type, and boot/system/active flags.
+- All volumes with file system, free space, label, and health.
+- Recovery partitions per `Get-RecoveryPartitions`, with `isTyped`, `isLabel`, and `onOsDisk` annotations.
+- The OS partition's `SizeMin`, `SizeMax`, shrinkable bytes, extendable bytes, and `S == M` status.
+- The bucket sizing preview: for the active WIM's size, what bucket the production script would compute.
+- The Windows Setup state (`ImageState`), with a warning when the value is present and is not `IMAGE_STATE_COMPLETE`.
+- BitLocker on C: (`ProtectionStatus`, `VolumeStatus`, `EncryptionMethod`, `EncryptionPercentage`), **plus a hazard warning for the four mid-operation states and a separate ambiguity warning for `Fully Encrypted + Protection Off`** (v12, warning text updated in v14).
+- **The target recovery partition state** (v14): the BitLocker status of the partition reagentc is registered to. This is the state that determines whether the production script will need to run `manage-bde -off` before calling `reagentc /enable`.
+- VMD hardware presence per manifest (fail-closed as of v18: an enumeration error reports `INDETERMINATE`).
+
+Then it runs the parser self-test (below).
+
+#### BitLocker (C:) warnings (v12, updated in v14)
+
+The BitLocker section of the diagnostic distinguishes two categories of state on C: that are relevant to the OS-fallback route. Both produce a warning block, in yellow.
+
+**Hazardous states.** When the section reports `ProtectionStatus` not `On` together with a `VolumeStatus` of `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, or `DecryptionPaused`, the harness prints:
+
+```
+  WARNING: ProtectionStatus=Off, VolumeStatus=EncryptionInProgress
+           Device Encryption is actively encrypting or decrypting C:.
+           Production refuses the OS-fallback path in this state.
+           The enable-only and dedicated-partition paths are still
+           available because they target the recovery partition.
+```
+
+**Ambiguous state.** When the section reports `ProtectionStatus` not `On` together with `VolumeStatus=FullyEncrypted`, the harness prints a distinct block:
+
+```
+  WARNING: ProtectionStatus=Off, VolumeStatus=FullyEncrypted
+           This state is ambiguous: legitimate suspension, OR
+           Device Encryption Waiting-for-Activation.
+           Production refuses the OS-fallback path in this state.
+```
+
+The wording of these warnings was updated in harness v14. The v12/v13 wording said production "will refuse destructive partition work" in these states, which described the removed OS-volume-gate policy and would have told a field engineer to defer a run that production would actually succeed on. Under the v43 patch 5 (further revision 5) policy, only the OS-fallback route depends on C:'s BitLocker state; the enable-only and dedicated-partition routes target the recovery partition directly and are not affected.
+
+**Confirmed-safe states.** `VolumeStatus=FullyDecrypted` (or empty) with `ProtectionStatus=Off`, and `ProtectionStatus=On` at any conversion status, are safe for the OS-fallback route. They do not trigger either warning.
+
+The classification predicate matches production's `Test-VolumeEncrypted`: the four mid-operation states are hazardous, `FullyEncrypted+Off` is ambiguous, and everything else is safe. The harness does not call into production's `Test-VolumeEncrypted` — it queries `Get-BitLockerVolume` directly and applies the same predicate — but a diagnostic that disagreed with production about which states are hazardous, ambiguous, or safe would be worse than no diagnostic at all.
+
+#### Target recovery partition state (v14)
+
+The v43 patch 5 (further revision 5) policy is target-volume-based. reagentc's BitLocker check is on the partition it is being asked to enable WinRE on, not on C:. The harness reports the BitLocker state of the partition reagentc is registered to. This is the state that determines whether the production script will need to run `manage-bde -off` on the target partition before calling `reagentc /enable`, and whether `Set-RecoveryPartitionReadyForWinRE` will find the partition already clean or need to prepare it.
+
+The section header is drawn with a divider, then the details are printed as aligned key/value pairs. The diagnostic prints one of the following four classifications, depending on what `manage-bde -status` reports for the target partition.
+
+**Unmanaged by BitLocker.** The partition is not managed by BitLocker — this is the expected state for a properly-typed recovery partition. The block reads:
+
+```
+  Target recovery partition state
+  ────────────────────────────────
+  Registered partition  Disk <n> Part <m>
+  Querying              manage-bde -status <letter or volume GUID>
+  Classification        unmanaged by BitLocker (reagentc /enable will accept this)
+```
+
+**Fully decrypted.** BitLocker manages the partition, but it is currently unencrypted. Also acceptable.
+
+```
+  Target recovery partition state
+  ────────────────────────────────
+  Registered partition  Disk <n> Part <m>
+  Querying              manage-bde -status <letter or volume GUID>
+  Classification        fully decrypted (reagentc /enable will accept this)
+```
+
+**BitLocker-managed.** The partition is encrypted or actively encrypting. Production will decrypt it in place before calling `reagentc /enable`; the harness prints the conversion status and a note about the expected additional runtime.
+
+```
+  Target recovery partition state
+  ────────────────────────────────
+  Registered partition  Disk <n> Part <m>
+  Querying              manage-bde -status <letter or volume GUID>
+  Conversion Status     <value>
+  Classification        BitLocker-managed - production will decrypt in place
+                  Expect up to 300s of additional runtime on the next run.
+```
+
+Note: the final `Expect up to 300s` line uses a shallower indent than the value column above it. That is a known cosmetic quirk in harness v16 and does not indicate a problem with the diagnostic. A future harness version may tidy the alignment.
+
+**Could not parse.** `manage-bde -status` produced output the harness did not recognise. Production's helper retries the query at runtime.
+
+```
+  Target recovery partition state
+  ────────────────────────────────
+  Registered partition  Disk <n> Part <m>
+  Querying              manage-bde -status <letter or volume GUID>
+  Classification        could not parse manage-bde output
+```
+
+When WinRE is not registered to a partition at all — the common case on a machine where WinRE is Disabled and no registered location exists — the section prints:
+
+```
+  Target recovery partition state
+  ────────────────────────────────
+  WinRE is not registered to a partition (Disabled, or unresolved).
+  If the plan is OS-fallback, production checks C: directly.
+```
+
+The harness remains read-only: it does not assign a drive letter. If the target partition already carries a drive letter, that letter is used for the `manage-bde -status` query. If it does not, `manage-bde` is invoked against the volume's `UniqueId` (the `\\?\Volume{...}\` form), which `manage-bde` accepts as a `<volume>` argument.
+
+The block is informational, not a PASS/FAIL/SKIP record. It does not appear in the summary.
+
+#### VMD hardware presence (v18)
+
+The VMD section runs the same `Get-PnpDevice` query that production uses, with the same fail-closed semantics. Three outcomes:
+
+- **Manifest has no `requiredDevices` patterns.** The section prints `(manifest has no requiredDevices patterns - VMD not applicable)`. This is informational.
+- **Enumeration succeeded.** The section prints the matching device count and a `VMD hardware present  True/False` line, colour-coded.
+- **Enumeration failed (indeterminate).** The section prints `VMD presence  INDETERMINATE` with the enumeration error message, and a note that production would defer rather than assume absence. Colour-coded yellow.
+
+The `INDETERMINATE` outcome is new in v18 and mirrors production v44 patch 6.
+
+#### Windows Setup state (v13)
+
+The diagnostic reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and warns when the value is present and not `IMAGE_STATE_COMPLETE`. Production's Audit Mode guard defers in that state before any state-modifying action. The diagnostic's check mirrors the guard so that a field engineer pre-flighting a freshly imaged machine sees the deferral condition before running production.
+
+### Option S — State file parity check (v15; VMD handling updated in v18; wording and no-state-file verdict updated in v19)
+
+Read-only. Recomputes the `DesiredStateId` production would compute right now — reading the live driver manifest, resolving the OEM package for this machine's vendor, and detecting VMD hardware presence — then reads the on-disk state file at `C:\Recovery\OEM\winre_state.json` and reports whether production would accept it or treat it as stale.
+
+The header reads: "does the stored DesiredStateId match current inputs? This is not a full-flow simulation." Option S is a component-level check, not a simulation of production's main-flow decisions. It compares the deployment ID; it does not execute production's WinRE-state check, its recovery-partition classifier, its WIM-hash check, its pending-reboot/repair logic, or its BitLocker gates.
+
+The output names the computed ID and the stored ID side by side, then prints one of four verdicts:
+
+- **DSI MATCH** (green). The stored deployment ID matches current inputs. This confirms DSI equality only. Production separately evaluates WinRE state/location, recovery-partition count, active WIM hash, pending-reboot/repair state, BitLocker, and other startup/flow gates before deciding what to do. Option 1 reports most of those conditions.
+- **DSI MISMATCH** (yellow). Production will treat the state file as stale and run the full-update path on the next scheduled run. This is expected on the first run after a `DesiredStateId` input change: `ScriptVersion`, `MANIFEST`, `OEMPACK`, CPU vendor/generation, or VMD presence. Subsequent runs take the fast path once the state file is rewritten.
+- **INDETERMINATE** (yellow, v18). The VMD hardware presence check could not complete because of a PnP enumeration error, so the correct driver set cannot be determined and the DSI cannot be computed with confidence. A live production run would defer with `EXIT_WARNING` before committing any state rather than take either the fast path or the full-update path. The harness records `SKIP` in the results with reason `VMD query indeterminate` and prints a paragraph explaining the situation. Resolve the PnP service issue and re-run. Applies when the state file exists.
+- **SKIP — no state file; VMD query indeterminate** (v19). Same VMD-query failure as the INDETERMINATE verdict above, but reached when the state file is absent. Before v19, this case returned `PASS` with detail `no state file (rebuild expected)`, ignoring the VMD-query failure. That was wrong: production defers in this situation rather than taking the full-update path, so the harness now records `SKIP` with detail `No state file; VMD query indeterminate` and explains that the verdict is not a rebuild-ready result.
+
+If the state file does not exist and the VMD query succeeded, the harness reports `PASS` with detail `no state file (rebuild expected)`, which is correct: `needInject = $true` when there is no state and VMD presence is determinable.
+
+Option S is the field engineer's tool for answering "is this machine's stored deployment ID consistent with current inputs?" without running the production script. It does not exercise the offline fallback (v44 patch 5): Option S always performs a live manifest fetch and a live VMD detection, so on an offline machine the harness reports the fetch failure rather than a DSI verdict.
+
+### Options 2 through 9 and A/B
+
+Exercise the download and extraction paths. Each option:
+
+- Downloads the source.
+- Extracts with the appropriate tool.
+- Counts INF files for driver packs.
+- For WIM downloads, extracts the WIM and reads its build with `Get-WindowsImage`.
+
+Option A runs the subset relevant to the current machine (its OS, its vendor, its CPU). Option B runs everything.
+
+## The parser self-test
+
+Fifteen checks as of v18 (ten before v18; unchanged in v19). Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
+
+| # | Check | What it verifies | Since |
+|---|---|---|---|
+| 1 | reagentc status regex | `(Enabled\|Disabled)` matches at least one line of `reagentc /info` output. | v1 |
+| 2 | reagentc location regex | `(GLOBALROOT\|Volume GUID)` matches at least one line. | v1 |
+| 3 | manage-bde protection regex | `Protection On` or `Protection Off` appears. | v1 |
+| 4 | manage-bde conversion status regex | A `Conversion Status:` value matches, **or** the string `could not be opened by BitLocker` appears. | v1 |
+| 5 | Get-BitLockerVolume shape | `ProtectionStatus` and `VolumeStatus` are non-null. SKIP if not elevated. | v1 |
+| 6 | OS resolution | `Get-OSPartition` and `Get-OSDisk` both resolve. | v1 |
+| 7 | Get-Partition shape | A sample partition exposes `DiskNumber`, `PartitionNumber`, `Size`, `GptType`, `MbrType`, `IsBoot`, `IsSystem`, `IsActive`. | v1 |
+| 8 | WinRE location resolution | The reagentc location resolves to a partition. SKIP if location is empty. | v1 |
+| 9 | Get-RecoveryPartitions | Returns at least one partition. | v1 |
+| 10 | Get-PartitionSupportedSize | Returns `SizeMin` and `SizeMax`. SKIP if no OS partition. | v1 |
+| 11 | DISM cmdlets | `Mount-WindowsImage`, `Dismount-WindowsImage`, `Get-WindowsImage`, `Add-WindowsDriver`, `Get-WindowsDriver` are all present. | v18 |
+| 12 | Get-Disk shape | `Number`, `FriendlyName`, `PartitionStyle`, `Size`, `BootFromDisk`, `IsSystem`, `IsBoot` are present. | v18 |
+| 13 | Get-Volume shape | `DriveLetter`, `FileSystemLabel`, `FileSystem`, `Size`, `SizeRemaining`, `DriveType`, `HealthStatus`, `UniqueId` are present. SKIP if no lettered volume to sample. | v18 |
+| 14 | CPU generation parser | Fourteen regression cases: 11th/12th/13th Gen, Core, Core Ultra, and negative cases for AMD/Celeron/Pentium/Xeon/Atom return the expected values. | v18 |
+| 15 | DesiredStateId | 64-hex, deterministic across repeat calls, VMD-sensitive, ScriptVersion-sensitive. | v18 |
+
+### What a FAIL means
+
+A FAIL means the machine's Windows tooling no longer matches an assumption the production script relies on. The production script **may** silently misclassify state on this machine and must be adapted before deploying to it.
+
+The most likely FAILs and their implications:
+
+- **Check 3 or 4 (manage-bde regex).** Windows changed `manage-bde -status` output format on this build. Production's `Test-VolumeEncrypted` will return `$null`; `Set-RecoveryPartitionReadyForWinRE` will treat the target partition as indeterminate and either retry the query once or proceed to run `manage-bde -off` against it. The machine is safe but the target preparation may take longer than expected.
+- **Check 7 (Get-Partition shape).** The `Storage` module is missing or reduced. Production's partition classification will fail.
+- **Check 10 (Get-PartitionSupportedSize).** The shrink path will fail. The script will fall back to OS-fallback after the OS-shrink attempt, but this is a machine-specific failure that should be investigated.
+- **Check 11 (DISM cmdlets).** A DISM cmdlet is missing. Production's driver-injection path cannot run on this machine at all; the pipeline gate will fire on every full-update pass and the machine will never take the fast path unless it is already in the fast-path state.
+- **Check 12 or 13 (Get-Disk / Get-Volume shape).** A property production reads has been removed or renamed. Production may misclassify a disk or a volume.
+- **Check 14 (CPU generation parser).** A CPU string no longer parses to the expected generation. `DesiredStateId` will contain a different `CPU=` value than intended, which will force a rebuild on machines whose state file was written under the previous parse. Investigate the raw CPU string (the diagnostic's Hardware section reports it) and extend the parser.
+- **Check 15 (DesiredStateId).** The DSI recipe has changed silently — a field dropped from the hash, or the output is no longer deterministic. This is a production correctness bug; do not deploy production to a fleet until the recipe is fixed.
+
+### What a SKIP means
+
+A SKIP means the check could not run in the current context. The reasons:
+
+- **Not elevated.** `Get-BitLockerVolume` requires elevation on some machines. The check SKIPs rather than FAILing.
+- **The state it inspects is absent.** WinRE location is empty, no OS partition, no lettered volume to sample, or similar. The check has nothing to inspect.
+- **A precondition was not met.** `Test-VmdDrivers` (not a parser check) records SKIP when the Intel CPU generation cannot be parsed, because driver applicability was not evaluated.
+- **Option S VMD-query-indeterminate (v19).** Option S records SKIP when the state file is absent and the VMD query is indeterminate. Same reasoning as the parser SKIPs: the check did not have a determinable answer.
+
+A SKIP does not indicate a defect.
+
+## Result states
+
+Every test records a result via `Record`:
+
+```powershell
+Record -Test "<name>" -Ok $true   -Detail "<description>"                        # PASS
+Record -Test "<name>" -Ok $false  -Detail "<description>"                        # FAIL
+Record -Test "<name>" -Ok $false  -State "SKIP" -Detail "<reason>"               # SKIP
+```
+
+The legacy `-Ok` boolean is still supported: when `-State` is not supplied, the state is derived from `-Ok`. When `-State` is supplied it is authoritative, and `OK` is `$true` only for PASS.
+
+`Show-Summary` prints each result, then the totals. The per-result state tags are colour-coded: green for `[PASS]`, red for `[FAIL]`, dark gray for `[SKIP]`. The totals on the last line are colour-coded: the pass count green when non-zero, the fail count red when non-zero else green, the skip count yellow when non-zero else dark gray.
+
+```
+Passed 8, failed 1, skipped 1 (of 10)
+```
+
+The BitLocker, target-partition, `ImageState`, and Option S outputs are informational. They do not produce PASS/FAIL/SKIP records and do not appear in `Show-Summary`. (Option S does record a PASS, FAIL, or SKIP for the parity check itself; the informational text above the verdict is what does not appear in the summary.)
+
+## Non-interactive mode
+
+```powershell
+.\scripts\Test-WinRE.ps1 -NonInteractive
+```
+
+Runs `Invoke-AllRelevant`, prints the summary, exits.
+
+`-NonInteractive` runs the download and extraction tests. It does not run the System Diagnostic (Option 1) or the State file parity check (Option S), so the BitLocker warnings, the target-partition state block, the `ImageState` check, and the DSI comparison are not printed in this mode. If you need any of those, run the harness interactively and choose Option 1 or Option S.
+
+The exit code is always 0, regardless of results. The summary is the source of truth. If a pipeline consumer is added later, the minimal change to make the exit code reflect pass/fail is to count FAIL records in `$Script:Results` and exit non-zero when any exist. This is documented in the v11 changelog but not implemented, on the grounds that no consumer currently needs it.
+
+## What the harness does not test
+
+The harness is deliberately narrow. It does not and cannot test:
+
+- **Partition creation, deletion, or resize.** No destructive operations.
+- **BitLocker preparation or decryption.** No state changes. The BitLocker sections of the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and do not call into production's `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`.
+- **`reagentc /setreimage` or `reagentc /enable`.** No WinRE registration changes.
+- **The program lock.** The harness does not acquire `C:\ProgramData\OEM\Logs\WinREManager.lock`. It is read-only and safe to run concurrently with a live production run, with another harness run, or with any number of other processes. Production's lock is a mutual-exclusion primitive for `WinRE.ps1` only; the harness deliberately does not participate in it.
+- **The offline fallback.** The harness always performs a live manifest fetch. On an offline machine it will fail the manifest fetch and report the failure rather than exercising production's offline fast-path behavior. This is intentional: the harness is a download-and-extraction validator first, and the offline path is only reachable in production by design.
+- **State file or checkpoint file writes.** Those files are production-only artifacts. Option S reads the state file but does not modify it.
+- **The full-update pipeline.** The harness exercises the download and extraction steps in isolation, not the pipeline.
+
+Those paths are covered by field testing on representative hardware. See the "Field-tested hardware" table in the [README](../README.md).
+
+## Differences from production
+
+The harness shares code paths with production in the download, extraction, and CPU-generation helpers. It is documented in the file's own docstring which functions are "based on" the production versions and which are harness-specific.
+
+Five known differences:
+
+- **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test. As of v17, the harness prints an explicit three-line note before the driver loop explaining this. The state-file parity check (Option S) *does* apply the hardware filter, because it is replicating production's DSI computation and production's DSI includes VMD presence.
+- **The harness does not run production's BitLocker helper functions.** The BitLocker sections in the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and apply the same classification the production guard uses — hazardous, ambiguous, or safe — but they do not call `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`. This is intentional: the harness does not exercise production's BitLocker control flow, and a change to that control flow does not require a harness update to remain correct. The v14 update changed the warning text and added the target-partition state block, but did not change the classifier itself.
+- **`Get-ThisMachineProfile` normalises manufacturer names identically to production, but is otherwise harness-specific.** Since v15 the manufacturer normalisation, the OS-detection method (Caption-based, not build-number-based), and the returned fields (including `Model`) all match production's `Get-HardwareObject` exactly, so the DSI computed by Option S is byte-identical to what production computes for the same inputs. The two helpers differ in that `Get-ThisMachineProfile` reads additional CIM data for the diagnostic and does not cache its result the way production's does.
+- **Network behavior is aligned with production as of v17.** Every `Invoke-RestMethod` and `Invoke-WebRequest` call in the harness carries `-TimeoutSec $NetworkTimeoutSeconds` where `$NetworkTimeoutSeconds = 15`. Before v17, the harness used PowerShell's default ~100-second timeout on each call, so a fully offline machine would take over 10 minutes to fail. The v17 alignment means the harness fails as fast as production does on a bad network. The `Invoke-OemPackDownload` helper's zero-byte check was also restored to match production's ordering: the length check now runs before the hash comparison, so a zero-byte download with an expected hash logs "file is empty" rather than "SHA256 mismatch". Both changes are correctness improvements that make the harness a more faithful replica of production's download path.
+- **VMD query-failure handling and Lenovo resolution are aligned with production as of v18; Option S's no-state-file verdict is a v19 refinement.** The harness's VMD presence check now treats a PnP enumeration error as indeterminate (matching production v44 patch 6), and the harness's `Get-LenovoWinPEPack` now sets `$Script:LenovoPackResolution` to the same five states as production. Before v18, an enumeration error in the harness produced a definitive answer, and a malformed Lenovo map entry looked identical to a legitimate no-pack case. Both were drift risks: the harness could disagree with production about what a live run would do. The v19 refinement closes a remaining divergence: Option S now records `SKIP` (not `PASS`) when the state file is absent and the VMD query is indeterminate, matching production's deferral in that case.
+
+## Adding a test
+
+The harness is a single file. To add a test:
+
+1. Write a function that follows the existing pattern: log via `Say`, record the result via `Record`.
+2. Add a menu entry in `Show-Menu` using the `MenuItem` helper and pick a shortcut-letter colour from the palette already in use.
+3. Add a case to the `switch` in the main loop.
+4. If the test should run as part of "all relevant for this machine," add it to `Invoke-AllRelevant`.
+5. If the test downloads anything, apply `-TimeoutSec $NetworkTimeoutSeconds` to every network call. The harness's `$NetworkTimeoutSeconds` is declared at the top of the file and matches production's value.
+
+For diagnostic output added to Option 1 or its sub-sections, use `Write-Diag` for free-form lines and `Write-KV` for aligned key/value pairs. The caller chooses the colour in both cases; there is no automatic severity mapping. For values inside tables, follow the pattern of the surrounding table and pick a colour from the restricted palette (Gray, DarkGray, Cyan, Green, Yellow, Red, Magenta, White).
+
+Do not add tests that modify the machine's state. The harness's contract with the operator is that it is read-only.
+
+## Related documents
+
+- [troubleshooting.md](troubleshooting.md) — how to use the diagnostic output to diagnose a failure, including the BitLocker hazard, VMD-query-indeterminate, and target-partition recovery procedures.
+- [driver-injection.md](driver-injection.md) — what the injection tests are actually testing.
+- [deployment.md](deployment.md) — the Audit Mode precondition for production deployment and the one-instance-per-machine program lock.
+- [state-and-idempotency.md](state-and-idempotency.md) — the `DesiredStateId` composition that Option S recomputes, and the offline fallback's residual risk.

@@ -6,6 +6,27 @@ This file is the authoritative user-facing record of what changed and when. The 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to a `ScriptVersion` + patch-generation scheme rather than strict SemVer — see [docs/state-and-idempotency.md](docs/state-and-idempotency.md) for why.
 
+## [harness v19] — 2026-09-30
+
+Two Option S corrections in the read-only harness. Production `WinRE.ps1` is unaffected; this entry is the harness's own version marker.
+
+### Fixed
+
+- **Option S reports SKIP (not PASS) when the state file is absent and the VMD query is indeterminate.** Before v19, `Show-StateFileParity` checked for the state file's existence before consulting the VMD query result, and returned `PASS` with detail `no state file (rebuild expected)` whenever the file was missing. That was correct when VMD presence was determinable, but wrong when the VMD query had failed: production defers the entire run with `EXIT_WARNING` in that case rather than taking the full-update path, and the harness's `PASS` disagreed with what a live run would do. The missing-state-file branch now checks `$vmdQueryOk` and records `SKIP` with detail `No state file; VMD query indeterminate`, printing a short explanation that production would defer rather than start the update. The existing `INDETERMINATE`/`SKIP` handling for the state-file-present case is unchanged.
+- **Option S wording clarified.** The header now reads "does the stored DesiredStateId match current inputs? This is not a full-flow simulation." The DSI MATCH verdict now reads "the stored deployment ID matches current inputs" followed by a note that production separately evaluates WinRE state/location, recovery-partition count, active WIM hash, pending-reboot/repair state, BitLocker, and other startup/flow gates before deciding what to do. The prior wording — "production will accept the state file" — implied that DSI equality alone was sufficient, which overstated what the check proves.
+
+### Changed (docs)
+
+- **`docs/testing.md`** — added a v19 version-history entry and a "v19 changes" subsection describing both Option S corrections; updated the Option S section heading and body to reflect the new no-state-file SKIP verdict and the clarified scope paragraph; updated the "Output style" heading to note that v19 did not change the output format; updated the parser self-test heading to note that v19 did not change the check count; added the Option S VMD-query-indeterminate case to the "What a SKIP means" list; added a clarifying parenthetical to the "Result states" section about Option S recording a result for the parity check itself; extended the fifth "differences from production" bullet to cover the v19 refinement.
+- **`docs/index.md`** — updated the harness version to v19 in the Versioning section and in the "two scripts" harness bullet; added the v18→v19 move to the sequence of harness moves; added a note that v19 corrected Option S; corrected the production-script bullet to lead with the operations ("Runs elevated on a single machine, or as `SYSTEM` under a scheduled task on a managed fleet") rather than presenting SYSTEM as definitional.
+- **`README.md`** — updated the "See it in action" banner to v19; updated the harness version to v19 in the Version section; added a note that the v19 change is confined to Option S and no managed machine rebuilds; clarified the ASUS field-verification row to note that v19 changes Option S only.
+- **`SECURITY.md`** — corrected the opening line and the privilege bullet to describe both execution modes (elevated for single-machine repair, `SYSTEM` for fleet deployment) rather than presenting SYSTEM as definitional.
+- **`CONTRIBUTING.md`** — corrected the opening line to say "runs with administrative privilege and modifies partition tables" rather than naming only the SYSTEM deployment mode.
+
+### Unchanged
+
+The harness's extraction cleanup, user-supplied `TestDir` protection, VMD-indeterminate reporting for the state-file-present case, Lenovo five-state resolution mirror, and parser self-test are unchanged. `Test-WinRE.ps1` remains read-only, requires no elevation, and modifies nothing. Production `WinRE.ps1` v44 patch 6 is unaffected.
+
 ## [v44 patch 6] — 2026-09-30
 
 Removes the v44 patch 3 destructive-path C: guard, makes Lenovo OEM-pack resolution distinguish five states, makes VMD hardware detection fail-closed, closes a Step 2 wedge left by interrupted runs, corrects the OS-fallback remediation wording, and mirrors the production changes into the harness as v18.

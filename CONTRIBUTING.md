@@ -1,6 +1,6 @@
 # Contributing to WinRE Manager
 
-Thanks for considering a contribution. This project is a self-healing production script that runs as SYSTEM on managed fleets and modifies partition tables, so the bar for changes is intentionally high.
+Thanks for considering a contribution. This project is a self-healing production script that runs with administrative privilege and modifies partition tables, so the bar for changes is intentionally high.
 
 ## Before you open an issue
 

@@ -87,7 +87,7 @@ Before running the production script on an unfamiliar machine, run `Test-WinRE.p
 
 ```
   ╔══════════════════════════════════════════════════════════════════╗
-  ║ WinRE Manager Test Harness (v18)                                 ║
+  ║ WinRE Manager Test Harness (v19)                                 ║
   ║ Working directory: C:\Temp\WinRETest                             ║
   ║ Detected: OS=Win11  Vendor=ASUS  MT=Syst  CPU=Intel              ║
   ╚══════════════════════════════════════════════════════════════════╝
@@ -248,11 +248,13 @@ There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (furthe
 ## Version
 
 **Production:** `WinRE.ps1` v44 patch 6.
-**Harness:** `Test-WinRE.ps1` v18.
+**Harness:** `Test-WinRE.ps1` v19.
 
 `ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM and do not change the `DesiredStateId` ship under the same `ScriptVersion`, so healthy machines do not rebuild unnecessarily. v43 patches 2, 3, 4, and 5 — and the further revisions to patch 5 — all shipped under `ScriptVersion = 43`. v44 patches 2, 3, 4, 5, and 6 all ship under `ScriptVersion = 44` for the same reason: v44 patch 2 added component cleanup and ResetBase; v44 patch 3 added the destructive-path C: encryption guard (removed in v44 patch 6) and the `base.wim` cleanup on injection failure; v44 patch 4 added the program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock`; v44 patch 5 added the offline fallback for the driver manifest fetch and a 15-second network timeout on every call; v44 patch 6 removed the v44 patch 3 C: guard, made Lenovo OEM-pack resolution distinguish five states, made VMD hardware detection fail-closed, added the Step 2 stale-file cleanup on the normal path, and corrected the OS-fallback remediation wording. None of those five changes affects the deployed WIM bytes, the partition layout, or the `DesiredStateId` inputs.
 
 The v44 patch 1 revision is the deliberate exception. It changed the `DesiredStateId` inputs — adding CPU vendor/generation and VMD presence — and therefore bumped `ScriptVersion` to 44. Every managed machine performed one full-update pass on the next scheduled run to rebuild the WIM against the new ID, then returned to the fast path permanently. See the migration note in [`CHANGELOG.md`](CHANGELOG.md).
+
+The harness's own version marker moved from v18 to v19 on 2026-09-30. The v19 change is confined to Option S of the parity check; the production `ScriptVersion` and `DesiredStateId` are unaffected, and no managed machine rebuilds.
 
 Already-completed machines will not rerun automatically on v44 patches 2 through 6 because `ScriptVersion` and the `DesiredStateId` are unchanged. To exercise the fixes on an already-healthy machine, the deployment mechanism must invoke the script explicitly (for example, by deleting the state file or forcing a full-update pass); the next natural rebuild picks them up regardless.
 
@@ -266,7 +268,7 @@ Already-completed machines will not rerun automatically on v44 patches 2 through
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v44 patch 3 — fast path 2026-09-30 12:02 (state file accepted, DSI match, DEDICATED, no machine changes) |
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v44 patch 2 — full-update pass 2026-09-30 02:06 (ResetBase ran, exported WIM 756.1 MiB vs. 756.36 MiB pre-ResetBase, DEDICATED), fast path 02:08 |
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v44 patch 1 — full-update pass 2026-09-30 00:29 (DSI mismatch on the v43 state file, 756.4 MiB WIM rebuilt and deployed, 1100 MiB partition accepted on size), fast path 00:32 |
-| ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v18 harness — Option 1 diagnostic 2026-09-30 (all fifteen parser self-test checks PASS: 15 passed, 0 failed, 0 skipped) |
+| ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v18 harness — Option 1 diagnostic 2026-09-30 (all fifteen parser self-test checks PASS: 15 passed, 0 failed, 0 skipped). v19 changes Option S only; the Option 1 diagnostic is unchanged from v18. |
 | Dell | Latitude 3550 (Core Ultra 5 125U) | Win11 26200 | v44 patch 3 — full-update pass 2026-09-30 12:29–12:47 (clean partition recreate, `Pre-deletion inventory:` followed by deletion and recreation, `Target partition 0/4 (Z:) is already unencrypted - reagentc /enable can proceed`, `reagentc /enable (exit 0)` Operation Successful, DEDICATED). The machine that motivated the v43 patch 5 investigation now runs cleanly under v44. |
 | Dell | Latitude 3550 (Core Ultra 5 125U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
 | Dell | Pro Slim QCS1250 (Core Ultra 5 235) | Win11 26200 | v43 patch 5 (revised) — startup gate fired correctly, machine left unchanged |
