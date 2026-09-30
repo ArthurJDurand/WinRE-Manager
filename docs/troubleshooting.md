@@ -1,16 +1,35 @@
 # Troubleshooting
 
-Per-symptom playbook. Each section names the symptom, the log lines to look for, the likely causes, and the resolution.
+Per-symptom playbook for WinRE Manager. Each section names the symptom, the log lines to look for, the likely causes, and the resolution.
+
+This document is for anyone who has run `WinRE.ps1` and gotten something other than a clean exit — a warning code, a fatal code, a deferral, or a machine that is still broken. It is written for both audiences: a single machine owner repairing their own laptop, and an IT admin diagnosing a fleet. The same symptoms, the same log signatures, and the same resolutions apply in both cases.
 
 Log location: `C:\ProgramData\OEM\Logs\WinRE-Manager.log`.
+
+## How to use this document
+
+1. **Find the symptom.** The section headings name the observable problem — "The machine has no recovery partition and WinRE is disabled", "The machine is in Audit Mode / OOBE / sysprep", "OEM or VMD injection failed", and so on. Skim the headings for the closest match.
+2. **Check the log signature.** Each section names the exact log lines that distinguish one failure from another. If your log does not contain those lines, you are probably looking at a different section.
+3. **Follow the resolution.** Each section ends with a concrete set of steps. Most are safe to run without stopping anything first.
+4. **If nothing matches**, see [Reporting a bug](#reporting-a-bug) at the bottom — the template tells you exactly what to include.
+
+Three common entry points, if you already know which one you are:
+
+- **"The script exited with code 2 or 3 and I don't know why."** → Read the [exit-codes.md](exit-codes.md) reference first, then come back here with the specific case in hand.
+- **"The machine still has the same problem after running the script."** → Find the section whose log signature matches your log. If no section matches, the machine is probably in a state this document does not cover and should be reported.
+- **"I have not run the script yet and want to know what it will see."** → Run `scripts\Test-WinRE.ps1` first. Option 1 shows the diagnostic; Option S shows whether production would take the fast path. Come back here only if the harness reports something unexpected.
 
 ## How to read the log
 
 Every line is `yyyy-MM-dd HH:mm:ss [LEVEL] message`. Levels are `INFO`, `WARN`, `ERROR`, `FATAL`. In `-DryRun` mode, every line is prefixed with `[DRYRUN-<LEVEL>]` instead so a dry-run audit can be distinguished from a live run.
 
-The first line is `========== WinRE Manager Started (v<version>) ==========`. The last line names the outcome and, if applicable, the exit code.
+The first line is `========== WinRE Manager Started (v<version> patch <level>) ==========`. The last line names the outcome and, if applicable, the exit code.
 
-One startup guard runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. The two BitLocker deferrals that remain are on the enable-only path (target preparation) and the OS-fallback path (C: check). Each logs a distinct message; see the corresponding sections below.
+The program lock is acquired first, immediately after the banner. The log records `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on success, `Another WinRE Manager instance is already running (program lock file is exclusively held). …` if a second instance is running, and `Could not set up program lock at <path> : <error> - proceeding without single-instance protection; concurrent runs may collide` if the lock could not be acquired for a non-contention reason. Under `-DryRun` the lock is skipped and the log records `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances`. See "The script exited with a rename error (concurrent instance)" below for the full discussion.
+
+One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. As of v44 patch 6, the destructive path no longer consults C:'s BitLocker state at all — only the OS-fallback route does, because on that route the target volume *is* C:.
+
+One further check that runs early and can defer the run is the VMD hardware presence detection. As of v44 patch 6 it is fail-closed: a PnP enumeration error is treated as indeterminate rather than as VMD hardware absent. See "VMD hardware detection was indeterminate" below.
 
 ## The machine has no recovery partition and WinRE is disabled
 
@@ -73,10 +92,11 @@ Read the `Conversion Status:` line.
 
 **Step 3 — re-run `WinRE.ps1`.** With the current policy, the script will:
 
-1. Pass the Audit Mode guard.
-2. Choose the enable-only or full-update path.
-3. Prepare the target recovery partition via `Set-RecoveryPartitionReadyForWinRE`. If the target is encrypted, the helper decrypts it in place with `manage-bde -off` and polls for completion, up to 300 seconds.
-4. Call `reagentc /setreimage` and `reagentc /enable` on the prepared target.
+1. Acquire the program lock.
+2. Pass the Audit Mode guard.
+3. Choose the enable-only or full-update path.
+4. Prepare the target recovery partition via `Set-RecoveryPartitionReadyForWinRE`. If the target is encrypted, the helper decrypts it in place with `manage-bde -off` and polls for completion, up to 300 seconds.
+5. Call `reagentc /setreimage` and `reagentc /enable` on the prepared target.
 
 The machine returns to a `DEDICATED` end state.
 
@@ -95,7 +115,7 @@ This gives you OS-fallback WinRE — functional but not the design goal. The ded
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v44) ==========` banner and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v44 patch 6) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -125,6 +145,198 @@ Field case: **Dell Latitude 5530** (12th Gen Intel i7-1265U, Windows 11 build 26
 Do **not** attempt to defeat the guard by editing the registry or by manually calling `reagentc /enable` while still in Audit Mode. The OS will reject it, and the script's state file may or may not record the attempt depending on which code path you used to invoke reagentc. Wait for OOBE to complete.
 
 **What if `ImageState` is a value other than `IMAGE_STATE_COMPLETE` but the machine is clearly in a normal desktop?** File a bug. The guard's whitelist is currently `IMAGE_STATE_COMPLETE` or the key being absent. If a legitimate running state reports a different value, add it to the whitelist in the startup guard and re-run. The log line names the exact value that triggered the deferral.
+
+## VMD hardware detection was indeterminate (v44 patch 6)
+
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no partition work, no WIM deployment, no `reagentc` calls, and the state file is unchanged (or absent). The run got as far as the VMD hardware presence check and could not complete it.
+
+**Log signature.** The last lines of the run before exit:
+
+```
+[WARN] VMD hardware detection reported N error(s) during PnP enumeration: <error> - treating VMD presence as indeterminate.
+[WARN] VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined. Re-run when PnP enumeration is healthy.
+```
+
+Followed by `Released program lock` and exit code 2.
+
+**Cause.** As of v44 patch 6, the VMD hardware presence check is fail-closed. It enumerates present PnP devices matching the manifest's VMD device IDs; if the enumeration itself reports an error, the script treats VMD presence as **indeterminate** rather than as "VMD hardware absent". This is deliberate: on a machine that genuinely has VMD hardware, guessing "absent" would select a driver set that omits the VMD package, and the deployed WinRE would not be able to see the OS disk.
+
+Common causes of the enumeration error:
+
+- The Plug and Play service or the Windows Device Management service is in a bad state.
+- An antivirus or EDR product is blocking device enumeration (some products do this under specific policy configurations).
+- A pending driver installation or a device in an error state is preventing the PnP manager from completing the query.
+- A Windows component store issue affecting the `Get-PnpDevice` cmdlet.
+
+**Why the run stops.** The VMD driver set is a function of VMD hardware presence. If VMD presence cannot be determined, the correct driver set cannot be selected. Proceeding on a guess would risk deploying a WinRE that cannot see the OS disk on a VMD-based machine — the exact failure mode that the v44 patch 1 `DesiredStateId` change was designed to prevent, and one that is worse than deferring. The deferral is a protective stop, not a degraded-success.
+
+**Resolution.**
+
+1. **Confirm the PnP services are healthy.**
+
+   ```powershell
+   Get-Service -Name "PlugPlay", "DeviceAssociationService", "DeviceInstall" | Select-Object Name, Status, StartType
+   ```
+
+   All three should be `Running`. If any is stopped, start it:
+
+   ```powershell
+   Start-Service -Name <name>
+   ```
+
+2. **Check for a pending driver installation or a device in an error state.** Open Device Manager and look for any device with a yellow warning icon. A device with a failed driver load can prevent `Get-PnpDevice -PresentOnly` from returning a clean result.
+
+3. **If an antivirus or EDR product is in use, check whether it has a policy blocking device enumeration.** Some products have a documented setting for this. Consult the vendor's documentation.
+
+4. **Re-run the harness Option 1 diagnostic.** It exercises the same `Get-PnpDevice` query and reports either the matching device count or the same enumeration error production saw. If the harness succeeds where production failed, the error was transient.
+
+5. **Re-run `WinRE.ps1`.** Once the PnP enumeration is healthy, the run proceeds normally.
+
+**Do not disable the fail-closed check.** The check exists because guessing wrong on VMD presence produces a recovery image that cannot see the OS disk. The cost of a deferral is one pipeline run; the cost of bypassing the check is a machine with a non-functional recovery environment. If the check is firing repeatedly, the underlying PnP service issue is the problem to solve.
+
+## The script exited with a rename error (concurrent instance)
+
+**This failure mode was substantially reduced by v44 patch 4.** Before patch 4, the script had no startup lock: two concurrent `WinRE.ps1` processes could collide at Step 2 and the second one would exit with `EXIT_FATAL` (code 3) on a rename error. Patch 4 adds an exclusive file lock at `C:\ProgramData\OEM\Logs\WinREManager.lock`. As of patch 4, the primary concurrent-instance failure shape is a fast exit with `EXIT_WARNING` (code 2), not a fatal rename error. The rename error is now reachable only in the narrow non-contention lock-failure case described below.
+
+**Symptom (v44 patch 4 and later — the common case).** A second `WinRE.ps1` process is launched while another instance is already running. The second process exits within seconds with code 2 (`EXIT_WARNING`). No partition was touched, no WIM was deployed, no state file was read or written, no checkpoint was left behind.
+
+**Log signature (v44 patch 4 and later — the common case).**
+
+```
+[WARN] Another WinRE Manager instance is already running (program lock file is exclusively held). Exiting without making any changes. This is not a deployment failure - the other instance is doing the work and will complete on its own. If you need to run manually, wait for the other instance to finish, or run scripts\Test-WinRE.ps1 for a read-only diagnostic that is safe to run concurrently.
+```
+
+The second process exits before the Audit Mode guard, before the hardware check, and before any state-modifying action.
+
+**Cause.** The program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock` is held exclusively by the first instance via `[System.IO.File]::Open` with `FileShare.None`. The Windows kernel refuses the second open. This is the intended behavior.
+
+The most common trigger is a **manual invocation** of `WinRE.ps1` (from an interactive PowerShell prompt, an RMM tool's "run now" button, or an Intune remediation script) overlapping with a scheduled run. The scheduled task's `MultipleInstancesPolicy = IgnoreNew` prevents two *scheduled* runs from overlapping, but has no effect on processes launched any other way — the file lock closes that gap.
+
+**Resolution (v44 patch 4 and later — the common case).**
+
+1. **Do nothing.** This is not a failure. The other instance is doing the work and will complete on its own. The log on the second instance is informational, not diagnostic.
+2. If your orchestration treats exit code 2 as a soft failure and re-queues the remediation, be aware that the re-queue will also exit 2 until the first instance completes. Wait, or disable the scheduled task before re-running manually:
+
+   ```powershell
+   schtasks /Change /TN "WinRE Manager" /DISABLE
+   schtasks /Change /TN "WinRE Manager Weekly" /DISABLE
+   # … wait for the first instance to complete, then run manually …
+   schtasks /Change /TN "WinRE Manager" /ENABLE
+   schtasks /Change /TN "WinRE Manager Weekly" /ENABLE
+   ```
+
+3. If you need a read-only diagnostic that is safe to run concurrently with any number of other processes, use `scripts\Test-WinRE.ps1`. The harness does not acquire the lock.
+
+**The lock file persists on disk.** `C:\ProgramData\OEM\Logs\WinREManager.lock` remains between runs and is empty by design — nothing is ever written to it. **Its existence does not indicate a running instance.** Only an active exclusive handle on the file blocks a second instance. Do not delete the lock file to "free" a stuck process; deletion has no effect on the handle and the file will simply be recreated. If you need to know whether an instance is currently running, check Task Scheduler for the scheduled task's "Last Run Result" column and look for a live `powershell.exe` process, not the lock file.
+
+**Symptom (v44 patch 4 and later — the narrow non-contention case).** The script exits with code 3 (`EXIT_FATAL`) on the rename error, because the lock could not be acquired for a reason other than contention. On the same run, an earlier line in the log records the lock failure.
+
+**Log signature (v44 patch 4 and later — the narrow non-contention case).**
+
+```
+[WARN] Could not set up program lock at C:\ProgramData\OEM\Logs\WinREManager.lock : <error> - proceeding without single-instance protection; concurrent runs may collide
+```
+
+followed later in the same run by:
+
+```
+[ERROR] FATAL ERROR: Cannot rename because item at 'C:\Temp\WinREWork\winre.wim' does not exist.
+[ERROR] Stack: at <ScriptBlock>, ...
+```
+
+**Cause (the narrow non-contention case).** The lock acquisition failed for a non-contention reason — a permission error on `C:\ProgramData\OEM\Logs\`, a missing `Logs` directory that could not be created, or a transient filesystem issue — and the script proceeded unprotected by design. While it was running unprotected, a second `WinRE.ps1` instance also started and reached Step 2 first, renaming `winre.wim` to `base.wim` before the first instance could do the same. The first instance's rename call then failed because the source file no longer existed.
+
+**Resolution (the narrow non-contention case).**
+
+1. **Investigate the lock failure first.** Check permissions on `C:\ProgramData\OEM\Logs\`. Confirm the directory exists. Confirm `SYSTEM` (or the account that ran the script) has write permission. A common cause is an antivirus product or a GPO locking the directory.
+2. **Confirm no other instance is currently running.** Open Task Scheduler, find `WinRE Manager` (and `WinRE Manager Weekly`), and check the "Last Run Result" column. If either task shows "Running", wait for it to complete. From the command line:
+
+   ```powershell
+   Get-ScheduledTask -TaskName "WinRE Manager","WinRE Manager Weekly" | Get-ScheduledTaskInfo | Select-Object TaskName, LastRunTime, LastTaskResult, NextRunTime
+   ```
+
+   A `LastTaskResult` of `267009` (0x41301) means the task is currently running.
+3. **Wait for the other instance to complete.** A healthy fast-path run finishes in under a second; a full-update run can take 3–5 minutes, and a run that has to download a fresh base WIM can take longer.
+4. **Re-run `WinRE.ps1` if the machine still needs attention.** There is no cleanup required — the failed process left nothing behind.
+5. **Fix the lock-acquisition condition** so the next run is protected. If the condition cannot be fixed (e.g. the log directory is on a filesystem that does not support `FileShare.None`), consider temporarily disabling the scheduled task while manual invocations run, and rely on the harness (`scripts\Test-WinRE.ps1`) for read-only diagnostics.
+
+**Not to be confused with a base WIM download failure.** The ["Base WIM download fails"](#base-wim-download-fails) section covers a different failure at the same step: the download itself could not complete. The rename error above is specific to concurrent access — the file was present, and was renamed by another process — and its resolution is to serialize runs (or fix the lock), not to check the network.
+
+## The manifest fetch failed and the machine is offline
+
+**Symptom.** The machine is offline (no network, DNS failure, proxy blocking `gist.github.com`, or a total loss of connectivity), and the run completes with one of three outcomes:
+
+- Exit code 2 (`EXIT_WARNING`) with the fast path having fired successfully. The machine is unchanged and healthy.
+- Exit code 2 (`EXIT_WARNING`) with the state file indicating a full update is needed and the offline fallback deferring.
+- Exit code 3 (`EXIT_FATAL`) with no state file at all.
+
+This section covers all three. The first is a **degraded-success** — do not treat it as a failure. The second is a **deferral** — no operator action needed; the next scheduled run with network completes the work. The third is a **fatal** — the machine has no state file and needs network for its first deployment.
+
+**Log signature (Case 1 — fast path fired).** The manifest fetch attempt lines, then the offline fallback engage line, then the four "skipping" lines, then the fast-path markers:
+
+```
+[WARN] Driver manifest fetch attempt 1 failed: <error>
+[WARN] Driver manifest fetch attempt 2 failed: <error>
+[WARN] Driver manifest unavailable - taking the offline fallback path using the state file's stored DesiredStateId (state file LastUpdated=yyyy-MM-dd HH:mm:ss). The run will exit EXIT_WARNING. …
+[INFO] Offline fallback: skipping OEM pack resolution (network unavailable)
+[INFO] Offline fallback: skipping VMD detection (manifest unavailable)
+[INFO] Offline fallback: skipping required-driver resolution
+[INFO] Offline fallback: using state file's stored DesiredStateId <id>
+[INFO] Checkpoint step: 0
+[INFO] WinRE status: Enabled, Location: <location>
+[INFO] State file accepted (DesiredStateId match)
+[INFO] Assigned temporary drive letter Z: (disk 4, part 4)
+[INFO] Removing temporary drive letter Z: (assigned for inspection)
+[INFO] Operating mode: DEDICATED (WinRE on dedicated recovery partition)
+[INFO] Released program lock
+```
+
+Exit code 2. Total runtime under 90 seconds. The machine is unchanged.
+
+**Log signature (Case 2 — offline, state file indicates full update needed).**
+
+```
+[WARN] Driver manifest fetch attempt 1 failed: <error>
+[WARN] Driver manifest fetch attempt 2 failed: <error>
+[WARN] Driver manifest unavailable - taking the offline fallback path using the state file's stored DesiredStateId (state file LastUpdated=yyyy-MM-dd HH:mm:ss). …
+[INFO] Offline fallback: skipping OEM pack resolution (network unavailable)
+[INFO] Offline fallback: skipping VMD detection (manifest unavailable)
+[INFO] Offline fallback: skipping required-driver resolution
+[INFO] Offline fallback: using state file's stored DesiredStateId <id>
+… classifier runs, needInject determination fires …
+[WARN] Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable. Cannot proceed without a live manifest. Will retry on the next scheduled run when the network is available.
+[INFO] Released program lock
+```
+
+Exit code 2. The machine is unchanged. No WIM deployed, no partition touched, WinRE not disabled, no state file written or modified.
+
+**Log signature (Case 3 — offline, no state file).**
+
+```
+[WARN] Driver manifest fetch attempt 1 failed: <error>
+[WARN] Driver manifest fetch attempt 2 failed: <error>
+[ERROR] Driver manifest unavailable and no state file exists - a live manifest is required for the first deployment on this machine.
+[ERROR] FATAL ERROR: Driver manifest unavailable and no state file exists. First deployment requires a live manifest.
+[ERROR] Stack: at <ScriptBlock>, ...
+```
+
+Exit code 3. The machine is unchanged. No WIM deployed, no partition touched.
+
+**Cause.** All three cases share the same root cause: the driver manifest fetch failed after its retry budget, and there was no network to fall back to. What distinguishes them is the state file's contents:
+
+- **Case 1** — the state file exists, its `DesiredStateId` is available, and the local safety checks pass (WinRE `Enabled`, exactly one recovery partition on the OS disk, deployed WIM hash matches the stored hash). The script trusts the stored `DesiredStateId` and takes the fast path.
+- **Case 2** — the state file exists and its `DesiredStateId` is available, but the local safety checks do not pass: the deployed WIM hash does not match the stored hash, or a force-upgrade was detected, or the stored driver set version differs from the expected one, or the state file indicates a full update is needed for some other locally-detectable reason. A full update requires the live manifest to resolve the driver set, which is not available. The script defers.
+- **Case 3** — there is no state file at all, so the script cannot compute a `DesiredStateId` to work with. The live manifest is required for the first deployment on a machine.
+
+**Resolution (Case 1 — nothing to do).** The machine is healthy. The exit code 2 is a degraded-success signal from the fact that the fast path was taken without a live manifest fetch. The next scheduled run with network performs a full manifest fetch and confirms there has been no hardware drift while offline.
+
+**Resolution (Case 2 — nothing to do if the machine will regain network; investigate if it will not).** The machine is stale but not damaged. The next scheduled run with network will complete the work. If the machine is expected to be offline for a prolonged period and the deployment is stale, resolve the network issue (restore DNS, unblock the gist host, or point `$DriverManifestUrl` at an internal mirror per [deployment.md](deployment.md#hosting-your-own-maps)) and re-run.
+
+**Resolution (Case 3 — restore network before the next run).** A first deployment requires the live manifest. On the next scheduled run with network, the script fetches the manifest, computes the initial `DesiredStateId`, and performs a full-update pass. If the machine is expected to be offline indefinitely, the deployment cannot complete; consider pre-staging the state file from a machine that has network by copying `C:\Recovery\OEM\winre_state.json` from a working machine of the same model — but note that the DSI is machine-specific and a copied state file may not match.
+
+**Residual risk while offline.** The offline fallback trusts the state file's stored `DesiredStateId` without verifying that the machine's local hardware still matches the inputs that produced it. On a machine whose hardware changed while offline — a CPU swap, a BIOS update that flipped VMD, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — the offline run could take the fast path with a stale DSI. The next successful manifest fetch detects the drift and forces a rebuild. A `LocalInputsId` field in the state file would close this; it is planned as its own version boundary. See [state-and-idempotency.md](state-and-idempotency.md) for the full discussion.
+
+**Not to be confused with the Audit Mode or OS-fallback BitLocker deferrals.** All three exit with code 2 and leave the state file unchanged, but the log signature is distinct. The Audit Mode deferral logs `Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=…)` and fires before the hardware check. The OS-fallback BitLocker deferral logs `OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=…)` and fires after the classifier runs. The offline deferral logs `Offline fallback: the machine requires a full update …` and fires before the full-update pipeline. A field engineer reading the log will see the difference immediately.
 
 ## OEM or VMD injection failed (Step 3 → Step 4 pipeline gate)
 
@@ -189,11 +401,11 @@ In every case, `$Script:ImageInjectionComplete` was set to `$false` and the pipe
 3. **For a VMD driver failure**, select Option 9 in the harness. This exercises every VMD package the manifest resolves for the machine's CPU generation. A failure here means the manifest's `driverUrl` is stale or the archive format changed.
 4. **If the failure is `Add-WindowsDriver produced no error output (silent rejection or no applicable drivers)`**, the package's INFs do not match any device on the image. This is the least common case and usually means the manifest is resolving a package intended for different hardware. Check the manifest entry's `match.cpuGenMin` / `cpuGenMax` against the machine's actual CPU generation. The harness's Option 1 diagnostic reports the generation and the VMD hardware presence.
 5. **Fix the underlying cause** — update the manifest or map gist, correct the download URL, install a missing dependency (7-Zip, `curl-impersonate` for the Lenovo builder), or resolve the network/proxy problem.
-6. **Re-run `WinRE.ps1`.** The checkpoint is already at step 2 and the `WorkDir` was cleaned by the gate; the next run re-acquires the base WIM and re-runs injection from a clean image.
+6. **Re-run `WinRE.ps1`.** The checkpoint is already at step 2 and the `WorkDir` was cleaned by the gate (including the v44 patch 3 `base.wim` cleanup); the next run re-acquires the base WIM and re-runs injection from a clean image.
 
 **What NOT to do.** Do not attempt to force the pipeline past the gate by editing the script. The gate is the mechanism that prevents a broken WIM from reaching the recovery partition. A machine in this state has a functional existing WinRE or a functional existing state file — whatever it had before the run is still in place. The cost of waiting is one pipeline run after the injection failure is resolved; the cost of bypassing the gate is a recovery environment that cannot see the OS disk.
 
-**Not to be confused with the Audit Mode or OS-fallback BitLocker deferrals.** All three exit with code 2 and leave the state file unchanged, but the log signature is distinct: the Audit Mode deferral logs `Deferring WinRE Manager: Windows is not in a normal-running state`, the OS-fallback BitLocker deferral logs `OS-fallback deferred: C: VolumeStatus=…`, and the pipeline gate logs `Image injection did not complete. Stopping before Step 4 and before any deployment.` The first two fire before any download or mount; the pipeline gate fires after both. A field engineer reading the log will see the difference immediately.
+**Not to be confused with the Audit Mode or OS-fallback BitLocker deferrals.** All three exit with code 2 and leave the state file unchanged, but the log signature is distinct: the Audit Mode deferral logs `Deferring WinRE Manager: Windows is not in a normal-running state`, the OS-fallback BitLocker deferral logs `OS-fallback deferred: C: could not be confirmed fully decrypted`, and the pipeline gate logs `Image injection did not complete. Stopping before Step 4 and before any deployment.` The first two fire before any download or mount; the pipeline gate fires after both. A field engineer reading the log will see the difference immediately.
 
 ## The OS-fallback route deferred because C: is encrypted
 
@@ -202,12 +414,12 @@ In every case, `$Script:ImageInjectionComplete` was set to `$false` and the pipe
 **Log signature.**
 
 ```
-[WARN] OS-fallback deferred: C: VolumeStatus=<value>. reagentc will refuse to enable WinRE on the encrypted OS volume. To resolve: sign in with a Microsoft account to complete Device Encryption activation, or add a key protector manually (Add-BitLockerKeyProtector -MountPoint C: -RecoveryPasswordProtector) and enable protection, or wait for decryption to finish. The script will not modify C:'s BitLocker state.
+[WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=<state>). reagentc will refuse to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state.
 ```
 
 **Cause.** On the OS-fallback route the target volume *is* the OS volume. reagentc refuses to enable WinRE on an encrypted OS volume, always — this is a hard OS check, not something the script can work around. The gate exists to prevent the script from deploying a WIM it cannot register.
 
-The `<value>` in the log line is C:'s `VolumeStatus` at the moment the gate fired. It is one of `FullyEncrypted`, `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, or `DecryptionPaused`. `FullyEncrypted` is the ambiguous suspended/Waiting-for-Activation state; the four mid-operation states mean the Device Encryption service is actively working.
+The `<state>` in the log line is the value returned by `Test-VolumeEncrypted -MountPoint "C:"` at the moment the gate fired. Because the gate only fires when the classifier did not return exactly `$false`, the value is either `True` (the classifier is confident C: is encrypted or not fully decrypted) or empty (`$null` — the classifier could not determine the state). Either way, the script treats the machine as not-ready for OS-fallback deployment and defers. The script never modifies C:'s BitLocker state.
 
 **Why the script does not decrypt C:.** Decrypting the OS volume is hours of I/O, changes the recovery key relationship, and the OS volume is the user's data. Removing encryption from the OS volume as a side effect of a WinRE repair is not a change the script is authorised to make. The operator resolves the state.
 
@@ -219,13 +431,19 @@ manage-bde -status C:
 
 Read the `Conversion Status:` line and act accordingly:
 
-- **`Fully Encrypted` with `Protection Off`** — the machine is in a suspended or Waiting-for-Activation state. Two options: sign in with a Microsoft account on this machine to complete Device Encryption activation (which arms protection and escrows the recovery key), or add a key protector manually and enable protection:
+- **`Fully Encrypted` with `Protection On`** — the volume is fully encrypted and protection is armed. To use the OS-fallback route you must **decrypt C:**, because reagentc refuses to enable WinRE on an encrypted OS volume regardless of the protector state:
 
   ```powershell
-  Add-BitLockerKeyProtector -MountPoint "C:" -RecoveryPasswordProtector
+  manage-bde -off C:
   ```
 
-  Then wait for `Protection Status:` to read `Protection On`.
+  Wait for `Conversion Status:` to read `Fully Decrypted`, then re-run `WinRE.ps1`. On a 256 GB SSD this typically takes 30–90 minutes.
+
+  Note that **adding a key protector or arming protection does not resolve this state** — those actions make C: *more* protected, not less. The OS-fallback route requires `FullyDecrypted`.
+
+  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed at the shrink step (which is why it fell back to OS-fallback), so the way to use the dedicated-partition route is to free up space on C: so the shrink can succeed. See the ["OS-fallback, retrying the dedicated path"](#os-fallback-retrying-the-dedicated-path) note below.
+
+- **`Fully Encrypted` with `Protection Off`** — the machine is in a suspended or Waiting-for-Activation state. To use the OS-fallback route you must still decrypt C: (`manage-bde -off C:`), because reagentc refuses on a `FullyEncrypted` volume regardless of protection state.
 
 - **`Encryption In Progress` or `Encryption Paused`** — the Device Encryption service is still working. Wait for it to finish, or abort it:
 
@@ -237,7 +455,9 @@ Read the `Conversion Status:` line and act accordingly:
 
 - **`Decryption In Progress` or `Decryption Paused`** — the encryption service is already stopping. Wait for it to finish.
 
-Once `manage-bde -status C:` reads either `Protection On` (any conversion status) or `Protection Off` with `Fully Decrypted`, re-run `WinRE.ps1`.
+- **`Fully Decrypted`** — this state should not have triggered the deferral. If it did, re-run `WinRE.ps1`; the previous classification may have hit a transient state.
+
+Once `manage-bde -status C:` reads `Fully Decrypted`, re-run `WinRE.ps1`.
 
 **Do not** attempt to defeat the gate by editing the state file. The gate is the mechanism that prevents the script from deploying a WIM to a target it cannot register. The cost of waiting is one pipeline run; the cost of bypassing the gate is a machine with an unreachable WinRE registration.
 
@@ -290,7 +510,7 @@ If the drive letter cannot be assigned (the helper logs `Set-RecoveryPartitionRe
 
 If a `manage-bde` call is being blocked (unusual, but antivirus and endpoint protection have been observed to do this), the log will show the `manage-bde` output. Resolve the block with the AV vendor's tooling, or add the recovery partition to the exclusion list, then re-run.
 
-**When the counter reaches 3.** The enable-only path's failure increments `EnableFailureAttempts` in the state file. After three consecutive failures, the next run's loop-breaker fires (see "reagentc /enable keeps failing on the enable-only path" below).
+**When the counter reaches 3.** The enable-only path's failure increments `EnableFailureAttempts` in the state file. After three consecutive failures, the next run's loop-breaker fires (see "`reagentc /enable` keeps failing on the enable-only path" below).
 
 ## `reagentc /enable` fails with "cannot be enabled on a volume with BitLocker Drive Encryption enabled"
 
@@ -312,7 +532,7 @@ reagentc /enable failed because the target volume is BitLocker-protected
 **Resolution.** The script records the failure and the counter increments. There is no automatic recovery under the current policy; the failure is treated the same as a generic enable failure.
 
 1. Determine which case applies. Grep the log for the last `Target partition` line before the failure and the last `OS-fallback deferred` line, if any.
-2. **Case 1:** re-run the script. The next run will re-prepare the target partition and retry. If the Device Encryption service is actively re-claiming the partition every time, the failure will repeat, and the loop-breaker will fire after three attempts — see "reagentc /enable keeps failing on the enable-only path" below for the next steps.
+2. **Case 1:** re-run the script. The next run will re-prepare the target partition and retry. If the Device Encryption service is actively re-claiming the partition every time, the failure will repeat, and the loop-breaker will fire after three attempts — see "`reagentc /enable` keeps failing on the enable-only path" below for the next steps.
 3. **Case 2:** check C:'s state:
 
    ```powershell
@@ -516,6 +736,8 @@ followed by a download error or a `FATAL` exit.
 2. Verify 7-Zip is present at `C:\Program Files\7-Zip\7z.exe`. If not, install it via `winget install 7zip.7zip --scope machine` from an elevated shell.
 3. Check the GitHub repository for the expected `winre.7z.NNN` parts. If the parts are missing, point the script at a mirror or restore the parts.
 
+**Note (v44 patch 6).** Step 2 now removes any stale `winre.wim` before extraction and any stale `base.wim` before the rename. If a previous run was interrupted between extraction and rename, this cleanup closes the wedge on the next run. If you see a `Removing stale extracted WIM before extraction` or `Removing stale base.wim before rename` line in the log, the cleanup fired as designed.
+
 ## `New-Partition` fails after 3 attempts
 
 **Symptom.** The OS partition has been shrunk, the recovery partitions have been deleted, and the script cannot create the new partition.
@@ -620,9 +842,11 @@ If the state file is repeatedly disappearing on a machine that has already taken
 2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
 3. Whether the loop-breaker is firing because the enable-failure counter reached 3. The state file is deliberately left in place in that case (the operator deletes it manually to reset the counter), but if a cleanup tool is configured to remove anything in `C:\Recovery\OEM\` on a schedule, it will also remove the state file for this reason.
 
-**Not to be confused with the Audit Mode, OS-fallback BitLocker, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The three are distinguishable: the deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
+**Not to be confused with the Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The four are distinguishable: the deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
 
 **Not to be confused with the enable-only failure path either.** The enable-only failure path **writes** the state file with a non-`"ok"` `LastEnableResult` and an incremented counter. The state file's `LastUpdated` timestamp will be newer than the run start, and its `EnableFailureAttempts` will be non-zero. If you were expecting the state file to be absent, this is what happened.
+
+**Not to be confused with the offline-fallback deferral.** The offline-fallback deferral leaves the state file untouched, but its log signature is unique: `Offline fallback: the machine requires a full update …`. The state file's `LastUpdated` timestamp is unchanged.
 
 ## The machine is in OS-fallback and stays there
 
@@ -640,7 +864,22 @@ Do not edit the state file's `UsedOSFallback` field and leave the rest in place;
 
 **Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
 
-**Not to be confused with a deferral.** A machine on which an Audit Mode, OS-fallback BitLocker, or injection-failure deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
+**Not to be confused with a deferral.** A machine on which an Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, injection-failure, or offline-fallback deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
+
+### OS-fallback, retrying the dedicated path
+
+If the machine is stuck in OS-fallback because the OS partition could not be shrunk enough to create a dedicated recovery partition, the fix is to free up space on C: so that the shrink can succeed on the next full-update attempt.
+
+1. Free up space on C:. The script attempts to shrink by the required bucket size (`WIM size + 250 MiB + 30 MiB`, rounded up to the next 100 MiB boundary, minimum 1000 MiB). Free at least that much plus a margin.
+2. Delete the state file to force the next run to re-attempt:
+
+   ```powershell
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force
+   ```
+
+3. Re-run `WinRE.ps1`. It will re-attempt the destructive path with the newly freed space. If the shrink succeeds, the machine ends in a `DEDICATED` end state.
+
+If the shrink still fails, the machine falls back to OS-fallback again with the same state. The C: volume's free space is the constraint.
 
 ## VMD hardware present but no driver matches
 
@@ -668,7 +907,7 @@ Skipping <name>: CPU gen <n> outside <min>-<max>
 3. If the regex is at fault, update `Get-IntelProcessorGeneration` in both `scripts/WinRE.ps1` and `scripts/Test-WinRE.ps1`. The two are mirrored on purpose; update both.
 4. If the CPU generation is correct but the manifest does not cover it, update the manifest.
 
-The harness (Option 9, VMD drivers) also logs a warning with the raw CPU string when an Intel CPU is detected but its generation cannot be parsed, which makes this failure mode visible.
+The harness (Option 9, VMD drivers) also logs a warning with the raw CPU string when an Intel CPU is detected but its generation cannot be parsed, which makes this failure mode visible. As of v18, the harness also records a `SKIP` result (not a PASS) in that case, because driver applicability was not evaluated.
 
 ## The script is running but nothing is happening
 
@@ -700,6 +939,7 @@ Use it to:
 
 The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step:
 
+- **The program lock is skipped.** The lock is a state-modifying action (it opens the lock file with an exclusive handle), and DryRun's contract is to modify nothing. A dry run is safe to run concurrently with a live deployment, and the harness (`scripts\Test-WinRE.ps1`) is safe to run concurrently with either.
 - The Audit Mode guard is read-only and logs `Would defer …` when the live run would defer.
 - The drive-letter assignment is skipped under DryRun; the caller works with the original `\\?\GLOBALROOT` path.
 - The **full-update pipeline** terminates at a single choke point at the top of the full-update path. It logs a plan for Steps 1 through 7 and exits cleanly without running `dism`, 7-Zip, or any file I/O in WorkDir.
@@ -713,7 +953,9 @@ Two checks run under `-DryRun` in read-only form and log a `Would defer …` or 
 
 A dry run that reports either of these is telling you the machine would be deferred on the next live run. Address the underlying condition before running the script for real.
 
-The DryRun contract for the OS-fallback BitLocker gate is that the gate is logged but does not short-circuit. If the OS-fallback route is reached under DryRun, the gate logs `OS-fallback deferred: C: VolumeStatus=…` and continues — but the deployed WIM plan downstream is not evaluated against C:'s state, because no WIM is deployed under DryRun.
+The DryRun contract for the OS-fallback BitLocker gate is that the gate is logged but does not short-circuit. If the OS-fallback route is reached under DryRun, the gate logs `OS-fallback deferred: C: could not be confirmed fully decrypted` and continues — but the deployed WIM plan downstream is not evaluated against C:'s state, because no WIM is deployed under DryRun.
+
+The DryRun contract for the VMD-query-indeterminate deferral (v44 patch 6) is the same: the enumeration error is logged, and the run continues rather than exiting.
 
 Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable …` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
 
@@ -725,10 +967,14 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - Windows build.
 - Vendor, model, Lenovo machine type.
 - Partition style (GPT or MBR).
-- BitLocker state — **both** `Protection Status:` and `Conversion Status:` from `manage-bde -status C:`. The `Conversion Status` value matters: on the OS-fallback route, `Fully Encrypted` with `Protection Off` is the ambiguous state that the script defers on, and on the dedicated-partition route, the target partition's conversion status is what determines whether `Set-RecoveryPartitionReadyForWinRE` will need to run `manage-bde -off`. Omitting the conversion status makes the report impossible to diagnose.
+- BitLocker state — **both** `Protection Status:` and `Conversion Status:` from `manage-bde -status C:`. The `Conversion Status` value matters: on the OS-fallback route, `Fully Encrypted` with `Protection Off` is one of the states that the script defers on, and on the dedicated-partition route, the target partition's conversion status is what determines whether `Set-RecoveryPartitionReadyForWinRE` will need to run `manage-bde -off`. Omitting the conversion status makes the report impossible to diagnose.
 - The target recovery partition's BitLocker state — the `manage-bde -status` output for the partition reagentc is registered to. The harness's `Test-WinRE.ps1` Option 1 reports this automatically.
 - `ImageState` from `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` if the machine may be in Audit Mode or OOBE.
 - Exit code.
+- If the run exited with code 2 and the log shows `Another WinRE Manager instance is already running (program lock file is exclusively held)`, note whether any other `WinRE.ps1` process (scheduled task, manual invocation, RMM tool, Intune remediation) was running at the same time. As of v44 patch 4, this is not a failure — the other instance is doing the work — but the reporter should confirm they are not looking at a machine with a scheduled task stuck in a running state. Check the scheduled task's "Last Run Result" via `Get-ScheduledTaskInfo`.
+- If the run exited with code 2 and the log shows `VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined`, include the raw PnP enumeration error from the line above it (`VMD hardware detection reported N error(s) during PnP enumeration: …`). The specific error text is what distinguishes a service issue from an antivirus/EDR block from a device in an error state.
+- If the run exited with code 2 and the log shows `Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable` or `Offline fallback: using state file's stored DesiredStateId`, note whether the machine was actually offline (no network, DNS failure, proxy) and what the state file's `LastUpdated` timestamp is. This discriminates the offline-fallback deferral (machine unchanged, next scheduled run with network completes the work) from the fast-path-under-offline case (degraded-success, exit 2).
+- If the run exited with code 3 and the log ends with `Cannot rename because item at 'C:\Temp\WinREWork\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
 - The relevant slice of the log — not the whole file unless asked.
 - The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes the BitLocker, Windows Setup state, target-partition state, and classifier verdicts. If the report is about the fast path or the state file, also include the output of Option S.
 
@@ -737,3 +983,4 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - [exit-codes.md](exit-codes.md) — what each exit code means.
 - [architecture.md](architecture.md) — where each failure mode fits in the pipeline.
 - [testing.md](testing.md) — how to use the harness to diagnose.
+- [deployment.md](deployment.md) — the "One instance per machine" precondition for manual invocations and the offline behavior of the scheduled task.

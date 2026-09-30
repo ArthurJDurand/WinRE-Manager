@@ -3,220 +3,64 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 44 (v44 patch 2)
+    Version : 44 (v44 patch 6)
 
-    Manages the Windows Recovery Environment on managed Windows 10/11
-    fleets. Downloads a base WinRE image, injects OEM and VMD drivers,
-    deploys it to a dedicated recovery partition, and enables WinRE via
-    reagentc. Maintains idempotency via a DesiredStateId state file.
+    Full history, design, and troubleshooting:
+      CHANGELOG.md, docs/architecture.md, docs/deployment.md,
+      docs/exit-codes.md, docs/troubleshooting.md
 
-    Full version history (v25 through v43 and all v43 patches) lives in
-    CHANGELOG.md. This header records only the current design invariants
-    and the lessons that must survive refactoring.
+    Design invariants:
+      - Dedicated recovery partition is the primary target. OS-fallback
+        (C:\Recovery\WindowsRE) only when C: is FullyDecrypted.
+        reagentc's BitLocker check is on the TARGET volume; prepare via
+        Set-RecoveryPartitionReadyForWinRE. Never modify C:'s state.
+      - New partitions carry the recovery type GUID at creation time
+        (v43 patch 5), closing the Device Encryption window.
+      - Destructive replacement deletes only type-coded recovery
+        partitions on the OS disk; label-only matches never authorize
+        deletion.
+      - Checkpoint writes (steps 3, 4, 6) gated on
+        $Script:ImageInjectionComplete. State-write gate not relaxed.
+        Migration guard resets $step to 2 when a step >= 4 checkpoint
+        coincides with a rebuild. Step 5 not checkpointed.
+      - Post-shrink failure calls Restore-OSPartitionSize; failure of
+        that sets $Script:GeometryRestoreFailed, which causes
+        Write-WinREState to delete the state file.
+      - Program lock (v44 patch 4) provides single-instance exclusion.
+        Non-contention failures log and proceed. Released last.
+      - Offline fallback (v44 patch 5) trusts the state file's stored
+        DesiredStateId; local safety checks still enforced. Residual
+        risk: hardware drift while offline.
+      - VMD query failure is indeterminate, not "no VMD hardware".
+        The run does not commit state on failure.
+      - Every network call carries -TimeoutSec $NetworkTimeoutSeconds.
 
-    ================================================================
-    Current BitLocker policy (v43 patch 5, further revision 5, 2026-09-29)
-    ================================================================
+    Known gaps:
+      - 2 GiB sanity ceiling for recovery-typed partitions (must gate
+        Ensure-AdequateRecoveryPartition, Find-SuitableRecoveryPartition,
+        and Remove-StrayRecoveryPartitions).
+      - LocalInputsId field to close the offline hardware-drift risk.
 
-    The policy is target-volume-based, driven by field evidence.
-
-    What changed:
-
-    1. reagentc's BitLocker check is on the TARGET volume, not the OS
-       volume. Proven by a same-machine test: with C: in the
-       FullyEncrypted/no-protectors state, `reagentc /enable` against
-       a dedicated recovery partition succeeds while `reagentc /enable`
-       against the OS volume fails with "Windows RE cannot be enabled
-       on a volume with BitLocker Drive Encryption enabled."
-
-    2. A partition claimed by Device Encryption does not re-encrypt
-       after `manage-bde -off` completes. Confirmed by the same test.
-
-    Removed:
-
-    - The startup BitLocker gate (it deferred on the OS volume state
-      when the OS volume state is irrelevant to enable-only work).
-    - Suspend-BitLockerForWinRE and Test-BitLockerSuspended. Suspension
-      does not prevent Device Encryption from claiming new partitions.
-    - The internal BitLocker check in Invoke-ReagentcEnable and its
-      "blunsafe" return value.
-    - The encrypted-partition delete-and-recreate retry in
-      Ensure-AdequateRecoveryPartition (it never worked).
-
-    Added:
-
-    - Set-RecoveryPartitionReadyForWinRE: prepares the target partition
-      by running `manage-bde -off` if needed and polling
-      Test-VolumeEncrypted until the volume is confirmed unencrypted.
-      5s poll interval, 300s timeout.
-    - Call sites at the point of action: enable-only path, full-update
-      existing-partition path, full-update new-partition path, and the
-      pending-reboot repair path.
-    - OS-fallback gate: reagentc refuses to enable WinRE on an
-      encrypted OS volume, so the OS-fallback path checks C:'s
-      VolumeStatus before deploying and defers unless it is
-      FullyDecrypted. The script never modifies C:'s BitLocker state.
-
-    Audit Mode guard (unchanged):
-
-    In Audit Mode, OOBE, and the sysprep generalize/specialize phases,
-    reagentc /enable fails with ERROR_CANCELLED (0x4c7) regardless of
-    WIM correctness. The script reads
-    HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State\ImageState
-    at startup and defers with EXIT_WARNING unless the value is absent
-    or IMAGE_STATE_COMPLETE.
-
-    Enable-failure counter and loop-breaker:
-
-    The state file records LastEnableResult and EnableFailureAttempts.
-    After 3 consecutive terminal failures (failed / bitlocker /
-    decryption timeout), the loop-breaker exits EXIT_FATAL with an
-    actionable message. The fast path clears stale counters.
-
-    ================================================================
-    Component cleanup and ResetBase (v44 patch 2)
-    ================================================================
-
-    On the full-update path, after driver injection completes and
-    before the image is dismounted, the script runs:
-
-        dism /image:<MountDir> /cleanup-image /StartComponentCleanup /ResetBase
-
-    ResetBase removes superseded components from the WinSxS store
-    inside the mounted image. The size reduction does not materialise
-    in the .wim file on disk until the image is re-exported; the
-    existing Step 4 dism /Export-Image /Compress:max is what writes a
-    smaller file. Without the export, ResetBase is wasted CPU.
-
-    ResetBase makes the image unserviceable for rollback purposes: any
-    update that was present when the command ran can no longer be
-    uninstalled. This is acceptable for a recovery image, which is
-    rebuilt from source whenever the DesiredStateId changes and is
-    never rolled back in place.
-
-    ResetBase runs only when $Script:ImageInjectionComplete is $true.
-    If injection failed, the pipeline aborts before Step 4, so a
-    successful ResetBase on a partially-injected image would waste CPU
-    for no benefit. ResetBase failure is non-fatal: the log records a
-    WARN with the DISM exit code, the pipeline continues, and the
-    Step 4 export writes whatever size the image currently is. The
-    Step 5 partition acceptance check decides whether the result fits.
-
-    ScriptVersion remains 44. DesiredStateId is unchanged. No
-    fleet-wide rebuild is forced: healthy machines continue to take
-    the fast path with their current WIM, and only receive the
-    ResetBase'd WIM on their next natural rebuild.
-
-    The technique was adopted from Microsoft's KB5028997 remediation
-    scripts (WinREPathScriptSamples), which use the same pair of
-    operations to make winre.wim fit an existing recovery partition.
-
-    ================================================================
-    Design invariants
-    ================================================================
-
-    - Dedicated recovery partition is the target. OS-fallback
-      (C:\Recovery\WindowsRE) is the degraded alternative and only
-      when C: is FullyDecrypted.
-    - Single state file at C:\Recovery\OEM\winre_state.json.
-    - DesiredStateId =
-      SHA256(HW=mfr|model|mt;;OS=build;;CPU=vendor|gen;;VMD=present|absent;;MANIFEST=version;;OEMPACK=version|NONE;;SCRIPT=44)
-    - DesiredStateId includes CPU vendor/generation and VMD presence
-      because those determine VMD driver selection. A machine whose VMD
-      state changes (BIOS update, firmware re-default, deliberate
-      config change) must rebuild even when Manufacturer / Model /
-      MachineType, OS build, and manifest version are unchanged.
-    - GPT recovery type GUID de94bba4-06d1-4d40-a16a-bfd50179d6ac and
-      attributes 0x8000000000000001 applied at partition creation.
-    - Drive letters removed before reagentc /enable; temporary letters
-      tracked in $Script:tempDriveLetters and cleaned in the finally
-      block.
-    - Recovery partition free space: existing-partition acceptance
-      requires (SizeRemaining + existing WIM) >= WIM + 250 MiB.
-      New-partition sizing = WIM + 250 + 30 MiB, rounded up to the
-      next 100 MiB, minimum 1000 MiB.
-    - Idempotency: DesiredStateId match + healthy state -> fast path,
-      no rebuild.
-    - Checkpoint gates: step 3/4/6 checkpoint writes gated on
-      $Script:ImageInjectionComplete; migration guard resets $step to
-      2 when a checkpoint at step >= 4 coincides with $needInject.
-    - Post-resize verification via Assert-PartitionSizeAfterResize.
-    - $Script:GeometryRestoreFailed is set by any failure to restore
-      C: to SizeMax after a post-shrink failure. Write-WinREState
-      deletes the state file when it is set, forcing a retry.
-
-    ================================================================
-    Known gaps (documented; not yet implemented)
-    ================================================================
-
-    - Recovery-typed partition sanity ceiling. Get-RecoveryPartitions
-      matches partitions by the recovery GPT type GUID
-      (de94bba4-06d1-4d40-a16a-bfd50179d6ac) or MBR type 0x27, and the
-      destructive path in Ensure-AdequateRecoveryPartition will delete
-      any such partition on the OS disk. Windows Setup and Windows
-      in-place upgrade create recovery partitions under 1.5 GiB. OEM
-      factory recovery volumes can be 7-20 GiB and may carry the
-      standard recovery type code. On a machine where an OEM factory
-      recovery volume carries the recovery type code, this script
-      treats it as a candidate and deletes it.
-
-      A 2 GiB sanity ceiling is planned but not yet implemented. It
-      would WARN and skip (not abort) any recovery-typed candidate
-      whose size exceeds 2 GiB, leaving the oversized partition in
-      place and creating a new recovery partition alongside it.
-
-      Until the ceiling is implemented, operators deploying this
-      script should verify the machine has no oversized recovery-typed
-      partition containing data they want to preserve. See the
-      "Before you run this" section in README.md for the operator-
-      facing warning.
-
-    ================================================================
-    CRITICAL LESSONS LEARNED (do not regress)
-    ================================================================
-
-    - Do NOT use 7-Zip as the primary extractor for Lenovo or HP EXEs.
-      Use the vendor's own EXE with the vendor's switches.
-    - Do NOT rename vendor downloads to a generic name before
-      extraction. The extractor may rely on the filename.
-    - Do NOT swallow Add-WindowsDriver errors; capture with
-      -ErrorVariable and log the first 5 lines.
-    - Always count .inf files after extraction.
-    - The state-write gate must not be relaxed.
-    - Invoke-WebRequest can throw an exception even when the download
-      completed successfully. Always verify the file after the
-      download attempt, not only inside the try block.
-    - [PSCustomObject]@{} objects may not accept new properties via
-      dot-assignment. Use Add-Member -Force or declare up-front.
-    - In double-quoted PowerShell strings, "$word:" is parsed as a
-      scope or drive qualifier. Use "${word}:" or "$($expr):" when a
-      literal colon must follow a variable reference.
-    - Add-WindowsDriver's returned objects do not reliably expose an
-      Operation property across DISM builds. Use the third-party
-      driver count delta via Get-WindowsDriver instead.
-    - manage-bde -status on a BitLocker-unmanaged volume emits "could
-      not be opened by BitLocker". That is definitive proof the
-      volume is not encrypted, not an unknown state.
-    - Prefer build-agnostic manage-bde text parsing to
-      -protectionaserrorlevel. The flag misbehaves on some builds.
-    - OEM and VMD injection success cannot be judged by provider
-      count alone. Cross-reference the package's INF basenames
-      against the image's third-party driver OriginalFileName values.
-    - Self-referential file operations must be guarded by comparing
-      [System.IO.Path]::GetFullPath on both sides.
-    - The recovery partition offset is rounded UP to the next 1 MiB
-      boundary. Shrink by (bucket + 1) MiB to leave alignment slack.
-    - The Audit Mode guard must run before any state-modifying action.
-    - reagentc's BitLocker check is on the target volume. Prepare the
-      target; do not gate on C:'s state. Only the OS-fallback path
-      gates on C:'s state, because there the target IS the OS volume.
-    - A recovery partition claimed by Device Encryption does not
-      re-encrypt after manage-bde -off. Decrypt in place.
-    - Get-RecoveryPartitions matches by type code, not by size or by
-      content. OEM factory recovery volumes that carry the standard
-      recovery type code are indistinguishable from Windows Setup's
-      recovery partition to the matcher. No size ceiling is
-      implemented yet; see the Known gaps section above.
+    Critical lessons (do not regress):
+      - No 7-Zip for Lenovo/HP EXE extraction; use the vendor's EXE with
+        its own switches. Do not rename downloads before extraction.
+      - Invoke-WebRequest can throw even on a successful download; always
+        verify the file after the attempt.
+      - In double-quoted strings, "$word:" parses as a scope qualifier.
+        Use "${word}:" for a literal colon.
+      - Add-WindowsDriver's return shape is unreliable across DISM builds.
+        Judge by third-party driver count delta plus INF-basename
+        cross-reference.
+      - manage-bde -status "could not be opened by BitLocker" means
+        unmanaged (unencrypted), not unknown.
+      - Self-referential file ops guard with GetFullPath.
+      - Recovery partition offset rounds UP to 1 MiB. Shrink by
+        (bucket + 1) MiB for alignment slack.
+      - Audit Mode guard runs before any state-modifying action.
+      - A partition claimed by Device Encryption does not re-encrypt
+        after manage-bde -off. Decrypt in place.
+      - Failed-injection abort removes base.wim too, else step 2 fails
+        on the next run at Rename-Item.
 #>
 
 [CmdletBinding()]
@@ -226,13 +70,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
+$NetworkTimeoutSeconds = 15
 
 $EXIT_SUCCESS          = 0
 $EXIT_REBOOT_REQUIRED  = 1
 $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
-$ScriptVersion = 44
+$ScriptVersion    = 44
+$ScriptPatchLevel = "6"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -264,6 +110,9 @@ $Script:CachedHardware         = $null
 $Script:LenovoWinPEMap         = $null
 $Script:HPWinPEMap             = $null
 $Script:DellWinPEMap           = $null
+$Script:LenovoPackResolution   = "unknown"
+$Script:ProgramLockStream      = $null
+$Script:offlineFallback        = $false
 
 # =========================== LOGGING ===========================
 function Write-Log {
@@ -370,8 +219,6 @@ function Get-WinREState {
     return @{ Status = $status; Location = $location }
 }
 
-# Resolve a WinRE location string (GLOBALROOT or Volume GUID form) to a
-# partition object. Returns $null if resolution fails.
 function Resolve-WinRELocationToPartition {
     param([string]$Location)
     if (-not $Location) { return $null }
@@ -395,14 +242,9 @@ function Get-OSPartition {
     return $part
 }
 
-# Return the disk that contains the running Windows installation.
-# Every use of "the boot disk" in this script means "the disk where
-# Windows lives and where the recovery partition belongs". That is the
-# disk of the OS partition, not necessarily the disk the firmware
-# booted from (MSFT_Disk.BootFromDisk). On virtually all configurations
-# the two are identical, but on multi-boot or cloned systems whose boot
-# files live on a different physical disk they can differ. Anchoring on
-# the OS partition's DiskNumber removes the ambiguity.
+# The disk where Windows lives, not necessarily MSFT_Disk.BootFromDisk.
+# Anchoring on the OS partition's DiskNumber removes the ambiguity for
+# multi-boot or cloned systems.
 function Get-OSDisk {
     $osPart = Get-OSPartition
     if (-not $osPart) { return $null }
@@ -417,6 +259,9 @@ function Get-AvailableDriveLetter {
 }
 
 # =========================== DRIVE LETTER HANDLING ===========================
+# Three-method fallback per candidate letter (Set-Partition,
+# Add-PartitionAccessPath, diskpart). DryRun returns the preferred
+# letter without assigning it.
 function Invoke-DriveLetterAssignment {
     param(
         [Parameter(Mandatory)][int]$DiskNumber,
@@ -424,13 +269,7 @@ function Invoke-DriveLetterAssignment {
         [Parameter(Mandatory)][string]$PreferredLetter
     )
     $preferred = $PreferredLetter.TrimEnd(':').ToUpper()
-    if ($Script:DryRun) {
-        # Return the preferred letter without assigning it. Callers that
-        # consume the letter for a real operation must check $Script:DryRun
-        # first - see Ensure-RecoveryPartitionAccess and
-        # Set-RecoveryPartitionReadyForWinRE for the pattern.
-        return $preferred
-    }
+    if ($Script:DryRun) { return $preferred }
 
     $candidates = [System.Collections.Generic.List[string]]::new()
     $candidates.Add($preferred)
@@ -507,7 +346,7 @@ function Invoke-DriveLetterRemoval {
     return $false
 }
 
-# =========================== ENSURE RECOVERY PARTITION ACCESS ===========================
+# =========================== RECOVERY PARTITION ACCESS ===========================
 function Ensure-RecoveryPartitionAccess {
     param([string]$TargetDir)
     if (-not $TargetDir) { return $null }
@@ -522,9 +361,6 @@ function Ensure-RecoveryPartitionAccess {
             return $path
         }
         if ($part.IsBoot -or $part.IsSystem) { return $TargetDir }
-        # DryRun must not assign a drive letter. Return the original
-        # GLOBALROOT path; the file system provider resolves it directly
-        # for Test-Path, Get-Item, and Get-FileHash.
         if ($Script:DryRun) {
             Write-Log "[DRY RUN] Would assign a temporary drive letter to disk $diskNum part $partNum for image discovery"
             return $TargetDir
@@ -572,25 +408,20 @@ function Ensure-RecoveryPartitionAccess {
 }
 
 # =========================== BITLOCKER ===========================
-# Three-state contract used across the recovery-partition paths:
+# Three-state classifier:
 #   $true  = encrypted or partially encrypted
 #   $false = confirmed fully decrypted
 #   $null  = could not determine
 #
-# Per Win32_EncryptableVolume.GetConversionStatus, all of
 # FullyEncrypted, EncryptionInProgress, DecryptionInProgress,
-# EncryptionPaused, and DecryptionPaused represent a volume that is
-# not fully decrypted and must not be treated as clean.
+# EncryptionPaused, and DecryptionPaused all represent a volume that
+# is not fully decrypted.
 #
-# manage-bde -status on a BitLocker-unmanaged volume emits "could not
-# be opened by BitLocker". For a properly-typed recovery partition
-# (GUID de94bba4-06d1-4d40-a16a-bfd50179d6ac, attributes
-# 0x8000000000000001) this is the expected output and is definitive
-# proof the volume is not encrypted, not an unknown state.
+# "could not be opened by BitLocker" from manage-bde on a properly-typed
+# recovery partition is definitive proof the volume is not encrypted.
 #
-# Prefer build-agnostic manage-bde text parsing to the
-# -protectionaserrorlevel sub-parameter, which misbehaves on some
-# Windows 11 builds.
+# Text parsing is preferred over -protectionaserrorlevel, which
+# misbehaves on some Windows 11 builds.
 function Test-VolumeEncrypted {
     param([string]$MountPoint)
 
@@ -626,35 +457,15 @@ function Test-VolumeEncrypted {
 
 # Prepare a target recovery partition for reagentc /enable.
 #
-# reagentc's BitLocker check is on the TARGET volume, not the OS volume.
-# Field evidence (2026-09-29): on a machine whose C: is
-# FullyEncrypted/no-protectors, /enable against a dedicated recovery
-# partition succeeds while /enable against the OS volume fails with
-# "Windows RE cannot be enabled on a volume with BitLocker Drive
-# Encryption enabled." The fix is therefore to make the target volume
-# unencrypted, not to gate on C:'s state.
+# reagentc's BitLocker check is on the TARGET volume, not on C:. This
+# function decrypts the target in place with manage-bde -off and polls
+# until confirmed-unencrypted or timeout. A partition claimed by Device
+# Encryption does not re-encrypt after -off completes (2026-09-29 field
+# evidence), so decrypt-in-place is safe and replaces delete-and-recreate.
 #
-# If the target is already unencrypted, returns immediately. If it is
-# encrypted or actively encrypting, runs manage-bde -off and polls
-# Test-VolumeEncrypted until it reports confirmed-unencrypted
-# (FullyDecrypted, or "could not be opened by BitLocker"). Returns
-# $true on success, $false on timeout or unrecoverable failure.
-#
-# A recovery partition claimed by Device Encryption does not re-encrypt
-# after manage-bde -off completes; confirmed by the same field test
-# (R: stayed unmanaged after decryption). This makes decrypt-in-place
-# safe and replaces the previous delete-and-recreate retry, which
-# never worked on the Dell.
-#
-# Poll policy: 5-second interval, 300-second timeout (60 polls). A 1 GB
-# recovery partition decrypts in well under a minute on NVMe; the
-# timeout is generous for HDDs and loaded systems.
-#
+# Poll policy: 5-second interval, 300-second timeout.
 # The caller is responsible for removing any drive letter this function
-# may assign. The letter is added to $Script:tempDriveLetters so the
-# script's finally block cleans it up if the caller forgets.
-#
-# -DryRun: logs the intent and returns $true without touching the volume.
+# assigns; letters are added to $Script:tempDriveLetters for cleanup.
 function Set-RecoveryPartitionReadyForWinRE {
     param(
         [Parameter(Mandatory)][int]$DiskNumber,
@@ -697,9 +508,6 @@ function Set-RecoveryPartitionReadyForWinRE {
     }
 
     if ($null -eq $state) {
-        # Indeterminate. Give it one retry after a short pause - the
-        # BitLocker service can briefly report an unparseable state right
-        # after partition creation.
         Write-Log "Target partition $DiskNumber/$PartitionNumber (${letter}:) encryption state indeterminate - sleeping ${PollIntervalSeconds}s and re-checking" -Level WARN
         Start-Sleep -Seconds $PollIntervalSeconds
         $state = Test-VolumeEncrypted -MountPoint "${letter}:"
@@ -719,8 +527,6 @@ function Set-RecoveryPartitionReadyForWinRE {
         return $false
     }
 
-    # manage-bde -off is asynchronous. Poll Test-VolumeEncrypted until it
-    # reports confirmed-unencrypted or the timeout expires.
     $elapsed   = 0
     $lastState = $state
     while ($elapsed -lt $PollTimeoutSeconds) {
@@ -738,10 +544,9 @@ function Set-RecoveryPartitionReadyForWinRE {
 }
 
 # =========================== RECOVERY PARTITION DETECTION ===========================
-# Broad detector: matches partitions by Recovery/WINRE label, GPT recovery
-# type GUID, or MBR type 0x27. Used on the OS disk. The narrower
-# type-code-only trust policy for non-OS-disk deletion is applied at
-# Remove-StrayRecoveryPartitions.
+# Broad detector: matches by Recovery/WINRE label, GPT recovery type
+# GUID, or MBR type 0x27. Used on the OS disk. The type-code gate for
+# authoritative deletion/reuse is applied by the callers.
 function Get-RecoveryPartitions {
     param([int]$DiskNumber = -1)
 
@@ -765,24 +570,10 @@ function Get-RecoveryPartitions {
     return @($allParts)
 }
 
-# Remove every type-coded recovery partition that is not on the OS disk.
-# The invariant is: no type-coded recovery partition exists on any
-# non-OS disk. Windows Setup and Startup Repair scan all attached
-# volumes for WinRE-capable partitions; a stray can point the BCD at
-# the wrong image during repair.
-#
-# The type-code gate (GPT DE94... or MBR 0x27) distinguishes "recovery
-# partition that could confuse the boot loader" from "data partition
-# that happens to carry the Recovery/WINRE label". On non-OS disks, a
-# label-only match is never sufficient authority to delete a partition.
-#
-# Called from the idempotent fast path, the enable-only path, the
-# pending-reboot exits, and Step 7 of the full-update path.
-#
-# Returns $true if every type-coded stray was removed (or none was
-# present), $false if any deletion failed. A failure also sets
-# $Script:nonFatalWarning so the caller's exit code reflects the
-# incomplete cleanup.
+# Delete every type-coded recovery partition on a non-OS disk. Label-only
+# matches on non-OS disks are logged and skipped — a label alone is never
+# sufficient authority to delete. Called from the fast path, the
+# enable-only path, both pending-reboot exits, and Step 7.
 function Remove-StrayRecoveryPartitions {
     param([Parameter(Mandatory)][int]$OSDiskNumber)
 
@@ -827,9 +618,6 @@ function Test-RecoveryPartitionHasRoom {
             if ($p) { $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue }
         }
         if (-not $vol) { Write-Log "Test-RecoveryPartitionHasRoom: no volume for ${Letter}:" -Level WARN; return $false }
-        # Use the volume's own drive letter when available so we do not
-        # build a path from a letter that may not exist on the volume
-        # (relevant in DryRun and after a racing letter removal).
         $effectiveLetter = if ($vol.DriveLetter) { $vol.DriveLetter } else { $Letter.TrimEnd(':') }
         $existingWimPath = "${effectiveLetter}:\Recovery\WindowsRE\winre.wim"
         $existingWimSize = 0
@@ -912,16 +700,9 @@ function Assert-PartitionSizeAfterResize {
 }
 
 # =========================== RECOVERY PARTITION CREATION ===========================
-# Re-extend the OS partition to its current SizeMax. Called from every
-# post-shrink failure path in Ensure-AdequateRecoveryPartition so no
-# failure leaves C: permanently shrunken.
-#
-# Returns $true if the OS partition is at SizeMax on return (or was
-# already), $false if the resize failed or verification failed. Any
-# failure sets both $Script:nonFatalWarning and
-# $Script:GeometryRestoreFailed; the latter causes Write-WinREState to
-# delete the state file so the next run retries from a clean slate
-# rather than accepting a state file that describes a shrunken C:.
+# Re-extend C: to SizeMax. Any failure sets nonFatalWarning and
+# GeometryRestoreFailed, which causes Write-WinREState to delete the
+# state file and forces a clean retry.
 function Restore-OSPartitionSize {
     param([Parameter(Mandatory)][string]$Reason)
 
@@ -958,18 +739,9 @@ function Restore-OSPartitionSize {
     }
 }
 
-# Clean up a partition we created but could not complete. Used when
-# Format-Volume fails or when the target cannot be made unencrypted,
-# so the freshly created partition does not survive as an orphan with
-# a default GPT type, no label, and no filesystem - a combination
-# Get-RecoveryPartitions cannot match, which would leave the orphan
-# permanently invisible and silently bound the OS partition's SizeMax
-# at its start.
-#
-# Uses the same delete-first / diskpart-override-second pattern as the
-# main deletion loop. Returns $true when the partition is confirmed
-# gone, $false when it survived (in which case the geometry-failure
-# flags are set so the state file is invalidated).
+# Delete a partition we created but could not complete. Uses delete-first
+# / diskpart-override-second. On survival, sets the geometry-failure
+# flags so the state file is invalidated.
 function Remove-OrphanPartition {
     param(
         [Parameter(Mandatory)][int]$DiskNumber,
@@ -992,17 +764,12 @@ function Remove-OrphanPartition {
     $stillThere = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
     if ($stillThere) {
         Write-Log "Orphan partition $DiskNumber/$PartitionNumber could not be removed after $Reason - manual cleanup may be required" -Level WARN
-        # If the orphan survives, C: is still shrunken and the space it
-        # consumed cannot be re-extended into it. Set the geometry-failure
-        # flags so Write-WinREState refuses to record the resulting
-        # layout as a valid state.
         $Script:nonFatalWarning = $true
         $Script:GeometryRestoreFailed = $true
         return $false
     }
     Write-Log "Removed orphan partition $DiskNumber/$PartitionNumber after $Reason"
 
-    # Absorb the freed space back into the OS partition.
     Restore-OSPartitionSize -Reason "after orphan removal" | Out-Null
     return $true
 }
@@ -1010,10 +777,8 @@ function Remove-OrphanPartition {
 function Ensure-AdequateRecoveryPartition {
     param([int]$RequiredWimSizeMB)
 
-    # Dynamic new-partition sizing: WIM + 250 MiB free-space target +
-    # 30 MiB filesystem allowance, rounded UP to the next 100 MiB
-    # boundary and clamped to a 1000 MiB minimum. The 250 MiB target
-    # matches Microsoft's current WinRE servicing guidance.
+    # Dynamic sizing: WIM + 250 MiB free-space + 30 MiB filesystem, rounded
+    # UP to the next 100 MiB boundary, minimum 1000 MiB.
     $neededMiB = $RequiredWimSizeMB + $WinREFreeSpaceMiB + $NewPartitionFilesystemMiB
     $bucketSizeMiB = [int]([Math]::Ceiling($neededMiB / $NewPartitionIncrementMiB) * $NewPartitionIncrementMiB)
     if ($bucketSizeMiB -lt $NewPartitionMinimumMiB) { $bucketSizeMiB = $NewPartitionMinimumMiB }
@@ -1033,6 +798,14 @@ function Ensure-AdequateRecoveryPartition {
     $R = [int64]0
     foreach ($rp in $parts) {
         if ($osPart -and $rp.DiskNumber -eq $osPart.DiskNumber -and $rp.PartitionNumber -eq $osPart.PartitionNumber) { continue }
+        # Type-code gate. A partition detected only by its Recovery/WINRE
+        # label is never sufficient authority for deletion, and is not
+        # counted as reclaimable recovery space.
+        $isTyped = ($rp.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($rp.MbrType -eq 0x27)
+        if (-not $isTyped) {
+            Write-Log "Skipping label-only recovery match on disk $($rp.DiskNumber) partition $($rp.PartitionNumber): recovery label alone does not authorize deletion." -Level WARN
+            continue
+        }
         $deletableParts += $rp
         $R += [int64]$rp.Size
     }
@@ -1050,12 +823,9 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "WARNING: If the final shrink fails, recovery partitions will have been destroyed. No rollback." -Level WARN
     }
 
-    # Dedicated recovery partition is the primary objective. The capacity
-    # pre-check is advisory only - we proceed with the destructive
-    # repartitioning attempt even when the arithmetic suggests the OS may
-    # not shrink enough. SizeMin is a conservative hint and can be
-    # pessimistic when the volume has movable files; the defrag retry in
-    # the shrink path may still succeed.
+    # The capacity pre-check is advisory only. We proceed even when it
+    # suggests the shrink may not fit, because SizeMin is a conservative
+    # hint and the defrag retry can succeed.
     if ($case3Fatal) {
         Write-Log "WARNING: Capacity pre-check: S=$([math]::Round($S/1MB,1)) MiB, R=$([math]::Round($R/1MB,1)) MiB, B=$([math]::Round($B/1MB,1)) MiB, M=$([math]::Round($M/1MB,1)) MiB. S+R-B=$([math]::Round(($S+$R-$B)/1MB,1)) MiB < M - the OS partition may not shrink enough for a dedicated recovery partition." -Level WARN
         Write-Log "WARNING: Proceeding with destructive repartitioning attempt anyway (dedicated recovery partition is the primary objective)." -Level WARN
@@ -1063,6 +833,17 @@ function Ensure-AdequateRecoveryPartition {
     }
 
     $stateBefore = Get-WinREState
+
+    # v44 patch 6: C: encryption is diagnostic, not a veto, for the
+    # dedicated-target path. reagentc's BitLocker check is on the target,
+    # and the 2026-09-29 test established that C: encryption does not
+    # block dedicated-partition work. The OS-fallback route retains its
+    # own separate C: gate.
+    $willDestroyCurrentRoute = ($stateBefore.Status -eq "Enabled") -or ($deletableParts.Count -gt 0)
+    if ($willDestroyCurrentRoute) {
+        Write-Log "Destructive recovery-partition replacement will remove the current WinRE route (status=$($stateBefore.Status), deletableParts=$($deletableParts.Count)). Proceeding; per the v43 patch 5 (further revision 5) target-volume policy, C:'s BitLocker state is not a veto for the dedicated-target path. The OS-fallback route retains its separate C: BitLocker gate." -Level WARN
+    }
+
     if ($stateBefore.Status -eq "Enabled") {
         if ($Script:DryRun) {
             Write-Log "[DRY RUN] Would disable WinRE before partition recreation"
@@ -1109,12 +890,8 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "  Disk $($rp.DiskNumber) Part $($rp.PartitionNumber): size $([math]::Round($rp.Size/1MB,1)) MiB, label='$rpLabel', used=$rpUsedMiB MiB, isWinRELocation=$isWinRELocation"
     }
 
-    # DryRun terminates here, after the read-only pre-checks and
-    # pre-deletion inventory and before any state-modifying action. This
-    # is the single structural choke point for the DryRun guarantee in
-    # this function: no future code inserted below can accidentally
-    # modify the machine under DryRun without first overriding this
-    # early return.
+    # DryRun stops here: single structural choke point before any
+    # state-modifying action.
     if ($Script:DryRun) {
         Write-Log "[DRY RUN] Would delete $($deletableParts.Count) recovery partition(s) on the OS disk:"
         foreach ($rp in $deletableParts) {
@@ -1167,10 +944,9 @@ function Ensure-AdequateRecoveryPartition {
         }
     }
 
-    # Add 1 MiB of alignment slack: the new partition offset below rounds
-    # the OS end UP to the next MiB boundary, and without slack that
-    # rounding can consume part of the requested bucket and leave the
-    # tail slightly too short for the new partition.
+    # +1 MiB alignment slack: the new-partition offset rounds the OS end
+    # UP to the next MiB boundary; without slack the rounding could
+    # consume part of the bucket.
     $shrinkBytes = [int64](($bucketSizeMiB + 1) * 1MB)
     $osPart = Get-OSPartition
     if (-not $osPart) { Write-Log "OS partition lost before shrink - FATAL" -Level ERROR; return $null }
@@ -1180,7 +956,6 @@ function Ensure-AdequateRecoveryPartition {
     $sizeMinBefore = [int64](Get-PartitionSupportedSize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber).SizeMin
     Write-Log "Shrink target $([math]::Round($expectedAfterShrink/1MB,1)) MiB; current SizeMin $([math]::Round($sizeMinBefore/1MB,1)) MiB"
 
-    # --- Attempt 1: immediate shrink ---
     Write-Log "Shrinking OS partition from $([math]::Round($initialOSSize/1MB,1)) MiB to $([math]::Round($expectedAfterShrink/1MB,1)) MiB (attempt 1, immediate)"
     $shrinkOK = $false
     try {
@@ -1195,12 +970,8 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "Shrink attempt 1 failed: $_" -Level WARN
     }
 
-    # --- Attempt 2: sleep and retry ---
-    # The v38 ASUS field log showed attempt 1 failing with "Size Not
-    # Supported" and attempt 2 succeeding after a defrag, but did not
-    # establish whether the defrag was the cause or whether something
-    # time-based lowered SizeMin. Attempt 2 settles that question on
-    # every run where attempt 1 fails.
+    # Attempt 2 settles whether the sleep or the defrag is what lowers
+    # SizeMin after a failed immediate shrink (v38 ASUS field log).
     $sizeMinAfterSleep = $sizeMinBefore
     if (-not $shrinkOK) {
         $sleepSec = 10
@@ -1228,7 +999,6 @@ function Ensure-AdequateRecoveryPartition {
         }
     }
 
-    # --- Attempt 3: defrag /x, then retry ---
     if (-not $shrinkOK) {
         Write-Log "Attempting free-space consolidation via defrag.exe C: /x before retrying shrink (attempt 3)" -Level WARN
         try {
@@ -1265,10 +1035,6 @@ function Ensure-AdequateRecoveryPartition {
 
     if (-not $shrinkOK) {
         Write-Log "OS partition shrink failed after all three attempts. Recovery partitions have already been deleted." -Level ERROR
-        # Resize-Partition and Assert-PartitionSizeAfterResize are not
-        # atomic. If Resize succeeded but verification failed, C: may
-        # already be shrunken. Restore before returning so no failure
-        # path leaves C: permanently shrunken.
         Write-Log "Restoring OS partition size before falling back to OS-fallback." -Level WARN
         Restore-OSPartitionSize -Reason "shrink failed after all three attempts" | Out-Null
         Write-Log "Returning null - main flow will attempt OS-partition fallback (C:\Recovery\WindowsRE)." -Level ERROR
@@ -1286,10 +1052,9 @@ function Ensure-AdequateRecoveryPartition {
         return $null
     }
 
-    # Create the partition with the recovery type GUID/type code already
-    # applied. This closes the window between New-Partition and
-    # Set-RecoveryPartitionAttributes during which the partition looks
-    # like a Basic Data partition.
+    # Apply recovery type GUID at creation (v43 patch 5) to close the
+    # Device Encryption window between New-Partition and
+    # Set-RecoveryPartitionAttributes.
     $gptRecoveryType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
     $style = ($osDisk.PartitionStyle)
     $newPart = $null
@@ -1326,27 +1091,17 @@ function Ensure-AdequateRecoveryPartition {
     }
     Start-Sleep 3
 
-    # Set recovery type and GPT attributes BEFORE assigning a drive
-    # letter. A freshly-formatted NTFS partition with a normal data type
-    # and a drive letter is a candidate for Device Encryption /
-    # BitLocker auto-encryption on Windows 11 24H2+. Applying the
-    # recovery type GUID and 0x8000000000000001
-    # (PLATFORM_REQUIRED + NO_DRIVE_LETTER) first tells BitLocker this
-    # is not a data volume.
+    # Attributes before drive letter — a freshly-formatted NTFS partition
+    # with a letter is a candidate for auto-encryption on Win11 24H2+.
     $attrsOk = Set-RecoveryPartitionAttributes -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Style $style
     if (-not $attrsOk) {
         Write-Log "Could not set recovery attributes on newly created partition - proceeding but BitLocker may encrypt it" -Level WARN
     }
 
-    # Prefer a letter we already used in this run for a recovery
-    # partition, then any other available letter. Windows caches
-    # letter-to-volume mappings in MountedDevices; reusing a letter
-    # we held earlier is more likely to succeed cleanly than picking
-    # a fresh one, and it avoids the "assigned, removed, reassigned"
-    # churn that can leave stale entries.
+    # Reuse a letter held earlier this run if now free; MountedDevices
+    # caches mappings and reuse avoids assign/remove/reassign churn.
     $preferredLetter = $null
     foreach ($prev in $Script:tempDriveLetters) {
-        # Only reuse if the letter is now free
         if (-not (Get-Volume -DriveLetter $prev -ErrorAction SilentlyContinue)) {
             $preferredLetter = $prev
             break
@@ -1372,10 +1127,8 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "Newly created recovery partition encryption state unknown - proceeding; Set-RecoveryPartitionReadyForWinRE will retry at the deploy step" -Level WARN
     }
     if ($encNewState -eq $true) {
-        # Decrypt in place rather than delete-and-recreate. A partition
-        # claimed by Device Encryption does not re-encrypt after
-        # manage-bde -off completes (field evidence 2026-09-29),
-        # so decrypting preserves the partition we just created.
+        # Decrypt in place; a claimed partition does not re-encrypt after
+        # manage-bde -off completes (2026-09-29 field evidence).
         Write-Log "Newly created recovery partition is BitLocker-managed - decrypting in place" -Level WARN
         if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber)) {
             Write-Log "Could not make newly created recovery partition unencrypted - aborting recovery partition creation" -Level ERROR
@@ -1404,9 +1157,6 @@ function Find-SuitableRecoveryPartition {
     if ($parts.Count -gt 1) { Write-Log "Find-SuitableRecoveryPartition: multiple ($($parts.Count)) recovery partitions - will relocate"; return $null }
 
     $osPart = Get-OSPartition
-    # Acceptance floor is WIM + WinREFreeSpaceMiB (250). Same standard as
-    # the new-partition sizing target and the OS's own pre-update WinRE
-    # check. No tolerance.
     $requiredBytes = [int64](($RequiredWimSizeMB + $WinREFreeSpaceMiB) * 1MB)
 
     foreach ($candidate in $parts) {
@@ -1418,11 +1168,6 @@ function Find-SuitableRecoveryPartition {
             Write-Log "Find-SuitableRecoveryPartition: candidate $($candidate.PartitionNumber) total size $([math]::Round($candidate.Size/1MB,1)) MiB < required $([math]::Round($requiredBytes/1MB,1)) MiB"
             continue
         }
-        # Encryption state is no longer a rejection criterion. reagentc's
-        # BitLocker check is on the TARGET volume, and
-        # Set-RecoveryPartitionReadyForWinRE decrypts the target in place
-        # before reagentc /enable is called. An existing encrypted
-        # recovery partition is therefore usable.
 
         $letter = $candidate.DriveLetter
         $assignedTemp = $false
@@ -1499,19 +1244,9 @@ function Deploy-WimToPartition {
 }
 
 # =========================== ENABLE WINRE ===========================
-# Wraps reagentc /enable. Returns:
-#   "ok"        - exit 0 and status Enabled (or repair produced Enabled)
-#   "reboot"    - exit 0 or repair path did not produce Enabled
-#   "failed"    - non-zero exit that is not the BitLocker error
-#   "bitlocker" - reagentc refused because the target volume is
-#                 BitLocker-protected. Callers decide whether to retry
-#                 after preparing the target or to defer.
-#
-# The internal BitLocker check and the "blunsafe" return value were
-# removed in v43 patch 5 (further revision 5). reagentc's BitLocker
-# check is on the TARGET volume, not C:, and the caller is now
-# responsible for making the target unencrypted via
-# Set-RecoveryPartitionReadyForWinRE before calling this function.
+# Returns: "ok" | "reboot" | "failed" | "bitlocker".
+# reagentc's BitLocker check is on the TARGET volume; callers are
+# responsible for preparing the target before calling this function.
 function Invoke-ReagentcEnable {
     param(
         [switch]$AllowTempLetter,
@@ -1519,11 +1254,6 @@ function Invoke-ReagentcEnable {
         [string]$ReRegisterPath = $null
     )
 
-    # DryRun must not call reagentc /enable. Log the intent and return
-    # "ok" - the closest approximation of a successful live run that can
-    # be made without running reagentc. Callers' "ok" branches are
-    # DryRun-safe: Remove-StrayRecoveryPartitions, Write-WinREState, and
-    # Remove-ItemIfExist all handle DryRun internally.
     if ($Script:DryRun) {
         Write-Log "[DRY RUN] Would call reagentc /enable and evaluate the result (exit code, WinRE status, and the registration repair path if the status check does not confirm Enabled)"
         return "ok"
@@ -1551,11 +1281,6 @@ function Invoke-ReagentcEnable {
 
     Write-Log "reagentc /enable: exit=$exitCode -> hard failure" -Level WARN
 
-    # Detect the BitLocker-specific failure. If the target volume is
-    # BitLocker-encrypted, reagentc refuses with exit 2 and the message
-    # "Windows RE cannot be enabled on a volume with BitLocker Drive
-    # Encryption enabled." The caller is responsible for deciding
-    # whether to defer or retry after preparing the target.
     if ($output -match 'cannot be enabled on a volume with BitLocker') {
         Write-Log "reagentc /enable failed because the target volume is BitLocker-protected" -Level ERROR
         return "bitlocker"
@@ -1596,12 +1321,6 @@ function Invoke-ReagentcEnable {
 function Invoke-ReAgentRegistrationRepair {
     param([string]$ReRegisterPath)
 
-    # DryRun: this function deletes ReAgent.xml and ReAgent_merged.xml and
-    # calls reagentc /setreimage followed by reagentc /enable. None of
-    # that may run under DryRun. The only current caller
-    # (Invoke-ReagentcEnable) already returns "ok" before reaching this
-    # function under DryRun, but the guard is placed here so the function
-    # upholds the contract on its own rather than relying on its caller.
     if ($Script:DryRun) {
         Write-Log "[DRY RUN] Would rebuild WinRE registration (delete ReAgent.xml / ReAgent_merged.xml, reagentc /setreimage, reagentc /enable) using path: $ReRegisterPath"
         return $true
@@ -1615,10 +1334,9 @@ function Invoke-ReAgentRegistrationRepair {
     $reagentXml = Join-Path $env:windir "System32\Recovery\ReAgent.xml"
     $mergedXml  = Join-Path $env:windir "System32\Recovery\ReAgent_merged.xml"
 
-    # NOTE: C:\Recovery\ReAgentOld.xml is deliberately NOT touched. That
-    # file is the downlevel / servicing configuration used by Windows
-    # Setup. Manual test confirmed its deletion does not resolve the
-    # issue.
+    # C:\Recovery\ReAgentOld.xml is deliberately NOT touched. It is the
+    # downlevel/servicing configuration used by Windows Setup; manual
+    # test confirmed its deletion does not resolve the issue.
     $anyDeleted = $false
     foreach ($xmlPath in @($reagentXml, $mergedXml)) {
         if (-not (Test-Path $xmlPath)) { continue }
@@ -1768,7 +1486,7 @@ function Get-DellWinPEPack {
     if (-not $Script:DellWinPEMap) {
         Write-Log "Downloading Dell WinPE map from gist"
         for ($retry = 1; $retry -le 3; $retry++) {
-            try { $Script:DellWinPEMap = Invoke-RestMethod -Uri $DellWinPEMapUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop; break }
+            try { $Script:DellWinPEMap = Invoke-RestMethod -Uri $DellWinPEMapUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop; break }
             catch { Write-Log "Dell map download attempt $retry failed: $_" -Level WARN; if ($retry -lt 3) { Start-Sleep 5 } }
         }
         if (-not $Script:DellWinPEMap) {
@@ -1801,7 +1519,7 @@ function Get-HPWinPEPack {
     if (-not $Script:HPWinPEMap) {
         Write-Log "Downloading HP WinPE map from gist"
         for ($retry = 1; $retry -le 3; $retry++) {
-            try { $Script:HPWinPEMap = Invoke-RestMethod -Uri $HPWinPEMapUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop; break }
+            try { $Script:HPWinPEMap = Invoke-RestMethod -Uri $HPWinPEMapUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop; break }
             catch { Write-Log "HP map download attempt $retry failed: $_" -Level WARN; if ($retry -lt 3) { Start-Sleep 5 } }
         }
         if (-not $Script:HPWinPEMap) {
@@ -1828,42 +1546,52 @@ function Get-HPWinPEPack {
     }
 }
 
+# Sets $Script:LenovoPackResolution to one of:
+#   "unknown-mt"      - machine type could not be determined (permanent)
+#   "map-unavailable" - map fetch failed (transient)
+#   "no-entry"        - map loaded, no entry for this MT (permanent)
+#   "malformed-entry" - key exists but is missing winpe.url (config error)
+#   "resolved"        - pack returned successfully
+# The caller uses this to distinguish "expected no-pack" from a real
+# failure, which previously were conflated by a $null return.
 function Get-LenovoWinPEPack {
     param($Hardware)
+    $Script:LenovoPackResolution = "unknown"
     $mt = $Hardware.MachineType
     if (-not $mt -or $mt -eq 'UNKN') {
         Write-Log "Lenovo WinPE map: cannot resolve - machine type unknown" -Level WARN
+        $Script:LenovoPackResolution = "unknown-mt"
         return $null
     }
     if (-not $Script:LenovoWinPEMap) {
         Write-Log "Downloading Lenovo WinPE map from gist"
         for ($retry = 1; $retry -le 3; $retry++) {
-            try { $Script:LenovoWinPEMap = Invoke-RestMethod -Uri $LenovoWinPEMapUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop; break }
+            try { $Script:LenovoWinPEMap = Invoke-RestMethod -Uri $LenovoWinPEMapUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop; break }
             catch { Write-Log "Lenovo map download attempt $retry failed: $_" -Level WARN; if ($retry -lt 3) { Start-Sleep 5 } }
         }
         if (-not $Script:LenovoWinPEMap) {
             Write-Log "Could not download Lenovo WinPE map" -Level WARN
+            $Script:LenovoPackResolution = "map-unavailable"
             return $null
         }
         Write-Log "Lenovo WinPE map loaded ($(@($Script:LenovoWinPEMap.Models.PSObject.Properties).Count) model entries)"
     }
     $entry = $Script:LenovoWinPEMap.Models.$mt
     if (-not $entry) {
-        # Many Lenovo machine types have no published WinPE driver pack.
-        # A loaded map with no entry for this MT is the expected,
-        # permanent answer, not a transient failure. Logged at INFO so
-        # it does not appear in the operator's "something to look at"
-        # filter. The caller decides the run's completion state based on
-        # whether the map loaded, not on whether this MT was present.
+        # Many Lenovo MTs have no published WinPE pack; this is the
+        # expected, permanent answer for those models.
         Write-Log "No WinPE pack in Lenovo map for machine type $mt (expected for some Lenovo models)" -Level INFO
+        $Script:LenovoPackResolution = "no-entry"
         return $null
     }
     $winpe = $entry.winpe
     if (-not $winpe -or -not $winpe.url) {
-        Write-Log "Lenovo map entry for $mt has no WinPE URL" -Level WARN
+        Write-Log "Lenovo map entry for $mt has no WinPE URL - treating as configuration failure, not a legitimate no-pack result" -Level WARN
+        $Script:LenovoPackResolution = "malformed-entry"
         return $null
     }
     Write-Log "Lenovo map resolved $mt -> $($winpe.name) (SHA256: $($winpe.sha256))"
+    $Script:LenovoPackResolution = "resolved"
     [PSCustomObject]@{
         Manufacturer   = "LENOVO"
         Name           = $winpe.name
@@ -1890,10 +1618,9 @@ function Get-OEMWinPEPack {
 function Get-DesiredStateId {
     param($Hardware, $OEMPackage, $ExpectedDriverSetVersion, [bool]$VMDPresent = $false)
     $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
-    # CPUGeneration is $null for AMD and for Intel CPUs that do not
-    # parse to a generation (Celeron, Pentium, Atom, Xeon, N/J-series).
-    # Use the literal string "N" so the ID string is deterministic.
-    # The "N" is stable: it will not silently flip on a re-run.
+    # "N" is the deterministic placeholder for any CPU whose Intel
+    # generation cannot be parsed (AMD, Celeron, Pentium, Atom, Xeon,
+    # N/J-series). It is stable across re-runs.
     $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
     $parts = @(
         "HW=$($Hardware.Manufacturer)|$($Hardware.Model)|$($Hardware.MachineType)",
@@ -1982,17 +1709,11 @@ function Write-WinREState {
     $stateJson = $state | ConvertTo-Json -Depth 3
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
 
-    # If a post-shrink failure left C: shrunken and Restore-OSPartitionSize
-    # could not return it to SizeMax, do not leave any state file on disk
-    # that could be accepted on a subsequent run. The state file is the
-    # machine-readable "last known good deployment" record. If
-    # GeometryRestoreFailed, the current deployment is NOT a known-good
-    # record - C: is still reduced by (bucketSizeMiB + 1) MiB. Deleting
-    # the file forces the next run to treat the state as absent, set
-    # needInject = $true, and re-run the full-update path, which
-    # re-extends C: as part of the destructive attempt.
     if ($Script:DryRun) { Write-Log "[DRY RUN] Would write state file"; return }
 
+    # GeometryRestoreFailed means C: is still shrunken after a failed
+    # destructive attempt. Delete the state file so the next run treats
+    # the state as absent and retries from clean.
     if ($Script:GeometryRestoreFailed) {
         Write-Log "Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file so the next run retries from a clean slate" -Level WARN
         if (Test-Path $path) {
@@ -2073,6 +1794,9 @@ function Get-InfFileCount {
     } catch { return 0 }
 }
 
+# Vendor-specific switches.
+#   LENOVO: Inno Setup based self-extractor.
+#   HP:     Custom SoftPaq self-extractor.
 function Invoke-VendorExtraction {
     param(
         [Parameter(Mandatory)][string]$ExePath,
@@ -2092,12 +1816,6 @@ function Invoke-VendorExtraction {
 
     New-DirectoryIfNotExists $DestinationDir | Out-Null
 
-    # Vendor-specific switch sets.
-    # Lenovo: Inno Setup based self-extractor. /VERYSILENT suppresses the
-    #   "change output location" dialog; /DIR sets the destination;
-    #   /SILENT and /SUPPRESSMSGBOXES suppress any remaining UI.
-    # HP: Custom HP SoftPaq self-extractor. /s = silent, /e = extract
-    #   without launching setup, /f = destination folder.
     $arguments = switch ($Vendor) {
         "LENOVO" { @("/VERYSILENT", "/DIR=`"$DestinationDir`"", "/SILENT", "/SUPPRESSMSGBOXES") }
         "HP"     { @("/s", "/e", "/f", "`"$DestinationDir`"") }
@@ -2113,7 +1831,7 @@ function Invoke-VendorExtraction {
         if ($proc.ExitCode -ne 0) {
             Write-Log "$Vendor extractor returned non-zero exit code $($proc.ExitCode)" -Level WARN
             # Some Lenovo packages return non-zero on success but still
-            # populate the target. Check for INF files before declaring failure.
+            # populate the target. INF count decides.
             $infCount = Get-InfFileCount -Directory $DestinationDir
             Write-Log "$Vendor extractor returned $($proc.ExitCode); INF files found: $infCount"
             if ($infCount -gt 0) {
@@ -2172,6 +1890,10 @@ function Invoke-CabExtraction {
 }
 
 # =========================== DOWNLOAD HELPERS ===========================
+# Invoke-WebRequest can throw even after writing a complete file
+# (connection reset on the final ACK). The no-hash path therefore
+# requires the request to have completed cleanly on the same attempt;
+# a partial file left behind by a throwing request is never accepted.
 function Invoke-OemPackDownload {
     param(
         [Parameter(Mandatory)][string]$Url,
@@ -2196,7 +1918,7 @@ function Invoke-OemPackDownload {
         Write-Log "Download attempt $retry of ${MaxRetries}: $Url"
         $requestSucceeded = $false
         try {
-            Invoke-WebRequest -Uri $Url -OutFile $DestinationPath -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
+            Invoke-WebRequest -Uri $Url -OutFile $DestinationPath -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
             $requestSucceeded = $true
             Write-Log "Invoke-WebRequest completed without exception (attempt $retry)"
         } catch {
@@ -2223,9 +1945,6 @@ function Invoke-OemPackDownload {
 
         $hasHash = [bool]$ExpectedSHA256 -or [bool]$ExpectedMD5
         if (-not $hasHash) {
-            # No integrity hash supplied. Require Invoke-WebRequest itself
-            # to have completed cleanly on this attempt. A partial file
-            # left behind by a throwing request is not accepted.
             if ($requestSucceeded) {
                 Write-Log "Download successful (no integrity hash supplied) on attempt $retry"
                 return $true
@@ -2281,21 +2000,38 @@ function Invoke-OemPackDownload {
 # =========================== MAIN ===========================
 try {
     New-DirectoryIfNotExists $LogDir
-    Write-Log "========== WinRE Manager Started (v$ScriptVersion) =========="
+    Write-Log "========== WinRE Manager Started (v$ScriptVersion patch $ScriptPatchLevel) =========="
     if ($Script:DryRun) { Write-Log "*** DRY RUN MODE ***" }
 
+    # ---- Program lock (v44 patch 4) ----
+    # Exclusive file handle at FileShare.None. Kernel-enforced, no DACL,
+    # released on process exit even after a crash. Skipped under DryRun;
+    # non-contention failures log a WARN and proceed unprotected.
+    if (-not $Script:DryRun) {
+        $lockPath = Join-Path $LogDir "WinREManager.lock"
+        try {
+            $Script:ProgramLockStream = [System.IO.File]::Open(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            Write-Log "Acquired program lock at $lockPath"
+        } catch [System.IO.IOException] {
+            Write-Log "Another WinRE Manager instance is already running (program lock file is exclusively held). Exiting without making any changes. This is not a deployment failure - the other instance is doing the work and will complete on its own. If you need to run manually, wait for the other instance to finish, or run scripts\Test-WinRE.ps1 for a read-only diagnostic that is safe to run concurrently." -Level WARN
+            exit $EXIT_WARNING
+        } catch {
+            Write-Log "Could not set up program lock at $lockPath : $_ - proceeding without single-instance protection; concurrent runs may collide" -Level WARN
+            $Script:nonFatalWarning = $true
+        }
+    } else {
+        Write-Log "[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances"
+    }
+
     # ---- Audit Mode / OOBE / sysprep guard ----
-    # In these transitional Windows states, reagentc /enable fails with
-    # ERROR_CANCELLED (0x4c7, 1223) regardless of the correctness of the
-    # deployed WIM or the state of the recovery partition. Confirmed
-    # field case: Dell Latitude 5530. After OOBE, /enable succeeded on
-    # the first attempt with the same WIM. The guard runs before any
-    # WinRE registration, partition, image, checkpoint, or recovery-state
-    # modification. It does not run before the log directory is created
-    # or the startup banner is written; those are not deployment state.
-    #
-    # Proceed only when ImageState is absent (some SKUs omit the key) or
-    # exactly IMAGE_STATE_COMPLETE. Any other value defers.
+    # reagentc /enable is blocked with ERROR_CANCELLED (0x4c7) until the
+    # machine reaches a normal desktop. Defer before any WinRE, partition,
+    # image, checkpoint, or recovery-state modification.
     $imageStatePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State"
     $imageState = $null
     try {
@@ -2308,42 +2044,90 @@ try {
         if (-not $Script:DryRun) { exit $EXIT_WARNING }
     }
 
-    # ---- Hardware, manifest, OEM pack ----
+    # ---- Hardware ----
     $Hardware = Get-HardwareObject
     Write-Log "System: $($Hardware.Manufacturer) $($Hardware.Model), MT=$($Hardware.MachineType), OS=$($Hardware.WinPE) (build $($Hardware.Build))"
 
+    # ---- Driver manifest fetch (v44 patch 5) ----
+    # Offline fallback: on fetch failure, trust the state file's stored
+    # DesiredStateId directly (does NOT recompute from cached inputs,
+    # which would need the OEM map on the same unavailable network).
+    # Local safety checks in the fast path still enforced.
     $manifest = $null
-    for ($retry = 1; $retry -le 3; $retry++) {
-        try { $manifest = Invoke-RestMethod -Uri $DriverManifestUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop; break }
-        catch { if ($retry -eq 3) { throw } }
-        Start-Sleep 5
+    for ($retry = 1; $retry -le 2; $retry++) {
+        try { $manifest = Invoke-RestMethod -Uri $DriverManifestUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop; break }
+        catch {
+            Write-Log "Driver manifest fetch attempt $retry failed: $($_.Exception.Message)" -Level WARN
+        }
+        if ($retry -lt 2) { Start-Sleep 2 }
     }
-    if (-not $manifest -or -not $manifest.version) { throw "Driver manifest invalid." }
-    $ExpectedDriverSetVersion = $manifest.version
 
-    $OEMPackage = Get-OEMWinPEPack -Hardware $Hardware
+    if ($manifest -and $manifest.version) {
+        $ExpectedDriverSetVersion = $manifest.version
+    } else {
+        if ($manifest) {
+            Write-Log "Driver manifest fetched but has no version field - treating as unavailable" -Level WARN
+        }
+        $manifestStateFilePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+        if (-not (Test-Path $manifestStateFilePath)) {
+            Write-Log "Driver manifest unavailable and no state file exists - a live manifest is required for the first deployment on this machine." -Level ERROR
+            throw "Driver manifest unavailable and no state file exists. First deployment requires a live manifest."
+        }
+        try {
+            $cachedManifestState = Get-Content $manifestStateFilePath -Raw | ConvertFrom-Json
+        } catch {
+            Write-Log "Driver manifest unavailable and the state file could not be parsed: $_" -Level ERROR
+            throw "Driver manifest unavailable and state file unparseable."
+        }
+        if (-not $cachedManifestState.DesiredStateId) {
+            Write-Log "Driver manifest unavailable and the state file does not record a DesiredStateId." -Level ERROR
+            throw "Driver manifest unavailable and state file lacks the required fields."
+        }
+        $ExpectedDriverSetVersion = $cachedManifestState.InjectedDriverSetVersion
+        $DesiredStateId           = $cachedManifestState.DesiredStateId
+        $Script:offlineFallback   = $true
+        $Script:nonFatalWarning   = $true
+        $stateFileAge = if ($cachedManifestState.LastUpdated) { "state file LastUpdated=$($cachedManifestState.LastUpdated)" } else { "state file LastUpdated=unknown" }
+        Write-Log "Driver manifest unavailable - taking the offline fallback path using the state file's stored DesiredStateId ($stateFileAge). The run will exit EXIT_WARNING. The machine will update automatically on the next successful manifest fetch if any deployment input has changed in the meantime." -Level WARN
+    }
 
-    # Get-OEMWinPEPack returns $null both for unsupported vendors and for
-    # supported vendors whose pack did not resolve. For Dell and HP
-    # (single-pack maps) a $null return always means the map failed to
-    # load or its entry is malformed - both transient. For Lenovo, a
-    # loaded map with no entry for this MT is the expected, permanent
-    # answer for many models: the run is treated as legitimately
-    # complete with OEMPACK=NONE in the DesiredStateId, and the fast
-    # path fires on subsequent runs. If Lenovo later publishes a pack
-    # for this MT, the DesiredStateId changes and the machine rebuilds
-    # automatically.
+    $OEMPackage = $null
+    if (-not $Script:offlineFallback) {
+        $OEMPackage = Get-OEMWinPEPack -Hardware $Hardware
+    } else {
+        Write-Log "Offline fallback: skipping OEM pack resolution (network unavailable)" -Level INFO
+    }
+
+    # ---- OEM pack null-result classification (v44 patch 6) ----
+    # For LENOVO, the resolution status distinguishes a legitimate no-pack
+    # (unknown-mt / no-entry) from transient or configuration failures.
+    # For Dell and HP, a null return is always transient.
     $oemVendorSupported = $Hardware.Manufacturer -in @("Dell", "HP", "LENOVO")
-    if ($oemVendorSupported -and -not $OEMPackage) {
-        # UNKN is also a permanent answer: if the machine type cannot be
-        # resolved, no Lenovo pack can ever match, so the run is complete
-        # with OEMPACK=NONE. Without this, the transient-failure branch
-        # fires every run, no state file is written, and the machine
-        # loops on EXIT_WARNING forever.
-        $mapLoadedNoEntry = ($Hardware.Manufacturer -eq "LENOVO" -and
-                             ($Script:LenovoWinPEMap -or $Hardware.MachineType -eq "UNKN"))
-        if ($mapLoadedNoEntry) {
-            Write-Log "LENOVO machine type $($Hardware.MachineType) has no published WinPE driver pack in the loaded map - OEM driver injection will be skipped. The run is recorded as complete with OEMPACK=NONE; if Lenovo publishes a pack for this model later, the DesiredStateId will change and the machine will rebuild." -Level INFO
+    if (-not $Script:offlineFallback -and $oemVendorSupported -and -not $OEMPackage) {
+        if ($Hardware.Manufacturer -eq "LENOVO") {
+            switch ($Script:LenovoPackResolution) {
+                "unknown-mt" {
+                    Write-Log "LENOVO machine type could not be resolved (MT=UNKN) - no pack can ever match. The run is recorded as complete with OEMPACK=NONE." -Level INFO
+                }
+                "no-entry" {
+                    Write-Log "LENOVO machine type $($Hardware.MachineType) has no published WinPE driver pack in the loaded map - OEM driver injection will be skipped. If Lenovo publishes a pack for this model later, the DesiredStateId will change and the machine will rebuild." -Level INFO
+                }
+                "malformed-entry" {
+                    Write-Log "LENOVO map entry for machine type $($Hardware.MachineType) is present but malformed (no winpe.url) - configuration failure, not a legitimate no-pack. OEM driver injection will be skipped and the run will be marked incomplete." -Level WARN
+                    $Script:nonFatalWarning = $true
+                    $Script:ImageInjectionComplete = $false
+                }
+                "map-unavailable" {
+                    Write-Log "LENOVO WinPE map could not be downloaded - transient failure. OEM driver injection will be skipped and the run will be marked incomplete." -Level WARN
+                    $Script:nonFatalWarning = $true
+                    $Script:ImageInjectionComplete = $false
+                }
+                default {
+                    Write-Log "LENOVO OEM pack resolution ended unexpectedly (state=$($Script:LenovoPackResolution)) - marking run incomplete." -Level WARN
+                    $Script:nonFatalWarning = $true
+                    $Script:ImageInjectionComplete = $false
+                }
+            }
         } else {
             Write-Log "$($Hardware.Manufacturer) is a supported vendor but no OEM WinPE pack could be resolved (map fetch failed or no matching entry) - OEM driver injection will be skipped" -Level WARN
             $Script:nonFatalWarning = $true
@@ -2351,39 +2135,68 @@ try {
         }
     }
 
-    # ---- VMD detection ----
-    # Computed before DesiredStateId so the ID captures whether VMD
-    # hardware is present. VMD presence is a deployment input, not
-    # incidental machine state: it determines whether the VMD driver
-    # package is selected for injection. A BIOS or firmware update
-    # that flips VMD on or off changes the deployed WIM and must
-    # change the ID.
-    $vmdIds = $manifest.drivers | Where-Object { $_.match.requiredDevices } | ForEach-Object { $_.match.requiredDevices }
-    $vmdPresent = $false
-    if ($vmdIds) {
-        $pattern = ($vmdIds | ForEach-Object { [regex]::Escape($_) }) -join '|'
-        $vmdPresent = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match $pattern }).Count -gt 0
+    # ---- VMD detection (v44 patch 6, fail-closed) ----
+    # VMD presence is a deployment input. A query failure is not the
+    # same as "no VMD hardware": only a successful enumeration that
+    # yields no matches proves absence. Any error during enumeration is
+    # treated as indeterminate, and the run defers before committing
+    # state.
+    $vmdPresent   = $false
+    $vmdQueryOk   = $true
+    if (-not $Script:offlineFallback) {
+        $vmdIds = $manifest.drivers | Where-Object { $_.match.requiredDevices } | ForEach-Object { $_.match.requiredDevices }
+        if ($vmdIds) {
+            $pattern = ($vmdIds | ForEach-Object { [regex]::Escape($_) }) -join '|'
+            $vmdErr = $null
+            $vmdDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue -ErrorVariable vmdErr |
+                            Where-Object { $_.InstanceId -match $pattern })
+            if ($vmdErr -and @($vmdErr).Count -gt 0) {
+                $vmdQueryOk = $false
+                Write-Log "VMD hardware detection reported $(@($vmdErr).Count) error(s) during PnP enumeration: $($vmdErr[0]) - treating VMD presence as indeterminate." -Level WARN
+            } else {
+                $vmdPresent = $vmdDevices.Count -gt 0
+                Write-Log "VMD hardware present: $vmdPresent ($($vmdDevices.Count) matching device(s) out of $(@($vmdIds).Count) pattern(s))"
+            }
+        } else {
+            Write-Log "VMD hardware present: False (manifest has no requiredDevices patterns)"
+        }
+    } else {
+        Write-Log "Offline fallback: skipping VMD detection (manifest unavailable)" -Level INFO
     }
-    Write-Log "VMD hardware present: $vmdPresent"
+
+    # Fail-closed guard: a full update or a fast path cannot be trusted
+    # when VMD presence is unknown. Defer rather than commit state.
+    if (-not $Script:DryRun -and -not $vmdQueryOk) {
+        Write-Log "VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined. Re-run when PnP enumeration is healthy." -Level WARN
+        $Script:nonFatalWarning = $true
+        Remove-ItemIfExist $CheckpointFile
+        exit $EXIT_WARNING
+    }
 
     # ---- Required VMD driver set ----
     # Deterministic for a given (manifest, hardware, vmdPresent) triple.
     # Not separately hashed into DesiredStateId - the manifest version
-    # already identifies the driver set, and the deployed artifact is
-    # tracked via CurrentImageHash. The resolved-inputs design (hashing
-    # the actual selected driver list) is deliberately deferred; the
-    # manifest version discipline is what makes this safe.
+    # identifies the driver set, and the deployed artifact is tracked
+    # via CurrentImageHash.
     $requiredDrivers = @()
-    foreach ($drv in $manifest.drivers) {
-        $osMatch = ($Hardware.IsWin10 -and $drv.os -contains "Win10") -or ($Hardware.IsWin11 -and $drv.os -contains "Win11")
-        $genOk = ($Hardware.CPUGeneration -ge $drv.match.cpuGenMin) -and ($Hardware.CPUGeneration -le $drv.match.cpuGenMax)
-        if ($drv.match.requiredDevices -and -not $vmdPresent) { Write-Log "Skipping $($drv.name): no matching VMD hardware detected"; continue }
-        if ($osMatch -and $Hardware.CPUVendor -eq "Intel" -and $genOk) { $requiredDrivers += $drv }
+    if (-not $Script:offlineFallback) {
+        foreach ($drv in $manifest.drivers) {
+            $osMatch = ($Hardware.IsWin10 -and $drv.os -contains "Win10") -or ($Hardware.IsWin11 -and $drv.os -contains "Win11")
+            $genOk = ($Hardware.CPUGeneration -ge $drv.match.cpuGenMin) -and ($Hardware.CPUGeneration -le $drv.match.cpuGenMax)
+            if ($drv.match.requiredDevices -and -not $vmdPresent) { Write-Log "Skipping $($drv.name): no matching VMD hardware detected"; continue }
+            if ($osMatch -and $Hardware.CPUVendor -eq "Intel" -and $genOk) { $requiredDrivers += $drv }
+        }
+        Write-Log "Required drivers (VMD): $($requiredDrivers.Count)"
+    } else {
+        Write-Log "Offline fallback: skipping required-driver resolution" -Level INFO
     }
-    Write-Log "Required drivers (VMD): $($requiredDrivers.Count)"
 
-    $DesiredStateId = Get-DesiredStateId -Hardware $Hardware -OEMPackage $OEMPackage -ExpectedDriverSetVersion $ExpectedDriverSetVersion -VMDPresent $vmdPresent
-    Write-Log "DesiredStateId: $DesiredStateId"
+    if (-not $Script:offlineFallback) {
+        $DesiredStateId = Get-DesiredStateId -Hardware $Hardware -OEMPackage $OEMPackage -ExpectedDriverSetVersion $ExpectedDriverSetVersion -VMDPresent $vmdPresent
+        Write-Log "DesiredStateId: $DesiredStateId"
+    } else {
+        Write-Log "Offline fallback: using state file's stored DesiredStateId $DesiredStateId"
+    }
 
     # ---- Checkpoint and WorkDir ----
     $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
@@ -2395,9 +2208,6 @@ try {
     if ($step -ge 4 -and -not (Test-Path "$WorkDir\winre_optimized.wim")) { $step = 4 }
 
     # ---- Recovery-volume drive-letter normalization ----
-    # A recovery volume should not carry a drive letter in steady state.
-    # Remove any that are present, tracking them so the finally block
-    # cleans up if the removal races a re-assignment.
     Get-Volume | Where-Object { $_.FileSystemLabel -eq "Recovery" -or $_.FileSystemLabel -eq "WINRE" } | ForEach-Object {
         if ($_.DriveLetter) {
             $part = Get-Partition -Volume $_ -ErrorAction SilentlyContinue
@@ -2405,6 +2215,8 @@ try {
                 if (-not $Script:DryRun) {
                     if (-not $Script:tempDriveLetters.Contains($_.DriveLetter)) { $Script:tempDriveLetters.Add($_.DriveLetter) }
                     Invoke-DriveLetterRemoval -Letter $_.DriveLetter | Out-Null
+                } else {
+                    Write-Log "[DRY RUN] Would remove drive letter $($_.DriveLetter): from recovery volume '$($_.FileSystemLabel)'"
                 }
             }
         }
@@ -2453,14 +2265,8 @@ try {
                         exit $EXIT_WARNING
                     }
                 } else {
-                    # OS-fallback: reagentc's BitLocker check is on the
-                    # target volume, which in this branch is the OS
-                    # partition. Defer unless C: is confirmed unencrypted.
-                    # Never modify C:'s BitLocker state. See the full-
-                    # update OS-fallback gate for the fail-closed
-                    # rationale; the pending-reboot branch uses the same
-                    # Test-VolumeEncrypted classifier and the same
-                    # anything-other-than-$false deferral rule.
+                    # OS-fallback: target IS C:. Defer unless confirmed
+                    # FullyDecrypted. Never modify C:'s state.
                     $prEnc = Test-VolumeEncrypted -MountPoint "C:"
                     if ($prEnc -ne $false) {
                         Write-Log "Pending-reboot OS-fallback: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=$prEnc) - deferring without changing C: BitLocker state" -Level WARN
@@ -2527,13 +2333,6 @@ try {
     }
 
     # ---- Enable-failure loop-breaker ----
-    # When the deployment is current but reagentc /enable has failed on
-    # the last 3 or more consecutive runs and WinRE is still Disabled, do
-    # not keep retrying silently. The state file is left in place so the
-    # operator can inspect it. Terminal failures include "failed" (generic
-    # enable failure, including decryption timeouts) and "bitlocker"
-    # (reagentc refused because the target volume was still encrypted
-    # after preparation).
     if ($state.EnableFailureAttempts -ge 3 -and $state.LastEnableResult -in @("failed","bitlocker") -and $WinREState.Status -ne "Enabled") {
         $loopVerb = if ($Script:DryRun) { "Would refuse to retry" } else { "Refusing to retry" }
         $loopStatePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
@@ -2548,12 +2347,6 @@ try {
     # ---- Active-location image discovery ----
     $ActiveLocationImage = $null
     $ActiveLocationHash = $null
-    # Track separately whether the reagentc-registered location actually
-    # contained a WIM. Without this, the fallback search below can
-    # substitute C:\Recovery\WindowsRE\winre.wim as the effective active
-    # image, and the idempotency check would then compare the fallback
-    # hash against the stored hash and conclude the machine is healthy
-    # even when the registered location has no usable image.
     $ActiveLocationWimPresent = $false
 
     if ($WinREState.Location) {
@@ -2561,9 +2354,6 @@ try {
         if ($tempLocation) {
             foreach ($cand in @(Join-Path $tempLocation "Recovery\WindowsRE\winre.wim"; Join-Path $tempLocation "winre.wim")) {
                 if (Test-Path -Path $cand -PathType Leaf -ErrorAction SilentlyContinue) {
-                    # ActiveLocationWimPresent must mean "present AND
-                    # readable". Only set the flag after Get-LiveWimHash
-                    # succeeds; otherwise continue to the next candidate.
                     $candidateHash = Get-LiveWimHash -WimPath $cand
                     if ($candidateHash) {
                         $ActiveLocationImage = $cand
@@ -2629,10 +2419,6 @@ try {
     elseif ($storedDriverVersion -and $storedDriverVersion -ne $ExpectedDriverSetVersion) { $needInject = $true; Write-Log "Driver version changed - rebuilding" }
     elseif (-not $storedHash -or -not $storedDriverVersion) { $needInject = $true; Write-Log "No valid state (missing or stale) - rebuilding" }
 
-    # If no WIM can be found anywhere (neither at the reagentc-registered
-    # location nor as a fallback), there is no source for the deployment
-    # step. Force a full rebuild so step 2 obtains a fresh WIM from
-    # GitHub.
     if (-not $needInject -and -not $ActiveLocationImage -and -not $FallbackImage) {
         Write-Log "No active or fallback WinRE image found - forcing rebuild" -Level WARN
         $needInject = $true
@@ -2661,12 +2447,9 @@ try {
         $isActiveOSPart = ($osPartCheck -and
                            $activePart.DiskNumber -eq $osPartCheck.DiskNumber -and
                            $activePart.PartitionNumber -eq $osPartCheck.PartitionNumber)
-        # activeOnRecovery must additionally require the active partition
-        # to be on the OS disk. Without this, a machine whose reagentc
-        # registration points at a recovery partition on a secondary disk
-        # and whose OS disk also has exactly one recovery partition takes
-        # the idempotent fast path and then lets Remove-StrayRecoveryPartitions
-        # delete the very partition reagentc is registered to.
+        # Require active partition to be on OS disk: otherwise a machine
+        # registered to a secondary-disk recovery partition would take
+        # the fast path and then lose it to Remove-StrayRecoveryPartitions.
         $isActiveOSDisk = ($osPartCheck -and
                            $activePart.DiskNumber -eq $osPartCheck.DiskNumber)
 
@@ -2677,16 +2460,7 @@ try {
         }
     }
 
-    # If WinRE is registered on a recovery partition but no WIM could be
-    # read at that location, force a rebuild so the full-update path
-    # repairs the registered location rather than reporting DEDICATED
-    # based on a fallback image that is not where reagentc is pointing.
     if ($activeOnRecovery -and -not $ActiveLocationWimPresent -and $WinREState.Status -eq "Enabled") {
-        # In DryRun we cannot assign a drive letter, so we cannot
-        # meaningfully Test-Path a \\?\GLOBALROOT path. Do not force a
-        # rebuild on an unverified negative - the live run will do the
-        # real check and force the rebuild only if the WIM really is
-        # missing or unreadable.
         if ($Script:DryRun -and $WinREState.Location -match '^\\\\\?\\GLOBALROOT') {
             Write-Log "[DRY RUN] Cannot verify winre.wim at the reagentc-registered GLOBALROOT location without a drive letter (which DryRun does not assign). A live run would Test-Path the WIM and force a rebuild only if it is missing or unreadable." -Level INFO
         } else {
@@ -2696,19 +2470,21 @@ try {
     }
 
     # ---- Idempotent fast path ----
+    # v44 patch 6: when accepting a stored OS-fallback state on the fast
+    # path, re-verify C: is still confirmed FullyDecrypted. The machine
+    # remains functional either way, but a state that has drifted is
+    # surfaced as EXIT_WARNING so an operator sees it.
     $nothingToDo = $false
     if (-not $needInject -and $WinREState.Status -eq "Enabled") {
         if ($existingRecoveryParts.Count -ne 1) {
-            # Exactly one recovery partition is the ideal end state.
-            # Anything else (zero, or multiple) forces the full-update
-            # path so the layout is consolidated. One exemption: count=0
-            # with UsedOSFallback for this DesiredStateId AND the active
-            # location actually being the OS partition - that is a
-            # previously-committed OS-fallback state and must not be
-            # rebuilt on every run.
             if ($existingRecoveryParts.Count -eq 0 -and $state.UsedOSFallback -eq $true -and $activeOnOSFallback) {
                 Write-Log "No recovery partition and state records OS-fallback for this DesiredStateId - preserving idempotent OS-fallback"
                 $Script:UsedOSFallback = $true
+                $osFbEncCheck = Test-VolumeEncrypted -MountPoint "C:"
+                if ($osFbEncCheck -ne $false) {
+                    Write-Log "OS-fallback fast path: C: is no longer confirmed fully decrypted (Test-VolumeEncrypted=$osFbEncCheck). The existing WinRE registration on C: remains functional, but the machine cannot be repaired by this script while C: is encrypted. Surfacing EXIT_WARNING." -Level WARN
+                    $Script:nonFatalWarning = $true
+                }
                 $nothingToDo = $true
             } else {
                 if ($existingRecoveryParts.Count -gt 1) {
@@ -2722,7 +2498,8 @@ try {
             if (-not $activePart.DriveLetter) {
                 $nothingToDo = $true
             } else {
-                Write-Log "Removing temporary drive letter $($activePart.DriveLetter): (assigned for inspection)"
+                $driveLetterVerb = if ($Script:DryRun) { "Would remove" } else { "Removing" }
+                Write-Log "$driveLetterVerb temporary drive letter $($activePart.DriveLetter): (assigned for inspection)"
                 if (-not $Script:tempDriveLetters.Contains($activePart.DriveLetter)) { $Script:tempDriveLetters.Add($activePart.DriveLetter) }
                 if (-not $Script:DryRun) { Invoke-DriveLetterRemoval -Letter $activePart.DriveLetter | Out-Null }
                 $nothingToDo = $true
@@ -2730,14 +2507,18 @@ try {
         } elseif ($activeOnOSFallback) {
             Write-Log "WinRE is enabled via OS-fallback (location: $($WinREState.Location))"
             $Script:UsedOSFallback = $true
+            $osFbEncCheck = Test-VolumeEncrypted -MountPoint "C:"
+            if ($osFbEncCheck -ne $false) {
+                Write-Log "OS-fallback fast path: C: is no longer confirmed fully decrypted (Test-VolumeEncrypted=$osFbEncCheck). The existing WinRE registration on C: remains functional, but the machine cannot be repaired by this script while C: is encrypted. Surfacing EXIT_WARNING." -Level WARN
+                $Script:nonFatalWarning = $true
+            }
             $nothingToDo = $true
         }
     }
 
-    # Migration guard: a checkpoint at step >= 4 alongside a required
-    # rebuild cannot be trusted. A prior failed-injection run may have
-    # advanced the checkpoint without committing new state; the next run
-    # would skip step 3 and commit the un-injected WIM. Reset to step 2.
+    # Migration guard: a step>=4 checkpoint alongside a required rebuild
+    # cannot be trusted (a prior failed-injection run may have advanced
+    # the checkpoint without committing new state).
     if ($step -ge 4 -and $needInject) {
         Write-Log "Checkpoint step $step cannot be trusted while a rebuild is required - resetting to step 2 to retry injection (v43 patch 4 migration)" -Level WARN
         $step = 2
@@ -2751,8 +2532,6 @@ try {
         }
         Remove-ItemIfExist $CheckpointFile
 
-        # Enforce the "no type-coded recovery partition on any non-OS
-        # disk" invariant on the idempotent fast path.
         if ($osDisk) {
             Remove-StrayRecoveryPartitions -OSDiskNumber $osDisk.Number | Out-Null
         }
@@ -2770,8 +2549,8 @@ try {
     }
 
     # ============ ENABLE-ONLY PATH ============
-    # Image is current, WinRE is disabled, and reagentc is registered on
-    # a recovery partition. Prepare the target and enable.
+    # Image current, WinRE disabled, reagentc registered on a recovery
+    # partition. Prepare the target and enable.
     $needEnableOnly = (-not $needInject -and $WinREState.Status -ne "Enabled" -and $activeOnRecovery)
     if ($needEnableOnly) {
         Write-Log "Enable-only path: image current, WinRE disabled, on recovery partition"
@@ -2787,12 +2566,6 @@ try {
         }
 
         if ($targetPart) {
-            # Prepare the target BEFORE /setreimage. reagentc's BitLocker
-            # check is on the target volume, so the target must be
-            # unencrypted by the time /enable runs. Decrypting in place
-            # is safe: a partition claimed by Device Encryption does not
-            # re-encrypt after manage-bde -off completes (field evidence
-            # 2026-09-29).
             if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $targetPart.DiskNumber -PartitionNumber $targetPart.PartitionNumber)) {
                 Write-Log "Enable-only path: target recovery partition could not be made unencrypted - deferring without further changes" -Level ERROR
                 Write-Log "Re-run after the target volume is decrypted, or after the Device Encryption service has stabilised." -Level WARN
@@ -2841,11 +2614,6 @@ try {
         }
 
         if ($needEnableOnly -and ($enableResult -eq "ok" -or $enableResult -eq "reboot")) {
-            # Enforce the "no type-coded recovery partition on any non-OS
-            # disk" invariant on the enable-only path. This path exits
-            # before Step 7, so without this a stray secondary-disk
-            # recovery partition would survive indefinitely on a machine
-            # whose WinRE was simply re-enabled.
             if ($osDisk) {
                 Remove-StrayRecoveryPartitions -OSDiskNumber $osDisk.Number | Out-Null
             } else {
@@ -2871,7 +2639,10 @@ try {
                 exit $EXIT_REBOOT_REQUIRED
             }
             if ($Script:nonFatalWarning) {
-                Write-Log "Enable succeeded with warnings"
+                $enableWarningReason = if ($Script:offlineFallback) { "offline fallback was engaged" }
+                                       elseif ($Script:UsedOSFallback) { "OS-fallback deployment" }
+                                       else { "one or more non-fatal warnings were logged above" }
+                Write-Log "Enable succeeded; exiting EXIT_WARNING because $enableWarningReason"
                 Remove-ItemIfExist $CheckpointFile
                 exit $EXIT_WARNING
             }
@@ -2898,11 +2669,6 @@ try {
             exit $EXIT_WARNING
         }
         if ($needEnableOnly -and $enableResult -eq "bitlocker") {
-            # The target was prepared before /setreimage; if reagentc
-            # still refuses with the BitLocker error, the Device
-            # Encryption service re-claimed the volume or reagentc is
-            # checking something else. Record the failure and defer; the
-            # loop-breaker handles repetition.
             $newEnableAttempts = [int]$state.EnableFailureAttempts + 1
             Write-Log "Enable-only /enable refused with the BitLocker error after the target partition was confirmed unencrypted (attempt $newEnableAttempts of 3). The Device Encryption service may have re-claimed the volume. Not falling through to full update." -Level WARN
             Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
@@ -2918,18 +2684,16 @@ try {
         }
     }
 
+    # ============ OFFLINE GUARD ============
+    if ($Script:offlineFallback) {
+        Write-Log "Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable. Cannot proceed without a live manifest. Will retry on the next scheduled run when the network is available." -Level WARN
+        Remove-ItemIfExist $CheckpointFile
+        exit $EXIT_WARNING
+    }
+
     # ============ FULL UPDATE PATH ============
     Write-Log "Starting full update"
 
-    # In DryRun the full-update pipeline (copy/download base WIM, mount,
-    # inject drivers, dismount, dism /Export-Image) performs file I/O in
-    # WorkDir and invokes dism and 7-Zip. None of that should run under
-    # -DryRun. Log the plan from the information already gathered and
-    # exit. The downstream plan-only functions
-    # (Find-SuitableRecoveryPartition, Ensure-AdequateRecoveryPartition,
-    # Invoke-ReagentcEnable, Remove-StrayRecoveryPartitions) have their
-    # own DryRun guards, but are not reached from here - that keeps the
-    # DryRun guarantee for the full-update path single and structural.
     if ($Script:DryRun) {
         Write-Log "[DRY RUN] Full update plan (checkpoint step $step):"
 
@@ -2985,17 +2749,36 @@ try {
                 if (-not (Ensure-7Zip)) { Write-Log "7-Zip required" -Level FATAL; exit $EXIT_FATAL }
                 $folder = if ($Hardware.IsWin10) { "Win10" } else { "Win11" }
                 $apiUrl = "$BaseWinRERepoApi/$folder"
-                $files = Invoke-RestMethod -Uri $apiUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
+                $files = Invoke-RestMethod -Uri $apiUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
                 $parts = $files | Where-Object { $_.name -match '^[Ww]inre\.7z\.\d+$' } | Sort-Object name
                 foreach ($part in $parts) {
-                    Invoke-WebRequest -Uri $part.download_url -OutFile (Join-Path $WorkDir $part.name) -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
+                    Invoke-WebRequest -Uri $part.download_url -OutFile (Join-Path $WorkDir $part.name) -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
+                }
+                # v44 patch 6: remove any stale winre.wim from an
+                # interrupted previous extraction, verify extraction
+                # produced it, then remove any stale destination
+                # base.wim before the rename. Closes the step-2 wedge
+                # where an abrupt interruption left base.wim in place
+                # and blocked the rename on the next run.
+                $extractedWim = Join-Path $WorkDir "winre.wim"
+                if (Test-Path -LiteralPath $extractedWim) {
+                    Write-Log "Removing stale extracted WIM before extraction: $extractedWim" -Level WARN
+                    Remove-Item -LiteralPath $extractedWim -Force -ErrorAction SilentlyContinue
                 }
                 & $7Zip x (Join-Path $WorkDir $parts[0].name) -o"$WorkDir" -y | Out-Null
-                Rename-Item "$WorkDir\winre.wim" "base.wim"
+                if (-not (Test-Path -LiteralPath $extractedWim -PathType Leaf)) {
+                    throw "GitHub base WIM extraction did not produce winre.wim"
+                }
+                $staleBase = Join-Path $WorkDir "base.wim"
+                if (Test-Path -LiteralPath $staleBase) {
+                    Write-Log "Removing stale base.wim before rename: $staleBase" -Level WARN
+                    Remove-Item -LiteralPath $staleBase -Force -ErrorAction SilentlyContinue
+                }
+                Rename-Item -LiteralPath $extractedWim -NewName "base.wim" -ErrorAction Stop
                 Write-Log "Downloaded base WIM from GitHub"
             } else {
                 $src = if ($ActiveLocationImage) { $ActiveLocationImage } else { $FallbackImage }
-                Copy-Item $src "$WorkDir\base.wim"
+                Copy-Item $src "$WorkDir\base.wim" -Force
                 Write-Log "Copied base WIM from $src"
             }
         }
@@ -3033,11 +2816,10 @@ try {
 
         $extractDir = "$WorkDir\oem_extract"
 
-        # Capture pre-injection third-party driver count.
-        # Add-WindowsDriver's return-shape filter
-        # ($_.Operation -in @("Add","Installed")) does not match on
-        # Windows 11 build 26100, so we compute success by comparing
-        # image inventories before and after injection.
+        # Add-WindowsDriver's return-shape filter ($_.Operation -in
+        # @("Add","Installed")) does not match on Windows 11 build 26100.
+        # Judge success by image third-party driver count delta plus
+        # INF-basename cross-reference.
         $preInjectThirdParty = 0
         try {
             $preInjectThirdParty = @(
@@ -3078,12 +2860,6 @@ try {
                 } else {
                     Write-Log "Injecting OEM drivers from $extractDir"
 
-                    # Cross-reference the extracted package's INF basenames
-                    # against the mounted image's third-party driver
-                    # OriginalFileName values after injection. Provider
-                    # count alone cannot distinguish "our package's
-                    # drivers are present" from "unrelated third-party
-                    # drivers happen to already be present".
                     $extractedInfNames = @()
                     try {
                         $extractedInfNames = @(
@@ -3120,9 +2896,8 @@ try {
                     $delta = $postInjectThirdParty - $preInjectThirdParty
                     Write-Log "Post-injection third-party driver count: $postInjectThirdParty (delta $delta); package INF matches: $matchedInfCount of $($extractedInfNames.Count)"
 
-                    # Success gate. Fail only when the package's INFs are
-                    # absent from the image AND no third-party drivers
-                    # were added this run.
+                    # Success gate: fail only when the package's INFs are
+                    # absent AND no third-party drivers were added this run.
                     if ($delta -eq 0 -and $matchedInfCount -eq 0) {
                         Write-Log "OEM injection failed - package INFs not found in image after injection" -Level WARN
                         if ($dismErrors.Count -gt 0) {
@@ -3149,7 +2924,7 @@ try {
             foreach ($drv in $requiredDrivers) {
                 Write-Log "Downloading VMD driver: $($drv.name)"
                 $drvArchive = "$WorkDir\driver_$($drv.name).7z"
-                Invoke-WebRequest -Uri $drv.driverUrl -OutFile $drvArchive -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
+                Invoke-WebRequest -Uri $drv.driverUrl -OutFile $drvArchive -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
                 $drvExtractDir = "$WorkDir\drv_extract_$($drv.name)"
                 & $7Zip x $drvArchive -o"$drvExtractDir" -y | Out-Null
                 try {
@@ -3199,9 +2974,6 @@ try {
             $vmdDelta = $postVmdThirdParty - $preVmdThirdParty
             Write-Log "VMD post-injection third-party driver count: $postVmdThirdParty (delta $vmdDelta); package INF matches: $vmdMatchedInfCount of $($extractedVmdInfNames.Count)"
 
-            # Success when the VMD package contributed either new drivers
-            # (delta > 0) or package INFs are already present (matched >
-            # 0). Failure only when neither.
             if ($vmdDelta -gt 0) {
                 Write-Log "VMD drivers injected: $vmdDelta new third-party driver(s) added to image"
             } elseif ($vmdMatchedInfCount -gt 0) {
@@ -3218,25 +2990,12 @@ try {
             $allDirs | ForEach-Object { Remove-ItemIfExist $_ -Recurse }
         }
 
-        # Run component cleanup and ResetBase on the mounted image before
-        # dismount. ResetBase removes superseded components from the WinSxS
-        # store inside the image. The size reduction does NOT materialise in
-        # the .wim file on disk until the image is re-exported — the export
-        # in Step 4 is what writes a smaller file. Without the export,
-        # ResetBase is wasted CPU.
-        #
-        # ResetBase makes the image unserviceable for rollback purposes: any
-        # update that was present when the command ran can no longer be
-        # uninstalled. This is acceptable for a recovery image, which is
-        # rebuilt from source whenever the DesiredStateId changes and is
-        # never rolled back in place.
-        #
-        # Only run when injection succeeded. If injection failed, the
-        # pipeline aborts before Step 4 anyway, so a successful ResetBase
-        # on a partially-injected image would waste minutes of CPU for no
-        # benefit. ResetBase failure is non-fatal: the WIM exports at
-        # whatever size it currently is, and the Step 5 partition
-        # acceptance check decides whether the result fits.
+        # ResetBase removes superseded components from the WinSxS store.
+        # The size reduction only materialises on disk in Step 4's export.
+        # Failure is non-fatal: the export writes whatever size the image
+        # currently is. ResetBase makes the image unserviceable for
+        # rollback, which is acceptable for a recovery image that is
+        # rebuilt from source whenever the DesiredStateId changes.
         if ($Script:ImageInjectionComplete) {
             Write-Log "Step 3: Running component cleanup and ResetBase on mounted image"
             & dism /image:"$MountDir" /cleanup-image /StartComponentCleanup /ResetBase | Out-Null
@@ -3248,11 +3007,6 @@ try {
         }
 
         Dismount-WindowsImage -Path $MountDir -Save; Remove-ItemIfExist $MountDir
-        # Do not advance the checkpoint past step 2 when image injection
-        # did not complete. If the checkpoint advances but the run is
-        # interrupted before cleanup, the next run resumes past step 3
-        # with a fresh $Script:ImageInjectionComplete = $true and can
-        # commit state for the un-injected WIM.
         if ($Script:ImageInjectionComplete) {
             Set-Checkpoint -CheckpointFile $CheckpointFile -Step 3 -DesiredStateId $DesiredStateId
         } else {
@@ -3260,23 +3014,14 @@ try {
         }
     }
 
-    # If image injection did not complete, stop here. Continuing to Step 4
-    # would export a WIM with no OEM or VMD drivers, and Step 5 would
-    # deploy it. On a VMD-based system the resulting recovery environment
-    # cannot see the OS disk at all. The state-write gate alone is not
-    # sufficient: it prevents the state file from recording the run, not
-    # the deployment of the broken WIM.
-    #
-    # Nothing has been deployed, no partition has been touched, and WinRE
-    # has not been disabled at this point. The recovery partition and the
-    # WinRE registration are unchanged. The checkpoint is set back to 2
-    # so the next run re-acquires the base WIM from source and re-runs
-    # injection against a clean WIM, rather than mounting a base.wim that
-    # was partially modified by this run's failed injection attempt.
+    # The pipeline gate: no Step 4, no partition work, no deployment, no
+    # reagentc when injection failed. A WIM with no OEM/VMD drivers is
+    # broken on hardware whose storage controller requires those drivers.
     if (-not $Script:ImageInjectionComplete) {
         Write-Log "Image injection did not complete. Stopping before Step 4 and before any deployment. The recovery partition and WinRE registration are unchanged. Next run will retry from step 2." -Level WARN
         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
         Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+        Remove-ItemIfExist "$WorkDir\base.wim"
         $Script:nonFatalWarning = $true
         exit $EXIT_WARNING
     }
@@ -3285,10 +3030,6 @@ try {
     if ($step -le 4 -and $needInject) {
         Write-Log "Step 4: Optimizing"
         & dism /Export-Image /SourceImageFile:"$WorkDir\base.wim" /SourceIndex:1 /DestinationImageFile:$OptimizedWim /Compress:max | Out-Null
-        # A native executable returning nonzero does not raise a
-        # PowerShell exception under $ErrorActionPreference = "Stop".
-        # Check the exit code and the output file explicitly before
-        # checkpointing step 4.
         if ($LASTEXITCODE -ne 0) {
             Write-Log "dism /Export-Image failed with exit code $LASTEXITCODE" -Level FATAL
             exit $EXIT_FATAL
@@ -3347,38 +3088,22 @@ try {
         exit $EXIT_SUCCESS
     }
 
-    # Prepare the target / gate the OS-fallback before any state
-    # modification. In the dedicated case, ensure the target recovery
-    # partition is unencrypted before we write the WIM to it (and before
-    # reagentc /enable later). In the OS-fallback case, reagentc's
-    # BitLocker check is on the target volume, which is C:. reagentc will
-    # refuse to enable WinRE on an encrypted OS volume. Defer rather than
-    # attempt a call that will be refused. Never modify C:'s BitLocker
-    # state - decrypting the OS volume is hours of I/O, changes the
-    # recovery key relationship, and the OS volume is the user's data.
+    # Dedicated: prepare the target recovery partition (reagentc's
+    # BitLocker check is on the target). OS-fallback: gate on C: being
+    # confirmed FullyDecrypted, because there the target IS the OS
+    # volume. Never modify C:'s BitLocker state.
     if ($recoveryPartition) {
         if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $recoveryPartition.DiskNumber -PartitionNumber $recoveryPartition.PartitionNumber)) {
             Write-Log "FATAL: Could not make target recovery partition unencrypted" -Level ERROR
             exit $EXIT_FATAL
         }
     } else {
-        # OS-fallback: reagentc's BitLocker check is on the target volume,
-        # which in this branch is the OS partition. reagentc refuses to
-        # enable WinRE on an encrypted OS volume. Defer unless C: is
-        # confirmed unencrypted. Never modify C:'s BitLocker state.
-        #
-        # Test-VolumeEncrypted returns $false only for a confirmed fully
-        # decrypted volume; $true for encrypted or partially encrypted;
-        # $null for unknown. Anything other than $false defers. This
-        # closes a fail-open path: the previous code passed the gate
-        # silently when Get-BitLockerVolume returned $null, because the
-        # $osFallbackVs -and condition short-circuited on the empty
-        # string. Test-VolumeEncrypted also brings the manage-bde text-
-        # parsing fallback, so a machine whose BitLocker module is
-        # unavailable is still classified correctly.
+        # v44 patch 6: corrected OS-fallback remediation wording.
+        # Actions that complete encryption, add a protector, or enable
+        # protection do NOT satisfy the FullyDecrypted requirement.
         $osFallbackEnc = Test-VolumeEncrypted -MountPoint "C:"
         if ($osFallbackEnc -ne $false) {
-            Write-Log "OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=$osFallbackEnc). reagentc will refuse to enable WinRE on an encrypted OS volume. To resolve: sign in with a Microsoft account to complete Device Encryption activation, or add a key protector manually (Add-BitLockerKeyProtector -MountPoint C: -RecoveryPasswordProtector) and enable protection, or wait for decryption to finish. The script will not modify C:'s BitLocker state." -Level WARN
+            Write-Log "OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=$osFallbackEnc). reagentc refuses to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state." -Level WARN
             $Script:nonFatalWarning = $true
             Remove-ItemIfExist $CheckpointFile
             exit $EXIT_WARNING
@@ -3391,9 +3116,6 @@ try {
         $disOut = cmd /c "reagentc /disable 2>&1"
         $disExit = $LASTEXITCODE
         Write-Log "reagentc /disable: exit=$disExit, output=$disOut"
-        # Treat a failed /disable as a hard stop. Deploying a new WIM
-        # while the old registration is still active is not a state we
-        # want to be in.
         if ($disExit -ne 0) {
             Write-Log "reagentc /disable failed (exit $disExit): $disOut" -Level ERROR
             Write-Log "FATAL: cannot deploy a new WinRE image while WinRE is still Enabled - aborting" -Level ERROR
@@ -3469,12 +3191,6 @@ try {
     } elseif ($enableResult -eq "failed") {
         $Script:nonFatalWarning = $true
     } elseif ($enableResult -eq "bitlocker") {
-        # The target was prepared before deployment; if reagentc still
-        # refuses with the BitLocker error, the Device Encryption service
-        # may have re-claimed the volume, or reagentc's check is against
-        # a different state than the two-field view exposes. Record the
-        # failure and continue - the state write below increments the
-        # counter, and the loop-breaker handles repetition.
         Write-Log "reagentc /enable refused with the BitLocker error after the target partition was confirmed unencrypted. Recording the failure so the loop-breaker can fire if this repeats." -Level ERROR
         $Script:nonFatalWarning = $true
     }
@@ -3536,10 +3252,7 @@ try {
     if ($Script:ImageInjectionComplete -and $finalHash) {
         $deployedDisk = if ($recoveryPartition) { $recoveryPartition.DiskNumber } else { -1 }
         $deployedPart = if ($recoveryPartition) { $recoveryPartition.PartitionNumber } else { -1 }
-        # Increment the enable-failure counter on terminal failures only.
-        # "failed" covers generic reagentc failures and decryption
-        # timeouts; "bitlocker" covers a BitLocker refusal after the
-        # target was prepared. Both feed the loop-breaker.
+        # Counter increments on terminal enable failures only.
         $newEnableAttempts = if ($enableResult -in @("failed","bitlocker")) { [int]$state.EnableFailureAttempts + 1 } else { 0 }
         Write-WinREState -Hash $finalHash -DriverVersion $ExpectedDriverSetVersion -DesiredStateId $DesiredStateId `
                          -PendingReboot $Script:rebootRequired `
@@ -3558,10 +3271,6 @@ try {
         }
         $Script:nonFatalWarning = $true
     }
-    # Same gate as steps 3 and 4. The step 6 checkpoint is written
-    # immediately before cleanup removes it; the window between the two
-    # operations is not atomic and spans the recursive WorkDir delete, so
-    # an interruption in that window leaves a step-6 checkpoint on disk.
     if ($Script:ImageInjectionComplete) {
         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 6 -DesiredStateId $DesiredStateId
     } else {
@@ -3571,12 +3280,7 @@ try {
     Write-Log "Step 6: Cleanup"
     Remove-ItemIfExist $WorkDir -Recurse; Remove-ItemIfExist $CheckpointFile
 
-    # Step 7: remove every type-coded recovery partition that is not on
-    # the OS disk. Windows Setup and Startup Repair scan all attached
-    # volumes for WinRE-capable partitions; a stray can point the BCD at
-    # the wrong image during repair. The invariant is: exactly one
-    # recovery partition exists on the machine, on the OS disk, correctly
-    # type-coded.
+    # Step 7: enforce "no type-coded recovery partition on any non-OS disk".
     Write-Log "Step 7: Removing stray recovery partitions on non-OS disks"
     $osDisk = Get-OSDisk
     if (-not $osDisk) {
@@ -3648,10 +3352,6 @@ try {
         Write-Log "WinRE reports $($finalState.Status) but enable succeeded - reboot will complete setup. Registered location: $winreLocation" -Level WARN
     }
     else {
-        # Last-ditch retry. Skip if the main flow already recorded a
-        # terminal failure that a retry cannot resolve ("bitlocker" means
-        # the target was encrypted after preparation; the state file
-        # records the failure for the loop-breaker).
         if ($enableResult -eq "bitlocker") {
             Write-Log "WinRE is not enabled at exit. Last enable attempt returned: bitlocker. The state file records the failure for the loop-breaker." -Level WARN
             exit $EXIT_WARNING
@@ -3703,9 +3403,24 @@ finally {
             if (-not $part) { continue }
             if ($part.IsBoot -or $part.IsSystem) { continue }
             if (Test-Path "${letter}:\Windows") { continue }
-            if (Invoke-DriveLetterRemoval -Letter $letter) { Write-Log "Removed temp drive letter ${letter}:" }
-            else { Write-Log "FAILED to remove drive letter ${letter}:" -Level ERROR; $leaks += $letter }
+            $removedOk = Invoke-DriveLetterRemoval -Letter $letter
+            if ($removedOk) {
+                if ($Script:DryRun) { Write-Log "[DRY RUN] Would remove temp drive letter ${letter}:" }
+                else { Write-Log "Removed temp drive letter ${letter}:" }
+            } else {
+                Write-Log "FAILED to remove drive letter ${letter}:" -Level ERROR; $leaks += $letter
+            }
         } catch { $leaks += $letter }
     }
     if ($leaks.Count -gt 0) { Write-Log "Drive letters still assigned: $($leaks -join ', ')" -Level ERROR }
+
+    # Lock released last, after every cleanup step.
+    if ($Script:ProgramLockStream) {
+        try {
+            $Script:ProgramLockStream.Dispose()
+            Write-Log "Released program lock"
+        } catch {
+            Write-Log "Could not release program lock: $_" -Level WARN
+        }
+    }
 }

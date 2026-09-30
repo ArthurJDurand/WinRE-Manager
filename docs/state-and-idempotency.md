@@ -22,10 +22,10 @@ The seven fields are joined with `;;`, encoded as UTF-8, and hashed. The result 
 
 - **`HW`** — vendor, model, and (for Lenovo) machine type. A Lenovo ThinkPad 21L1 and a Lenovo 21L2 have different IDs. Two machines of the same model have the same ID.
 - **`OS`** — the Windows build number. A machine that upgrades from 26100 to 26200 gets a new ID and rebuilds.
-- **`CPU`** — CPU vendor (`Intel` or `AMD`) and Intel generation. The generation is the value returned by `Get-IntelProcessorGeneration`, or the literal string `N` when the generation cannot be parsed (AMD CPUs, Intel Celeron / Pentium / Atom / Xeon, and N/J-series CPUs). The `N` is deterministic and stable: it does not flip between runs on the same hardware.
-- **`VMD`** — `present` or `absent`. Computed from the union of the `requiredDevices` field across all manifest entries, matched against the machine's present PnP devices. VMD presence is a deployment input because it determines whether the VMD driver package is selected for injection.
+- **`CPU`** — CPU vendor (`Intel` or `AMD`) and Intel generation. The generation is the value returned by `Get-IntelProcessorGeneration`, or the literal string `N` when the generation cannot be parsed (AMD CPUs, Intel Celeron / Pentium / Atom / Xeon, and N/J-series CPUs). The `N` is deterministic and stable: it does not flip between runs on the same hardware. **The vendor label is not a general vendor classifier.** Non-Intel processors are labelled `AMD` — the label is a bucket for "not Intel", not an assertion about the actual silicon vendor. A future non-Intel, non-AMD CPU (ARM, Qualcomm, RISC-V, etc.) would also be labelled `AMD` unless `Get-HardwareObject` is changed. The purpose of the field is to determine whether the manifest's Intel-generation-gated VMD driver packages apply, not to record the machine's CPU vendor for its own sake. Do not treat `CPU=AMD` as a claim about the silicon.
+- **`VMD`** — `present` or `absent`. Computed from the union of the `requiredDevices` field across all manifest entries, matched against the machine's present PnP devices. VMD presence is a deployment input because it determines whether the VMD driver package is selected for injection. As of v44 patch 6, the VMD presence query is fail-closed: an enumeration error during the query produces an indeterminate result rather than `absent`, and the run defers with `EXIT_WARNING` before committing any state. A deferral does not write a state file, so the `VMD` field is never populated on the basis of a guess.
 - **`MANIFEST`** — the version field of the driver manifest JSON. The manifest author bumps it when driver URLs change.
-- **`OEMPACK`** — the resolved OEM pack version for this machine's vendor. For Dell it is the `dellVersion`; for HP the SoftPaq `version`; for Lenovo the `dsId`. If the vendor is unsupported or the map failed to resolve, this is `NONE`.
+- **`OEMPACK`** — the resolved OEM pack version for this machine's vendor. For Dell it is the `dellVersion`; for HP the SoftPaq `version`; for Lenovo the `dsId`. If the vendor is unsupported or the map failed to resolve, this is `NONE`. As of v44 patch 6, the Lenovo resolution distinguishes five states. Only `unknown-mt` (machine type could not be determined) and `no-entry` (map loaded, no entry for this machine type) produce `OEMPACK=NONE` and let the run proceed to completion. `map-unavailable` and `malformed-entry` mark the run as incomplete and the state file is not written; the next run retries.
 - **`SCRIPT`** — the production script's `ScriptVersion` constant.
 
 ### Why CPU and VMD were added in v44
@@ -33,6 +33,8 @@ The seven fields are joined with `;;`, encoded as UTF-8, and hashed. The result 
 The v43 `DesiredStateId` was a hardware fingerprint for the base WIM and the OEM pack, but it did not capture the inputs that determine **VMD driver selection**. A machine whose VMD presence flipped from `absent` to `present` — because of a BIOS or firmware update that changed the default, or a deliberate configuration change applied post-deployment — would take the fast path with a driver set that no longer matched its hardware. On a VMD-based system the resulting WinRE cannot see the OS disk at all, and Startup Repair fails. The same class of problem applies to a CPU or motherboard swap on the same chassis with the same `Manufacturer` / `Model` / `MachineType` string.
 
 Adding these two inputs to the ID makes it a **deployment-input fingerprint** rather than a hardware fingerprint. The principle is: the ID should change whenever the inputs that determine the desired WinRE artifact change. It should not change merely because unrelated machine state changes.
+
+The `CPU` field's job within this scheme is narrow: it distinguishes Intel CPUs whose generation selects a VMD driver package from every other CPU, for which the same generation-gated selection is skipped. The `AMD` label is a marker for "not an Intel generation to match against", not a general-purpose vendor classification. See the `CPU` bullet under "What each field means" for the full scope note.
 
 The v44 patch 1 revision deliberately does **not** go further than this. It does not hash the actual resolved driver list (which would be cleaner in principle — the ID would change exactly when the artifact would change, not when hardware that happens to correlate with the artifact changes) because the manifest `version` field already plays that role when the manifest author maintains it correctly. If a future revision needs to hash the resolved driver set, it should do so together with another `ScriptVersion` bump.
 
@@ -51,13 +53,13 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 ### When it does not change
 
 - Any cosmetic or logging fix shipped without bumping `ScriptVersion`.
-- Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, and the further revisions to patch 5 (including further revision 5), all ship under v43, so the ID is unchanged and healthy machines do not rebuild.
+- Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, the further revisions to patch 5 (including further revision 5), and v44 patches 2, 3, 4, 5, and 6 all ship under their respective `ScriptVersion`s without changing the DSI inputs, so the ID is unchanged and healthy machines do not rebuild.
 - A new WIM hash at the registered location. That is a separate check (see below), not part of the ID.
 - A Windows Update that changes the WIM inside the recovery partition without changing the OS build.
 - A change to the BitLocker policy or the target-preparation logic. The state file does not record BitLocker state; it records the deployment's identity and outcome.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, and the harness's move to v14 and v15 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
+`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, and the harness's moves to v14, v15, v16, v17, and v18 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
 
 The v44 patch 1 revision is the deliberate exception. It changes the DSI inputs and therefore bumps `ScriptVersion` to 44. Every managed machine performs one full-update pass on the next run and returns to the fast path. See the migration note in `CHANGELOG.md`.
 
@@ -100,13 +102,35 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 `LastEnableResult` and `EnableFailureAttempts` are read with defaults of `"ok"` and `0`. A state file written by an earlier version of the script that does not contain those fields is accepted without triggering a rebuild; the fast path treats it as a healthy machine on the counters dimension.
 
+### Offline fallback trust (v44 patch 5)
+
+When the manifest fetch fails after its retry budget (typically a DNS failure, a proxy block, or a total network outage), the script engages the offline fallback. Its read of the state file differs from the online case in one important way: **it trusts the state file's stored `DesiredStateId` directly, without recomputing it from cached inputs.**
+
+Recomputing the DSI offline would require the OEM pack version, which is resolved from the OEM map — a different gist, on the same unavailable network. The first implementation of the offline fallback attempted this and was wrong: on a fully offline machine, the OEM map fetch also fails, so the recomputed DSI contained `OEMPACK=NONE` versus the state file's `OEMPACK=A10`, and the fast path did not fire. The corrected implementation treats the state file's stored `DesiredStateId` as ground truth.
+
+The local safety checks are still fully enforced and do not depend on the manifest:
+
+- WinRE is `Enabled`
+- Exactly one recovery partition exists on the OS disk
+- The deployed WIM hash matches the state file's stored `CurrentImageHash`
+
+If all three pass, the fast path fires and the run exits `EXIT_WARNING` (code 2) because `$Script:offlineFallback = $true` is set. The state file may be rewritten by the fast path to clear stale counters, exactly as it would online; that rewrite preserves the stored `DesiredStateId`. If any of the three checks does not pass, the run exits `EXIT_WARNING` before the full-update pipeline, having done nothing. If the state file does not exist at all, the run throws and exits `EXIT_FATAL` — a first deployment requires the live manifest to compute the initial `DesiredStateId`.
+
+**The residual risk.** A machine whose local hardware changed while offline — a CPU swap, a BIOS update that flipped VMD, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — could take the fast path with a stale `DesiredStateId`. The next successful manifest fetch detects the drift and forces a rebuild. A `LocalInputsId` field in the state file would close this; it is planned as its own version boundary and is referenced in [architecture.md](architecture.md) and [CHANGELOG.md](../CHANGELOG.md).
+
+### VMD-query-indeterminate deferral does not write state (v44 patch 6)
+
+The VMD hardware presence check runs before the fast-path decision in the online path, and before any state-write point. When the check is indeterminate — a PnP enumeration error during the query — the run defers with `EXIT_WARNING` **before** any state is committed. No state file is written, no state file is deleted, and the existing state file's `LastUpdated` timestamp is not advanced.
+
+The consequence is that a machine with a valid state file that takes the VMD-query-indeterminate deferral leaves that state file exactly as it was. The next run with a healthy PnP enumeration either accepts the state file (if its `DesiredStateId` matches) or treats it as stale (if the DSI inputs have changed while the machine was deferring). The deferral does not consume the enable-failure counter, does not advance `PendingReboot`, and does not affect `UsedOSFallback`.
+
 ### Write semantics
 
 `Write-WinREState` is called from:
 
 - The fast path when `PendingReboot`, `RepairAttempts`, `EnableFailureAttempts`, or a non-`"ok"` `LastEnableResult` was carried in from a previous run and needs clearing.
 - The enable-only path, to record the registration result. On a terminal outcome — `"failed"` from a generic enable failure, `"failed"` from a target-preparation failure, or `"bitlocker"` — the counter is incremented and the state file is written with the corresponding `LastEnableResult`. On `"reboot"` the state file is written with `PendingReboot = $true` and the counter reset to 0. On `"ok"` the enable-only path exits `EXIT_SUCCESS` (or `EXIT_WARNING` if a non-fatal warning flag was set) **without writing the state file**; the counter is not reset by the enable-only path on this outcome. The next run's fast path clears a stale non-zero counter, so the counter is reset one run later.
-- The pending-reboot path, to update the `PendingReboot` and `RepairAttempts` flags. A successful pending-reboot repair resets the enable-failure counter to 0; a reboot-required outcome keeps `RepairAttempts` and resets the enable-failure counter.
+- The pending-reboot path, to update the `PendingReboot` and `RepairAttempts` flags. A successful pending-reboot repair resets the enable-failure counter to 0; a reboot-required outcome keeps `RepairAttempts` and resets the enable-failure counter. **A target-preparation failure on the pending-reboot path does not increment `EnableFailureAttempts`** — the exclusion is deliberate, because immediately after a reboot the target partition's encryption state may be transiently indeterminate, and a preparation failure that would resolve on its own within one poll cycle must not be counted against the enable-failure threshold. The pending-reboot path is tracked exclusively by `RepairAttempts`.
 - The full-update path, after Step 6 succeeds. If the run's `$enableResult` is `"failed"` or `"bitlocker"`, the counter is incremented; on any other outcome it resets to 0. The loop-breaker checks the incremented value on the next run.
 
 The enable-failure counter is incremented on both terminal outcomes. The distinction between `"failed"` and `"bitlocker"` is preserved in the state file so the operator can see *why* the enable step is failing, but the counter treats them the same way — a machine that keeps failing on the BitLocker error is in the same kind of loop as a machine failing generically, and both need the same manual intervention.
@@ -131,6 +155,8 @@ If all five conditions hold, the machine is in the correct end state. The fast p
 
 If any condition fails, the script forces a full rebuild. The conditions above are also the fast-path `elseif` branches — the log records which one failed.
 
+Under the offline fallback (v44 patch 5), the same five conditions apply, but the `DesiredStateId` used for the comparison is the one read directly from the state file, and the run exits `EXIT_WARNING` even if all five conditions hold. See "Offline fallback trust" above.
+
 ### The loop-breaker
 
 The enable-failure counter is checked near the top of the main flow, after the pending-reboot block and before the classifier runs:
@@ -145,7 +171,7 @@ This fires when `reagentc /enable` has failed terminally on 3 or more consecutiv
 
 The state file is left in place when the loop-breaker fires. The log message names the state file path and instructs the operator to delete it to reset the counter, once the underlying cause has been resolved.
 
-Under `-DryRun` the loop-breaker logs `Would refuse to retry …` and continues rather than exiting, matching the pattern used by the Audit Mode guard.
+Under `-DryRun` the loop-breaker logs `Would refuse to retry …` and continues, matching the pattern used by the Audit Mode guard.
 
 ## The checkpoint file
 
@@ -222,6 +248,10 @@ The checkpoint file is deleted:
 
 If a run is interrupted between `Set-Checkpoint -Step 6` and `Remove-ItemIfExist $CheckpointFile`, the checkpoint file persists. The migration guard handles this on the next run.
 
+### VMD-query-indeterminate deferral removes the checkpoint (v44 patch 6)
+
+When the VMD hardware presence check is indeterminate, the run removes the checkpoint file before exiting `EXIT_WARNING`. This is deliberate: the deferral is a stop before any work is committed, and a stale checkpoint from an interrupted previous run would otherwise cause the next run to resume from a step that no longer reflects reality. Removing the checkpoint forces the next run to start from step 0, re-evaluate the VMD presence check, and proceed cleanly if the enumeration is now healthy.
+
 ## Crash consistency
 
 The two files have independent lifecycles, and their interaction is what the guards above are protecting.
@@ -238,17 +268,38 @@ The two files have independent lifecycles, and their interaction is what the gua
 
 The two files are written atomically (`Write-FileAtomically` uses a temp file + `Move-Item` with retries), so neither can be partially written even on power loss.
 
-## Why not file locks or a database?
+## Why not a database?
 
-Two constraints made a simpler design the right one:
+The state file could in principle be a SQLite database, a binary blob, a Windows registry key, or a full configuration management system. The design uses a small JSON file on disk, written atomically, for four reasons:
 
-1. **The script runs as SYSTEM from a scheduled task that uses `IgnoreNew` for overlapping instances.** Two runs cannot overlap by construction; a file lock would be redundant.
-2. **The state file is small, JSON, and human-readable on purpose.** When a field engineer opens `C:\Recovery\OEM\winre_state.json`, they should see something they understand. A SQLite database or a binary blob would not serve that requirement.
+1. **Atomic writes are easy to get right with a temp file and a rename.** `Write-FileAtomically` writes to a temp file and calls `Move-Item`. On NTFS, `Move-Item` over an existing target is atomic. A database would bring its own atomicity guarantees, but also its own machinery: a database engine to load, a schema migration path, and a file-format compatibility contract to maintain. The current design's atomicity is one helper function.
+
+2. **The state is small.** It is a few hundred bytes on disk. A database is overkill for this size of data, and the schema has not grown significantly since the v43 generation.
+
+3. **The state file is human-readable on purpose.** When a field engineer opens `C:\Recovery\OEM\winre_state.json`, they should see something they understand: a `DesiredStateId`, a WIM hash, an enable result, a failure counter. A SQLite database or a binary blob would not serve that requirement, and a field engineer diagnosing a stuck machine is exactly the scenario the state file is designed to support. The [troubleshooting.md](troubleshooting.md) playbook depends on it.
+
+4. **The state file is deliberately editable and deletable by the operator.** The loop-breaker recovery procedure tells the operator to delete the state file to reset the enable-failure counter. That is a design choice: the state file is not opaque, and its removal is a legitimate reset operation. A database would add ceremony to that reset without adding safety.
 
 The trade-off is that the script does not defend against an operator manually editing the state file. That is not a scenario the design needs to support; if you edit the state file, you own the consequences.
 
+### What the program lock does not replace
+
+The v44 patch 4 program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock` is sometimes confused with persistence. It is not. The lock and the state file serve different purposes:
+
+- **The program lock** enforces single-instance exclusion. It has no content. It is a `FileShare.None` handle that the Windows kernel refuses to grant twice; the handle is released on process exit and the file is left in place. It carries no information between runs.
+- **The state file** records the deployment's identity and outcome. It persists across runs, it is read at startup, and it is what the fast path validates against.
+
+The lock does not replace the state file, and the state file does not replace the lock. A machine that runs the script twice in a row has the same state file and the same lock file throughout; the lock is acquired, the fast path runs, the lock is released. The lock's only job is to prevent two concurrent instances from racing on `C:\Temp\WinREWork`, on the log directory, and on the partition operations the script performs.
+
+**Deleting the lock file has no effect.** The lock is the open handle, not the file's existence. A second instance that opens the same path with `FileShare.None` will be refused by the kernel regardless of whether the file was present before. The file's presence on disk between runs is inert.
+
+**Deleting the state file is a legitimate reset operation.** The loop-breaker recovery procedure explicitly says to do it. Do not confuse the two.
+
+For the design reasoning behind the file lock (kernel enforcement, DACL avoidance, automatic release on process termination, why a file handle rather than a named mutex), see [architecture.md](architecture.md).
+
 ## Related documents
 
-- [architecture.md](architecture.md) — the pipeline and how the state fits into it.
+- [architecture.md](architecture.md) — the pipeline and how the state fits into it, plus the program lock's design reasoning.
 - [recovery-partition.md](recovery-partition.md) — what the `GeometryRestoreFailed` flag protects against.
 - [exit-codes.md](exit-codes.md) — the exit code each state leads to.
+- [troubleshooting.md](troubleshooting.md) — the operator-facing playbook for each failure mode.

@@ -10,16 +10,18 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v44 patch 1, from the .NOTES block -->
+- **WinRE.ps1 version:** <!-- e.g. v44 patch 3, from the .NOTES block -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
 - **Windows Setup state:** <!-- output of: (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State" -Name ImageState -ErrorAction SilentlyContinue).ImageState -->
   <!-- IMAGE_STATE_COMPLETE, another value, or blank. Another value means the machine is in Audit Mode, OOBE, or a sysprep phase. -->
-- **BitLocker state on C::** <!-- paste both fields from: manage-bde -status C: -->
+- **BitLocker state on C:** <!-- paste both fields from: manage-bde -status C: -->
   - **Protection Status:** <!-- Protection On / Protection Off -->
   - **Conversion Status:** <!-- Fully Decrypted / Fully Encrypted / Encryption In Progress / Decryption In Progress / Encryption Paused / Decryption Paused -->
   <!-- C:'s state matters only on the OS-fallback route. On the enable-only and dedicated-partition routes, production targets the recovery partition directly and does not depend on C:'s state. -->
+- **If the run exited with code 2 and the log shows `OS-fallback deferred: C: VolumeStatus=…`:** <!-- state whether the destructive sequence's own log lines (the point-of-no-return marker and any per-partition deletion lines) appear in the log before the deferral -->
+  <!-- This discriminates sub-variant A (v44 patch 3 destructive-path guard fired early; machine is intact) from sub-variant B (destructive sequence ran first; machine has lost its recovery partition and needs the docs/troubleshooting.md recovery procedure). Without this the report cannot be triaged. -->
 - **Target recovery partition state:** <!-- run: .\scripts\Test-WinRE.ps1 and choose Option 1. Copy the "Target recovery partition state" block. -->
   <!-- This is the partition reagentc is registered to. It is what production prepares via Set-RecoveryPartitionReadyForWinRE. If the block says "BitLocker-managed", production will run manage-bde -off against it before calling reagentc /enable. -->
 - **VMD hardware present:** <!-- output of the harness Option 1 "VMD hardware presence" block, or "yes/no" from BIOS if the harness cannot be run. VMD presence is one of the DesiredStateId inputs. -->

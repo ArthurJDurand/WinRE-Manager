@@ -246,8 +246,6 @@ Write-T "Resolved: $($dsIdCache.Count) of $total" -L SUCCESS
 # ═══════════════════════════════════════════════════════════════════════
 # machineType -> { model, winpe: { dsId, name, url, sha256, size, osId } }
 # If multiple recipes exist (Win10 + Win11), keep the newest OS version's entry.
-$osRank = @{ "7" = 7; "6" = 6; "5" = 5; "3" = 3; "2" = 2 }
-
 $finalMap = @{}
 foreach ($mt in $machineTypeMap.Keys) {
     $candidates = @()

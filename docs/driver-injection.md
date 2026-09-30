@@ -44,11 +44,17 @@ The manifest is a JSON file hosted on GitHub Gist. `WinRE.ps1` reads it from `$D
 - **`drivers[].match.requiredDevices`** — array of device hardware IDs. If set, the driver is only downloaded if a matching PnP device is present on the machine. If absent or empty, the driver is downloaded regardless of hardware.
 - **`drivers[].driverUrl`** — URL to a `.7z` archive containing one or more driver INFs.
 
-### VMD hardware presence
+### VMD hardware presence (fail-closed as of v44 patch 6)
 
 The script reads all `requiredDevices` values from all manifest entries into a single regex, then matches against `Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match $pattern }`. If at least one device matches, VMD hardware is considered present.
 
 If a manifest entry has `requiredDevices` but the machine has no matching device, that driver is skipped. The log records `Skipping <name>: no matching VMD hardware detected`.
+
+**As of v44 patch 6, the enumeration is fail-closed.** If `Get-PnpDevice` reports an error during the query — for example, the Plug and Play service is in a bad state, an antivirus or EDR product is blocking device enumeration, or a device in an error state is preventing the PnP manager from completing the query — the script treats VMD presence as **indeterminate** rather than as absent. It does not assume the machine has no VMD hardware.
+
+An indeterminate result means the correct driver set cannot be determined. The run logs the enumeration error, sets `$Script:nonFatalWarning = $true`, removes the checkpoint file, and exits `EXIT_WARNING` **before** committing any state. No WIM is deployed, no partition is touched, no `reagentc` call is made.
+
+Why fail-closed and not "assume absent": on a machine that genuinely has VMD hardware, guessing "absent" would select a driver set that omits the VMD package. The deployed WinRE would not be able to see the OS disk. That is the exact failure mode the v44 patch 1 `DesiredStateId` change was designed to prevent, and an empty device list from an errored enumeration is not evidence of absence. The cost of a deferral is one pipeline run; the cost of guessing wrong is a machine with a non-functional recovery environment. See [troubleshooting.md](troubleshooting.md) for the resolution.
 
 ## The OEM pack source
 
@@ -125,6 +131,26 @@ Selection: always `WinPE1011`. HP does not currently publish per-OS versions. Fo
 
 Selection: `$entry = $Script:LenovoWinPEMap.Models.$mt` where `$mt` is the machine type. Format is EXE (Inno Setup). The `sha256` is verified after download.
 
+### Lenovo five-state resolution (v44 patch 6)
+
+Lenovo does not publish WinPE driver packs for every model in their catalog. That is a normal, expected fact about the Lenovo lineup, not a failure of the map or of the script. As of v44 patch 6, the Lenovo resolution distinguishes five states so that the caller can tell a legitimate "no pack available" answer apart from a broken map or a transient network failure.
+
+`Get-LenovoWinPEPack` sets `$Script:LenovoPackResolution` to one of:
+
+| State | Meaning | What the run does |
+|---|---|---|
+| `unknown-mt` | Machine type could not be determined (`MT=UNKN`). | **Normal.** No pack can ever match. Run recorded as complete with `OEMPACK=NONE`. |
+| `no-entry` | Map loaded successfully, but has no entry for this machine type. | **Normal.** Lenovo does not publish a pack for every model. Run recorded as complete with `OEMPACK=NONE`. |
+| `map-unavailable` | The map gist could not be downloaded. Transient. | **Incomplete.** `$Script:ImageInjectionComplete = $false`, `$Script:nonFatalWarning = $true`. Pipeline gate aborts before Step 4. Next run retries. |
+| `malformed-entry` | The map has an entry for this machine type, but it has no `winpe.url`. | **Incomplete.** Configuration failure of the map, not a legitimate "no pack" answer. Same handling as `map-unavailable`. |
+| `resolved` | Pack returned successfully. | Normal injection path. |
+
+Before v44 patch 6, the caller could only distinguish "pack resolved" from "pack did not resolve". A malformed map entry looked identical to a legitimate no-pack case, and the machine would silently complete without OEM driver injection even though the map itself was broken. The five-state resolution closes that gap.
+
+The distinction matters because `unknown-mt` and `no-entry` are **expected, permanent answers** for a substantial fraction of Lenovo hardware. Treating them as failures would force the pipeline gate to fire on every Lenovo machine with no published pack, and those machines would never take the fast path. Treating `malformed-entry` as a legitimate no-pack answer would hide a genuine configuration error in the map. The five states keep the two apart.
+
+The state flows into `DesiredStateId` via the `OEMPACK` field. `unknown-mt` and `no-entry` both produce `OEMPACK=NONE`, so the machine takes the fast path on subsequent runs as long as nothing else has changed. `map-unavailable` and `malformed-entry` do not write a state file at all; the next run recomputes from scratch.
+
 ## Download
 
 All three downloads go through `Invoke-OemPackDownload`, which:
@@ -135,6 +161,8 @@ All three downloads go through `Invoke-OemPackDownload`, which:
 - Accepts a hashless download only if `Invoke-WebRequest` completed cleanly on the same attempt.
 
 The last rule is important. `Invoke-WebRequest` can throw an exception **after** writing the file (connection reset while waiting for a final ACK). Without the rule, a partial file left by a throwing request would be treated as a successful download. The script removes the file and retries.
+
+Every network call in `Invoke-OemPackDownload` carries `-TimeoutSec $NetworkTimeoutSeconds` where `$NetworkTimeoutSeconds = 15`. A fully offline machine fails a download within ~15 seconds rather than the ~100-second default.
 
 ## Extraction
 
@@ -236,6 +264,8 @@ Then `Add-WindowsDriver -Driver $allDirs -Recurse` in one call.
 
 The same INF cross-reference gate applies. A failure sets `$Script:ImageInjectionComplete = $false`.
 
+**VMD hardware presence is checked before this path runs.** As of v44 patch 6, the check is fail-closed: an enumeration error produces an indeterminate result rather than treating VMD as absent. The run defers with `EXIT_WARNING` before committing any state, so the VMD injection path is not reached at all when the presence check cannot complete. See "VMD hardware presence (fail-closed as of v44 patch 6)" above.
+
 ## When injection fails
 
 When `$Script:ImageInjectionComplete` is `$false` after Step 3, the pipeline **exits with `EXIT_WARNING` immediately**. It does not proceed to Step 4 (`dism /Export-Image`), Step 5 (partition work), Step 6 (deployment), or any `reagentc` call. This is the v44 patch 1 pipeline gate.
@@ -246,6 +276,7 @@ The gate exists because a WIM with no OEM or VMD drivers is broken on hardware w
 
 - Sets the checkpoint back to `Step=2`, so the next run re-acquires the base WIM from source and re-runs injection against a clean image rather than mounting a `base.wim` that was partially modified by the failed injection attempt.
 - Removes any stale `winre_optimized.wim` left from a previous run.
+- Removes `base.wim` from `WorkDir`. Without this, the next run's Step 2 would fail at `Rename-Item "$WorkDir\winre.wim" "base.wim"` because the destination file still existed, and the machine would not progress past Step 2 until an operator deleted `WorkDir` by hand. This is the v44 patch 3 cleanup.
 - Sets `$Script:nonFatalWarning = $true`.
 - Exits with `EXIT_WARNING` (code 2).
 
@@ -256,14 +287,19 @@ The gate exists because a WIM with no OEM or VMD drivers is broken on hardware w
 - It does not write or delete the state file.
 - It does not change the currently-registered WinRE image.
 
-The machine is left exactly as it was before the run — WinRE is still in whatever state it started, the recovery partition is untouched, and the next scheduled run retries from Step 2.
+The machine is left exactly as it was before the run — WinRE is still in whatever state it started, the recovery partition is untouched, and the next scheduled run retries from Step 2 with a clean `WorkDir`.
 
 **Related to ResetBase (v44 patch 2).** Component cleanup and ResetBase run inside Step 3, after injection, but only when `$Script:ImageInjectionComplete` is `$true`. When injection fails, ResetBase is skipped — the pipeline aborts before that point, so running the reset would only waste CPU on an image whose driver state is already invalid.
 
-**Before v44 patch 1** the pipeline continued to Step 4 and beyond even when injection failed, and relied on the state-write gate to prevent the state file from recording the run. That was not sufficient for the reasons above. The v44 patch 1 gate is the correction.
+**Related to the offline fallback (v44 patch 5).** When the manifest fetch fails and the offline fallback engages, the entire driver-resolution pipeline is skipped: no OEM pack resolution, no VMD detection, no required-driver resolution, no download, no injection. The full-update path is not reachable offline. A machine on the offline fallback either takes the fast path (state file valid, all local safety checks pass) or exits `EXIT_WARNING` before the full-update pipeline. It never reaches Step 3. This is by design: the driver set is a function of the manifest, and without the manifest there is no safe way to determine which drivers to inject. A machine in this state does not lose its existing WinRE; it simply defers the injection work to a future run with network. See the "Offline behavior" section in [deployment.md](deployment.md) for the operator-facing description of the three cases.
+
+**Related to the VMD fail-closed guard (v44 patch 6).** When the VMD hardware presence check is indeterminate, the run defers with `EXIT_WARNING` **before** reaching Step 3. The full-update path is not reached. The machine is unchanged and the next run retries the enumeration.
+
+**Before v44 patch 1** the pipeline continued to Step 4 and beyond even when injection failed, and relied on the state-write gate to prevent the state file from recording the run. That was not sufficient for the reasons above. The v44 patch 1 gate is the correction. The `base.wim` cleanup on the abort branch is the v44 patch 3 follow-up, and the Step 2 stale-file cleanup on the normal path is the v44 patch 6 follow-up.
 
 ## Related documents
 
-- [architecture.md](architecture.md) — where Step 3 fits in the pipeline, and the "pipeline stops before deployment when injection fails" invariant.
-- [state-and-idempotency.md](state-and-idempotency.md) — how `ImageInjectionComplete` gates the state write and the checkpoint writes.
-- [troubleshooting.md](troubleshooting.md) — diagnosing injection failures.
+- [architecture.md](architecture.md) — where Step 3 fits in the pipeline, the "pipeline stops before deployment when injection fails" invariant, the offline fallback's effect on driver resolution, and the VMD fail-closed guard.
+- [state-and-idempotency.md](state-and-idempotency.md) — how `ImageInjectionComplete` gates the state write and the checkpoint writes, the offline fallback's residual risk, and how the Lenovo five-state resolution feeds the `OEMPACK` field of the `DesiredStateId`.
+- [troubleshooting.md](troubleshooting.md) — diagnosing injection failures and the VMD-query-indeterminate deferral.
+- [deployment.md](deployment.md) — the operator-facing description of offline behavior, including why an offline machine never reaches Step 3.

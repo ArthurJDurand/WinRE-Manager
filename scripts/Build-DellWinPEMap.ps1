@@ -30,13 +30,15 @@ if (-not (Test-Path $7Zip)) { Write-T "7-Zip not found at $7Zip - aborting" -L E
 $cabPath = Join-Path $WorkDir "DriverPackCatalog.cab"
 Write-T "Downloading Dell catalog CAB ..." -L INFO
 for ($retry = 1; $retry -le 3; $retry++) {
+    if (Test-Path $cabPath) { Remove-Item $cabPath -Force -ErrorAction SilentlyContinue }
     try {
         Invoke-WebRequest -Uri $CabUrl -OutFile $cabPath -Headers $Headers -UseBasicParsing -ErrorAction Stop
-        break
+        if ((Test-Path $cabPath) -and (Get-Item $cabPath).Length -gt 0) { break }
+        Write-T "Attempt $retry produced a zero-byte file" -L WARN
     } catch {
         Write-T "Attempt $retry failed: $_" -L WARN
-        if ($retry -lt 3) { Start-Sleep 5 }
     }
+    if ($retry -lt 3) { Start-Sleep 5 }
 }
 if (-not (Test-Path $cabPath)) { Write-T "Could not download CAB" -L ERROR; return }
 Write-T "CAB: $((Get-Item $cabPath).Length) bytes" -L SUCCESS

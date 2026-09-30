@@ -6,6 +6,213 @@ This file is the authoritative user-facing record of what changed and when. The 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to a `ScriptVersion` + patch-generation scheme rather than strict SemVer — see [docs/state-and-idempotency.md](docs/state-and-idempotency.md) for why.
 
+## [v44 patch 6] — 2026-09-30
+
+Removes the v44 patch 3 destructive-path C: guard, makes Lenovo OEM-pack resolution distinguish five states, makes VMD hardware detection fail-closed, closes a Step 2 wedge left by interrupted runs, corrects the OS-fallback remediation wording, and mirrors the production changes into the harness as v18.
+
+The change was driven by a review of the v44 patch 3 guard in light of the v43 patch 5 (further revision 5) target-volume policy that the guard was built on top of. The guard was correct in spirit — prevent the destructive path from leaving a machine with no working recovery route — but it applied an OS-fallback precondition to the dedicated-partition path. The dedicated-partition path does not depend on C:'s BitLocker state at all; reagentc's check is on the **target** volume, and on the dedicated-partition path the target is the recovery partition. The guard was deferring runs that would have succeeded.
+
+### Changed
+
+- **C:'s encryption state is no longer a veto for the dedicated-recovery-partition path.** The v44 patch 3 destructive-path C: guard inside `Ensure-AdequateRecoveryPartition` has been removed. When the destructive path is about to run and the run will destroy the current recovery route (WinRE `Enabled` or a non-empty deletable-part set), the function still logs the `Destructive recovery-partition replacement will remove the current WinRE route` WARN, but it no longer calls `Test-VolumeEncrypted -MountPoint "C:"`, no longer returns `$null` on a non-`FullyDecrypted` result, and no longer defers via the OS-fallback machinery. The destructive sequence proceeds.
+
+  **Why the guard was removed.** The v44 patch 3 guard was added preemptively on the reasoning that the destructive path could disable WinRE and delete a recovery partition on a machine whose C: was not in a state where the OS-fallback route — the path the destructive attempt falls through to on shrink failure — could itself complete. That reasoning over-applied the OS-fallback precondition to the dedicated-partition path. The dedicated-partition path's objective is to **create** a dedicated partition; it succeeds or fails on the partition geometry, not on C:'s BitLocker state. If the dedicated-partition path succeeds, C:'s state never matters. If it fails at the shrink step, the run falls through to OS-fallback, and *there* the OS-fallback gate checks C: and defers as designed. The safety property — never leave a machine with no working recovery route — is preserved end-to-end without the guard.
+
+  The only place C:'s BitLocker state is now consulted is the OS-fallback route: the fast-path OS-fallback re-verification, the full-update deploy step's OS-fallback branch, and the pending-reboot OS-fallback branch. All three exist because on the OS-fallback route the target volume *is* the OS volume, and reagentc refuses to enable WinRE on an encrypted OS volume. The dedicated-partition path — including the destructive sequence — does not consult C:'s state at any point.
+
+- **Lenovo OEM-pack resolution now distinguishes five states.** `Get-LenovoWinPEPack` sets `$Script:LenovoPackResolution` to one of `unknown-mt`, `map-unavailable`, `no-entry`, `malformed-entry`, or `resolved`. The caller uses the state to distinguish "this Lenovo model has no published WinPE driver pack" (normal, expected, run recorded as complete with `OEMPACK=NONE`) from "the map entry exists but is missing its `winpe.url`" (configuration failure, run marked incomplete). Before patch 6, the caller could only distinguish "pack resolved" from "pack did not resolve"; a malformed map entry looked identical to a legitimate no-pack case, and the machine would silently complete without OEM driver injection even though the map itself was broken.
+
+  Lenovo does not publish WinPE driver packs for every model in their catalog. `unknown-mt` and `no-entry` are the two states that represent that fact, and both correctly let the run proceed with `OEMPACK=NONE`. `map-unavailable` (transient network failure fetching the map gist) and `malformed-entry` (map entry present but missing `winpe.url`) both mark the run with `$Script:ImageInjectionComplete = $false` and `$Script:nonFatalWarning = $true`; the pipeline gate then aborts before Step 4 and the next run retries. A malformed map entry is a configuration failure of the map itself, not a legitimate "no pack available" answer.
+
+- **VMD hardware detection is now fail-closed.** The VMD presence query wraps `Get-PnpDevice -PresentOnly` in `-ErrorVariable vmdErr` and treats any enumeration error as an indeterminate result, not as "VMD hardware absent". Previously, an enumeration error would produce an empty device list, `$vmdPresent` would be set to `$false`, and the run would proceed to select a driver set that omits the VMD package on a machine that may well have VMD hardware. On a VMD-based machine whose deployed WinRE lacks the VMD driver, the recovery environment cannot see the OS disk — this is the failure mode the v44 patch 1 `DesiredStateId` change was designed to prevent, and patch 6 closes the remaining path by which it could still occur.
+
+  On an indeterminate VMD query the run logs the enumeration error, sets `$Script:nonFatalWarning = $true`, removes the checkpoint file, and exits with `EXIT_WARNING` **before** committing any state. No WIM is deployed, no partition is touched, no `reagentc` call is made. The next run retries the enumeration; a transient PnP service issue is the most likely cause.
+
+- **Step 2 removes stale `winre.wim` and `base.wim` before extraction and rename.** When the base WIM is obtained from the GitHub repository — the path reached only when no usable WIM exists at the reagentc-registered location or via fallback — Step 2 now:
+
+  1. Removes any stale `winre.wim` at `$WorkDir\winre.wim` before invoking 7-Zip, in case an interrupted previous run left the extraction output partially written.
+  2. Verifies that 7-Zip produced `winre.wim` after extraction.
+  3. Removes any stale `base.wim` at `$WorkDir\base.wim` before the `Rename-Item "$WorkDir\winre.wim" "base.wim"` call.
+
+  Before patch 6, an interrupted previous run could leave a `base.wim` in place at the moment the next run reached the rename. The rename would fail, and the machine would not progress past Step 2 until an operator deleted `WorkDir` by hand. The v44 patch 3 fix added the same `base.wim` cleanup to the **injection-failure abort branch**; patch 6 adds it to the **normal Step 2 path** so the wedge is closed whether the previous run failed in injection or in the download-and-rename step itself.
+
+- **OS-fallback remediation wording corrected.** The log message the OS-fallback gate emits when it defers has been rewritten. The previous message told the operator that the machine could be made ready for OS-fallback by "completing encryption, adding a protector, or enabling protection." That was wrong: those actions make C: *more* encrypted, not less, and reagentc refuses to enable WinRE on an encrypted OS volume regardless of which protector is present or whether protection is armed.
+
+  The corrected message tells the operator what actually resolves the state — complete decryption of C: (`manage-bde -off C:`) or waiting for an in-progress decryption to finish — and states explicitly that the OS-fallback route requires C: to be `FullyDecrypted`. The corrected message also points at the dedicated-partition path as the alternative when decryption of C: is not an option, because the dedicated-partition path does not depend on C:'s BitLocker state.
+
+- **The 2 GiB sanity ceiling note now names three functions consistently.** The `.NOTES` block in `scripts/WinRE.ps1` names three functions that the future ceiling must gate: `Ensure-AdequateRecoveryPartition`, `Find-SuitableRecoveryPartition`, and `Remove-StrayRecoveryPartitions`. The README, the `[v44 patch 2]` and `[v44 patch 3]` CHANGELOG entries, and `docs/recovery-partition.md` previously named two, omitting `Remove-StrayRecoveryPartitions`. That function deletes any type-coded recovery partition on a non-OS disk without checking size — the same class of hazard the ceiling is designed to guard against, and one that is reached by a different code path than the other two. All four references now name three.
+
+### Changed (harness)
+
+- **`Test-WinRE.ps1` moved to v18.** Six behavior changes, five new future-proofing checks, and three cosmetic fixes.
+
+  Mirror drift from production patch 6:
+
+  1. **VMD query-failure handling.** Options 1 and S now treat a PnP enumeration error as an indeterminate result rather than absence. Option 1's VMD hardware presence section reports `INDETERMINATE` with the enumeration error message. Option S records `SKIP` in the results with reason `VMD query indeterminate` and prints an `INDETERMINATE` verdict instead of a DSI MATCH or DSI MISMATCH. Before v18, the harness could produce a "definitive" DSI that disagreed with what a live production run would compute, which is the opposite of what Option S is for.
+  2. **Lenovo map resolution status machine.** `Get-LenovoWinPEPack` in the harness now sets `$Script:LenovoPackResolution` to the same five states as production. `Test-OemMaps` distinguishes `malformed-entry` (red, marks the test failed) from `no-entry` (gray, informational), and treats `map-unavailable` (yellow, marks the test failed) separately from both.
+
+  Harness-specific bugs:
+
+  3. **`Get-DriverManifest` extracted as a shared helper.** Options 2, 9, and S now all use the same two-attempt / 2-second-sleep / WARN-log retry policy that production uses. Previously each option had its own fetch code, and they had drifted from each other and from production.
+  4. **Cleanup footgun closed.** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. The pre-existing state is captured before any directory work. This prevents `Remove-Item $TestDir -Recurse -Force` from wiping a user-supplied path like `C:\Users\Me\Desktop`.
+  5. **Stale extraction destinations are cleared before each extraction.** Applies to `Invoke-VendorExtraction`, `Invoke-CabExtraction`, and the GitHub base-WIM test's working directory. Before v18, a stale INF file left by an earlier run could satisfy a failed extraction's INF-count success check. The Lenovo "non-zero exit but INFs present" branch was the sharpest case: it treats an INF-count greater than zero as success regardless of the extractor's exit code, so a stale INF could mask a genuine extraction failure.
+  6. **`Test-VmdDrivers` records SKIP (not PASS) when the Intel CPU generation cannot be parsed.** Driver applicability was not evaluated in that case, so a PASS would misrepresent what the harness actually checked. The raw CPU string is logged so the parser can be extended. The result detail reads `Intel CPU generation could not be parsed`.
+
+  Future-proofing checks added to the parser self-test (production dependency verification):
+
+  7. **DISM cmdlet availability.** Verifies `Mount-WindowsImage`, `Dismount-WindowsImage`, `Get-WindowsImage`, `Add-WindowsDriver`, and `Get-WindowsDriver` are all present. Production hard-depends on all five; a missing cmdlet would only be discovered at injection time.
+  8. **`Get-Disk` shape.** Verifies `Number`, `FriendlyName`, `PartitionStyle`, `Size`, `BootFromDisk`, `IsSystem`, and `IsBoot` are present.
+  9. **`Get-Volume` shape.** Verifies `DriveLetter`, `FileSystemLabel`, `FileSystem`, `Size`, `SizeRemaining`, `DriveType`, `HealthStatus`, and `UniqueId` are present.
+  10. **CPU-generation parser regression table.** Fourteen cases spanning 11th, 12th, 13th Gen, Core, Core Ultra, AMD, Celeron, Pentium, Xeon, and Atom CPU strings. Catches a Windows update or firmware rename that changes `Win32_Processor.Name` in a way that would silently desynchronise `DesiredStateId`.
+  11. **`DesiredStateId` determinism and input sensitivity.** Same inputs must hash identically; flipping VMD presence must change the hash; flipping `ProductionScriptVersion` must change the hash; the output must be 64 hex characters. A silent change to the DSI recipe would be caught before it desynchronised every deployed state file.
+
+  Cosmetic fixes:
+
+  12. **`Write-KV` overflow handling.** A key at or past `$KeyWidth` now gets a separating space before its value. Previously, `Manifest VMD device IDs` (23 chars, one over the 22-char key column) rendered flush against the value.
+  13. **Changelog "Four" → "Five"** for the count of future-proofing checks (previous entry miscounted).
+  14. **Changelog "in the detail" → "in the log line"** for the `Test-VmdDrivers` SKIP path (the raw CPU string is logged via `Say`, not recorded in `Record -Detail`).
+
+### Changed (docs)
+
+- **`docs/troubleshooting.md`** — the "v44 patch 3 — the destructive-path guard" section is removed. The OS-fallback deferral section is unchanged except for the deletion of the sub-variant A/B discriminator, which referred to the removed guard.
+- **`docs/exit-codes.md`** — the sub-variant A/B breakdown of the OS-fallback BitLocker deferral is removed. The `Pre-deletion inventory:` discriminator no longer applies; the guard's deferral line is no longer logged.
+- **`docs/architecture.md`** — Invariant 13 (destructive-path C: guard) is removed. The "same shape" narrative in the closing section no longer uses the guard as an example of preemptive correctness.
+- **`docs/deployment.md`** — the "v44 patch 3" section is reduced to the `base.wim` cleanup only; the C: guard discussion is removed.
+- **`docs/recovery-partition.md`** — section 2 is simplified to "disable WinRE" with no C: check.
+- **`docs/state-and-idempotency.md`** — the paragraph describing the destructive-path C: guard's effect on the state file is removed.
+- **`docs/driver-injection.md`** — a new section documents the Lenovo five-state resolution and why `unknown-mt` and `no-entry` are legitimate "no pack" answers while `map-unavailable` and `malformed-entry` are not.
+- **`.github/ISSUE_TEMPLATE/bug_report.md`** — the sub-variant A/B discriminator field is removed; the OS-fallback deferral log-string example is corrected from `C: VolumeStatus=…` to `Test-VolumeEncrypted=…`.
+
+### Removed
+
+- **The v44 patch 3 destructive-path C: guard.** `Ensure-AdequateRecoveryPartition` no longer calls `Test-VolumeEncrypted -MountPoint "C:"`, no longer returns `$null` on a non-`FullyDecrypted` result, and no longer defers via the OS-fallback machinery when C: is encrypted. The `Destructive recovery-partition replacement would remove the current WinRE route, and C: is not confirmed fully decrypted` deferral line is no longer logged. When the destructive path is about to run, the function logs `Destructive recovery-partition replacement will remove the current WinRE route. … C:'s BitLocker state is not a veto for the dedicated-target path. The OS-fallback route retains its separate C: BitLocker gate.` and continues.
+
+### Unchanged
+
+`ScriptVersion` remains 44. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. Healthy machines continue to take the fast path. A machine that is already healthy will not rerun automatically; the deployment mechanism must invoke the script explicitly to pick up the patch-6 changes. A machine whose next natural rebuild is already due (manifest bump, OEM pack version change, Windows build change, or CPU/VMD presence change) picks up the patch-6 changes on that rebuild.
+
+### Field verification
+
+- **Harness v18 on ASUS desktop (PRIME H510M-D, i5-11400, Win11 26200), 2026-09-30.** Option 1 diagnostic completed. All fifteen parser self-test checks PASS: reagentc status and location regexes, both `manage-bde` regexes, `Get-BitLockerVolume` shape, OS resolution, `Get-Partition` shape, WinRE location resolution, `Get-RecoveryPartitions`, `Get-PartitionSupportedSize`, the five v18 additions (DISM cmdlets, `Get-Disk` shape, `Get-Volume` shape, CPU-generation regression table, `DesiredStateId` determinism). 15 passed, 0 failed, 0 skipped. The `Write-KV` overflow fix was verified visually: `Manifest VMD device IDs PCI\VEN_8086&DEV_9A0B, …` renders with the separating space.
+- **Production v44 patch 6.** Pending. The intended coverage is a fast-path run on a machine whose state file matches, followed by a full-update run on a machine whose state file has been deleted. Neither has been exercised on real hardware yet; both are the same code paths as v44 patch 5 with the five patch-6 changes layered on.
+
+## [v44 patch 5] — 2026-09-30
+
+Offline fallback for the driver manifest fetch, network timeouts on every call, and two harness refinements.
+
+The change was driven by a 2026-09-30 field observation on a healthy ASUS desktop: the manifest fetch failed with `FATAL ERROR: The remote name could not be resolved: 'gist.github.com'` on a machine whose state file was still valid. The manifest fetch runs before the fast-path decision, so a DNS failure took a healthy machine down to `EXIT_FATAL` without any local state being wrong. The run had done nothing to warrant a fatal exit; it simply could not reach the network to prove what the state file already recorded.
+
+### Added
+
+- **Offline fallback for the manifest fetch.** When the driver manifest fetch fails after its retry budget, the script now reads the state file at `C:\Recovery\OEM\winre_state.json` and trusts its stored `DesiredStateId` directly. It does **not** attempt to recompute the ID from cached inputs — recomputing would require the OEM pack version, which is resolved from the OEM map, another gist on the same unavailable network. The local safety checks (WinRE `Enabled`, exactly one recovery partition on the OS disk, deployed WIM hash matches the stored hash) remain fully enforced and do not depend on the manifest. If the fast path does not fire under the offline fallback, the run exits `EXIT_WARNING` before the full-update pipeline and the machine retries on its next scheduled run when the network is available. The residual risk is named below.
+
+- **`$NetworkTimeoutSeconds = 15` on every network call.** Previously, `Invoke-RestMethod` and `Invoke-WebRequest` defaulted to roughly 100 seconds each. On a fully offline machine with a stale cache, the aggregate worst-case runtime was over 10 minutes before the offline fallback could engage. All eight network calls in `WinRE.ps1` now carry `-TimeoutSec $NetworkTimeoutSeconds`. The fully offline worst-case runtime dropped to roughly 90 seconds, dominated by the fixed sleeps in the retry loops rather than by the network timeouts. The last of the eight calls — the GitHub API listing reached only in the full-update path when no local WIM is available — was applied in a follow-up edit within the same patch.
+
+### Changed
+
+- **`Test-WinRE.ps1` moved to v17.** Three changes. `$NetworkTimeoutSeconds = 15` was added and applied to every network call, matching production. `Invoke-OemPackDownload`'s zero-byte check was moved back above the `$hasHash` computation so that a zero-byte download with an expected hash logs `file is empty` rather than `SHA256 mismatch`. A note was added to `Test-VmdDrivers` stating that the harness intentionally exercises every OS/CPU-eligible driver to validate the download path, whereas production additionally filters on VMD hardware presence. The harness output format is unchanged from v16.
+
+- **`docs/troubleshooting.md`, `docs/exit-codes.md`, and `docs/deployment.md`** gained an offline-deferral section. See the individual documents.
+
+### Known limitation (introduced by this patch; not fixed)
+
+The offline fallback trusts the state file's stored `DesiredStateId` without verifying that the machine's local hardware still matches the inputs that produced it. On a machine whose hardware changed while offline — a CPU swap, a BIOS update that flipped VMD, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — the offline run could take the fast path with a stale DSI and exit `EXIT_WARNING` on a machine that would have rebuilt under the live manifest. The next successful manifest fetch detects the drift and forces a rebuild. A `LocalInputsId` field in the state file would close this; it is planned as its own version boundary and is documented in [docs/state-and-idempotency.md](docs/state-and-idempotency.md).
+
+### Field verification
+
+- **ASUS desktop (PRIME H510M-D, i5-11400, Win11 26200), 2026-09-30 13:22.** The motivating observation: the pre-release version of patch 5 exited `FATAL ERROR: The remote name could not be resolved: 'gist.github.com'` on a healthy machine. The initial implementation was wrong in a way that the offline case exposed — it recomputed the DSI from cached inputs, which fails on a fully offline machine because the OEM map fetch (a different gist) also fails, producing `OEMPACK=NONE` in the candidate DSI versus the state file's `OEMPACK=A10`. The corrected implementation trusts the state file directly.
+
+- **ASUS desktop, 2026-09-30 15:08:36 and 15:08:57.** Two consecutive v44 patch 5 fast-path runs. Both runs: banner `(v44 patch 5)`, `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock`, manifest fetch succeeded, DSI `62DE5C7D…` matched the on-disk state file, `Assigned temporary drive letter Z:` followed by `Removing temporary drive letter Z:`, `Operating mode: DEDICATED`, `Released program lock`. Both runs exited 0. No contention, no warnings, no leaked drive letters. This is the healthy online path.
+
+- **Offline verification.** Pending. The intended coverage is a hosts-file block on the ASUS (`0.0.0.0 gist.github.com` and `0.0.0.0 api.github.com`) followed by a run of `WinRE.ps1`, expecting: two `Driver manifest fetch attempt N failed` lines, the offline-fallback engage line with a `state file LastUpdated=…` suffix, four `Offline fallback: skipping …` lines, `Checkpoint step: 0`, `State file accepted (DesiredStateId match)`, `Operating mode: DEDICATED`, `Released program lock`, exit code 2, total runtime under 90 seconds.
+
+### Unchanged
+
+`ScriptVersion` remains 44. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. Healthy machines continue to take the fast path.
+
+## [v44 patch 4] — 2026-09-30
+
+Single-instance guarantee via an exclusive file lock, closing the concurrent-instance defect first observed on the Dell Latitude 3550.
+
+The change was driven by a 2026-09-30 field observation on the Dell Latitude 3550 (12:29–12:40). Two `WinRE.ps1` processes ran simultaneously on the same machine, one of them exiting on `Cannot rename because item at 'C:\Temp\WinREWork\winre.wim' does not exist.` The script assumed exclusive access to `C:\Temp\WinREWork` but had no startup lock. The scheduled task's `MultipleInstancesPolicy = IgnoreNew` prevents scheduled-vs-scheduled overlap but does nothing about manual invocations (interactive shells, RMM "run now" buttons, Intune remediation scripts).
+
+### Added
+
+- **Program lock via an exclusive file handle.** Before any state-modifying action, `WinRE.ps1` opens `C:\ProgramData\OEM\Logs\WinREManager.lock` with `FileShare.None` via `[System.IO.File]::Open($path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)`. The Windows kernel enforces the exclusive handle: cross-session, cross-privilege exclusion is guaranteed by the OS, not by a security descriptor the script would have to configure. The handle is released automatically when the process exits, cleanly or after a crash — there is no stale-lock recovery logic to get wrong. The lock file is not deleted on release; its existence is not the lock, the open handle is.
+
+  **The lock is deliberately not acquired under `-DryRun`.** A dry run is read-only and safe to run concurrently with a live deployment, so an operator can inspect a machine with `WinRE.ps1 -DryRun` or `scripts\Test-WinRE.ps1` while a scheduled run is in progress.
+
+  **Failure to open the lock file for any reason other than contention is non-fatal.** A permission error, a missing `Logs` directory, or a transient filesystem issue causes the script to log a WARN and proceed without single-instance protection. The lock is defensive: a broken lock must not prevent a legitimate deployment.
+
+  **The lock is released last.** In the `finally` block, after the WIM-mount discard and after every temporary drive letter has been cleaned up. This ensures the lock is held until all cleanup is complete, so a waiting second instance cannot begin work while the first is still releasing resources.
+
+### Changed
+
+- **`docs/deployment.md` — "One instance per machine" section** rewritten. The section previously stated that the script had no lock and that exclusive operation was the operator's responsibility. It now leads with the file lock and describes the failure mode of a second instance: it fails fast with `Another WinRE Manager instance is already running (program lock file is exclusively held)` and exits `EXIT_WARNING` (code 2), not `EXIT_FATAL` (code 3). The mitigations for manual invocations (wait for the scheduled task, temporarily disable it, use the harness) remain as secondary guidance. A new note clarifies that the lock file persists on disk between runs and that its presence does not indicate a running instance.
+
+- **`docs/troubleshooting.md` — "The script exited with a rename error (concurrent instance)" section** rewritten. The rename error is now reachable only if the lock acquisition fails for a permission reason and the run proceeds unprotected. The primary concurrent-instance failure shape is now a fast exit with `EXIT_WARNING` and the `Another WinRE Manager instance is already running` log line. A new log-string reference for the lock-acquisition failure sub-case (`Could not set up program lock at … : … - proceeding without single-instance protection`) is included.
+
+- **`docs/deployment.md` — Intune/MDM section.** The prediction that a remediation that coincides with a scheduled run would exit `EXIT_FATAL` was corrected to `EXIT_WARNING`.
+
+### Field verification
+
+- **Dell Latitude 3550, 2026-09-30 12:29–12:40.** The concurrent-instance defect that motivated this patch. Two processes running, one exiting on the rename error. Post-patch, this run shape produces one successful run and one fast-fail exit with `EXIT_WARNING`.
+
+- **ASUS desktop, 2026-09-30 14:04:37.** First successful field run of the file lock. Log shows `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` early in the run and `Released program lock` at the end. Only one instance was running, so the concurrent-failure path was not exercised; the mechanism itself was confirmed.
+
+- **ASUS desktop, 2026-09-30 15:08:36 and 15:08:57.** Two consecutive v44 patch 5 runs (which inherit patch 4). Both runs show the acquired/released lock pair, confirming the lock release is not blocking subsequent runs even when the runs are seconds apart.
+
+- **Concurrent-instance test (Test C from the hand-off).** Pending. The intended coverage is a second interactive invocation of `WinRE.ps1` while a first is mid-flight, expecting the second to log `Another WinRE Manager instance is already running (program lock file is exclusively held)` and exit code 2 within seconds.
+
+- **Crash-recovery test (Test D from the hand-off).** Pending. The intended coverage is a PowerShell process killed mid-flight followed by a fresh run, expecting the fresh run to acquire the lock immediately with no stale-lock loop. The design guarantees this — the kernel releases the handle on process termination — but it has not been exercised.
+
+### Unchanged
+
+`ScriptVersion` remains 44. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. The lock acquisition is transparent to all downstream logic; no existing behavior depends on whether the lock is held.
+
+## [v44 patch 3] — 2026-09-30
+
+> **Note.** The destructive-path C: guard described in this entry was removed in [v44 patch 6](#v44-patch-6--2026-09-30). The `base.wim` cleanup on the injection-failure abort branch remains, and its description below is still accurate. See the patch 6 entry for the reasoning behind the reversal.
+
+Two targeted correctness fixes from the v44 patch 2 peer-review round, a harness beautification (v16), and an extension of the documented 2 GiB ceiling known gap to name both affected code paths.
+
+Both fixes are small and scoped. Neither changes `ScriptVersion`, neither changes the `DesiredStateId`, and neither forces a rebuild on any machine. Already-completed machines will not rerun automatically; the deployment mechanism must invoke the script explicitly to pick the fixes up.
+
+### Fixed
+
+- **Destructive-path C: encryption guard in `Ensure-AdequateRecoveryPartition`.** Before the `reagentc /disable` call, if the path is about to destroy the current recovery route — either WinRE is `Enabled` or `$deletableParts.Count -gt 0` — the function now checks C: via `Test-VolumeEncrypted -MountPoint "C:"`. If the result is not exactly `$false` (confirmed fully decrypted), it logs the reason, sets `$nonFatalWarning`, and returns `$null` without touching WinRE registration, partitions, or drive letters. The `$null` return propagates to the OS-fallback machinery, which then defers. This closes the gap ChatGPT identified in the v44 patch 2 round: the destructive path could disable WinRE and delete a recovery partition on a machine whose C: was not in a state where the OS-fallback route could complete, leaving the machine without a working recovery route. The guard is scoped to the destructive path only. It is **not** a reinstatement of the global C: startup gate, which the 2026-09-29 same-machine differential test disproved. The code comment names the reason, per the standing rule that any new C: check must be scoped and justified. **(Removed in [v44 patch 6](#v44-patch-6--2026-09-30).)**
+- **`Remove-ItemIfExist "$WorkDir\base.wim"` in the failed-injection abort branch.** The abort branch already removed `winre_optimized.wim`; it did not remove `base.wim`. Without the extra line, the next run's Step 2 failed at `Rename-Item "$WorkDir\winre.wim" "base.wim"` because the destination file existed. The machine never progressed past Step 2 until an operator deleted `WorkDir` by hand. This is a genuine defect on the injection-failure path, not a hypothetical.
+
+### Changed
+
+- **`Test-WinRE.ps1` moved to v16.** The harness is colour-coded. Disks, partitions, volumes, recovery partitions, and the parser self-test are rendered as tables. Free-space values are colour-coded against explicit thresholds: Red below 5% **or** below 3 GB; Yellow below 15% **or** below 20 GB; Green otherwise. The colour rules apply to Fixed volumes only; CD-ROM and Removable volumes keep neutral colours because their free space is not a deployment constraint. A boxed warning banner is drawn when the OS volume's free space is critical. Diagnostic output uses `Write-Diag` and `Write-KV` instead of `Say` so key/value pairs align and values render with the correct colour. The harness remains read-only, and its menu structure, parser self-test, download test, and extraction test are unchanged. See the `.NOTES` block in `scripts/Test-WinRE.ps1` for the full v16 change list.
+
+### Known limitation (extended in this revision; not fixed)
+
+The v44 patch 2 entry documented the destructive path in `Ensure-AdequateRecoveryPartition` as the exposure for the planned 2 GiB sanity ceiling. Claude identified in the v44 patch 2 peer-review round that the reuse path in `Find-SuitableRecoveryPartition` is also exposed: an oversized recovery-typed partition can be **accepted** for reuse by that function and then re-registered against, which is a different failure shape from deletion but draws on the same missing size check. The Known gap is therefore extended to name both functions.
+
+Until the 2 GiB ceiling ships:
+
+- The destructive path (`Ensure-AdequateRecoveryPartition`) deletes every partition on the OS disk carrying the standard recovery GPT type GUID or MBR type code, without checking its size or contents.
+- The reuse path (`Find-SuitableRecoveryPartition`) accepts an existing recovery-typed partition that meets the free-space policy without checking its size against an upper bound.
+- The 2 GiB ceiling, when it ships, must gate **both** functions, not only the destructive one.
+
+The README carries a "Before you run this" warning at the top of the page. The `.NOTES` block in `scripts/WinRE.ps1` carries the "Known gaps" section. Operators deploying to machines they did not image themselves should run the harness Option 1 diagnostic and inspect the "Recovery partitions" section before proceeding. The ceiling is planned as its own version boundary and will ship with a fresh CHANGELOG entry and a `ScriptVersion` decision.
+
+Note: as of [v44 patch 6](#v44-patch-6--2026-09-30), the known-gap list names a third function — `Remove-StrayRecoveryPartitions`, which deletes type-coded recovery partitions on non-OS disks without checking size. The planned ceiling must gate all three functions. See the patch 6 entry.
+
+### Field verification
+
+- **Dell Latitude 3550 (Intel Core Ultra 5 125U, Win11 26200), 2026-09-30 12:29–12:47.** The machine that motivated the entire v43 patch 5 investigation now runs cleanly under v44. The run produced a clean partition recreate: `Component cleanup and ResetBase completed successfully`, `Pre-deletion inventory:` followed by partition deletion and recreation, `Target partition 0/4 (Z:) is already unencrypted - reagentc /enable can proceed`, `reagentc /enable (exit 0): … Operation Successful.`, `Operating mode: DEDICATED`. The old v43 failure mode (`delete-and-recreate` retry, OS-fallback, `FATAL: WinRE is not enabled at exit`) is gone. This confirms the destructive-path C: guard and the target-volume policy work on the machine that broke the previous design.
+
+- **ASUS desktop (PRIME H510M-D, i5-11400, Win11 26200), 2026-09-30 12:02.** Fast path with the v44 patch 3 code. State file accepted (DSI match), `Operating mode: DEDICATED`, no machine changes. Confirms no regression on the healthy path.
+
+The v44 patch 2 field verification below remains the latest confirmed data for the ResetBase change specifically.
+
+### Unchanged
+
+`ScriptVersion` remains 44. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. Healthy machines continue to take the fast path. A machine whose next natural rebuild is already due (manifest bump, OEM pack version change, Windows build change, or CPU/VMD presence change) picks up the v44 patch 3 fixes on that rebuild. A machine that is already in a completed state and whose inputs have not changed will not see the fixes until the deployment mechanism invokes the script with intent to rerun, for example by deleting the state file or forcing a full-update pass.
+
 ## [v44 patch 2] — 2026-09-30
 
 ### Changed
@@ -27,6 +234,8 @@ The destructive path in `Ensure-AdequateRecoveryPartition` deletes every partiti
 - The `.NOTES` block in `scripts/WinRE.ps1` carries a "Known gaps" section describing the limitation.
 - The README carries a "Before you run this" warning at the top of the page.
 - Operators deploying to machines they did not image themselves should run the harness Option 1 diagnostic and inspect the "Recovery partitions" section before proceeding.
+
+Note: as of [v44 patch 3](#v44-patch-3--2026-09-30), this limitation is extended to also name the reuse path in `Find-SuitableRecoveryPartition`. As of [v44 patch 6](#v44-patch-6--2026-09-30), it names a third function — `Remove-StrayRecoveryPartitions` — which deletes type-coded recovery partitions on non-OS disks without checking size. The planned ceiling must gate all three functions.
 
 ### Field verification
 

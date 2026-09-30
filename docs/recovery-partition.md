@@ -49,6 +49,26 @@ The 30 MiB is the project's own allowance for NTFS filesystem overhead on a fres
 
 The result is rounded **up** to the next 100 MiB boundary, then clamped to a 1000 MiB minimum. Rounding is always up — never to nearest — so the bucket can only be larger than required, never smaller.
 
+### The planned 2 GiB sanity ceiling (not yet implemented)
+
+Both thresholds above are **lower bounds**. Neither places an upper bound on the size of a partition the script will accept or delete. This is a documented gap, not an oversight, and the plan to close it — a 2 GiB sanity ceiling that would WARN and skip oversized candidates — is tracked here so that whoever implements it knows which code paths it must cover.
+
+Three functions are exposed, and the ceiling must gate **all three**:
+
+- **The destructive path — `Ensure-AdequateRecoveryPartition`.** This function deletes every partition on the OS disk that carries the standard recovery GPT type GUID (`{de94bba4-06d1-4d40-a16a-bfd50179d6ac}`) or MBR type code (`0x27`), without checking its size or contents. Windows Setup and Windows in-place upgrade create recovery partitions under 1.5 GiB. **OEM factory recovery volumes** — the Dell / HP / Lenovo image-restore volumes that hold the OEM's factory Windows image and utilities — can be 7–20 GiB and may carry the same recovery type code. On a machine where an OEM factory recovery volume carries the recovery type code, this function will delete it.
+- **The reuse path — `Find-SuitableRecoveryPartition`.** This function accepts an existing recovery-typed partition on the OS disk that meets the free-space policy, without checking its size against an upper bound. On the same kind of machine, the reuse path would accept an oversized OEM recovery volume, re-register WinRE against it, and (through the normal flow) leave the partition in a state where the OEM's restore utilities no longer function. The failure shape is different from deletion, but the missing size check is the same.
+- **The stray-cleanup path — `Remove-StrayRecoveryPartitions`.** This function deletes any type-coded recovery partition on a non-OS disk, without checking size. A type-coded 7–20 GiB OEM factory recovery volume on a secondary disk would be deleted by this function on the same type-code-equals-deletable logic that the other two use. Reached by a different code path than the destructive or reuse paths.
+
+When the ceiling ships it must apply to **all three** functions. A check in only one or two of them would leave the remaining path(s) exposed, and each is reached by a different code path — a machine can take the reuse path without ever entering `Ensure-AdequateRecoveryPartition`, and a machine with a secondary-disk recovery volume can enter `Remove-StrayRecoveryPartitions` without entering either of the others.
+
+Until the ceiling ships:
+
+- The README carries a "Before you run this" warning at the top of the page. The warning names all three functions and states that the planned ceiling must gate all three.
+- The `.NOTES` block in `scripts/WinRE.ps1` carries a "Known gaps" section describing the limitation, again naming all three functions.
+- Operators deploying to machines they did not image themselves should run the harness Option 1 diagnostic and inspect the "Recovery partitions" section before proceeding. A recovery-typed partition larger than 2 GiB is a red flag.
+
+The ceiling is planned as its own version boundary and will ship with a fresh CHANGELOG entry and a `ScriptVersion` decision. It is not a v44 patch 3 change; v44 patch 3 extended this section to name the reuse path, and v44 patch 6 extended it again to name the stray-cleanup path.
+
 ### Worked examples
 
 | WIM size | Needed (WIM + 280) | Rounded up | Final |
@@ -78,6 +98,8 @@ One read-only startup check runs before any of the steps below: the Audit Mode g
 Under the v43 patch 5 (further revision 5) policy there is **no startup BitLocker gate**. The BitLocker decision is made where the action is taken, not at startup: the target volume is not known until the classifier has resolved the reagentc-registered location, and the OS volume's BitLocker state is irrelevant to the enable-only and dedicated-partition paths.
 
 The consequence for this document is that the resize sequence below is only entered on machines whose `ImageState` is `IMAGE_STATE_COMPLETE` (or absent). No other startup check gates the destructive partition path.
+
+**As of v44 patch 6, the destructive partition path does not consult C:'s BitLocker state.** The resize sequence is entered on machines that have passed the Audit Mode guard, and no additional C: check runs before the destructive sequence begins. If the destructive sequence fails at the shrink step and the run falls through to OS-fallback, the OS-fallback gate checks C: at that point and defers as designed. The safety property — never leave a machine with no working recovery route — is preserved by the OS-fallback gate alone.
 
 ### 1. Pre-checks
 
@@ -198,7 +220,7 @@ Each call is the same: if the target is unencrypted, return immediately; otherwi
 
 **The helper targets the recovery partition, not C:.** This is the v43 patch 5 (further revision 5) change. reagentc's BitLocker check is on the volume it is being asked to enable WinRE on, and that volume is the recovery partition on the dedicated-partition path and on the enable-only path. The script therefore prepares the recovery partition.
 
-**The OS-fallback route is different.** On the OS-fallback route, the target volume *is* C:, and the script does not prepare C: — it never runs `manage-bde -off` against the OS volume. Instead, the OS-fallback gate checks C:'s `VolumeStatus` and defers unless it is `FullyDecrypted`. C:'s BitLocker state is the operator's responsibility: sign in with a Microsoft account to complete Device Encryption activation, add a key protector manually, or wait for decryption to finish.
+**The OS-fallback route is different.** On the OS-fallback route, the target volume *is* C:, and the script does not prepare C: — it never runs `manage-bde -off` against the OS volume. Instead, the OS-fallback gate checks C:'s `VolumeStatus` and defers unless it is `FullyDecrypted`. C:'s BitLocker state is the operator's responsibility: complete decryption of C: (`manage-bde -off C:`) or wait for an in-progress decryption to finish.
 
 See [architecture.md](architecture.md) for the full policy and [deployment.md](deployment.md) for the operator-facing preconditions.
 
