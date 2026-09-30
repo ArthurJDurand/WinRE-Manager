@@ -20,6 +20,12 @@ The invariant exists because Windows Setup and Startup Repair scan all attached 
 
 ## The sizing policy
 
+### Where the source WIM size comes from
+
+The `wimSizeMiB` used in both thresholds below is the size of the WIM the script intends to deploy. On the full-update path this is `winre_optimized.wim`, produced by `dism /Export-Image /Compress:max` in Step 4. The input to that export is `base.wim`, which the pipeline has mounted, injected with OEM and VMD drivers, and — as of v44 patch 2 — reset with `dism /cleanup-image /StartComponentCleanup /ResetBase`. ResetBase removes superseded components from the image's WinSxS store; the export is what materialises the size reduction on disk as a smaller WIM. The sizing decision therefore uses the post-ResetBase size.
+
+On the enable-only path no WIM is rebuilt — the existing deployed WIM's size is used directly.
+
 ### Two thresholds
 
 The script uses two separate free-space thresholds, and it is important not to confuse them.

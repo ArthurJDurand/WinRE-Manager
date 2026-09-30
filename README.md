@@ -37,13 +37,26 @@ WinRE Manager addresses all of these idempotently. Running it twice in a row on 
 3. Computes the `DesiredStateId` from the current deployment inputs and reads the on-disk state file. A matching ID and a healthy machine take the fast path and exit without modifying anything.
 4. Resolves the current base WIM: reads the live recovery image at the reagentc-registered location, or falls back to `C:\Recovery\WindowsRE\winre.wim`, or downloads a fresh one from GitHub.
 5. Mounts and injects drivers: OEM WinPE pack for the vendor, then Intel VMD pack if VMD hardware is present.
-6. Optimizes and exports the WIM (`dism /Export-Image /Compress:max`).
-7. Ensures a correctly sized recovery partition exists on the **OS disk**: it either accepts an existing one that meets the 250 MiB free-space policy, or deletes stray recovery partitions, extends the OS partition, shrinks it by the required bucket + 1 MiB, and creates a new partition with the recovery type GUID applied at creation.
-8. Deploys the WIM: prepares the **target recovery partition** with `Set-RecoveryPartitionReadyForWinRE` — which decrypts it in place if the Device Encryption service claimed it, polling for completion up to 300 seconds — copies the WIM, verifies SHA256, sets the recovery type GUID and GPT attributes, registers it with `reagentc /setreimage`, and enables WinRE. On the OS-fallback route, where the target *is* the OS volume, the script instead checks C:'s BitLocker state and defers unless it is `FullyDecrypted`; it never modifies C:'s state.
-9. Enforces the invariant "exactly one recovery partition, on the OS disk" by removing any stray type-coded recovery partition on non-OS disks.
-10. Writes a state file containing the deployed WIM hash and the `DesiredStateId` so the next run can short-circuit.
+6. Runs component cleanup and ResetBase (`dism /cleanup-image /StartComponentCleanup /ResetBase`) on the mounted image. This removes superseded components from the WinSxS store inside the image; the size reduction is materialised by the export in the next step. ResetBase failure is non-fatal — the pipeline continues and the export writes whatever size the image currently is.
+7. Optimizes and exports the WIM (`dism /Export-Image /Compress:max`). The export writes a fresh WIM; this is where the ResetBase savings appear as a smaller file on disk.
+8. Ensures a correctly sized recovery partition exists on the **OS disk**: it either accepts an existing one that meets the 250 MiB free-space policy, or deletes stray recovery partitions, extends the OS partition, shrinks it by the required bucket + 1 MiB, and creates a new partition with the recovery type GUID applied at creation.
+9. Deploys the WIM: prepares the **target recovery partition** with `Set-RecoveryPartitionReadyForWinRE` — which decrypts it in place if the Device Encryption service claimed it, polling for completion up to 300 seconds — copies the WIM, verifies SHA256, sets the recovery type GUID and GPT attributes, registers it with `reagentc /setreimage`, and enables WinRE. On the OS-fallback route, where the target *is* the OS volume, the script instead checks C:'s BitLocker state and defers unless it is `FullyDecrypted`; it never modifies C:'s state.
+10. Enforces the invariant "exactly one recovery partition, on the OS disk" by removing any stray type-coded recovery partition on non-OS disks.
+11. Writes a state file containing the deployed WIM hash and the `DesiredStateId` so the next run can short-circuit.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full design, [`docs/recovery-partition.md`](docs/recovery-partition.md) for the partition-lifecycle model, and [`docs/state-and-idempotency.md`](docs/state-and-idempotency.md) for the `DesiredStateId` composition and the fast-path gates.
+
+## ⚠️ Before you run this
+
+> **Known limitation — verify your recovery partitions first.**
+>
+> WinRE Manager identifies recovery partitions by their GPT recovery type GUID (`{de94bba4-06d1-4d40-a16a-bfd50179d6ac}`) or MBR type code (`0x27`). The destructive path deletes every partition on the OS disk that carries that type code, without checking its size or contents.
+>
+> Windows Setup and Windows in-place upgrade create recovery partitions under 1.5 GiB. **OEM factory recovery volumes** — the Dell / HP / Lenovo image-restore volumes that hold the OEM's factory Windows image and utilities — can be 7–20 GiB and may carry the same recovery type code. On a machine where an OEM factory recovery volume carries the recovery type code, this script will delete it.
+>
+> **Before running this script on a machine you did not image yourself**, run `scripts\Test-WinRE.ps1` and inspect the "Recovery partitions" section of the Option 1 diagnostic. It lists every recovery-typed partition on the machine with its size. A recovery-typed partition larger than 2 GiB is a red flag — investigate before proceeding.
+>
+> A 2 GiB sanity ceiling is planned but not yet implemented. When implemented, it will warn and skip oversized candidates instead of deleting them. Tracked in the "Known gaps" section of the `.NOTES` block in `scripts/WinRE.ps1`.
 
 ## Quick start
 
@@ -68,12 +81,12 @@ Recommended deployment method is a scheduled task running as `SYSTEM`, triggered
 |------|------|---------|
 | `0` | `EXIT_SUCCESS` | WinRE enabled, dedicated recovery partition healthy, state file written. |
 | `1` | `EXIT_REBOOT_REQUIRED` | Deployment succeeded; a reboot is required to complete registration. |
-| `2` | `EXIT_WARNING` | WinRE functional but degraded (OS-fallback, incomplete injection, geometry restore, cleanup failure), **or** the run made no changes to the machine and deferred work (Audit Mode / OOBE guard, OS-fallback BitLocker deferral), **or** the enable step failed and the failure counter incremented. |
+| `2` | `EXIT_WARNING` | WinRE functional but degraded (OS-fallback, incomplete injection, geometry restore, cleanup failure), **or** the run made no changes to the machine and deferred work (Audit Mode / OOBE guard, OS-fallback BitLocker deferral, injection failure), **or** the enable step failed and the failure counter incremented. |
 | `3` | `EXIT_FATAL` | Deployment aborted. No state written, or the enable-failure loop-breaker fired. Investigate the log. |
 
 `EXIT_REBOOT_REQUIRED` has priority over `EXIT_WARNING`. `EXIT_FATAL` always wins.
 
-See [`docs/exit-codes.md`](docs/exit-codes.md) for the full matrix, including the four distinct cases of exit code 2 and how the state file's timestamp distinguishes them.
+See [`docs/exit-codes.md`](docs/exit-codes.md) for the full matrix, including the five distinct cases of exit code 2 and how the state file's timestamp distinguishes them.
 
 ## Requirements
 
@@ -116,14 +129,14 @@ There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (furthe
 
 ## Version
 
-**Production:** `WinRE.ps1` v44 patch 1.
+**Production:** `WinRE.ps1` v44 patch 2.
 **Harness:** `Test-WinRE.ps1` v15.
 
-The production script has been through 44 versions and one patch within v44, with several further revisions to v43 patch 5 that added the Audit Mode / OOBE guard, the enable-failure counter, and the target-volume BitLocker policy before v44 arrived. Full changelog is in `CHANGELOG.md`; the `.NOTES` block at the top of `scripts/WinRE.ps1` records the current design invariants and the CRITICAL LESSONS LEARNED list.
+The production script has been through 44 versions and two patches within v44, with several further revisions to v43 patch 5 that added the Audit Mode / OOBE guard, the enable-failure counter, and the target-volume BitLocker policy before v44 arrived. Full changelog is in `CHANGELOG.md`; the `.NOTES` block at the top of `scripts/WinRE.ps1` records the current design invariants and the CRITICAL LESSONS LEARNED list.
 
-`ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM and do not change the `DesiredStateId` ship under the same `ScriptVersion`, so healthy machines do not rebuild unnecessarily. v43 patches 2, 3, 4, and 5 — and the further revisions to patch 5, including further revision 5 — all shipped under `ScriptVersion = 43`.
+`ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM and do not change the `DesiredStateId` ship under the same `ScriptVersion`, so healthy machines do not rebuild unnecessarily. v43 patches 2, 3, 4, and 5 — and the further revisions to patch 5, including further revision 5 — all shipped under `ScriptVersion = 43`. v44 patch 2 (component cleanup and ResetBase) ships under `ScriptVersion = 44` for the same reason: it changes the size of the exported WIM on the next natural rebuild, but does not force a rebuild and does not change the `DesiredStateId`.
 
-The v44 patch 1 revision is the deliberate exception. It changes the `DesiredStateId` inputs — adding CPU vendor/generation and VMD presence — and therefore bumps `ScriptVersion` to 44. Every managed machine performs one full-update pass on the next scheduled run to rebuild the WIM against the new ID, then returns to the fast path permanently. The migration note in `CHANGELOG.md` describes the expected fleet behaviour and the rollback procedure.
+The v44 patch 1 revision is the deliberate exception. It changed the `DesiredStateId` inputs — adding CPU vendor/generation and VMD presence — and therefore bumped `ScriptVersion` to 44. Every managed machine performed one full-update pass on the next scheduled run to rebuild the WIM against the new ID, then returned to the fast path permanently. The migration note in `CHANGELOG.md` describes the expected fleet behaviour and the rollback procedure.
 
 ## Field-tested hardware
 
@@ -131,6 +144,7 @@ The v44 patch 1 revision is the deliberate exception. It changes the `DesiredSta
 |---|---|---|---|
 | ASUS | 11th-gen desktop (i5-11400) | Win11 26100/26200 | DEDICATED |
 | ASUS | 11th-gen desktop (i5-11400), PRIME H510M-D | Win11 26200 | v44 patch 1 — full-update pass 2026-09-30 00:29 (DSI mismatch on the v43 state file, 756.4 MiB WIM rebuilt and deployed, 1100 MiB partition accepted on size), fast path 00:32 |
+| ASUS | 11th-gen desktop (i5-11400), PRIME H510M-D | Win11 26200 | v44 patch 2 — full-update pass 2026-09-30 02:06 (state file deleted to force rebuild; ResetBase ran on the mounted image with exit 0 in ~2s; exported WIM 756.1 MiB vs. the pre-ResetBase 756.36 MiB; DEDICATED), fast path 02:08 |
 | HP | ProBook 445 14 inch G10 (Ryzen 5 7530U) | Win11 26200 | DEDICATED after v28 fix |
 | HP | ProBook 450 15.6 inch G10 (i7-1355U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
 | HP | ProBook 455 15.6 inch G10 (Ryzen 5 7530U) | Win11 26200 | DEDICATED — full update 2026-09-29 (190 drivers injected, dedicated partition created at 1200 MiB); second run fast path |
@@ -147,6 +161,8 @@ The two Device Encryption failures pre-patch-5 are documented in [`docs/troubles
 The Dell Latitude 5530 is the Audit Mode case. The script's predecessor had no Audit Mode guard; it deployed successfully through Step 5, failed at `reagentc /enable` with `0x4c7` on two consecutive runs, and wrote a state file recording the deployment as complete. After the user completed OOBE, `reagentc /enable` succeeded on the first attempt with the same WIM. The Audit Mode guard added in the further revision prevents this failure mode by deferring before any state-modifying action.
 
 The VM and ASUS entries on 2026-09-30 are the field verification for the v44 patch 1 `DesiredStateId` change. Both machines took the full-update path on the first run after the patch (the state files written under `ScriptVersion = 43` no longer matched), rebuilt the WIM with the new ID, wrote a state file under the new ID, and returned to the fast path on the second run. No drive-letter leaks, no checkpoint residue, no state-write anomalies.
+
+The second ASUS entry (02:06–02:08) is the field verification for v44 patch 2. The state file was deleted manually to force a full-update pass. ResetBase ran on the mounted image, took ~2 seconds, and exited 0. The exported WIM was 756.1 MiB against 756.36 MiB before — a 0.26 MiB reduction, expected for an image with little superseded component state. The run completed normally with `Operating mode: DEDICATED`, and the second run took the fast path. ResetBase's savings are only material on images that have accumulated multiple cumulative updates; on a fresh image the WinSxS store has nothing meaningful to reset.
 
 ## Contributing
 

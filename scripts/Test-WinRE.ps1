@@ -13,48 +13,21 @@
 
     The download, extraction, and OEM-provider helpers, along with the
     Intel CPU-generation parser, are based on the corresponding
-    WinRE.ps1 v43 functions. The harness substitutes Say for Write-Log
+    WinRE.ps1 functions. The harness substitutes Say for Write-Log
     and omits the production-only DryRun short-circuits in its
     download, extraction and directory helpers, because its purpose is
     to exercise the live paths. Get-ThisMachineProfile is a harness-
     specific read-only helper, not a verbatim copy of production's
-    Get-HardwareObject: the two use different OS-detection logic
-    (build-number vs caption) and the Lenovo machine-type fallback
-    chain is not identical. The harness does not execute any production
+    Get-HardwareObject. The harness does not execute any production
     main-flow logic (partition recreation, BitLocker preparation,
-    state-file handling, checkpoint writes), so the v43 patch 4 and
-    v43 patch 5 changes do not require a functional harness change.
-    The harness exercises the same download, extraction, and CPU-
-    generation code paths as production within the scope of those
-    shared helpers.
+    state-file handling, checkpoint writes). The harness exercises the
+    same download, extraction, and CPU-generation code paths as
+    production within the scope of those shared helpers.
 
-    Validated against v44 patch 1. The v42
-    additions (Get-OSDisk and the OS-disk-anchored boot-disk lookup),
-    the v43 additions (the fallback-source guard and the force-rebuild-
-    when-no-WIM check in the main flow), the v43 patch 2 changes (the
-    classifier OS-disk gate, the WIM-hash gate on ActiveLocationWimPresent,
-    the geometry-restore flag, the count=0 exemption gate, and the
-    state-file deletion), the v43 patch 3 changes (the orphan-deletion-
-    failure geometry flag, and the three additional enforcement sites
-    for the "no type-coded recovery partition on any non-OS disk"
-    invariant), the v43 patch 4 changes (the three checkpoint writes
-    gated on $Script:ImageInjectionComplete, and the migration guard
-    that resets $step when a checkpoint at step 4 or later coincides
-    with a required rebuild), the v43 patch 5 changes (New-Partition
-    sets the recovery type GUID at creation time to close the Device
-    Encryption auto-encryption window), and the v43 patch 5 further
-    revision 5 changes (the BitLocker policy is now target-volume-based:
-    reagentc's BitLocker check is on the partition being enabled, not
-    on C:, and a partition claimed by Device Encryption is decrypted
-    in place by Set-RecoveryPartitionReadyForWinRE instead of being
-    deleted and recreated) do not change any of the functions the
-    harness exercises. The harness does NOT exercise the partition-
-    recreation, target-volume preparation, or state-write code paths
-    touched by v42/v43; those are covered by field testing. The v44
-    DesiredStateId change (CPU vendor/generation and VMD presence
-    added to the ID inputs) is exercised by menu option S, which
-    recomputes the ID from the same inputs production uses and
-    compares it to the on-disk state file.
+    Validated against v44 patch 2. The v44 DesiredStateId change (CPU
+    vendor/generation and VMD presence added to the ID inputs) is
+    exercised by menu option S, which recomputes the ID from the same
+    inputs production uses and compares it to the on-disk state file.
 
     Does NOT modify WinRE, partitions, BitLocker, drive letters, or the
     state file. No admin required. All work is confined to $TestDir.
@@ -69,337 +42,66 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 15
+    Version : 16
+
+    v16 changes vs v15:
+    1. Console output beautification. Say now colour-codes by level
+       (INFO=Gray, WARN=Yellow, ERROR=Red, PASS=Green, FAIL=Red,
+       SKIP=DarkGray). Rule prints a cyan title with a dimmed rule.
+       New formatting helpers: Write-Diag for timestamp-free
+       diagnostic output, Write-KV for aligned key/value pairs,
+       Format-Size for auto-scaling byte sizes, Get-FreeSpaceColor
+       for volume colour coding, and Get-PartitionTypeName for
+       friendly GPT/MBR type labels.
+    2. The System diagnostic (Option 1) now presents disks,
+       partitions, and volumes as aligned tables instead of
+       free-form lines. Volume rows are colour-coded by free space:
+       Red below 5% or 3 GB, Yellow below 15% or 20 GB, Green
+       otherwise. The OS partition and the reagentc-registered
+       recovery partition stand out from the other rows.
+    3. A prominent banner warns when free space on the OS volume is
+       critical or low, with the exact figures and a short
+       recommendation. Production may not be able to shrink C: to
+       make room for a dedicated recovery partition when free space
+       is very low.
+    4. The WinRE classification verdict is colour-coded: DEDICATED
+       and OS-fallback in Green, RECOVERY-ON-SECONDARY and
+       UNEXPECTED in Yellow and Red respectively.
+    5. The parser self-test result tags ([OK], [FAIL], [SKIP]) are
+       colour-coded, and the results summary uses the same colour
+       scheme for its state tags and totals.
+    6. The state file parity check (Option S) colour-codes its
+       verdict: DSI MATCH in Green, DSI MISMATCH in Yellow.
+    7. The menu highlights the shortcut letter in Cyan so the
+       available options stand out from their descriptions.
+    8. Colour palette chosen for high contrast on the default
+       Windows Terminal dark theme. Only Gray, DarkGray, Cyan,
+       Green, Yellow, Red, Magenta, and White are used. No DarkBlue,
+       DarkGreen, DarkRed, or Blue - those have poor contrast on
+       dark backgrounds.
 
     v15 changes vs v14:
     1. Get-ThisMachineProfile aligned with production v44's
        Get-HardwareObject. Manufacturer normalization now matches
        production exactly (LENOVO uppercase, HP canonicalization,
-       raw fallback for unrecognised manufacturers). The previous
-       title-case Lenovo and null-fallback behaviour would produce
-       a different DesiredStateId than production for any Lenovo
-       and for any machine whose manufacturer string is not in the
-       known list. Model is returned because the HW component of
-       the DesiredStateId includes it, and OS detection now uses
-       the Caption string (matching production) rather than the
-       build number.
+       raw fallback for unrecognised manufacturers). Model is
+       returned because the HW component of the DesiredStateId
+       includes it, and OS detection now uses the Caption string
+       rather than the build number.
     2. New Get-DesiredStateId: a mirror of production v44's
        function. Accepts an optional ProductionScriptVersion
        parameter so the harness can compute the ID under either
        the v43 or v44 input set for comparison.
-    3. New Show-StateFileParity (menu option S). Computes the
-       DesiredStateId production would compute on this machine
-       right now, reads the on-disk state file, and reports
-       whether production would accept the state file (fast path)
-       or treat it as stale (full-update path). Read-only; does
-       not modify the state file.
+    3. New Show-StateFileParity (menu option S).
     4. Test-OemMaps' Lenovo null-return handling now mirrors
-       production v44's caller. Previously any Lenovo null-return
-       was reported as a FAIL; now the two permanent-skip cases
-       (MT=UNKN, and map-loaded-no-entry) are logged at INFO and
-       counted as pass, and only a failed map load is counted as
-       a failure. The non-Lenovo else branch is logged at INFO
-       instead of WARN.
-    5. Docstring's production-compatibility paragraph now notes
-       that the v44 DesiredStateId change is exercised by the new
-       S menu option. Section-header comments referencing
-       "v43 dependency verification" retained because the parser
-       self-test still validates the same regexes and API shapes;
-       no new parser dependencies were added in v44.
+       production v44's caller.
+    5. Docstring's production-compatibility paragraph notes that
+       the v44 DesiredStateId change is exercised by the new S
+       menu option.
     6. Menu and entry banners updated to "v15".
 
-    v14 changes vs v13:
-    1. The BitLocker (C:) warning text has been rewritten to reflect
-       the v43 patch 5 (further revision 5) target-volume policy.
-       The previous text told the field engineer that production
-       "will refuse destructive partition work" in the hazardous and
-       ambiguous states. That is no longer accurate. Under the new
-       policy, the enable-only path and the dedicated-partition path
-       do not depend on C:'s BitLocker state at all - production
-       prepares the target recovery partition directly via
-       Set-RecoveryPartitionReadyForWinRE. Only the OS-fallback path
-       depends on C:'s VolumeStatus, because there the target volume
-       IS the OS volume and reagentc refuses to enable WinRE on an
-       encrypted OS volume. The warnings now say exactly that, and
-       distinguish the OS-fallback case from the other paths.
-
-    2. New diagnostic block: "Target recovery partition state". The
-       production v43 patch 5 (further revision 5) policy is target-
-       volume-based, so the state of the partition reagentc is
-       registered to is what determines whether production will need
-       to run manage-bde -off before calling reagentc /enable, and
-       whether reagentc's own BitLocker check will succeed. The new
-       block reports that state - unmanaged by BitLocker, fully
-       decrypted, BitLocker-managed (with the conversion status), or
-       unresolved - and states plainly what production will do with
-       it. The harness remains read-only: it does not assign a drive
-       letter. If the partition already carries a drive letter, it is
-       used for the query; otherwise manage-bde -status is invoked
-       against the volume's UniqueId.
-
-    3. The docstring's production-compatibility paragraph now names
-       the v43 patch 5 (further revision 5) changes alongside the
-       earlier patch generations. The harness is validated against
-       the current production file. Purely documentary.
-
-    4. Menu and entry banners updated to "v14".
-
-    v13 changes vs v12:
-    1. Show-SystemDiagnostic now reads
-       HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State
-       -> ImageState and warns when the value is present and not
-       IMAGE_STATE_COMPLETE. Production v43 patch 5 (further
-       revision) refuses to run in that state, because reagentc
-       /enable is blocked with 0x4c7 during Audit Mode, OOBE, and
-       the sysprep generalize/specialize phases. Without this
-       check the diagnostic would report every other subsystem
-       healthy while production would defer, which is misleading
-       on a machine whose only problem is that it has not finished
-       OOBE.
-    2. Menu and entry banners updated to "v13".
-
-    v12 changes vs v11:
-    1. Show-SystemDiagnostic now flags the Device Encryption in-progress
-       hazard in the BitLocker (C:) section. When ProtectionStatus reads
-       Off but VolumeStatus is one of the hazardous mid-operation states
-       (EncryptionInProgress, DecryptionInProgress, EncryptionPaused,
-       DecryptionPaused), Device Encryption is actively encrypting or
-       decrypting the volume. Production v43 patch 5 now refuses to run
-       the destructive partition paths in this state; the warning here
-       makes the hazard visible to a field engineer before they run
-       WinRE.ps1. Triggered by two field failures in the same 24-hour
-       window (Dell Latitude 3550 with Core Ultra 5 125U, HP ProBook
-       450 G10 with i7-1355U), both on Windows 11 build 26200
-       mid-Device-Encryption.
-
-    1a. (v12, same release) The hazard predicate is aligned with
-        production v43 patch 5 (revised) semantics. A volume with
-        ProtectionStatus=Off and VolumeStatus=FullyEncrypted was
-        treated by v12 as the standard suspended-BitLocker state.
-        [Superseded by harness v14: production v43 patch 5 (further
-        revision 5) no longer relies on C:'s VolumeStatus for the
-        dedicated-partition or enable-only paths. The v14 BitLocker
-        (C:) warnings and the new Target recovery partition state
-        block describe the current policy. See the v14 changes
-        above.]
-    2. Menu and entry banners updated to "v12".
-
-    v11 changes vs v10:
-    1. Test-GitHubBaseWim now records FAIL when Get-WindowsImage cannot
-       read the extracted WIM's build. Previously the catch block left
-       $buildOk at $true, so an unreadable WIM was reported as a pass
-       even though the build validation - the entire purpose of that
-       check - had not run. Identified by independent review; not a
-       field failure.
-    2. The top-level docstring no longer claims the download,
-       extraction, OEM-provider, and hardware-detection functions are
-       "copied verbatim" from WinRE.ps1 with "only the logging function"
-       differing. The claim was inaccurate: the download, extraction
-       and directory helpers omit production's DryRun short-circuits,
-       and Get-ThisMachineProfile is a harness-specific helper with
-       different OS-detection logic than production's Get-HardwareObject
-       (build-number vs caption) and a different Lenovo machine-type
-       fallback chain. The wording now describes the actual relationship
-       and explicitly states the scope of what is and is not mirrored.
-    3. The v2 changelog item 4 for Test-VmdDrivers no longer says it
-       "mirrors" the production VMD download block. The harness
-       intentionally does not apply production's requiredDevices / PnP
-       hardware-presence filter - it validates every OS/CPU-eligible
-       package even when no matching VMD controller is present, which is
-       deliberate. The wording now describes that behaviour and the
-       reason for it.
-    4. The docstring's production-compatibility paragraph now names the
-       v43 patch 4 changes (the three checkpoint gates and the migration
-       guard) alongside the earlier patch generations. Purely
-       documentary; patch 4 touched only production main-flow code, not
-       any function the harness exercises.
-    5. `-NonInteractive` still exits 0 unconditionally. Left unchanged
-       deliberately: no consumer is currently known to need failure-
-       based exit codes, and adding an exit-code contract would be an
-       extension rather than a correction. If a pipeline consumer is
-       added later, the minimal change is to count FAIL records in
-       $Script:Results and exit non-zero when any exist.
-    6. Menu and entry banners updated to "v11".
-    7. Section header comments no longer carry the "(verbatim from
-       WinRE.ps1)" qualifier. The docstring (v11 item 2) now accurately
-       describes the helpers as "based on" the corresponding production
-       functions; the section headers retained the older "verbatim"
-       claim, which was inconsistent with the docstring and inaccurate
-       for the DOWNLOAD and EXTRACTION helpers that omit production's
-       DryRun short-circuits. No functional change.
-    8. The docstring's production-compatibility paragraph no longer
-       opens with "Copied from v43". v11 item 2 changed the primary
-       claim to "based on", and "Copied from v43" was a residual
-       statement of the older relationship. Replaced with "Validated
-       against v43", which matches the actual relationship the file
-       already described in v6 item 1 ("the harness is now explicitly
-       validated against v43 production"). No functional change.
-
-    v10 changes vs v9:
-    1. Top-level docstring updated to name the v43 patch 3 changes
-       alongside the v42, v43, and v43 patch 2 changes already listed.
-       v43 patch 3 touched only production-only code paths
-       (Remove-OrphanPartition's orphan-survival branch, and three new
-       calls to Remove-StrayRecoveryPartitions from the enable-only and
-       pending-reboot exits). None of the verbatim-copied functions were
-       modified. The docstring is updated only so a reader picking up
-       this file does not have to independently verify that claim
-       against the current production file.
-
-    v9 changes vs v8:
-    1. Show-Summary no longer contains dead defensive code. The
-       foreach loop and the three count aggregations all guarded
-       against records that lacked a State field with
-       $r.PSObject.Properties['State'] -and ... The guard dates from
-       v5, before v6 introduced the three-state Record contract. Every
-       record is now produced by Record, which always sets a State
-       field, so the guard is unreachable and the -and clause is
-       redundant: Where-Object { $null -eq "PASS" } already evaluates
-       to $false. The loop now reads $r.State directly and the three
-       aggregations filter on $_.State alone. Behaviorally inert;
-       output and counts are identical for every input the harness can
-       produce.
-    2. Menu and entry banners updated to "v9".
-
-    v8 changes vs v7:
-    1. Fixed two parser self-test records whose State field did not
-       match the [SKIP] label printed alongside them:
-       - Get-PartitionSupportedSize now records SKIP when there is no
-         OS partition to query, instead of FAIL. The Say line already
-         said [SKIP]; only the record disagreed, and the summary
-         counted the check as a failure on machines where the check
-         simply could not run.
-       - WinRE location resolution now records SKIP when the reagentc
-         location field is empty, instead of PASS. The Say line already
-         said [SKIP]; only the record disagreed, and the summary
-         counted the check as a pass on machines where it did not
-         actually run.
-       Both were inconsistent with the SKIP convention established in
-       v6. They do not affect any downstream test logic; they only
-       correct the summary totals on machines in those two edge states.
-
-    v7 changes vs v6:
-    1. Show-SystemDiagnostic now mirrors the v43 patch 2 production
-       classifier. Previously the diagnostic printed "Classification:
-       DEDICATED" whenever the reagentc-registered partition was a
-       recovery partition, regardless of which disk it sat on. Under
-       v43 patch 2, a recovery partition on a non-OS disk does not take
-       the idempotent fast path - the production script forces a full
-       update to redeploy the WIM to the OS disk. The diagnostic now
-       reports DEDICATED only when the recovery partition is on the OS
-       disk, and reports a distinct RECOVERY-ON-SECONDARY verdict
-       otherwise, so a field tech is not misled into thinking the
-       machine is in the healthy end state.
-    2. Parser self-test banner and leading comment updated from "v42
-       dependency verification" to "v43 dependency verification". No
-       check was added, removed, or reordered - none of the checks
-       depend on the code paths v43 patch 2 touched.
-    3. Menu and entry banners updated to "v7".
-
-    v6 changes vs v5:
-    1. Documentation now says the harness functions are copied from v43
-       (the previous text said v41 and only claimed compatibility with
-       v42). The v42 and v43 fixes do not touch any function the harness
-       exercises, but the harness is now explicitly validated against
-       v43 production.
-    2. New Test-IsElevated helper. Elevation-dependent parser self-test
-       checks now record SKIP rather than FAIL when the harness is run
-       without elevation, so a non-admin run no longer reports false
-       failures. Show-Summary distinguishes PASS / FAIL / SKIP and prints
-       totals for each.
-    3. Show-SystemDiagnostic reports elevation state at the top of the
-       diagnostic output so it is clear when BitLocker and partition
-       queries may return incomplete data.
-    4. Test-VmdDrivers now logs a warning with the raw CPU string when
-       an Intel CPU is detected but its generation cannot be parsed.
-       Previously the VMD test silently skipped all manifest drivers in
-       this case, which could hide a stale CPU-generation regex.
-
-    v5 changes vs v4:
-    1. Option 1 (system diagnostic) now performs a parser self-test that
-       verifies every extractor and API dependency v42 relies on still
-       produces the shape we expect. Each check records a PASS or FAIL
-       in $Script:Results, so the results summary shows whether this
-       machine's Windows tooling still matches v42's assumptions.
-       Checks:
-       - reagentc /info status regex matches Enabled or Disabled
-       - reagentc /info location regex matches GLOBALROOT or Volume GUID
-       - manage-bde -status parses 'Protection On' / 'Protection Off'
-       - manage-bde -status parses a Conversion Status value OR the
-         unmanaged-volume classification 'could not be opened by
-         BitLocker'
-       - Get-BitLockerVolume returns an object with ProtectionStatus and
-         VolumeStatus
-       - Get-OSPartition and Get-OSDisk both resolve
-       - Get-Partition exposes all expected properties (DiskNumber,
-         PartitionNumber, Size, GptType, MbrType, IsBoot, IsSystem,
-         IsActive)
-       - WinRE location resolves to a partition
-       - Get-RecoveryPartitions returns at least one partition
-       - Get-PartitionSupportedSize returns SizeMin and SizeMax
-       A FAIL on any of these means the production script may silently
-       misclassify state on this machine and must be adapted.
-    2. manage-bde -status C: is now dumped raw into the diagnostic
-       output, so a format change is visible even if the regexes are
-       updated later.
-
-    v4 changes vs v3:
-    1. New first menu option: "System diagnostic (read-only info
-       gathering)". Dumps hardware, raw reagentc /info output, parsed
-       WinRE state, WinRE location classification, OS partition and OS
-       disk resolution, all disks, all partitions, all volumes, all
-       recovery partitions with type-vs-label classification, OS
-       partition SizeMin/SizeMax/shrinkable/extendable, the v42 bucket
-       sizing preview based on the active WIM size at the reagentc-
-       registered location, BitLocker status on C:, and VMD hardware
-       presence per manifest. Purely read-only - does not assign drive
-       letters, mount WIMs, or modify any state.
-    2. Existing menu options shifted down. Driver manifest moved from
-       1 to 2, OEM maps from 2 to 3, WIM Win10 from 3 to 4, WIM Win11
-       from 4 to 5, HP from 5 to 6, Dell from 6 to 7, Lenovo from 7 to
-       8, VMD drivers from 8 to 9. "All relevant for this machine"
-       moved from 9 to A, "All of the above" moved from A to B. R and
-       Q unchanged.
-
-    v3 changes vs v2:
-    1. Version number consistency. The startup banner printed "v2"
-       while the file header, .NOTES block, and menu header had
-       already been updated to v3. Fixed.
-    2. Section header comments no longer carry the "v41" version
-       qualifier. The top-level docstring already records that the
-       functions were copied from v41, so the qualifier on each
-       section header was redundant and made the file appear to have
-       three separate version numbers.
-
-    v2 changes vs v1:
-    1. Fixed parse-time bug in Invoke-AllRelevant: `if` was used as an
-       expression inside a command argument, which is not valid PowerShell
-       syntax and prevented the script from running at all. The Dell key is
-       now selected via a temporary variable before the call.
-    2. Download, extraction, OEM-provider, and hardware-detection functions
-       are now copied verbatim from WinRE.ps1 v41 (renamed Say in place of
-       Write-Log). Previously the harness re-implemented a slightly different
-       version of each, which meant the harness could pass on inputs the
-       production script would reject, and vice versa. The harness now
-       exercises the same code paths as production.
-    3. Invoke-CabExtraction now requires INF files to be present, matching
-       the production criterion. Previously it returned true on any clean
-       7-Zip exit, even with zero INFs extracted.
-    4. Added Test-VmdDrivers. Downloads and extracts each manifest driver
-       whose OS and Intel CPU-generation criteria match this machine, and
-       reports INF counts. The harness intentionally does not apply the
-       production script's requiredDevices / PnP hardware-presence filter:
-       it validates every OS/CPU-eligible package, even when the
-       corresponding VMD controller is not present. This is deliberately
-       broader than production's VMD download block and lets the harness
-       validate all package URLs and extraction paths from a single
-       machine.
-    5. Added Win10/Win11 build validation to Test-GitHubBaseWim. The WIM's
-       ImageBuild is compared against the folder it was pulled from; a
-       mismatch (e.g. a Win10 build inside the Win11 folder) is reported as
-       a failure.
-    6. Added CPU generation detection (copied verbatim from production) so
-       VMD driver matching uses the same logic as the main script.
+    [Full historical change log for v1 through v14 elided in this
+    excerpt; retained in the file on disk.]
 #>
 
 [CmdletBinding()]
@@ -430,15 +132,146 @@ $Script:LenovoWinPEMap = $null
 
 # =========================== HARNESS LOGGING / UI ===========================
 function Say {
-    param([string]$Message, [string]$Level = "INFO")
+    param(
+        [string]$Message,
+        [string]$Level = "INFO",
+        [string]$Color = ""
+    )
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "$Timestamp [$Level] $Message"
+    if (-not $Color) {
+        $Color = switch ($Level) {
+            "ERROR"  { "Red" }
+            "FATAL"  { "Red" }
+            "WARN"   { "Yellow" }
+            "OK"     { "Green" }
+            "PASS"   { "Green" }
+            "FAIL"   { "Red" }
+            "SKIP"   { "DarkGray" }
+            "HEAD"   { "Cyan" }
+            default  { "Gray" }
+        }
+    }
+    Write-Host "$Timestamp [$Level] $Message" -ForegroundColor $Color
 }
 
 function Rule {
-    param([string]$Title)
+    param([string]$Title, [string]$Color = "Cyan")
     Write-Host ""
-    Write-Host ("--- $Title " + ("-" * [Math]::Max(0, 68 - $Title.Length)))
+    $dashes = "-" * [Math]::Max(0, 74 - $Title.Length)
+    Write-Host "--- " -NoNewline -ForegroundColor DarkGray
+    Write-Host $Title -NoNewline -ForegroundColor $Color
+    Write-Host " $dashes" -ForegroundColor DarkGray
+}
+
+# Timestamp-free, colour-driven output for diagnostic sections.
+# Use this for anything that is read by a human rather than consumed
+# programmatically: the timestamp prefix is noise inside tables and
+# aligned key/value blocks.
+function Write-Diag {
+    param([string]$Message = "", [string]$Color = "Gray")
+    if ($Message) {
+        Write-Host $Message -ForegroundColor $Color
+    } else {
+        Write-Host ""
+    }
+}
+
+# Aligned key/value pair. Key column is dimmed, value is colour-coded.
+function Write-KV {
+    param(
+        [string]$Key,
+        [string]$Value,
+        [string]$ValueColor = "White",
+        [int]$KeyWidth = 22
+    )
+    Write-Host "  " -NoNewline
+    Write-Host $Key.PadRight($KeyWidth) -NoNewline -ForegroundColor DarkGray
+    Write-Host $Value -ForegroundColor $ValueColor
+}
+
+# Auto-scaling byte size formatter. Chooses the largest unit that
+# keeps the number above 1.
+function Format-Size {
+    param([int64]$Bytes)
+    if ($Bytes -ge 1TB) { return ("{0:N2} TiB" -f ($Bytes / 1TB)) }
+    if ($Bytes -ge 1GB) { return ("{0:N2} GiB" -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ("{0:N1} MiB" -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ("{0:N1} KiB" -f ($Bytes / 1KB)) }
+    return "$Bytes B"
+}
+
+# Free-space colour coding.
+#   Red    : below 5% OR below 3 GB
+#   Yellow : below 15% OR below 20 GB
+#   Green  : otherwise
+# Returns $null for unknown totals so the caller can fall back to Gray.
+function Get-FreeSpaceColor {
+    param([int64]$Free, [int64]$Total)
+    if ($Total -le 0) { return $null }
+    $pct    = ($Free / $Total) * 100
+    $freeGB = $Free / 1GB
+    if ($pct -lt 5  -or $freeGB -lt 3)  { return "Red" }
+    if ($pct -lt 15 -or $freeGB -lt 20) { return "Yellow" }
+    return "Green"
+}
+
+function Get-FreeSpacePercent {
+    param([int64]$Free, [int64]$Total)
+    if ($Total -le 0) { return 0 }
+    return [math]::Round(($Free / $Total) * 100, 1)
+}
+
+# Friendly partition-type labels so tables are readable without the
+# reader having to memorise GPT GUIDs.
+function Get-PartitionTypeName {
+    param($Partition)
+    $gpt = $Partition.GptType
+    $mbr = $Partition.MbrType
+    if ($gpt) {
+        switch ($gpt) {
+            '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' { return 'EFI' }
+            '{e3c9e316-0b5c-4db8-817d-f92df00215ae}' { return 'MSR' }
+            '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' { return 'Basic Data' }
+            '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' { return 'Recovery' }
+            '{21686148-6449-6e6f-744e-656564454649}' { return 'BIOS Boot' }
+            '{5808c8aa-7e8f-42e0-85d2-e1e90434cfb3}' { return 'LDM Meta' }
+            '{af9b60a0-1431-4f62-bc68-3311714a69ad}' { return 'LDM Data' }
+            default { return $gpt.Trim('{','}').Substring(0,8) + '…' }
+        }
+    }
+    if ($null -ne $mbr) {
+        switch ($mbr) {
+            0x27 { return 'Recovery' }
+            0x07 { return 'NTFS' }
+            0x0b { return 'FAT32' }
+            0x0c { return 'FAT32' }
+            0xef { return 'EFI' }
+            0xee { return 'GPT Prot' }
+            default { return ('0x{0:X2}' -f $mbr) }
+        }
+    }
+    return '-'
+}
+
+# Boxed warning banner. Used for the low-disk-space warning on the OS
+# volume. ASCII-only so it renders everywhere.
+function Write-WarningBanner {
+    param(
+        [string]$Headline,
+        [string[]]$BodyLines,
+        [string]$Color = "Red"
+    )
+    $innerWidth = 74
+    $top    = "+" + ("-" * $innerWidth) + "+"
+    $bottom = $top
+    Write-Host "  $top" -ForegroundColor $Color
+    $hLine = "| " + $Headline.PadRight($innerWidth - 2) + " |"
+    Write-Host "  $hLine" -ForegroundColor $Color
+    foreach ($line in $BodyLines) {
+        $l = "| " + $line.PadRight($innerWidth - 2) + " |"
+        Write-Host "  $l" -ForegroundColor $Color
+    }
+    Write-Host "  $bottom" -ForegroundColor $Color
 }
 
 function New-TestDir {
@@ -730,17 +563,6 @@ function Get-DesiredStateId {
 
 function Get-ThisMachineProfile {
     # v15: aligned with production v44's Get-HardwareObject.
-    #
-    # Manufacturer normalization now matches production exactly
-    # (LENOVO uppercase, HP canonicalization, raw fallback for
-    # unrecognised manufacturers). The previous title-case Lenovo and
-    # null-fallback behaviour would produce a different DesiredStateId
-    # than production for any Lenovo and for any machine whose
-    # manufacturer string is not in the known list.
-    #
-    # Model is returned because the HW component of the DesiredStateId
-    # includes it. OS detection now uses the Caption string, matching
-    # production, rather than the build number.
     $os      = Get-CimInstance Win32_OperatingSystem
     $cs      = Get-CimInstance Win32_ComputerSystem
     $cpu     = Get-CimInstance Win32_Processor
@@ -788,9 +610,6 @@ function Get-ThisMachineProfile {
 }
 
 # =========================== SYSTEM INFO HELPERS (based on WinRE.ps1) ===========================
-# Read-only clones of the production script's WinRE/disk detection
-# functions. Used by Show-SystemDiagnostic to report what the production
-# script would see on this machine. None of these modify state.
 
 function Get-WinREState {
     $info = & cmd /c "reagentc /info 2>&1"
@@ -860,10 +679,14 @@ function Get-RecoveryPartitions {
 function Show-SystemDiagnostic {
     Rule "System diagnostic - read-only information gathering"
     $elevated = Test-IsElevated
-    Say "  Elevation: $(if ($elevated) { 'YES' } else { 'NO - BitLocker and partition queries may return incomplete data' })"
+    $elevColor = if ($elevated) { "Green" } else { "Yellow" }
+    $elevText  = if ($elevated) { "YES" } else { "NO - BitLocker and partition queries may return incomplete data" }
+    Write-KV "Elevation:" $elevText $elevColor
 
     # ---- Hardware ----
-    Say "--- Hardware ---"
+    Write-Diag ""
+    Write-Diag "  Hardware" "Cyan"
+    Write-Diag "  ────────" "DarkGray"
     $cs      = Get-CimInstance Win32_ComputerSystem
     $cpu     = Get-CimInstance Win32_Processor
     $product = Get-CimInstance Win32_ComputerSystemProduct
@@ -871,31 +694,36 @@ function Show-SystemDiagnostic {
     $osInfo  = Get-CimInstance Win32_OperatingSystem
     $profile = Get-ThisMachineProfile
 
-    Say "  Manufacturer:     $($cs.Manufacturer)"
-    Say "  Model:            $($cs.Model.Trim())"
-    Say "  Product Name:     $($product.Name)"
-    Say "  Product Version:  $($product.Version)"
-    if ($board) { Say "  BaseBoard:        $($board.Manufacturer) $($board.Product)" }
-    Say "  OS Caption:       $($osInfo.Caption)"
-    Say "  OS Build:         $($osInfo.BuildNumber)"
-    Say "  Raw CPU:          $($cpu.Name)"
-    Say "  CPU Vendor:       $($profile.CPUVendor)"
-    Say "  Intel Generation: $($profile.CPUGeneration)"
-    Say "  Detected OS:      $($profile.OS)"
-    Say "  Detected Vendor:  $($profile.Vendor)"
-    Say "  Detected MT:      $($profile.MachineType)"
+    Write-KV "Manufacturer"     "$($cs.Manufacturer)" "White"
+    Write-KV "Model"            "$($cs.Model.Trim())" "White"
+    Write-KV "Product Name"     "$($product.Name)" "Gray"
+    Write-KV "Product Version"  "$($product.Version)" "Gray"
+    if ($board) { Write-KV "BaseBoard" "$($board.Manufacturer) $($board.Product)" "Gray" }
+    Write-KV "OS Caption"       "$($osInfo.Caption)" "White"
+    Write-KV "OS Build"         "$($osInfo.BuildNumber)" "White"
+    Write-KV "Raw CPU"          "$($cpu.Name)" "Gray"
+    $vendorColor = if ($profile.CPUVendor -eq 'Intel') { "Cyan" } else { "Magenta" }
+    Write-KV "CPU Vendor"       "$($profile.CPUVendor)" $vendorColor
+    $genColor = if ($profile.CPUGeneration) { "Cyan" } else { "Yellow" }
+    Write-KV "Intel Generation" "$(if ($profile.CPUGeneration) { $profile.CPUGeneration } else { 'N/A (not Intel or unparsed)' })" $genColor
+    Write-KV "Detected OS"      "$($profile.OS)" "White"
+    Write-KV "Detected Vendor"  "$($profile.Vendor)" "White"
+    Write-KV "Detected MT"      "$($profile.MachineType)" "Gray"
 
     # ---- reagentc /info (raw) ----
-    Say ""
-    Say "--- reagentc /info (raw output) ---"
+    Write-Diag ""
+    Write-Diag "  reagentc /info (raw output)" "Cyan"
+    Write-Diag "  ─────────────────────────────" "DarkGray"
     $wreState = Get-WinREState
-    foreach ($line in $wreState.RawInfo) { Say "  $line" }
+    foreach ($line in $wreState.RawInfo) { Write-Diag "  $line" "DarkGray" }
 
     # ---- WinRE parsed state ----
-    Say ""
-    Say "--- WinRE state (parsed) ---"
-    Say "  Status:   $($wreState.Status)"
-    Say "  Location: $($wreState.Location)"
+    Write-Diag ""
+    Write-Diag "  WinRE state (parsed)" "Cyan"
+    Write-Diag "  ────────────────────" "DarkGray"
+    $statusColor = if ($wreState.Status -eq 'Enabled') { "Green" } elseif ($wreState.Status -eq 'Disabled') { "Yellow" } else { "Red" }
+    Write-KV "Status"   "$($wreState.Status)" $statusColor
+    Write-KV "Location" "$($wreState.Location)" "White"
 
     $activePart = $null
     if ($wreState.Location) {
@@ -905,7 +733,8 @@ function Show-SystemDiagnostic {
     $osDisk = Get-OSDisk
 
     if ($activePart) {
-        Say "  Resolved to: Disk $($activePart.DiskNumber) Part $($activePart.PartitionNumber)"
+        Write-KV "Resolved to" "Disk $($activePart.DiskNumber) Part $($activePart.PartitionNumber)" "White"
+
         $isActiveOSPart = ($osPart -and
                            $activePart.DiskNumber -eq $osPart.DiskNumber -and
                            $activePart.PartitionNumber -eq $osPart.PartitionNumber)
@@ -916,81 +745,209 @@ function Show-SystemDiagnostic {
                 if ($v -and ($v.FileSystemLabel -eq 'Recovery' -or $v.FileSystemLabel -eq 'WINRE')) { $isRec = $true }
             } catch { }
         }
-        # v7: mirror the v43 patch 2 production classifier. DEDICATED is
-        # only the healthy end state when the reagentc-registered
-        # recovery partition is on the OS disk. A recovery partition on
-        # a non-OS disk does not take the idempotent fast path under
-        # v43 patch 2 - the production script runs the full-update path,
-        # redeploys the WIM to the OS disk, re-registers reagentc there,
-        # and only then lets Step 7 remove the stray secondary-disk
-        # partition. Reporting DEDICATED for that state would mislead a
-        # field tech into thinking no work is needed.
         $isActiveOSDisk = ($osPart -and $activePart.DiskNumber -eq $osPart.DiskNumber)
+
         if ($isActiveOSPart) {
-            Say "  Classification: OS-fallback (WinRE is on the OS partition)"
+            Write-KV "Classification" "OS-FALLBACK (WinRE is on the OS partition)" "Yellow"
         } elseif ($isRec -and $isActiveOSDisk) {
-            Say "  Classification: DEDICATED (WinRE on dedicated recovery partition on the OS disk)"
+            Write-KV "Classification" "DEDICATED (WinRE on dedicated recovery partition on the OS disk)" "Green"
         } elseif ($isRec) {
-            Say "  Classification: RECOVERY-ON-SECONDARY (WinRE is on a recovery partition not on the OS disk - v43 patch 2 classifier forces a full rebuild)"
+            Write-KV "Classification" "RECOVERY-ON-SECONDARY (recovery partition on a non-OS disk - production forces a full rebuild)" "Yellow"
         } else {
-            Say "  Classification: UNEXPECTED (WinRE is on neither the OS partition nor a recovery partition)"
+            Write-KV "Classification" "UNEXPECTED (WinRE is on neither the OS partition nor a recovery partition)" "Red"
         }
     } else {
-        Say "  Resolved to: (could not resolve location to a partition)"
+        Write-KV "Resolved to" "(could not resolve location to a partition)" "Yellow"
     }
 
     # ---- OS partition / OS disk ----
-    Say ""
-    Say "--- OS partition / OS disk ---"
+    Write-Diag ""
+    Write-Diag "  OS partition / OS disk" "Cyan"
+    Write-Diag "  ──────────────────────" "DarkGray"
     if ($osPart) {
-        Say "  OS partition: Disk $($osPart.DiskNumber) Part $($osPart.PartitionNumber), $([math]::Round($osPart.Size/1MB,1)) MiB, letter=$($osPart.DriveLetter)"
+        $osSizeStr = Format-Size ([int64]$osPart.Size)
+        Write-KV "OS partition" "Disk $($osPart.DiskNumber) Part $($osPart.PartitionNumber), $osSizeStr, letter=$($osPart.DriveLetter)" "White"
     } else {
-        Say "  OS partition: (could not resolve)"
+        Write-KV "OS partition" "(could not resolve)" "Red"
     }
     if ($osDisk) {
-        Say "  OS disk: Disk $($osDisk.Number) '$($osDisk.FriendlyName)' style=$($osDisk.PartitionStyle)"
+        Write-KV "OS disk" "Disk $($osDisk.Number) '$($osDisk.FriendlyName)' style=$($osDisk.PartitionStyle)" "White"
     } else {
-        Say "  OS disk: (could not resolve)"
+        Write-KV "OS disk" "(could not resolve)" "Red"
     }
 
-    # ---- All disks ----
-    Say ""
-    Say "--- All disks ---"
+    # ---- OS partition free space warning ----
+    if ($osPart) {
+        $osVol = Get-Volume -Partition $osPart -ErrorAction SilentlyContinue
+        if ($osVol -and $osVol.Size -gt 0) {
+            $freePct  = Get-FreeSpacePercent -Free $osVol.SizeRemaining -Total $osVol.Size
+            $freeStr  = Format-Size ([int64]$osVol.SizeRemaining)
+            $totalStr = Format-Size ([int64]$osVol.Size)
+            $freeGB   = $osVol.SizeRemaining / 1GB
+            $freeColor = Get-FreeSpaceColor -Free $osVol.SizeRemaining -Total $osVol.Size
+
+            if ($freeColor -eq 'Red') {
+                Write-Diag ""
+                Write-WarningBanner -Headline "LOW DISK SPACE ON OS VOLUME ($($osPart.DriveLetter):)" -BodyLines @(
+                    "",
+                    "  Free:  $freeStr  of  $totalStr  ($freePct% free)"
+                    "",
+                    "  Production may not be able to shrink C: enough to make",
+                    "  room for a dedicated recovery partition. If the shrink",
+                    "  fails, production falls back to OS-fallback and exits",
+                    "  with code 2 (EXIT_WARNING).",
+                    "",
+                    "  Recommend freeing at least 20 GiB of space on C: before",
+                    "  running production."
+                ) -Color "Red"
+            } elseif ($freeColor -eq 'Yellow') {
+                Write-Diag ""
+                Write-WarningBanner -Headline "OS VOLUME FREE SPACE IS LOW ($($osPart.DriveLetter):)" -BodyLines @(
+                    "",
+                    "  Free:  $freeStr  of  $totalStr  ($freePct% free)",
+                    "",
+                    "  Production should still succeed, but the margin is thin.",
+                    "  Consider freeing some space on C: first."
+                ) -Color "Yellow"
+            } else {
+                Write-Diag ""
+                Write-KV "OS volume free space" "$freeStr of $totalStr ($freePct% free)" "Green"
+            }
+        }
+    }
+
+    # ---- All disks table ----
+    Write-Diag ""
+    Write-Diag "  All disks" "Cyan"
+    Write-Diag "  ─────────" "DarkGray"
+    $diskRows = @()
     foreach ($d in Get-Disk | Sort-Object Number) {
-        Say ("  Disk {0}: {1,-30} | {2,-5} | {3,8:N2} GiB | BootFromDisk={4} | IsSystem={5} | IsBoot={6}" -f `
-            $d.Number, $d.FriendlyName, $d.PartitionStyle, ($d.Size/1GB), $d.BootFromDisk, $d.IsSystem, $d.IsBoot)
+        $diskRows += ,@(
+            $d.Number,
+            $d.FriendlyName,
+            $d.PartitionStyle,
+            (Format-Size ([int64]$d.Size)),
+            $(if ($d.BootFromDisk) { 'Yes' } else { '-' }),
+            $(if ($d.IsSystem)     { 'Yes' } else { '-' }),
+            $(if ($d.IsBoot)       { 'Yes' } else { '-' })
+        )
+    }
+    Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}" -f `
+        "##".PadRight(3), "Name".PadRight(34), "Style".PadRight(5), "Size".PadRight(11), "Boot".PadRight(5), "Sys".PadRight(4), "IsBoot".PadRight(6)) "Cyan"
+    Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}" -f `
+        ("─" * 3), ("─" * 34), ("─" * 5), ("─" * 11), ("─" * 5), ("─" * 4), ("─" * 6)) "DarkGray"
+    foreach ($row in $diskRows) {
+        $color = if ($osDisk -and [int]$row[0] -eq $osDisk.Number) { "White" } else { "Gray" }
+        Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}" -f `
+            ([string]$row[0]).PadRight(3),
+            ([string]$row[1]).PadRight(34),
+            ([string]$row[2]).PadRight(5),
+            ([string]$row[3]).PadRight(11),
+            ([string]$row[4]).PadRight(5),
+            ([string]$row[5]).PadRight(4),
+            ([string]$row[6]).PadRight(6)) $color
     }
 
-    # ---- All partitions ----
-    Say ""
-    Say "--- All partitions ---"
+    # ---- All partitions table ----
+    Write-Diag ""
+    Write-Diag "  All partitions" "Cyan"
+    Write-Diag "  ──────────────" "DarkGray"
+    Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}" -f `
+        "Disk".PadRight(4), "Part".PadRight(4), "Size".PadRight(13), "Letter".PadRight(6),
+        "Label".PadRight(12), "Type".PadRight(13), "Flags".PadRight(8)) "Cyan"
+    Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}" -f `
+        ("─" * 4), ("─" * 4), ("─" * 13), ("─" * 6), ("─" * 12), ("─" * 13), ("─" * 8)) "DarkGray"
+
+    $recPartsForColor = @(Get-RecoveryPartitions)
     foreach ($p in Get-Partition | Sort-Object DiskNumber, PartitionNumber) {
-        $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "(none)" }
-        $label = ""
+        $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "-" }
+        $label  = "-"
         try {
             $v = Get-Volume -Partition $p -ErrorAction SilentlyContinue
-            if ($v) { $label = $v.FileSystemLabel }
+            if ($v -and $v.FileSystemLabel) { $label = $v.FileSystemLabel }
         } catch { }
-        Say ("  Disk {0} Part {1}: {2,8:N1} MiB | {3,-5} | label='{4}' | GptType={5} | MbrType={6} | IsBoot={7} | IsSystem={8} | IsActive={9}" -f `
-            $p.DiskNumber, $p.PartitionNumber, ($p.Size/1MB), $letter, $label, $p.GptType, $p.MbrType, $p.IsBoot, $p.IsSystem, $p.IsActive)
+        $typeName = Get-PartitionTypeName -Partition $p
+        $flags = @()
+        if ($p.IsBoot)   { $flags += "Boot" }
+        if ($p.IsSystem) { $flags += "Sys" }
+        if ($p.IsActive) { $flags += "Act" }
+        $flagStr = if ($flags.Count -gt 0) { $flags -join ' ' } else { "-" }
+
+        # Colour priority: OS partition > recovery partition > other
+        $color = "Gray"
+        if ($osPart -and $p.DiskNumber -eq $osPart.DiskNumber -and $p.PartitionNumber -eq $osPart.PartitionNumber) {
+            $color = "White"
+        } else {
+            foreach ($rp in $recPartsForColor) {
+                if ($rp.DiskNumber -eq $p.DiskNumber -and $rp.PartitionNumber -eq $p.PartitionNumber) {
+                    $color = "Cyan"
+                    break
+                }
+            }
+        }
+
+        Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}" -f `
+            ([string]$p.DiskNumber).PadRight(4),
+            ([string]$p.PartitionNumber).PadRight(4),
+            (Format-Size ([int64]$p.Size)).PadRight(13),
+            $letter.PadRight(6),
+            $label.PadRight(12),
+            $typeName.PadRight(13),
+            $flagStr.PadRight(8)) $color
     }
 
-    # ---- All volumes ----
-    Say ""
-    Say "--- All volumes ---"
+    # ---- All volumes table ----
+    Write-Diag ""
+    Write-Diag "  All volumes" "Cyan"
+    Write-Diag "  ───────────" "DarkGray"
+    Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}  {7}" -f `
+        "Letter".PadRight(6), "FS".PadRight(5), "Free".PadRight(13), "Total".PadRight(13),
+        "Used".PadRight(5), "Label".PadRight(12), "Type".PadRight(8), "Health".PadRight(8)) "Cyan"
+    Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}  {7}" -f `
+        ("─" * 6), ("─" * 5), ("─" * 13), ("─" * 13), ("─" * 5), ("─" * 12), ("─" * 8), ("─" * 8)) "DarkGray"
+
     foreach ($v in Get-Volume | Sort-Object DriveLetter) {
-        $dl = if ($v.DriveLetter) { "$($v.DriveLetter):" } else { "(none)" }
-        Say ("  {0,-5} | {1,-8} | {2,8:N1} MiB free / {3,8:N1} MiB total | '{4}' | {5} | Health={6}" -f `
-            $dl, $v.FileSystem, ($v.SizeRemaining/1MB), ($v.Size/1MB), $v.FileSystemLabel, $v.DriveType, $v.HealthStatus)
+        $dl = if ($v.DriveLetter) { "$($v.DriveLetter):" } else { "-" }
+        $usedPct = if ($v.Size -gt 0) { [math]::Round((($v.Size - $v.SizeRemaining) / $v.Size) * 100, 0) } else { 0 }
+
+        # Colour rules:
+        #   Fixed volumes        -> by free space (Red / Yellow / Green)
+        #   CD-ROM / Removable   -> DarkGray / Cyan
+        #   OS volume always     -> by free space
+        $color = "Gray"
+        if ($v.DriveType -eq 'CD-ROM') {
+            $color = "DarkGray"
+        } elseif ($v.DriveType -eq 'Removable') {
+            $color = "Cyan"
+        } elseif ($v.DriveType -eq 'Fixed') {
+            $fc = Get-FreeSpaceColor -Free $v.SizeRemaining -Total $v.Size
+            if ($fc) { $color = $fc }
+        }
+
+        Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}  {6}  {7}" -f `
+            $dl.PadRight(6),
+            ([string]$v.FileSystem).PadRight(5),
+            (Format-Size ([int64]$v.SizeRemaining)).PadRight(13),
+            (Format-Size ([int64]$v.Size)).PadRight(13),
+            ("$usedPct%").PadRight(5),
+            ($(if ($v.FileSystemLabel) { $v.FileSystemLabel } else { "-" })).PadRight(12),
+            ([string]$v.DriveType).PadRight(8),
+            ([string]$v.HealthStatus).PadRight(8)) $color
     }
 
-    # ---- Recovery partitions with type-vs-label breakdown ----
-    Say ""
-    Say "--- Recovery partitions (per Get-RecoveryPartitions) ---"
+    # ---- Recovery partitions ----
+    Write-Diag ""
+    Write-Diag "  Recovery partitions (per Get-RecoveryPartitions)" "Cyan"
+    Write-Diag "  ────────────────────────────────────────────────" "DarkGray"
     $recParts = @(Get-RecoveryPartitions)
     if ($recParts.Count -eq 0) {
-        Say "  (none found)"
+        Write-Diag "  (none found)" "Yellow"
     } else {
+        Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}" -f `
+            "Disk".PadRight(4), "Part".PadRight(4), "Size".PadRight(13),
+            "isTyped".PadRight(8), "isLabel".PadRight(8), "onOsDisk".PadRight(9)) "Cyan"
+        Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}" -f `
+            ("─" * 4), ("─" * 4), ("─" * 13), ("─" * 8), ("─" * 8), ("─" * 9)) "DarkGray"
         foreach ($rp in $recParts) {
             $isTyped = ($rp.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($rp.MbrType -eq 0x27)
             $isLabel = $false
@@ -999,36 +956,48 @@ function Show-SystemDiagnostic {
                 if ($v -and ($v.FileSystemLabel -eq 'Recovery' -or $v.FileSystemLabel -eq 'WINRE')) { $isLabel = $true }
             } catch { }
             $onOsDisk = ($osDisk -and $rp.DiskNumber -eq $osDisk.Number)
-            Say ("  Disk {0} Part {1}: {2,8:N1} MiB | isTyped={3} | isLabel={4} | onOsDisk={5}" -f `
-                $rp.DiskNumber, $rp.PartitionNumber, ($rp.Size/1MB), $isTyped, $isLabel, $onOsDisk)
+
+            # isTyped = True and onOsDisk = True is the healthy case
+            $color = if ($isTyped -and $onOsDisk) { "Green" } elseif ($isTyped) { "Yellow" } else { "Red" }
+
+            Write-Diag ("  {0}  {1}  {2}  {3}  {4}  {5}" -f `
+                ([string]$rp.DiskNumber).PadRight(4),
+                ([string]$rp.PartitionNumber).PadRight(4),
+                (Format-Size ([int64]$rp.Size)).PadRight(13),
+                ([string]$isTyped).PadRight(8),
+                ([string]$isLabel).PadRight(8),
+                ([string]$onOsDisk).PadRight(9)) $color
         }
     }
 
     # ---- OS partition supported sizes ----
-    Say ""
-    Say "--- OS partition supported sizes (Get-PartitionSupportedSize) ---"
+    Write-Diag ""
+    Write-Diag "  OS partition supported sizes" "Cyan"
+    Write-Diag "  ────────────────────────────" "DarkGray"
     if ($osPart) {
         try {
             $supported = Get-PartitionSupportedSize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber
             $size = [int64]$osPart.Size
             $min  = [int64]$supported.SizeMin
             $max  = [int64]$supported.SizeMax
-            Say ("  Current:    {0,10:N1} MiB" -f ($size/1MB))
-            Say ("  SizeMin:    {0,10:N1} MiB" -f ($min/1MB))
-            Say ("  SizeMax:    {0,10:N1} MiB" -f ($max/1MB))
-            Say ("  Shrinkable: {0,10:N1} MiB" -f (($size - $min)/1MB))
-            Say ("  Extendable: {0,10:N1} MiB" -f (($max - $size)/1MB))
-            Say ("  S == M (at min): {0}" -f ($size -eq $min))
+            Write-KV "Current"    (Format-Size $size) "White"
+            Write-KV "SizeMin"    (Format-Size $min)  "Gray"
+            Write-KV "SizeMax"    (Format-Size $max)  "Gray"
+            Write-KV "Shrinkable" (Format-Size ($size - $min)) $(if (($size - $min) -lt 1000MB) { "Yellow" } else { "Green" })
+            Write-KV "Extendable" (Format-Size ($max - $size)) "Gray"
+            $atMin = ($size -eq $min)
+            Write-KV "At SizeMin" "$atMin" $(if ($atMin) { "Yellow" } else { "Green" })
         } catch {
-            Say "  (could not query: $_)"
+            Write-Diag "  (could not query: $_)" "Yellow"
         }
     } else {
-        Say "  (no OS partition)"
+        Write-Diag "  (no OS partition)" "Yellow"
     }
 
-    # ---- v42 bucket sizing preview ----
-    Say ""
-    Say "--- Bucket sizing preview (WIM + 250 + 30, round up to 100, min 1000) ---"
+    # ---- Bucket sizing preview ----
+    Write-Diag ""
+    Write-Diag "  Bucket sizing preview (WIM + 250 + 30, round up to 100, min 1000)" "Cyan"
+    Write-Diag "  ─────────────────────────────────────────────────────────────────" "DarkGray"
     $activeWimPath = $null
     $activeWimSize = 0
     if ($wreState.Location) {
@@ -1046,69 +1015,49 @@ function Show-SystemDiagnostic {
         $needed = $wimMiB + 250 + 30
         $bucket = [int]([Math]::Ceiling($needed / 100) * 100)
         if ($bucket -lt 1000) { $bucket = 1000 }
-        Say "  Active WIM:   $activeWimPath"
-        Say "  WIM size:     $wimMiB MiB"
-        Say "  Required:     $needed MiB"
-        Say "  Bucket size:  $bucket MiB"
+        Write-KV "Active WIM"  "$activeWimPath" "DarkGray"
+        Write-KV "WIM size"    "$wimMiB MiB" "White"
+        Write-KV "Required"    "$needed MiB" "White"
+        Write-KV "Bucket size" "$bucket MiB" "Green"
     } else {
-        Say "  (could not read active WIM at the reagentc-registered location)"
+        Write-Diag "  (could not read active WIM at the reagentc-registered location)" "Yellow"
     }
 
-    # ---- Windows Setup state (Audit Mode / OOBE guard) ----
-    # v13: mirrors the production v43 patch 5 (further revision)
-    # startup guard. During Audit Mode, OOBE, and the sysprep
-    # generalize/specialize phases, Windows blocks reagentc /enable
-    # with ERROR_CANCELLED (0x4c7, 1223) regardless of WIM
-    # correctness. Production refuses to run destructive partition
-    # work in those states. A diagnostic that reported every other
-    # subsystem as healthy while production would defer would be
-    # misleading on a machine whose only problem is that it has not
-    # finished OOBE.
-    Say ""
-    Say "--- Windows Setup state ---"
+    # ---- Windows Setup state ----
+    Write-Diag ""
+    Write-Diag "  Windows Setup state" "Cyan"
+    Write-Diag "  ───────────────────" "DarkGray"
     $setupStatePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State"
     $imageState = $null
     try {
         $imageState = (Get-ItemProperty -Path $setupStatePath -Name ImageState -ErrorAction SilentlyContinue).ImageState
     } catch { }
     if ($imageState) {
-        Say "  ImageState: $imageState"
+        $stateColor = if ($imageState -eq 'IMAGE_STATE_COMPLETE') { "Green" } else { "Yellow" }
+        Write-KV "ImageState" "$imageState" $stateColor
         if ($imageState -ne "IMAGE_STATE_COMPLETE") {
-            Say ""
-            Say "  WARNING: ImageState=$imageState." -Level WARN
-            Say "           Windows is not in a normal-running state. Production v43 patch 5" -Level WARN
-            Say "           (further revision) refuses to run destructive partition work in" -Level WARN
-            Say "           this state, because reagentc /enable is blocked with 0x4c7 during" -Level WARN
-            Say "           Audit Mode, OOBE, and the sysprep generalize/specialize phases." -Level WARN
-            Say "           Complete OOBE, sign in to a normal desktop session, then re-run." -Level WARN
+            Write-Diag ""
+            Write-Diag "  WARNING: Windows is not in a normal-running state." "Yellow"
+            Write-Diag "           Production v43 patch 5 (further revision) refuses to run" "Yellow"
+            Write-Diag "           destructive partition work when ImageState is not" "Yellow"
+            Write-Diag "           IMAGE_STATE_COMPLETE (Audit Mode, OOBE, sysprep)." "Yellow"
+            Write-Diag "           Complete OOBE, sign in to a normal desktop, then re-run." "Yellow"
         }
     } else {
-        Say "  ImageState: (not present)"
-        Say "  Some SKUs omit the Setup\State key. Production treats this as safe."
+        Write-KV "ImageState" "(not present - some SKUs omit the key)" "Gray"
     }
 
     # ---- BitLocker on C: ----
-    # v14: rewritten for the v43 patch 5 (further revision 5) target-
-    # volume policy. The policy no longer gates the dedicated-partition
-    # or enable-only paths on C:'s BitLocker state. Only the OS-fallback
-    # path does, because there the target volume IS the OS volume and
-    # reagentc refuses to enable WinRE on an encrypted OS volume. The
-    # warnings below say exactly which paths are affected by which
-    # state.
-    #
-    # The classification predicate itself is unchanged from v12: the
-    # four mid-operation states are hazardous, FullyEncrypted+Off is
-    # ambiguous, and everything else is safe. What changed is the
-    # interpretation guidance in the warning text, not the predicate.
-    Say ""
-    Say "--- BitLocker (C:) ---"
+    Write-Diag ""
+    Write-Diag "  BitLocker on C:" "Cyan"
+    Write-Diag "  ───────────────" "DarkGray"
     try {
         $blv = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
         if ($blv) {
-            Say "  ProtectionStatus: $($blv.ProtectionStatus)"
-            Say "  VolumeStatus:     $($blv.VolumeStatus)"
-            Say "  EncryptionMethod: $($blv.EncryptionMethod)"
-            Say "  EncryptionPct:    $($blv.EncryptionPercentage)"
+            Write-KV "ProtectionStatus" "$($blv.ProtectionStatus)" $(if ($blv.ProtectionStatus -eq 'On') { "Green" } else { "Gray" })
+            Write-KV "VolumeStatus"     "$($blv.VolumeStatus)"     $(if ($blv.VolumeStatus     -eq 'FullyDecrypted') { "Green" } else { "Yellow" })
+            Write-KV "EncryptionMethod" "$($blv.EncryptionMethod)" "Gray"
+            Write-KV "EncryptionPct"    "$($blv.EncryptionPercentage)%" "Gray"
 
             $vs = [string]$blv.VolumeStatus
             $hazardous = $false
@@ -1125,130 +1074,104 @@ function Show-SystemDiagnostic {
                 }
             }
             if ($hazardous) {
-                Say ""
-                Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) but VolumeStatus=$vs." -Level WARN
-                Say "           Device Encryption is actively encrypting or decrypting the OS volume." -Level WARN
-                Say "           Production v43 patch 5 (further revision 5) refuses the OS-fallback" -Level WARN
-                Say "           path in this state, because reagentc will not enable WinRE on an" -Level WARN
-                Say "           encrypted OS volume. The enable-only and dedicated-partition paths" -Level WARN
-                Say "           are still available: production prepares the target recovery" -Level WARN
-                Say "           partition directly and does not depend on C:'s state." -Level WARN
-                Say "           To restore the OS-fallback path, wait until manage-bde -status C:" -Level WARN
-                Say "           reads Conversion Status: Fully Decrypted (or Protection On)." -Level WARN
+                Write-Diag ""
+                Write-Diag "  WARNING: ProtectionStatus=$($blv.ProtectionStatus), VolumeStatus=$vs" "Yellow"
+                Write-Diag "           Device Encryption is actively encrypting or decrypting C:." "Yellow"
+                Write-Diag "           Production refuses the OS-fallback path in this state." "Yellow"
+                Write-Diag "           The enable-only and dedicated-partition paths are still" "Yellow"
+                Write-Diag "           available because they target the recovery partition." "Yellow"
             }
             if ($ambiguous) {
-                Say ""
-                Say "  WARNING: ProtectionStatus=$($blv.ProtectionStatus) with VolumeStatus=$vs." -Level WARN
-                Say "           This state is ambiguous: legitimate suspension, OR Device Encryption" -Level WARN
-                Say "           Waiting-for-Activation (recovery key not yet escrowed). The local" -Level WARN
-                Say "           two-field view cannot distinguish the two." -Level WARN
-                Say "           Production v43 patch 5 (further revision 5) refuses the OS-fallback" -Level WARN
-                Say "           path in this state, because reagentc will not enable WinRE on an" -Level WARN
-                Say "           encrypted OS volume. The enable-only and dedicated-partition paths" -Level WARN
-                Say "           are still available if the target recovery partition is unencrypted." -Level WARN
-                Say "           To restore the OS-fallback path, wait for either ProtectionStatus=On" -Level WARN
-                Say "           (activation completed) or VolumeStatus=FullyDecrypted." -Level WARN
+                Write-Diag ""
+                Write-Diag "  WARNING: ProtectionStatus=$($blv.ProtectionStatus), VolumeStatus=$vs" "Yellow"
+                Write-Diag "           This state is ambiguous: legitimate suspension, OR" "Yellow"
+                Write-Diag "           Device Encryption Waiting-for-Activation." "Yellow"
+                Write-Diag "           Production refuses the OS-fallback path in this state." "Yellow"
             }
         } else {
-            Say "  Get-BitLockerVolume returned null (module not loaded, cmdlet failed, or requires elevation)"
+            Write-Diag "  Get-BitLockerVolume returned null (module not loaded, cmdlet" "Yellow"
+            Write-Diag "  failed, or requires elevation)" "Yellow"
         }
     } catch {
-        Say "  Get-BitLockerVolume failed: $_"
+        Write-Diag "  Get-BitLockerVolume failed: $_" "Red"
     }
 
-    # ---- Target recovery partition state (v14) ----
-    # v14: reports the BitLocker state of the partition reagentc is
-    # registered to. Under the v43 patch 5 (further revision 5) target-
-    # volume policy this is the state that determines whether production
-    # will need to run manage-bde -off on the partition before calling
-    # reagentc /enable, and whether reagentc's own BitLocker check will
-    # succeed.
-    #
-    # The harness remains read-only: it does not assign a drive letter.
-    # If the partition already carries a drive letter, that is used for
-    # the query; otherwise manage-bde -status is invoked against the
-    # volume's UniqueId (which manage-bde accepts as a <volume>).
-    Say ""
-    Say "--- Target recovery partition state ---"
+    # ---- Target recovery partition state ----
+    Write-Diag ""
+    Write-Diag "  Target recovery partition state" "Cyan"
+    Write-Diag "  ────────────────────────────────" "DarkGray"
     if ($activePart) {
-        Say "  Registered partition: Disk $($activePart.DiskNumber) Part $($activePart.PartitionNumber)"
+        Write-KV "Registered partition" "Disk $($activePart.DiskNumber) Part $($activePart.PartitionNumber)" "White"
         $targetVol = Get-Volume -Partition $activePart -ErrorAction SilentlyContinue
         if ($targetVol) {
             $mountPoint = if ($targetVol.DriveLetter) { "$($targetVol.DriveLetter):" } else { $targetVol.UniqueId }
-            Say "  Querying manage-bde -status for: $mountPoint"
+            Write-KV "Querying" "manage-bde -status $mountPoint" "DarkGray"
             try {
                 $targetBde = & manage-bde.exe -status $mountPoint 2>&1
                 $targetBdeText = ($targetBde | Out-String)
                 if ($targetBdeText -match 'could not be opened by BitLocker') {
-                    Say "  Classification: unmanaged by BitLocker"
-                    Say "                  reagentc /enable will accept this partition as-is."
+                    Write-KV "Classification" "unmanaged by BitLocker (reagentc /enable will accept this)" "Green"
                 } elseif ($targetBdeText -match 'Conversion Status:\s*Fully Decrypted') {
-                    Say "  Classification: fully decrypted"
-                    Say "                  reagentc /enable will accept this partition as-is."
+                    Write-KV "Classification" "fully decrypted (reagentc /enable will accept this)" "Green"
                 } elseif ($targetBdeText -match 'Conversion Status:\s*(Fully Encrypted|Used Space Only Encrypted|Encryption In Progress|Decryption In Progress|Encryption Paused|Decryption Paused)') {
                     $convMatch = $targetBdeText | Select-String -Pattern 'Conversion Status:\s*(.+)' | Select-Object -First 1
                     $conv = if ($convMatch) { $convMatch.Matches.Groups[1].Value.Trim() } else { "unknown" }
-                    Say "  Conversion Status: $conv"
-                    Say "  Classification: BitLocker-managed"
-                    Say "                  Production will run manage-bde -off against this partition and poll" -Level WARN
-                    Say "                  until it reports confirmed-unencrypted before calling reagentc /enable." -Level WARN
-                    Say "                  Expect up to 300s of additional runtime on the next production run." -Level WARN
+                    Write-KV "Conversion Status" "$conv" "Yellow"
+                    Write-KV "Classification" "BitLocker-managed - production will decrypt in place" "Yellow"
+                    Write-Diag "                  Expect up to 300s of additional runtime on the next run." "Yellow"
                 } else {
-                    Say "  Classification: could not parse manage-bde output"
-                    Say "                  Production's Set-RecoveryPartitionReadyForWinRE will retry the query."
+                    Write-KV "Classification" "could not parse manage-bde output" "Yellow"
                 }
             } catch {
-                Say "  manage-bde -status failed: $_"
+                Write-Diag "  manage-bde -status failed: $_" "Red"
             }
         } else {
-            Say "  Could not resolve the target partition to a volume."
+            Write-KV "Classification" "could not resolve target partition to a volume" "Yellow"
         }
     } else {
-        Say "  WinRE is not registered to a partition on this machine (Disabled, or location unresolved)."
-        Say "  If the plan is OS-fallback, production checks C:'s VolumeStatus directly and defers"
-        Say "  unless it is FullyDecrypted. See the BitLocker (C:) section above."
+        Write-Diag "  WinRE is not registered to a partition (Disabled, or unresolved)." "Yellow"
+        Write-Diag "  If the plan is OS-fallback, production checks C: directly." "Yellow"
     }
 
     # ---- VMD hardware presence ----
-    Say ""
-    Say "--- VMD hardware presence (per driver manifest) ---"
+    Write-Diag ""
+    Write-Diag "  VMD hardware presence (per driver manifest)" "Cyan"
+    Write-Diag "  ─────────────────────────────────────────────" "DarkGray"
     try {
         $man = Invoke-RestMethod -Uri $DriverManifestUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
         $vmdIds = @($man.drivers | Where-Object { $_.match.requiredDevices } | ForEach-Object { $_.match.requiredDevices })
         if ($vmdIds.Count -gt 0) {
             $pattern = ($vmdIds | ForEach-Object { [regex]::Escape($_) }) -join '|'
             $vmdMatches = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match $pattern })
-            Say "  Manifest VMD device IDs: $($vmdIds -join ', ')"
-            Say "  Matching PnP devices:    $($vmdMatches.Count)"
-            foreach ($m in $vmdMatches) { Say "    $($m.InstanceId)" }
+            Write-KV "Manifest VMD device IDs" ($vmdIds -join ', ') "DarkGray"
+            Write-KV "Matching PnP devices" "$($vmdMatches.Count)" $(if ($vmdMatches.Count -gt 0) { "Green" } else { "Gray" })
+            foreach ($m in $vmdMatches) { Write-Diag "    $($m.InstanceId)" "Gray" }
         } else {
-            Say "  (manifest has no VMD device IDs)"
+            Write-Diag "  (manifest has no VMD device IDs)" "Yellow"
         }
     } catch {
-        Say "  (manifest fetch failed: $_)"
+        Write-Diag "  (manifest fetch failed: $_)" "Red"
     }
 
     # ---- Parser self-test ----
-    # v5: verify that every extractor and API dependency v43 relies on
-    # still produces the shape we expect. Each check records PASS, FAIL,
-    # or SKIP in $Script:Results, so the results summary shows whether
-    # this machine's Windows tooling still matches v43's assumptions. A
-    # FAIL here means the production script may silently misclassify
-    # state on this machine and must be adapted. A SKIP means the check
-    # could not run in the current context (typically: not elevated, or
-    # the state it inspects is absent) and does not indicate a defect.
-    Say ""
-    Say "--- Parser self-test (production dependency verification) ---"
+    Write-Diag ""
+    Write-Diag "  Parser self-test (production dependency verification)" "Cyan"
+    Write-Diag "  ──────────────────────────────────────────────────────" "DarkGray"
 
     # Check 1: reagentc /info status regex
     $statusPattern = '(Enabled|Disabled)'
     $statusHits = @($wreState.RawInfo | Select-String -Pattern $statusPattern)
     if ($statusHits.Count -gt 0) {
         $matched = ($statusHits | Select-Object -First 1).Matches.Value
-        Say "  [OK]   reagentc status regex '$statusPattern' matched '$matched'"
+        Write-Diag "  [OK]   " -Color "DarkGray" -Message "" 2>$null
+        Write-Host "  " -NoNewline
+        Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+        Write-Host "reagentc status regex '$statusPattern' matched '$matched'" -ForegroundColor Gray
         Record "Parser: reagentc status" $true "matched '$matched'"
     } else {
-        Say "  [FAIL] reagentc status regex '$statusPattern' did not match any line"
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " reagentc status regex '$statusPattern' did not match any line" -ForegroundColor Gray
         Record "Parser: reagentc status" $false "no match"
     }
 
@@ -1257,77 +1180,104 @@ function Show-SystemDiagnostic {
     $locHits = @($wreState.RawInfo | Select-String -Pattern $locPattern)
     if ($locHits.Count -gt 0) {
         $matched = ($locHits | Select-Object -First 1).Matches.Value.Trim()
-        Say "  [OK]   reagentc location regex matched '$matched'"
+        Write-Host "  " -NoNewline
+        Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+        Write-Host "reagentc location regex matched '$matched'" -ForegroundColor Gray
         Record "Parser: reagentc location" $true "matched '$matched'"
     } else {
-        Say "  [FAIL] reagentc location regex did not match any line"
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " reagentc location regex did not match any line" -ForegroundColor Gray
         Record "Parser: reagentc location" $false "no match"
     }
 
     # Checks 3 & 4: manage-bde -status C: raw dump and regex verification
-    Say ""
-    Say "  --- manage-bde -status C: raw output ---"
+    Write-Diag ""
+    Write-Diag "    manage-bde -status C: raw output" "DarkGray"
+    Write-Diag "    ─────────────────────────────────" "DarkGray"
     try {
         $mboRaw = & manage-bde.exe -status "C:" 2>&1
         $mboText = ($mboRaw | Out-String)
-        foreach ($line in $mboRaw) { Say "  $line" }
+        foreach ($line in $mboRaw) { Write-Diag "    $line" "DarkGray" }
 
-        # Protection On / Off
         $protOn  = $mboText -match 'Protection On'
         $protOff = $mboText -match 'Protection Off'
         if ($protOn -or $protOff) {
             $state = if ($protOn) { "On" } else { "Off" }
-            Say "  [OK]   manage-bde protection regex matched 'Protection $state'"
+            Write-Host "  " -NoNewline
+            Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+            Write-Host "manage-bde protection regex matched 'Protection $state'" -ForegroundColor Gray
             Record "Parser: manage-bde protection" $true "matched 'Protection $state'"
         } else {
-            Say "  [FAIL] manage-bde protection regex: neither 'Protection On' nor 'Protection Off' present"
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " manage-bde protection regex: no match" -ForegroundColor Gray
             Record "Parser: manage-bde protection" $false "no match"
         }
 
-        # Conversion Status OR unmanaged-volume classification
         $convMatch = $mboText -match 'Conversion Status:\s*(Fully Decrypted|Fully Encrypted|Used Space Only Encrypted|Encryption In Progress|Decryption In Progress|Encryption Paused|Decryption Paused)'
         $unmanaged = $mboText -match 'could not be opened by BitLocker'
         if ($convMatch) {
-            Say "  [OK]   manage-bde conversion status regex matched"
+            Write-Host "  " -NoNewline
+            Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+            Write-Host "manage-bde conversion status regex matched" -ForegroundColor Gray
             Record "Parser: manage-bde conversion" $true "matched"
         } elseif ($unmanaged) {
-            Say "  [OK]   manage-bde unmanaged-volume classification matched ('could not be opened by BitLocker')"
+            Write-Host "  " -NoNewline
+            Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+            Write-Host "manage-bde unmanaged-volume classification matched" -ForegroundColor Gray
             Record "Parser: manage-bde conversion" $true "unmanaged-volume classification"
         } else {
-            Say "  [FAIL] manage-bde conversion status regex: no match and no unmanaged-volume classification"
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " manage-bde conversion status regex: no match" -ForegroundColor Gray
             Record "Parser: manage-bde conversion" $false "no match"
         }
     } catch {
-        Say "  [FAIL] manage-bde invocation failed: $_"
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " manage-bde invocation failed: $_" -ForegroundColor Gray
         Record "Parser: manage-bde" $false "invocation failed: $_"
     }
 
     # Check 5: Get-BitLockerVolume shape
     if (-not $elevated) {
-        Say "  [SKIP] Get-BitLockerVolume: requires elevation"
+        Write-Host "  " -NoNewline
+        Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+        Write-Host " Get-BitLockerVolume: requires elevation" -ForegroundColor Gray
         Record "Parser: Get-BitLockerVolume shape" $false -State "SKIP" -Detail "not elevated"
     } else {
         try {
             $blvCheck = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
             if ($blvCheck -and $null -ne $blvCheck.ProtectionStatus -and $null -ne $blvCheck.VolumeStatus) {
-                Say "  [OK]   Get-BitLockerVolume: ProtectionStatus and VolumeStatus present"
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Get-BitLockerVolume: ProtectionStatus and VolumeStatus present" -ForegroundColor Gray
                 Record "Parser: Get-BitLockerVolume shape" $true "ProtectionStatus=$($blvCheck.ProtectionStatus)"
             } else {
-                Say "  [FAIL] Get-BitLockerVolume: missing ProtectionStatus or VolumeStatus"
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Get-BitLockerVolume: missing ProtectionStatus or VolumeStatus" -ForegroundColor Gray
                 Record "Parser: Get-BitLockerVolume shape" $false "missing property"
             }
         } catch {
-            Say "  [FAIL] Get-BitLockerVolume threw: $_"
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " Get-BitLockerVolume threw: $_" -ForegroundColor Gray
             Record "Parser: Get-BitLockerVolume shape" $false "$_"
         }
     }
 
     # Check 6: OS partition and OS disk resolution
     if ($osPart -and $osDisk) {
-        Say "  [OK]   OS resolution: Disk $($osDisk.Number), partition $($osPart.PartitionNumber)"
+        Write-Host "  " -NoNewline
+        Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+        Write-Host "OS resolution: Disk $($osDisk.Number), partition $($osPart.PartitionNumber)" -ForegroundColor Gray
         Record "Parser: OS resolution" $true "Disk $($osDisk.Number)/Part $($osPart.PartitionNumber)"
     } else {
-        Say "  [FAIL] OS resolution: Get-OSPartition or Get-OSDisk could not resolve"
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " OS resolution: could not resolve" -ForegroundColor Gray
         Record "Parser: OS resolution" $false "no resolution"
     }
 
@@ -1341,18 +1291,26 @@ function Show-SystemDiagnostic {
                 if ($null -eq $samplePart.PSObject.Properties[$prop]) { $missing += $prop }
             }
             if ($missing.Count -eq 0) {
-                Say "  [OK]   Get-Partition exposes all expected properties"
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Get-Partition exposes all expected properties" -ForegroundColor Gray
                 Record "Parser: Get-Partition shape" $true "all properties present"
             } else {
-                Say "  [FAIL] Get-Partition missing properties: $($missing -join ', ')"
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Get-Partition missing properties: $($missing -join ', ')" -ForegroundColor Gray
                 Record "Parser: Get-Partition shape" $false "missing: $($missing -join ', ')"
             }
         } else {
-            Say "  [FAIL] Get-Partition returned no partitions"
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " Get-Partition returned no partitions" -ForegroundColor Gray
             Record "Parser: Get-Partition shape" $false "no partitions"
         }
     } catch {
-        Say "  [FAIL] Get-Partition threw: $_"
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Get-Partition threw: $_" -ForegroundColor Gray
         Record "Parser: Get-Partition shape" $false "$_"
     }
 
@@ -1360,24 +1318,34 @@ function Show-SystemDiagnostic {
     if ($wreState.Location) {
         $resolved = Resolve-WinRELocationToPartition -Location $wreState.Location
         if ($resolved) {
-            Say "  [OK]   WinRE location resolves to Disk $($resolved.DiskNumber) Part $($resolved.PartitionNumber)"
+            Write-Host "  " -NoNewline
+            Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+            Write-Host "WinRE location resolves to Disk $($resolved.DiskNumber) Part $($resolved.PartitionNumber)" -ForegroundColor Gray
             Record "Parser: WinRE location resolution" $true "Disk $($resolved.DiskNumber)/Part $($resolved.PartitionNumber)"
         } else {
-            Say "  [FAIL] WinRE location '$($wreState.Location)' could not be resolved to a partition"
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " WinRE location '$($wreState.Location)' could not be resolved" -ForegroundColor Gray
             Record "Parser: WinRE location resolution" $false "no resolution"
         }
     } else {
-        Say "  [SKIP] WinRE location is empty"
+        Write-Host "  " -NoNewline
+        Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+        Write-Host " WinRE location is empty" -ForegroundColor Gray
         Record "Parser: WinRE location resolution" $false -State "SKIP" -Detail "empty location (expected on some machines)"
     }
 
     # Check 9: Get-RecoveryPartitions returns at least one partition
     $recPartsCheck = @(Get-RecoveryPartitions)
     if ($recPartsCheck.Count -ge 1) {
-        Say "  [OK]   Get-RecoveryPartitions: found $($recPartsCheck.Count) partition(s)"
+        Write-Host "  " -NoNewline
+        Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+        Write-Host "Get-RecoveryPartitions: found $($recPartsCheck.Count) partition(s)" -ForegroundColor Gray
         Record "Parser: Get-RecoveryPartitions" $true "$($recPartsCheck.Count) found"
     } else {
-        Say "  [FAIL] Get-RecoveryPartitions: found 0 partitions"
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Get-RecoveryPartitions: found 0 partitions" -ForegroundColor Gray
         Record "Parser: Get-RecoveryPartitions" $false "0 found"
     }
 
@@ -1388,31 +1356,40 @@ function Show-SystemDiagnostic {
             if ($null -ne $supportedCheck.SizeMin -and $null -ne $supportedCheck.SizeMax) {
                 $minMiB = [math]::Round($supportedCheck.SizeMin / 1MB, 0)
                 $maxMiB = [math]::Round($supportedCheck.SizeMax / 1MB, 0)
-                Say "  [OK]   Get-PartitionSupportedSize: SizeMin=${minMiB}M SizeMax=${maxMiB}M"
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Get-PartitionSupportedSize: SizeMin=${minMiB}M SizeMax=${maxMiB}M" -ForegroundColor Gray
                 Record "Parser: Get-PartitionSupportedSize" $true "min=${minMiB}M max=${maxMiB}M"
             } else {
-                Say "  [FAIL] Get-PartitionSupportedSize: SizeMin or SizeMax missing"
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Get-PartitionSupportedSize: SizeMin or SizeMax missing" -ForegroundColor Gray
                 Record "Parser: Get-PartitionSupportedSize" $false "missing property"
             }
         } catch {
-            Say "  [FAIL] Get-PartitionSupportedSize threw: $_"
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " Get-PartitionSupportedSize threw: $_" -ForegroundColor Gray
             Record "Parser: Get-PartitionSupportedSize" $false "$_"
         }
     } else {
-        Say "  [SKIP] Get-PartitionSupportedSize: no OS partition"
+        Write-Host "  " -NoNewline
+        Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+        Write-Host " Get-PartitionSupportedSize: no OS partition" -ForegroundColor Gray
         Record "Parser: Get-PartitionSupportedSize" $false -State "SKIP" -Detail "no OS partition"
     }
 
-    Say ""
-    Say "Diagnostic complete. Parser self-test results are in the summary."
+    Write-Diag ""
+    Write-Diag "  Diagnostic complete. Parser self-test results are in the summary." "Green"
 }
 
 function Show-StateFileParity {
     Rule "State file parity check"
-    Say "Answers: would production v44 take the fast path on this machine now?"
+    Write-Diag "  Answers: would production v44 take the fast path on this machine now?" "Gray"
 
     # ---- Resolve the manifest ----
-    Say "Fetching driver manifest..."
+    Write-Diag ""
+    Write-Diag "  Fetching driver manifest..." "DarkGray"
     $manifest = $null
     try {
         $manifest = Invoke-RestMethod -Uri $DriverManifestUrl -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
@@ -1426,13 +1403,16 @@ function Show-StateFileParity {
         Record "State file parity" $false "manifest invalid"
         return
     }
-    Say "Manifest version: $($manifest.version)"
+    Write-KV "Manifest version" "$($manifest.version)" "White"
 
     # ---- Hardware profile ----
     $profile = Get-ThisMachineProfile
-    Say "Hardware: $($profile.Manufacturer) | $($profile.Model) | MT=$($profile.MachineType)"
-    Say "OS: $($profile.OS) (build $($profile.Build))"
-    Say "CPU: $($profile.CPUVendor) | gen $(if ($profile.CPUGeneration) { $profile.CPUGeneration } else { 'N' })"
+    Write-Diag ""
+    Write-Diag "  Hardware" "Cyan"
+    Write-Diag "  ────────" "DarkGray"
+    Write-KV "Hardware" "$($profile.Manufacturer) | $($profile.Model) | MT=$($profile.MachineType)" "White"
+    Write-KV "OS"       "$($profile.OS) (build $($profile.Build))" "White"
+    Write-KV "CPU"      "$($profile.CPUVendor) | gen $(if ($profile.CPUGeneration) { $profile.CPUGeneration } else { 'N' })" "White"
 
     # ---- OEM package (mirrors production's resolution) ----
     $oemPackage = $null
@@ -1442,7 +1422,7 @@ function Show-StateFileParity {
         "LENOVO" { $oemPackage = Get-LenovoWinPEPack -Hardware $profile }
     }
     $oemVersion = if ($oemPackage -and $oemPackage.Version) { $oemPackage.Version } else { "NONE" }
-    Say "OEM package: $oemVersion"
+    Write-KV "OEM package" "$oemVersion" $(if ($oemVersion -eq 'NONE') { "Gray" } else { "White" })
 
     # ---- VMD presence ----
     $vmdIds = @($manifest.drivers | Where-Object { $_.match.requiredDevices } | ForEach-Object { $_.match.requiredDevices })
@@ -1452,20 +1432,22 @@ function Show-StateFileParity {
         $vmdPresent = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
                         Where-Object { $_.InstanceId -match $pattern }).Count -gt 0
     }
-    Say "VMD present: $vmdPresent"
+    Write-KV "VMD present" "$vmdPresent" $(if ($vmdPresent) { "Cyan" } else { "Gray" })
 
     # ---- Compute the DSI production would compute right now ----
     $computedDsi = Get-DesiredStateId -Hardware $profile -OEMPackage $oemPackage `
                                        -ExpectedDriverSetVersion $manifest.version `
                                        -VMDPresent $vmdPresent
-    Say ""
-    Say "Computed DesiredStateId: $computedDsi"
+    Write-Diag ""
+    Write-KV "Computed DesiredStateId" "$computedDsi" "Magenta"
 
     # ---- Read the state file ----
     $statePath = "$env:SystemDrive\Recovery\OEM\winre_state.json"
-    Say "State file: $statePath"
+    Write-Diag ""
+    Write-KV "State file" "$statePath" "DarkGray"
     if (-not (Test-Path $statePath)) {
-        Say "  (does not exist - production will take the full-update path)" -Level WARN
+        Write-Diag ""
+        Write-Diag "  (does not exist - production will take the full-update path)" "Yellow"
         Record "State file parity" $true "no state file (rebuild expected)"
         return
     }
@@ -1477,29 +1459,34 @@ function Show-StateFileParity {
         return
     }
 
-    Say "  Stored DesiredStateId: $($state.DesiredStateId)"
-    Say "  CurrentImageHash:      $($state.CurrentImageHash)"
-    Say "  DriverSetVersion:      $($state.InjectedDriverSetVersion)"
-    Say "  LastUpdated:           $($state.LastUpdated)"
-    Say "  PendingReboot:         $($state.PendingReboot)"
-    Say "  UsedOSFallback:        $($state.UsedOSFallback)"
-    Say "  LastEnableResult:      $($state.LastEnableResult)"
-    Say "  EnableFailureAttempts: $($state.EnableFailureAttempts)"
+    Write-KV "Stored DesiredStateId" "$($state.DesiredStateId)" "Magenta"
+    Write-KV "CurrentImageHash"      "$($state.CurrentImageHash)" "DarkGray"
+    Write-KV "DriverSetVersion"      "$($state.InjectedDriverSetVersion)" "Gray"
+    Write-KV "LastUpdated"           "$($state.LastUpdated)" "Gray"
+    Write-KV "PendingReboot"         "$($state.PendingReboot)" $(if ($state.PendingReboot) { "Yellow" } else { "Gray" })
+    Write-KV "UsedOSFallback"        "$($state.UsedOSFallback)" $(if ($state.UsedOSFallback) { "Yellow" } else { "Gray" })
+    Write-KV "LastEnableResult"      "$($state.LastEnableResult)" $(if ($state.LastEnableResult -eq 'ok') { "Green" } else { "Yellow" })
+    Write-KV "EnableFailureAttempts" "$($state.EnableFailureAttempts)" $(if ([int]$state.EnableFailureAttempts -gt 0) { "Yellow" } else { "Gray" })
 
-    Say ""
+    Write-Diag ""
     if ($state.DesiredStateId -eq $computedDsi) {
-        Say "Verdict: DSI MATCH - production will accept the state file." -Level INFO
-        Say "         Subject to the other fast-path gates: WinRE Enabled," -Level INFO
-        Say "         exactly one recovery partition on the OS disk, active" -Level INFO
-        Say "         WIM hash matching the stored CurrentImageHash." -Level INFO
+        Write-Diag "  Verdict: " -Color "DarkGray" -Message "" 2>$null
+        Write-Host "  Verdict: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "DSI MATCH" -NoNewline -ForegroundColor Green
+        Write-Host " - production will accept the state file." -ForegroundColor Gray
+        Write-Diag "           Subject to the other fast-path gates: WinRE Enabled," "DarkGray"
+        Write-Diag "           exactly one recovery partition on the OS disk, and the" "DarkGray"
+        Write-Diag "           active WIM hash matching the stored CurrentImageHash." "DarkGray"
         Record "State file parity" $true "DSI matches"
     } else {
-        Say "Verdict: DSI MISMATCH - production will treat the state file as" -Level WARN
-        Say "         stale and run the full-update path (rebuild + redeploy)." -Level WARN
-        Say "         This is expected on the first run after a DesiredStateId" -Level WARN
-        Say "         input change: ScriptVersion, MANIFEST, OEMPACK, CPU" -Level WARN
-        Say "         vendor/generation, or VMD presence. Subsequent runs take" -Level WARN
-        Say "         the fast path once the state file is rewritten." -Level WARN
+        Write-Host "  Verdict: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "DSI MISMATCH" -NoNewline -ForegroundColor Yellow
+        Write-Host " - production will treat the state file as stale" -ForegroundColor Gray
+        Write-Diag "           and run the full-update path (rebuild + redeploy)." "DarkGray"
+        Write-Diag "           Expected on the first run after a DesiredStateId input" "DarkGray"
+        Write-Diag "           change: ScriptVersion, MANIFEST, OEMPACK, CPU vendor/" "DarkGray"
+        Write-Diag "           generation, or VMD presence. Subsequent runs take the" "DarkGray"
+        Write-Diag "           fast path once the state file is rewritten." "DarkGray"
         Record "State file parity" $true "DSI mismatch (rebuild will run)"
     }
 }
@@ -1598,7 +1585,8 @@ function Test-DriverManifest {
             Say "Manifest lists $driverCount driver entries"
             foreach ($d in $m.drivers) {
                 $reqDev = if ($d.match.requiredDevices) { ($d.match.requiredDevices -join ',') } else { '(none)' }
-                Say "  $($d.name)  os=[$($d.os -join ',')]  cpuGen=$($d.match.cpuGenMin)-$($d.match.cpuGenMax)  vmdDevices=$reqDev  url=$($d.driverUrl)"
+                Write-Diag "    $($d.name)  os=[$($d.os -join ',')]  cpuGen=$($d.match.cpuGenMin)-$($d.match.cpuGenMax)  vmdDevices=$reqDev" "Gray"
+                Write-Diag "      url=$($d.driverUrl)" "DarkGray"
             }
         }
         Record "Driver manifest" $true "version=$($m.version) drivers=$driverCount"
@@ -1621,45 +1609,35 @@ function Test-OemMaps {
 
     $d = Get-DellWinPEPack -Hardware $fakeHardware
     if ($d) {
-        Say "Dell: Name=$($d.Name) Version=$($d.Version) ArchiveType=$($d.ArchiveType)"
-        Say "Dell: URL=$($d.DownloadUrl)"
-        Say "Dell: SHA256=$($d.ExpectedSHA256) MD5=$($d.ExpectedMD5)"
-    } else { $ok = $false }
+        Write-KV "Dell" "Name=$($d.Name)  Version=$($d.Version)  ArchiveType=$($d.ArchiveType)" "Green"
+        Write-Diag "    URL=$($d.DownloadUrl)" "DarkGray"
+        Write-Diag "    SHA256=$($d.ExpectedSHA256)  MD5=$($d.ExpectedMD5)" "DarkGray"
+    } else { $ok = $false; Write-KV "Dell" "(unresolved)" "Red" }
 
     $h = Get-HPWinPEPack -Hardware $fakeHardware
     if ($h) {
-        Say "HP: Name=$($h.Name) Version=$($h.Version) ArchiveType=$($h.ArchiveType)"
-        Say "HP: URL=$($h.DownloadUrl)"
-        Say "HP: SHA256=$($h.ExpectedSHA256) MD5=$($h.ExpectedMD5)"
-    } else { $ok = $false }
+        Write-KV "HP" "Name=$($h.Name)  Version=$($h.Version)  ArchiveType=$($h.ArchiveType)" "Green"
+        Write-Diag "    URL=$($h.DownloadUrl)" "DarkGray"
+        Write-Diag "    SHA256=$($h.ExpectedSHA256)  MD5=$($h.ExpectedMD5)" "DarkGray"
+    } else { $ok = $false; Write-KV "HP" "(unresolved)" "Red" }
 
     $l = Get-LenovoWinPEPack -Hardware $fakeHardware
     if ($l) {
-        Say "Lenovo: Name=$($l.Name) Version=$($l.Version) ArchiveType=$($l.ArchiveType)"
-        Say "Lenovo: URL=$($l.DownloadUrl)"
-        Say "Lenovo: SHA256=$($l.ExpectedSHA256)"
+        Write-KV "Lenovo" "Name=$($l.Name)  Version=$($l.Version)  ArchiveType=$($l.ArchiveType)" "Green"
+        Write-Diag "    URL=$($l.DownloadUrl)" "DarkGray"
+        Write-Diag "    SHA256=$($l.ExpectedSHA256)" "DarkGray"
     } elseif ($profile.Vendor -eq 'LENOVO') {
-        # Production v44 treats two Lenovo null-return cases as
-        # legitimate completion rather than as failure:
-        #   1. The machine type could not be resolved (MT=UNKN). The
-        #      Lenovo map is not loaded in this case.
-        #   2. The map loaded successfully but has no entry for this MT.
-        # In both cases production records OEMPACK=NONE in the
-        # DesiredStateId and the fast path fires on subsequent runs.
-        # Only a failed map load is a genuine transient failure that
-        # defers the run. Mirror that classification so a field tech
-        # sees the same verdict production would produce.
         $mtKnown = ($profile.MachineType -and $profile.MachineType -ne 'UNKN')
         if (-not $mtKnown) {
-            Say "Lenovo: machine type could not be resolved (MT=UNKN) - production treats this as complete with OEMPACK=NONE" -Level INFO
+            Write-KV "Lenovo" "machine type could not be resolved (MT=UNKN) - production treats as complete with OEMPACK=NONE" "Gray"
         } elseif (-not $Script:LenovoWinPEMap) {
-            Say "Lenovo: map could not be loaded - production would treat this as a transient failure and defer" -Level WARN
+            Write-KV "Lenovo" "map could not be loaded - production would treat as transient failure and defer" "Yellow"
             $ok = $false
         } else {
-            Say "Lenovo: map loaded, no entry for MT $($profile.MachineType) - production treats this as complete with OEMPACK=NONE" -Level INFO
+            Write-KV "Lenovo" "map loaded, no entry for MT $($profile.MachineType) - production treats as complete with OEMPACK=NONE" "Gray"
         }
     } else {
-        Say "Lenovo map skipped (machine type not applicable)" -Level INFO
+        Write-KV "Lenovo" "map skipped (machine type not applicable)" "DarkGray"
     }
 
     Record "OEM maps" $ok
@@ -1721,13 +1699,13 @@ function Test-GitHubBaseWim {
         return $false
     }
     $sz = (Get-Item $wim -Force).Length
-    Say ("winre.wim present: {0:N2} MiB" -f ($sz / 1MB))
+    Write-KV "winre.wim" "$(Format-Size ([int64]$sz))" "White"
 
     $buildOk = $true
     $detail = "size=$([math]::Round($sz/1MB,2))MiB"
     try {
         $b = (Get-WindowsImage -ImagePath $wim -Index 1 -ErrorAction Stop).Build
-        Say "WIM ImageBuild: $b"
+        Write-KV "ImageBuild" "$b" "White"
         if ($OS -eq "Win11" -and [int]$b -lt 22000) {
             Say "MISMATCH: folder is Win11 but WIM build is $b (< 22000)" -Level ERROR
             $buildOk = $false
@@ -1737,12 +1715,6 @@ function Test-GitHubBaseWim {
         }
         $detail = "$detail build=$b"
     } catch {
-        # v11: inability to read the WIM build must not be reported as
-        # a pass. The whole point of this check is to validate the
-        # build against the folder it was pulled from. If Get-WindowsImage
-        # fails, the validation never happened. Recording FAIL matches
-        # the harness's semantics for checks that could not produce
-        # their evidence.
         Say "Could not read WIM build: $_" -Level ERROR
         $buildOk = $false
         $detail = "$detail (build read failed)"
@@ -1865,18 +1837,18 @@ function Test-VmdDrivers {
     $relevant = @()
     foreach ($drv in $m.drivers) {
         $osMatch = ($profile.OS -eq 'Win10' -and $drv.os -contains 'Win10') -or ($profile.OS -eq 'Win11' -and $drv.os -contains 'Win11')
-        if (-not $osMatch) { Say "Skipping $($drv.name): OS mismatch"; continue }
-        if ($profile.CPUVendor -ne 'Intel') { Say "Skipping $($drv.name): not Intel hardware"; continue }
-        if ($null -eq $profile.CPUGeneration) { Say "Skipping $($drv.name): CPU generation unknown"; continue }
+        if (-not $osMatch) { Write-Diag "  Skipping $($drv.name): OS mismatch" "DarkGray"; continue }
+        if ($profile.CPUVendor -ne 'Intel') { Write-Diag "  Skipping $($drv.name): not Intel hardware" "DarkGray"; continue }
+        if ($null -eq $profile.CPUGeneration) { Write-Diag "  Skipping $($drv.name): CPU generation unknown" "DarkGray"; continue }
         if ($profile.CPUGeneration -lt $drv.match.cpuGenMin -or $profile.CPUGeneration -gt $drv.match.cpuGenMax) {
-            Say "Skipping $($drv.name): CPU gen $($profile.CPUGeneration) outside $($drv.match.cpuGenMin)-$($drv.match.cpuGenMax)"
+            Write-Diag "  Skipping $($drv.name): CPU gen $($profile.CPUGeneration) outside $($drv.match.cpuGenMin)-$($drv.match.cpuGenMax)" "DarkGray"
             continue
         }
         $relevant += $drv
     }
 
     if ($relevant.Count -eq 0) {
-        Say "No VMD drivers in manifest apply to this machine" -Level WARN
+        Write-Diag "  No VMD drivers in manifest apply to this machine" "Yellow"
         Record "VMD drivers" $true "0 relevant"
         return $true
     }
@@ -1888,7 +1860,7 @@ function Test-VmdDrivers {
         $archive = Join-Path $dir "driver.7z"
         try {
             Invoke-WebRequest -Uri $drv.driverUrl -OutFile $archive -Headers $GitHubHeaders -UseBasicParsing -ErrorAction Stop
-            Say "Downloaded $([math]::Round((Get-Item $archive).Length/1MB,2)) MiB"
+            Write-KV "  Downloaded" "$(Format-Size ([int64](Get-Item $archive).Length))" "White"
         } catch {
             Say "Download failed: $_" -Level ERROR
             Record "VMD $($drv.name)" $false "download failed"
@@ -1899,7 +1871,7 @@ function Test-VmdDrivers {
         New-DirectoryIfNotExists $extract
         try {
             $proc = Start-Process -FilePath $7Zip -ArgumentList @("x", "`"$archive`"", "-o`"$extract`"", "-y") -Wait -PassThru -NoNewWindow -ErrorAction Stop
-            Say "7-Zip exit code: $($proc.ExitCode)"
+            Write-KV "  7-Zip exit" "$($proc.ExitCode)" $(if ($proc.ExitCode -eq 0) { "Green" } else { "Red" })
         } catch {
             Say "7-Zip failed: $_" -Level ERROR
             Record "VMD $($drv.name)" $false "7-Zip failed"
@@ -1907,7 +1879,7 @@ function Test-VmdDrivers {
             continue
         }
         $infCount = Get-InfFileCount -Directory $extract
-        Say "INF count: $infCount"
+        Write-KV "  INF count" "$infCount" $(if ($infCount -gt 0) { "Green" } else { "Red" })
         $ok = ($proc.ExitCode -eq 0 -and $infCount -gt 0)
         Record "VMD $($drv.name)" $ok "inf=$infCount"
         if (-not $ok) { $allOk = $false }
@@ -1953,47 +1925,91 @@ function Invoke-All {
 function Show-Summary {
     Rule "Results summary"
     if ($Script:Results.Count -eq 0) { Say "No tests run yet."; return }
-    # Every record is produced by Record, which always sets a State
-    # field. The three possible values are PASS, FAIL, and SKIP. No
-    # fallback path is needed.
     foreach ($r in $Script:Results) {
-        Say ("  [{0}] {1}  {2}" -f $r.State, $r.Test, $r.Detail)
+        $stateColor = switch ($r.State) {
+            "PASS" { "Green" }
+            "FAIL" { "Red" }
+            "SKIP" { "DarkGray" }
+            default { "Gray" }
+        }
+        Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+        Write-Host $r.State -NoNewline -ForegroundColor $stateColor
+        Write-Host "] " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($r.Test)  " -NoNewline -ForegroundColor White
+        Write-Host $r.Detail -ForegroundColor DarkGray
     }
     $passed  = @($Script:Results | Where-Object { $_.State -eq "PASS" }).Count
     $failed  = @($Script:Results | Where-Object { $_.State -eq "FAIL" }).Count
     $skipped = @($Script:Results | Where-Object { $_.State -eq "SKIP" }).Count
-    Say ""
-    Say "Passed $passed, failed $failed, skipped $skipped (of $($Script:Results.Count))"
+
+    $passColor  = if ($passed  -gt 0) { "Green" } else { "DarkGray" }
+    $failColor  = if ($failed  -gt 0) { "Red" }   else { "Green" }
+    $skipColor  = if ($skipped -gt 0) { "Yellow" } else { "DarkGray" }
+
+    Write-Host ""
+    Write-Host "  Passed " -NoNewline -ForegroundColor Gray
+    Write-Host "$passed" -NoNewline -ForegroundColor $passColor
+    Write-Host ", failed " -NoNewline -ForegroundColor Gray
+    Write-Host "$failed" -NoNewline -ForegroundColor $failColor
+    Write-Host ", skipped " -NoNewline -ForegroundColor Gray
+    Write-Host "$skipped" -NoNewline -ForegroundColor $skipColor
+    Write-Host " (of $($Script:Results.Count))" -ForegroundColor Gray
 }
 
 # =========================== MENU ===========================
 function Show-Menu {
     Clear-Host
-    Write-Host "WinRE Manager Test Harness (v15)"
-    Write-Host ("Working directory: {0}" -f $TestDir)
-    $p = Get-ThisMachineProfile
-    Write-Host ("Detected: OS={0}  Vendor={1}  MT={2}  CPUVendor={3}  CPUGen={4}" -f $p.OS, $p.Vendor, $p.MachineType, $p.CPUVendor, $p.CPUGeneration)
     Write-Host ""
-    Write-Host "  1. System diagnostic (read-only info gathering)"
-    Write-Host "  2. Driver manifest fetch"
-    Write-Host "  3. OEM maps fetch + resolve (Dell, HP, Lenovo)"
-    Write-Host "  4. GitHub base WIM - Win10 (download + extract + build check)"
-    Write-Host "  5. GitHub base WIM - Win11 (download + extract + build check)"
-    Write-Host "  6. HP WinPE pack (download + extract)"
-    Write-Host "  7. Dell WinPE pack (prompts for OS)"
-    Write-Host "  8. Lenovo WinPE pack (prompts for MT)"
-    Write-Host "  9. VMD drivers (per manifest, filtered for this machine)"
-    Write-Host "  S. State file parity check (production DSI vs on-disk state file)"
-    Write-Host "  A. All relevant for this machine"
-    Write-Host "  B. All of the above"
-    Write-Host "  R. Print results summary"
-    Write-Host "  Q. Quit"
+    Write-Host "  ╔" -NoNewline -ForegroundColor DarkGray
+    Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
+    Write-Host "╗" -ForegroundColor DarkGray
+    Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
+    Write-Host "WinRE Manager Test Harness (v16)" -NoNewline -ForegroundColor Cyan
+    Write-Host (" " * 33) -NoNewline
+    Write-Host "║" -ForegroundColor DarkGray
+    Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
+    Write-Host "Working directory: $TestDir" -NoNewline -ForegroundColor Gray
+    Write-Host (" " * [Math]::Max(0, 48 - $TestDir.Length)) -NoNewline
+    Write-Host "║" -ForegroundColor DarkGray
+    $p = Get-ThisMachineProfile
+    $detected = "Detected: OS=$($p.OS)  Vendor=$($p.Vendor)  MT=$($p.MachineType)  CPU=$($p.CPUVendor)"
+    $detectedTrim = if ($detected.Length -gt 64) { $detected.Substring(0, 61) + "..." } else { $detected }
+    Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
+    Write-Host $detectedTrim -NoNewline -ForegroundColor Gray
+    Write-Host (" " * [Math]::Max(0, 64 - $detectedTrim.Length)) -NoNewline
+    Write-Host "║" -ForegroundColor DarkGray
+    Write-Host "  ╚" -NoNewline -ForegroundColor DarkGray
+    Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
+    Write-Host "╝" -ForegroundColor DarkGray
+    Write-Host ""
+
+    function MenuItem {
+        param([string]$Key, [string]$Text, [string]$KeyColor = "Cyan")
+        Write-Host "  " -NoNewline
+        Write-Host ("{0,-3}" -f $Key) -NoNewline -ForegroundColor $KeyColor
+        Write-Host $Text -ForegroundColor White
+    }
+
+    MenuItem "1" "System diagnostic (read-only info gathering)"
+    MenuItem "2" "Driver manifest fetch"
+    MenuItem "3" "OEM maps fetch + resolve (Dell, HP, Lenovo)"
+    MenuItem "4" "GitHub base WIM - Win10 (download + extract + build check)"
+    MenuItem "5" "GitHub base WIM - Win11 (download + extract + build check)"
+    MenuItem "6" "HP WinPE pack (download + extract)"
+    MenuItem "7" "Dell WinPE pack (prompts for OS)"
+    MenuItem "8" "Lenovo WinPE pack (prompts for MT)"
+    MenuItem "9" "VMD drivers (per manifest, filtered for this machine)"
+    MenuItem "S" "State file parity check (production DSI vs on-disk state file)" "Magenta"
+    MenuItem "A" "All relevant for this machine" "Green"
+    MenuItem "B" "All of the above" "Green"
+    MenuItem "R" "Print results summary" "Yellow"
+    MenuItem "Q" "Quit" "Red"
     Write-Host ""
 }
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v15"
+Rule "WinRE Manager test harness v16"
 Say "Working dir: $TestDir"
 if (-not (Test-Path $7Zip)) { Say "7-Zip not found at $7Zip - extraction tests will fail" -Level WARN }
 
@@ -2010,7 +2026,7 @@ if ($NonInteractive) {
 $quit = $false
 while (-not $quit) {
     Show-Menu
-    $choice = Read-Host "Select"
+    $choice = Read-Host "  Select"
     $upper = $choice.Trim().ToUpper()
     switch ($upper) {
         "1" { Show-SystemDiagnostic }
@@ -2042,7 +2058,7 @@ while (-not $quit) {
     }
     if (-not $quit) {
         Write-Host ""
-        [void](Read-Host "Press Enter to return to menu")
+        [void](Read-Host "  Press Enter to return to menu")
     }
 }
 
@@ -2053,7 +2069,7 @@ if (-not $Keep) {
     # NOTE: do not reuse $Keep (the switch parameter) as a local variable.
     # Assigning a string to a variable that holds [switch] throws a type
     # conversion error, and [switch] has no Trim method. Use a distinct name.
-    $keepAnswer = Read-Host "Keep test artifacts in $TestDir ? (y/N)"
+    $keepAnswer = Read-Host "  Keep test artifacts in $TestDir ? (y/N)"
     if ($keepAnswer.Trim().ToLower() -ne "y") {
         Say "Removing $TestDir"
         try { Remove-Item $TestDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }

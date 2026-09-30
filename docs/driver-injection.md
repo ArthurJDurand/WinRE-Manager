@@ -238,18 +238,32 @@ The same INF cross-reference gate applies. A failure sets `$Script:ImageInjectio
 
 ## When injection fails
 
-A failed injection does not stop the pipeline. The script continues to Step 4 and the full-update path. What changes is:
+When `$Script:ImageInjectionComplete` is `$false` after Step 3, the pipeline **exits with `EXIT_WARNING` immediately**. It does not proceed to Step 4 (`dism /Export-Image`), Step 5 (partition work), Step 6 (deployment), or any `reagentc` call. This is the v44 patch 1 pipeline gate.
 
-- `$Script:ImageInjectionComplete = $false`.
-- `$Script:nonFatalWarning = $true`.
-- Step 3 and Step 4 checkpoints are **not** advanced (v43 patch 4).
-- The final state-write gate is skipped, so no state file is written.
-- The exit code is `EXIT_WARNING` (2).
+The gate exists because a WIM with no OEM or VMD drivers is broken on hardware whose storage controller requires those drivers. On a VMD-based system the resulting WinRE cannot see the OS disk at all, and the deployed recovery environment is worse than useless — it is actively misleading. The state-write gate alone would not have prevented this: it stops the state file from recording the run, but does not prevent the deployment of the broken WIM. The explicit pipeline gate closes that gap.
 
-The next run will attempt injection again. The migration guard resets `$step` to 2 to force Step 3 to re-run even if the checkpoint was orphaned at a higher step.
+**What the gate does:**
+
+- Sets the checkpoint back to `Step=2`, so the next run re-acquires the base WIM from source and re-runs injection against a clean image rather than mounting a `base.wim` that was partially modified by the failed injection attempt.
+- Removes any stale `winre_optimized.wim` left from a previous run.
+- Sets `$Script:nonFatalWarning = $true`.
+- Exits with `EXIT_WARNING` (code 2).
+
+**What the gate does not do:**
+
+- It does not disable WinRE.
+- It does not touch any partition.
+- It does not write or delete the state file.
+- It does not change the currently-registered WinRE image.
+
+The machine is left exactly as it was before the run — WinRE is still in whatever state it started, the recovery partition is untouched, and the next scheduled run retries from Step 2.
+
+**Related to ResetBase (v44 patch 2).** Component cleanup and ResetBase run inside Step 3, after injection, but only when `$Script:ImageInjectionComplete` is `$true`. When injection fails, ResetBase is skipped — the pipeline aborts before that point, so running the reset would only waste CPU on an image whose driver state is already invalid.
+
+**Before v44 patch 1** the pipeline continued to Step 4 and beyond even when injection failed, and relied on the state-write gate to prevent the state file from recording the run. That was not sufficient for the reasons above. The v44 patch 1 gate is the correction.
 
 ## Related documents
 
-- [architecture.md](architecture.md) — where Step 3 fits in the pipeline.
-- [state-and-idempotency.md](state-and-idempotency.md) — how `ImageInjectionComplete` gates the state write.
+- [architecture.md](architecture.md) — where Step 3 fits in the pipeline, and the "pipeline stops before deployment when injection fails" invariant.
+- [state-and-idempotency.md](state-and-idempotency.md) — how `ImageInjectionComplete` gates the state write and the checkpoint writes.
 - [troubleshooting.md](troubleshooting.md) — diagnosing injection failures.

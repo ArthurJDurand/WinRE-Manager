@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 44 (v44 patch 1)
+    Version : 44 (v44 patch 2)
 
     Manages the Windows Recovery Environment on managed Windows 10/11
     fleets. Downloads a base WinRE image, injects OEM and VMD drivers,
@@ -74,6 +74,44 @@
     actionable message. The fast path clears stale counters.
 
     ================================================================
+    Component cleanup and ResetBase (v44 patch 2)
+    ================================================================
+
+    On the full-update path, after driver injection completes and
+    before the image is dismounted, the script runs:
+
+        dism /image:<MountDir> /cleanup-image /StartComponentCleanup /ResetBase
+
+    ResetBase removes superseded components from the WinSxS store
+    inside the mounted image. The size reduction does not materialise
+    in the .wim file on disk until the image is re-exported; the
+    existing Step 4 dism /Export-Image /Compress:max is what writes a
+    smaller file. Without the export, ResetBase is wasted CPU.
+
+    ResetBase makes the image unserviceable for rollback purposes: any
+    update that was present when the command ran can no longer be
+    uninstalled. This is acceptable for a recovery image, which is
+    rebuilt from source whenever the DesiredStateId changes and is
+    never rolled back in place.
+
+    ResetBase runs only when $Script:ImageInjectionComplete is $true.
+    If injection failed, the pipeline aborts before Step 4, so a
+    successful ResetBase on a partially-injected image would waste CPU
+    for no benefit. ResetBase failure is non-fatal: the log records a
+    WARN with the DISM exit code, the pipeline continues, and the
+    Step 4 export writes whatever size the image currently is. The
+    Step 5 partition acceptance check decides whether the result fits.
+
+    ScriptVersion remains 44. DesiredStateId is unchanged. No
+    fleet-wide rebuild is forced: healthy machines continue to take
+    the fast path with their current WIM, and only receive the
+    ResetBase'd WIM on their next natural rebuild.
+
+    The technique was adopted from Microsoft's KB5028997 remediation
+    scripts (WinREPathScriptSamples), which use the same pair of
+    operations to make winre.wim fit an existing recovery partition.
+
+    ================================================================
     Design invariants
     ================================================================
 
@@ -106,6 +144,32 @@
     - $Script:GeometryRestoreFailed is set by any failure to restore
       C: to SizeMax after a post-shrink failure. Write-WinREState
       deletes the state file when it is set, forcing a retry.
+
+    ================================================================
+    Known gaps (documented; not yet implemented)
+    ================================================================
+
+    - Recovery-typed partition sanity ceiling. Get-RecoveryPartitions
+      matches partitions by the recovery GPT type GUID
+      (de94bba4-06d1-4d40-a16a-bfd50179d6ac) or MBR type 0x27, and the
+      destructive path in Ensure-AdequateRecoveryPartition will delete
+      any such partition on the OS disk. Windows Setup and Windows
+      in-place upgrade create recovery partitions under 1.5 GiB. OEM
+      factory recovery volumes can be 7-20 GiB and may carry the
+      standard recovery type code. On a machine where an OEM factory
+      recovery volume carries the recovery type code, this script
+      treats it as a candidate and deletes it.
+
+      A 2 GiB sanity ceiling is planned but not yet implemented. It
+      would WARN and skip (not abort) any recovery-typed candidate
+      whose size exceeds 2 GiB, leaving the oversized partition in
+      place and creating a new recovery partition alongside it.
+
+      Until the ceiling is implemented, operators deploying this
+      script should verify the machine has no oversized recovery-typed
+      partition containing data they want to preserve. See the
+      "Before you run this" section in README.md for the operator-
+      facing warning.
 
     ================================================================
     CRITICAL LESSONS LEARNED (do not regress)
@@ -148,6 +212,11 @@
       gates on C:'s state, because there the target IS the OS volume.
     - A recovery partition claimed by Device Encryption does not
       re-encrypt after manage-bde -off. Decrypt in place.
+    - Get-RecoveryPartitions matches by type code, not by size or by
+      content. OEM factory recovery volumes that carry the standard
+      recovery type code are indistinguishable from Windows Setup's
+      recovery partition to the matcher. No size ceiling is
+      implemented yet; see the Known gaps section above.
 #>
 
 [CmdletBinding()]
@@ -3147,6 +3216,35 @@ try {
                 $Script:ImageInjectionComplete = $false
             }
             $allDirs | ForEach-Object { Remove-ItemIfExist $_ -Recurse }
+        }
+
+        # Run component cleanup and ResetBase on the mounted image before
+        # dismount. ResetBase removes superseded components from the WinSxS
+        # store inside the image. The size reduction does NOT materialise in
+        # the .wim file on disk until the image is re-exported — the export
+        # in Step 4 is what writes a smaller file. Without the export,
+        # ResetBase is wasted CPU.
+        #
+        # ResetBase makes the image unserviceable for rollback purposes: any
+        # update that was present when the command ran can no longer be
+        # uninstalled. This is acceptable for a recovery image, which is
+        # rebuilt from source whenever the DesiredStateId changes and is
+        # never rolled back in place.
+        #
+        # Only run when injection succeeded. If injection failed, the
+        # pipeline aborts before Step 4 anyway, so a successful ResetBase
+        # on a partially-injected image would waste minutes of CPU for no
+        # benefit. ResetBase failure is non-fatal: the WIM exports at
+        # whatever size it currently is, and the Step 5 partition
+        # acceptance check decides whether the result fits.
+        if ($Script:ImageInjectionComplete) {
+            Write-Log "Step 3: Running component cleanup and ResetBase on mounted image"
+            & dism /image:"$MountDir" /cleanup-image /StartComponentCleanup /ResetBase | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "dism /cleanup-image /StartComponentCleanup /ResetBase returned exit code $LASTEXITCODE - continuing without ResetBase savings. The export in Step 4 will still run." -Level WARN
+            } else {
+                Write-Log "Component cleanup and ResetBase completed successfully"
+            }
         }
 
         Dismount-WindowsImage -Path $MountDir -Save; Remove-ItemIfExist $MountDir

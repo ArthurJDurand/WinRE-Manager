@@ -6,6 +6,32 @@ This file is the authoritative user-facing record of what changed and when. The 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to a `ScriptVersion` + patch-generation scheme rather than strict SemVer — see [docs/state-and-idempotency.md](docs/state-and-idempotency.md) for why.
 
+## [v44 patch 2] — 2026-09-30
+
+### Changed
+
+- **`dism /cleanup-image /StartComponentCleanup /ResetBase` now runs on the mounted image after driver injection completes and before the dismount, on the full-update path only.** The size reduction is materialised by the existing Step 4 `dism /Export-Image /Compress:max`, which writes a smaller `winre_optimized.wim`. The technique was adopted from Microsoft's KB5028997 remediation scripts (`WinREPathScriptSamples`), which use the same pair of operations to make `winre.wim` fit an existing recovery partition.
+
+  ResetBase makes the image unserviceable for rollback (updates present when it ran can no longer be uninstalled). This is acceptable for a recovery image, which is rebuilt from source whenever the `DesiredStateId` changes and is never rolled back in place.
+
+  ResetBase failure is non-fatal: the log records a WARN with the DISM exit code, the pipeline continues, and the Step 4 export writes whatever size the image currently is. The Step 5 partition acceptance check decides whether the result fits. ResetBase runs only when `$Script:ImageInjectionComplete` is `$true`; if injection failed, the pipeline aborts before Step 4 and the reset would waste CPU.
+
+  **Field-observed size reduction.** The first v44 patch 2 run on a machine with a base WinRE image that had not accumulated update history produced 0.26 MiB of savings (756.36 MiB → 756.1 MiB). This is expected: the WinRE WinSxS store is only a few hundred MB to begin with, and on a fresh image most of that is the current baseline with nothing to reset. The savings will be material only on a machine whose WinRE image has accumulated multiple cumulative updates. The runtime cost is roughly 2 seconds on a fresh image and longer on one with more superseded state.
+
+  `ScriptVersion` remains 44. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced: healthy machines continue to take the fast path with their current WIM, and only receive the ResetBase'd WIM on their next natural rebuild (manifest bump, OEM pack version change, Windows build change, or CPU/VMD presence change). The behavioural change is a slower full-update pass and a smaller exported WIM.
+
+### Known limitation (documented; not fixed in this revision)
+
+The destructive path in `Ensure-AdequateRecoveryPartition` deletes every partition on the OS disk that carries the standard recovery GPT type GUID or MBR type code, without checking its size or contents. Windows Setup and in-place upgrade recovery partitions are under 1.5 GiB; OEM factory recovery volumes can be 7–20 GiB and may carry the same type code. A 2 GiB sanity ceiling that would WARN and skip oversized candidates is planned but not implemented. Until it ships:
+
+- The `.NOTES` block in `scripts/WinRE.ps1` carries a "Known gaps" section describing the limitation.
+- The README carries a "Before you run this" warning at the top of the page.
+- Operators deploying to machines they did not image themselves should run the harness Option 1 diagnostic and inspect the "Recovery partitions" section before proceeding.
+
+### Field verification
+
+- **ASUS desktop (PRIME H510M-D, i5-11400, Win11 26200), 2026-09-30 02:06.** State file deleted manually to force a full-update pass. ResetBase ran on the mounted image, took ~2 seconds, exited 0, and logged `Component cleanup and ResetBase completed successfully`. The exported WIM was 756.1 MiB, versus 756.36 MiB on the pre-ResetBase run. The run completed normally with `Operating mode: DEDICATED`; the second run at 02:08 took the fast path.
+
 ## [v44 patch 1] — 2026-09-30
 
 This revision bumps `ScriptVersion` from 43 to 44 and changes the `DesiredStateId` inputs. Every managed machine performs one full-update pass on its next scheduled run to rebuild the WIM against the new ID, then returns to the fast path. The revision also carries six patches that were applied on disk during the [v43 patch 5 (further revision 5)] session but never documented, and two correctness fixes for edge cases identified during review.
