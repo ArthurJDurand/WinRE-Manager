@@ -20,7 +20,7 @@ The change was driven by a review of the v44 patch 3 guard in light of the v43 p
 
   The only place C:'s BitLocker state is now consulted is the OS-fallback route: the fast-path OS-fallback re-verification, the full-update deploy step's OS-fallback branch, and the pending-reboot OS-fallback branch. All three exist because on the OS-fallback route the target volume *is* the OS volume, and reagentc refuses to enable WinRE on an encrypted OS volume. The dedicated-partition path — including the destructive sequence — does not consult C:'s state at any point.
 
-- **Lenovo OEM-pack resolution now distinguishes five states.** `Get-LenovoWinPEPack` sets `$Script:LenovoPackResolution` to one of `unknown-mt`, `map-unavailable`, `no-entry`, `malformed-entry`, or `resolved`. The caller uses the state to distinguish "this Lenovo model has no published WinPE driver pack" (normal, expected, run recorded as complete with `OEMPACK=NONE`) from "the map entry exists but is missing its `winpe.url`" (configuration failure, run marked incomplete). Before patch 6, the caller could only distinguish "pack resolved" from "pack did not resolve"; a malformed map entry looked identical to a legitimate no-pack case, and the machine would silently complete without OEM driver injection even though the map itself was broken.
+- **Lenovo OEM-pack resolution now distinguishes five states.** `Get-LenovoWinPEPack` sets `$Script:LenovoPackResolution` to one of `unknown-mt`, `map-unavailable`, `no-entry`, `malformed-entry`, or `resolved`. The caller uses the state to distinguish "this Lenovo model has no published WinPE driver pack" (normal, expected, run recorded as complete with `OEMPACK=NONE`) from "the map entry exists but is missing its `winpe.url`" (configuration failure, run marked incomplete). Before patch 6, the caller could distinguish a map-fetch failure from a no-pack answer, but could not distinguish a malformed map entry from a legitimate no-pack case; both produced the same `$null` return and the same handling, and the machine would silently complete without OEM driver injection even though the map itself was broken.
 
   Lenovo does not publish WinPE driver packs for every model in their catalog. `unknown-mt` and `no-entry` are the two states that represent that fact, and both correctly let the run proceed with `OEMPACK=NONE`. `map-unavailable` (transient network failure fetching the map gist) and `malformed-entry` (map entry present but missing `winpe.url`) both mark the run with `$Script:ImageInjectionComplete = $false` and `$Script:nonFatalWarning = $true`; the pipeline gate then aborts before Step 4 and the next run retries. A malformed map entry is a configuration failure of the map itself, not a legitimate "no pack available" answer.
 
@@ -69,8 +69,8 @@ The change was driven by a review of the v44 patch 3 guard in light of the v43 p
   Cosmetic fixes:
 
   12. **`Write-KV` overflow handling.** A key at or past `$KeyWidth` now gets a separating space before its value. Previously, `Manifest VMD device IDs` (23 chars, one over the 22-char key column) rendered flush against the value.
-  13. **Changelog "Four" → "Five"** for the count of future-proofing checks (previous entry miscounted).
-  14. **Changelog "in the detail" → "in the log line"** for the `Test-VmdDrivers` SKIP path (the raw CPU string is logged via `Say`, not recorded in `Record -Detail`).
+  13. **`Test-WinRE.ps1`'s `.NOTES` block count.** The v18 future-proofing regression check count was corrected from "Four" to "Five" to match the number of bullets listed.
+  14. **`Test-WinRE.ps1`'s `.NOTES` block wording.** For the `Test-VmdDrivers` SKIP path, the phrase "in the detail" was corrected to "in the log line" (the raw CPU string is logged via `Say`, not recorded in `Record -Detail`).
 
 ### Changed (docs)
 
@@ -82,6 +82,7 @@ The change was driven by a review of the v44 patch 3 guard in light of the v43 p
 - **`docs/state-and-idempotency.md`** — the paragraph describing the destructive-path C: guard's effect on the state file is removed.
 - **`docs/driver-injection.md`** — a new section documents the Lenovo five-state resolution and why `unknown-mt` and `no-entry` are legitimate "no pack" answers while `map-unavailable` and `malformed-entry` are not.
 - **`.github/ISSUE_TEMPLATE/bug_report.md`** — the sub-variant A/B discriminator field is removed; the OS-fallback deferral log-string example is corrected from `C: VolumeStatus=…` to `Test-VolumeEncrypted=…`.
+- **`SECURITY.md`** — a new bullet under "Known limitations (not vulnerabilities)" documents the offline-fallback trust model, names the residual hardware-drift risk, and clarifies that the state file's editability is a documented correctness limitation rather than a privilege boundary crossing.
 
 ### Removed
 
