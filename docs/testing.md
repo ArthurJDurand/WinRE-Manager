@@ -42,7 +42,7 @@ See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete p
 
 Two changes.
 
-**1. The active-location classifier requires a type-coded partition on the OS disk for the DEDICATED verdict.** Mirrors production's v44 patch 3 classifier change. The previous harness logic computed a single `$isRec` flag from `GptType`-or-`MbrType`, and if that was `$false` it fell back to a `Get-Volume -Partition` label check that promoted a label-only match to `$isRec = $true`. The classifier now computes `$isTypedRecovery` and `$isLabelRecovery` separately, and the branches report:
+**1. The active-location classifier requires a type-coded partition on the OS disk for the DEDICATED verdict.** Mirrors production's active-location classifier change (patch 3 of the v44 patch 7 cycle). The previous harness logic computed a single `$isRec` flag from `GptType`-or-`MbrType`, and if that was `$false` it fell back to a `Get-Volume -Partition` label check that promoted a label-only match to `$isRec = $true`. The classifier now computes `$isTypedRecovery` and `$isLabelRecovery` separately, and the branches report:
 
 - **`DEDICATED`** — the location resolves to a **type-coded** recovery partition on the OS disk (GPT recovery GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27`). The verdict text now reads `DEDICATED (WinRE on type-coded recovery partition on the OS disk)`.
 - **`OS-FALLBACK`** — the location resolves to the OS partition.
@@ -50,7 +50,7 @@ Two changes.
 - **`LABEL-ONLY`** — on the OS disk with a `Recovery`/`WINRE` label but no matching type code. Production does **not** treat this as DEDICATED; the fast path's count also excludes it, so production converges on the full-update path instead of the fast path.
 - **`UNEXPECTED`** — neither of the above.
 
-The `LABEL-ONLY` verdict is new in v20. Before v20, a machine whose reagentc-registered WinRE location was a Basic Data partition labelled "Recovery" would have been reported as `DEDICATED` by the harness, while production would have taken the full-update path. This was a false positive that could have misled a field engineer. Production's final-verification classifier (v44 patch 4) has no direct harness equivalent and is not claimed; the harness classifies the reagentc-registered location, which is the active-location decision point.
+The `LABEL-ONLY` verdict is new in v20. Before v20, a machine whose reagentc-registered WinRE location was a Basic Data partition labelled "Recovery" would have been reported as `DEDICATED` by the harness, while production would have taken the full-update path. This was a false positive that could have misled a field engineer. Production's final-verification classifier (patch 4 of the v44 patch 7 cycle) has no direct harness equivalent and is not claimed; the harness classifies the reagentc-registered location, which is the active-location decision point.
 
 **2. Menu box alignment fixed.** The menu box's border is 66 columns wide interior (plus the two border characters and two leading spaces). The three content rows — title, working directory, and detected — were each padded to values that did not equal `interior width minus the leading space`, so the closing border character was misaligned on two of the three rows. All three rows now pad their content to exactly 65 columns, truncating with an ellipsis if content overflows. Purely cosmetic; no functional change.
 
