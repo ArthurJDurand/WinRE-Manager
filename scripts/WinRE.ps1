@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 44 (v44 patch 6)
+    Version : 44 (v44 patch 7)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -78,7 +78,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 44
-$ScriptPatchLevel = "6"
+$ScriptPatchLevel = "7"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -793,7 +793,13 @@ function Ensure-AdequateRecoveryPartition {
     $B = [int64]($bucketSizeMiB * 1MB)
     $M = [int64](Get-PartitionSupportedSize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber).SizeMin
 
-    $parts = @(Get-RecoveryPartitions -DiskNumber $osDisk.Number)
+    $parts = @(
+        Get-RecoveryPartitions -DiskNumber $osDisk.Number |
+            Where-Object {
+                ($_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or
+                ($_.MbrType -eq 0x27)
+            }
+    )
     $deletableParts = @()
     $R = [int64]0
     foreach ($rp in $parts) {
@@ -841,7 +847,14 @@ function Ensure-AdequateRecoveryPartition {
     # own separate C: gate.
     $willDestroyCurrentRoute = ($stateBefore.Status -eq "Enabled") -or ($deletableParts.Count -gt 0)
     if ($willDestroyCurrentRoute) {
-        Write-Log "Destructive recovery-partition replacement will remove the current WinRE route (status=$($stateBefore.Status), deletableParts=$($deletableParts.Count)). Proceeding; per the v43 patch 5 (further revision 5) target-volume policy, C:'s BitLocker state is not a veto for the dedicated-target path. The OS-fallback route retains its separate C: BitLocker gate." -Level WARN
+        $cEnc = Test-VolumeEncrypted -MountPoint "C:"
+
+        if ($cEnc -eq $false) {
+            Write-Log "Dedicated recovery-partition replacement will remove the current WinRE route (status=$($stateBefore.Status), deletableParts=$($deletableParts.Count)). C: is confirmed fully decrypted; proceeding." -Level INFO
+        } else {
+            $cEncText = if ($null -eq $cEnc) { "unknown" } else { "$cEnc" }
+            Write-Log "Dedicated recovery-partition replacement will remove the current WinRE route (status=$($stateBefore.Status), deletableParts=$($deletableParts.Count)). C: encryption state=$cEncText; proceeding because C: encryption is not a veto for the dedicated-target path. The OS-fallback path retains its separate C: BitLocker gate." -Level WARN
+        }
     }
 
     if ($stateBefore.Status -eq "Enabled") {
@@ -1152,7 +1165,13 @@ function Find-SuitableRecoveryPartition {
     $osDisk = Get-OSDisk
     if (-not $osDisk) { Write-Log "Find-SuitableRecoveryPartition: no OS disk" -Level WARN; return $null }
 
-    $parts = @(Get-RecoveryPartitions -DiskNumber $osDisk.Number)
+    $parts = @(
+        Get-RecoveryPartitions -DiskNumber $osDisk.Number |
+            Where-Object {
+                ($_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or
+                ($_.MbrType -eq 0x27)
+            }
+    )
     if ($parts.Count -eq 0) { Write-Log "Find-SuitableRecoveryPartition: no recovery partitions on boot disk"; return $null }
     if ($parts.Count -gt 1) { Write-Log "Find-SuitableRecoveryPartition: multiple ($($parts.Count)) recovery partitions - will relocate"; return $null }
 
@@ -2426,7 +2445,15 @@ try {
 
     # ---- Recovery-partition classification ----
     $osDisk = Get-OSDisk
-    $existingRecoveryParts = @( if ($osDisk) { @(Get-RecoveryPartitions -DiskNumber $osDisk.Number) } else { @() } )
+    $existingRecoveryParts = @(
+        if ($osDisk) {
+            Get-RecoveryPartitions -DiskNumber $osDisk.Number |
+                Where-Object {
+                    ($_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or
+                    ($_.MbrType -eq 0x27)
+                }
+        }
+    )
 
     $activePart = $null
     if ($WinREState.Location) {
@@ -2437,10 +2464,15 @@ try {
     $activeOnOSFallback = $false
 
     if ($activePart) {
-        $isRec = ($activePart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($activePart.MbrType -eq 0x27)
-        if (-not $isRec) {
+        $isTypedRecovery = ($activePart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or
+                           ($activePart.MbrType -eq 0x27)
+        $isLabelRecovery = $false
+
+        if (-not $isTypedRecovery) {
             $vol = Get-Volume -Partition $activePart -ErrorAction SilentlyContinue
-            if ($vol -and ($vol.FileSystemLabel -eq 'Recovery' -or $vol.FileSystemLabel -eq 'WINRE')) { $isRec = $true }
+            $isLabelRecovery = ($vol -and
+                                ($vol.FileSystemLabel -eq 'Recovery' -or
+                                 $vol.FileSystemLabel -eq 'WINRE'))
         }
 
         $osPartCheck = Get-OSPartition
@@ -2455,8 +2487,10 @@ try {
 
         if ($isActiveOSPart) {
             $activeOnOSFallback = $true
-        } elseif ($isRec -and $isActiveOSDisk) {
+        } elseif ($isTypedRecovery -and $isActiveOSDisk) {
             $activeOnRecovery = $true
+        } elseif ($isLabelRecovery -and $isActiveOSDisk) {
+            Write-Log "Active WinRE location is label-matched but not type-coded on the OS disk (disk $($activePart.DiskNumber), partition $($activePart.PartitionNumber)) - it will not qualify as a dedicated recovery partition; scheduling migration to a type-coded target." -Level WARN
         }
     }
 
@@ -2926,6 +2960,8 @@ try {
                 $drvArchive = "$WorkDir\driver_$($drv.name).7z"
                 Invoke-WebRequest -Uri $drv.driverUrl -OutFile $drvArchive -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
                 $drvExtractDir = "$WorkDir\drv_extract_$($drv.name)"
+                Remove-ItemIfExist $drvExtractDir -Recurse
+                New-DirectoryIfNotExists $drvExtractDir | Out-Null
                 & $7Zip x $drvArchive -o"$drvExtractDir" -y | Out-Null
                 try {
                     $extractedVmdInfNames += @(
@@ -3311,11 +3347,8 @@ try {
                               $finalPart.DiskNumber -eq $finalOSPartCheck.DiskNumber -and
                               $finalPart.PartitionNumber -eq $finalOSPartCheck.PartitionNumber)
 
-            $isRec = ($finalPart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($finalPart.MbrType -eq 0x27)
-            if (-not $isRec) {
-                $vol = Get-Volume -Partition $finalPart -ErrorAction SilentlyContinue
-                if ($vol -and ($vol.FileSystemLabel -eq 'Recovery' -or $vol.FileSystemLabel -eq 'WINRE')) { $isRec = $true }
-            }
+            $isRec = ($finalPart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or
+                     ($finalPart.MbrType -eq 0x27)
 
             if ($isFinalOSPart) {
                 if ($Script:UsedOSFallback) {
@@ -3325,7 +3358,8 @@ try {
                     exit $EXIT_FATAL
                 }
             }
-            elseif ($isRec) {
+            elseif ($isRec -and $finalOSPartCheck -and
+                    $finalPart.DiskNumber -eq $finalOSPartCheck.DiskNumber) {
                 if ($finalPart.DriveLetter) {
                     Write-Log "Removing temporary drive letter $($finalPart.DriveLetter): (assigned for verification)" -Level WARN
                     if (-not $Script:tempDriveLetters.Contains($finalPart.DriveLetter)) { $Script:tempDriveLetters.Add($finalPart.DriveLetter) }

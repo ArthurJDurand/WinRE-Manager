@@ -27,14 +27,41 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v18.** The version history is:
+**Current version: v20.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
 - **v17** aligned the harness's network behavior with production v44 patch 5: `$NetworkTimeoutSeconds = 15` on every network call, the zero-byte download check restored to match production's ordering, and a note added to `Test-VmdDrivers` explaining why the harness exercises drivers production would skip. The output format is unchanged from v16.
 - **v18** mirrors production v44 patch 6 and closes several harness-specific issues. See "v18 changes" below.
+- **v19** corrects two Option S issues: the state-file-absent case now reports `SKIP` (not `PASS`) when the VMD query is indeterminate, and the header and DSI MATCH verdict wording no longer imply that DSI equality alone proves production will take the fast path. See "v19 changes" below.
+- **v20** mirrors production v44 patch 3's type-coded active-location classifier and fixes the menu box alignment. See "v20 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
+
+### v20 changes
+
+Two changes.
+
+**1. The active-location classifier requires a type-coded partition on the OS disk for the DEDICATED verdict.** Mirrors production's v44 patch 3 classifier change. The previous harness logic computed a single `$isRec` flag from `GptType`-or-`MbrType`, and if that was `$false` it fell back to a `Get-Volume -Partition` label check that promoted a label-only match to `$isRec = $true`. The classifier now computes `$isTypedRecovery` and `$isLabelRecovery` separately, and the branches report:
+
+- **`DEDICATED`** — the location resolves to a **type-coded** recovery partition on the OS disk (GPT recovery GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27`). The verdict text now reads `DEDICATED (WinRE on type-coded recovery partition on the OS disk)`.
+- **`OS-FALLBACK`** — the location resolves to the OS partition.
+- **`RECOVERY-ON-SECONDARY`** — type-coded but on a non-OS disk (production forces a full rebuild).
+- **`LABEL-ONLY`** — on the OS disk with a `Recovery`/`WINRE` label but no matching type code. Production does **not** treat this as DEDICATED; the fast path's count also excludes it, so production converges on the full-update path instead of the fast path.
+- **`UNEXPECTED`** — neither of the above.
+
+The `LABEL-ONLY` verdict is new in v20. Before v20, a machine whose reagentc-registered WinRE location was a Basic Data partition labelled "Recovery" would have been reported as `DEDICATED` by the harness, while production would have taken the full-update path. This was a false positive that could have misled a field engineer. Production's final-verification classifier (v44 patch 4) has no direct harness equivalent and is not claimed; the harness classifies the reagentc-registered location, which is the active-location decision point.
+
+**2. Menu box alignment fixed.** The menu box's border is 66 columns wide interior (plus the two border characters and two leading spaces). The three content rows — title, working directory, and detected — were each padded to values that did not equal `interior width minus the leading space`, so the closing border character was misaligned on two of the three rows. All three rows now pad their content to exactly 65 columns, truncating with an ellipsis if content overflows. Purely cosmetic; no functional change.
+
+The output format for every other section is unchanged from v16.
+
+### v19 changes
+
+Two Option S corrections.
+
+1. **Option S reports `SKIP` (not `PASS`) when the state file is absent and the VMD query is indeterminate.** Before v19, `Show-StateFileParity` checked for the state file's existence before consulting the VMD query result, and returned `PASS` with detail `no state file (rebuild expected)` whenever the file was missing. That was correct when VMD presence was determinable, but wrong when the VMD query had failed: production defers the entire run with `EXIT_WARNING` in that case rather than taking the full-update path, and the harness's `PASS` disagreed with what a live run would do. The missing-state-file branch now checks `$vmdQueryOk` and records `SKIP` with detail `No state file; VMD query indeterminate`. The existing `INDETERMINATE` / `SKIP` handling for the state-file-present case is unchanged.
+2. **Option S wording clarified.** The header now reads "does the stored DesiredStateId match current inputs? This is not a full-flow simulation." The DSI MATCH verdict reads "the stored deployment ID matches current inputs" followed by a note that production separately evaluates WinRE state/location, recovery-partition count, active WIM hash, pending-reboot/repair state, BitLocker, and other startup/flow gates before deciding what to do. The prior wording — "production will accept the state file" — implied that DSI equality alone was sufficient.
 
 ### v18 changes
 
@@ -88,9 +115,9 @@ The default working directory is `C:\Temp\WinRETest`. All downloads and extracti
 
 **Cleanup guard (v18).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
 
-## Output style (v16; unchanged in v17 and v18)
+## Output style (v16; format unchanged in v17 through v20 except for the v20 menu box alignment)
 
-As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17 and v18 do not modify the output format.
+As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, and v19 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged.
 
 ### Colour-coded values
 
@@ -102,6 +129,7 @@ Diagnostic values are rendered with a colour that reflects their state:
 - **OS volume free-space banner.** When the OS volume's free space falls into the Red or Yellow band, the harness draws a boxed warning banner above the disk tables. The Red banner's headline is `LOW DISK SPACE ON OS VOLUME`; the Yellow banner's headline is `OS VOLUME FREE SPACE IS LOW`. The banner body names the exact free/total figures and a short recommendation. The banner is yellow for the Yellow band and red for the Red band.
 - **VMD hardware presence (v18).** The line reads `VMD hardware present  True` or `VMD hardware present  False` on a successful enumeration, and `VMD presence  INDETERMINATE` with the enumeration error below it on a failed one. The indeterminate state renders in yellow.
 - **Option S verdict (v18).** DSI MATCH is green, DSI MISMATCH is yellow, and INDETERMINATE is yellow with a paragraph explaining that a live production run would defer rather than commit state.
+- **Classifier verdict (v20).** `DEDICATED` is green, `OS-FALLBACK` is yellow, `RECOVERY-ON-SECONDARY` is yellow, `LABEL-ONLY` is yellow, and `UNEXPECTED` is red. The `LABEL-ONLY` colouring matches `OS-FALLBACK` and `RECOVERY-ON-SECONDARY` because the machine is not in a fatal state — production will simply take the full-update path on the next run rather than the fast path — but it is not the healthy DEDICATED state either.
 
 ### Tables
 
@@ -147,7 +175,7 @@ Read-only information gathering. Dumps:
 
 - Hardware: manufacturer, model, product name/version, baseboard, CPU, OS build, Intel generation.
 - Raw `reagentc /info` output and the parsed status/location.
-- The WinRE classifier verdict: `DEDICATED`, `OS-fallback`, `RECOVERY-ON-SECONDARY`, or `UNEXPECTED`. Matches the v43 patch 2 production classifier.
+- The WinRE classifier verdict: `DEDICATED`, `OS-FALLBACK`, `RECOVERY-ON-SECONDARY`, `LABEL-ONLY`, or `UNEXPECTED`. As of v20 this mirrors production v44 patch 3's rule: only a **type-coded** recovery partition on the OS disk reaches `DEDICATED`. A label-only match on the OS disk gets its own `LABEL-ONLY` verdict.
 - OS partition and OS disk.
 - All disks with `BootFromDisk`, `IsSystem`, `IsBoot`.
 - All partitions with size, drive letter, label, GPT type, MBR type, and boot/system/active flags.
@@ -185,7 +213,7 @@ The BitLocker section of the diagnostic distinguishes two categories of state on
            Production refuses the OS-fallback path in this state.
 ```
 
-The wording of these warnings was updated in harness v14. The v12/v13 wording said production "will refuse destructive partition work" in these states, which described the removed OS-volume-gate policy and would have told a field engineer to defer a run that production would actually succeed on. Under the v43 patch 5 (further revision 5) policy, only the OS-fallback route depends on C:'s BitLocker state; the enable-only and dedicated-partition routes target the recovery partition directly and are not affected.
+The wording of these warnings was updated in harness v14. The v12/v13 wording said production "will refuse destructive partition work" in these states, which described the removed OS-volume-gate policy and would have told a field engineer to defer a run that production would actually succeed on. Under the v43 patch 5 (further revision 5) policy, only the OS-fallback route depends on C:'s BitLocker state; the enable-only and dedicated-partition routes target the recovery partition directly and are not affected. As of v44 patch 6, the destructive partition path does not consult C:'s state either — only the OS-fallback route does.
 
 **Confirmed-safe states.** `VolumeStatus=FullyDecrypted` (or empty) with `ProtectionStatus=Off`, and `ProtectionStatus=On` at any conversion status, are safe for the OS-fallback route. They do not trigger either warning.
 
@@ -268,17 +296,17 @@ The `INDETERMINATE` outcome is new in v18 and mirrors production v44 patch 6.
 
 The diagnostic reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and warns when the value is present and not `IMAGE_STATE_COMPLETE`. Production's Audit Mode guard defers in that state before any state-modifying action. The diagnostic's check mirrors the guard so that a field engineer pre-flighting a freshly imaged machine sees the deferral condition before running production.
 
-### Option S — State file parity check (v15; VMD handling updated in v18)
+### Option S — State file parity check (v15; VMD handling and wording refined in v18 and v19)
 
 Read-only. Recomputes the `DesiredStateId` production would compute right now — reading the live driver manifest, resolving the OEM package for this machine's vendor, and detecting VMD hardware presence — then reads the on-disk state file at `C:\Recovery\OEM\winre_state.json` and reports whether production would accept it or treat it as stale.
 
 The output names the computed ID and the stored ID side by side, then prints one of three verdicts:
 
-- **DSI MATCH** (green). Production will accept the state file. The other fast-path gates still apply: WinRE must be Enabled, exactly one recovery partition must exist on the OS disk, and the deployed WIM hash must match `CurrentImageHash`. The harness does not check those three conditions — Option 1 reports them.
+- **DSI MATCH** (green). The stored deployment ID matches current inputs. The other fast-path gates still apply: WinRE must be Enabled, exactly one **type-coded** recovery partition must exist on the OS disk, and the deployed WIM hash must match `CurrentImageHash`. The harness does not check those three conditions — Option 1 reports them.
 - **DSI MISMATCH** (yellow). Production will treat the state file as stale and run the full-update path on the next scheduled run. This is expected on the first run after a `DesiredStateId` input change: `ScriptVersion`, `MANIFEST`, `OEMPACK`, CPU vendor/generation, or VMD presence. Subsequent runs take the fast path once the state file is rewritten.
 - **INDETERMINATE** (yellow, v18). The VMD hardware presence check could not complete because of a PnP enumeration error, so the correct driver set cannot be determined and the DSI cannot be computed with confidence. A live production run would defer with `EXIT_WARNING` before committing any state rather than take either the fast path or the full-update path. The harness records `SKIP` in the results with reason `VMD query indeterminate` and prints a paragraph explaining the situation. Resolve the PnP service issue and re-run.
 
-If the state file does not exist, the harness reports that production will take the full-update path (which is correct: `needInject = $true` when there is no state).
+If the state file does not exist, the harness reports that production will take the full-update path (which is correct: `needInject = $true` when there is no state) — except when the VMD query is also indeterminate, in which case the harness records `SKIP` and explains that a live production run would defer rather than start the update (v19).
 
 Option S is the field engineer's tool for answering "is this machine about to rebuild?" without running the production script. It does not exercise the offline fallback (v44 patch 5): Option S always performs a live manifest fetch and a live VMD detection, so on an offline machine the harness reports the fetch failure rather than a DSI verdict.
 
@@ -295,7 +323,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Fifteen checks as of v18 (ten before v18). Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
+Fifteen checks as of v18 (ten before v18). Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions. v19 and v20 did not change the check count or the check contents.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -335,7 +363,7 @@ A SKIP means the check could not run in the current context. The reasons:
 
 - **Not elevated.** `Get-BitLockerVolume` requires elevation on some machines. The check SKIPs rather than FAILing.
 - **The state it inspects is absent.** WinRE location is empty, no OS partition, no lettered volume to sample, or similar. The check has nothing to inspect.
-- **A precondition was not met.** `Test-VmdDrivers` (not a parser check) records SKIP when the Intel CPU generation cannot be parsed, because driver applicability was not evaluated.
+- **A precondition was not met.** `Test-VmdDrivers` (not a parser check) records SKIP when the Intel CPU generation cannot be parsed, because driver applicability was not evaluated. Option S records SKIP when the VMD query is indeterminate, because the DSI parity verdict cannot be computed from an indeterminate driver-set determination.
 
 A SKIP does not indicate a defect.
 
@@ -357,7 +385,7 @@ The legacy `-Ok` boolean is still supported: when `-State` is not supplied, the 
 Passed 8, failed 1, skipped 1 (of 10)
 ```
 
-The BitLocker, target-partition, `ImageState`, and Option S outputs are informational. They do not produce PASS/FAIL/SKIP records and do not appear in `Show-Summary`.
+The BitLocker, target-partition, `ImageState`, and Option S outputs are informational — Option S records a result for the parity check itself but its intermediate verdict output is a separate thing. The BitLocker, target-partition, and `ImageState` blocks do not produce PASS/FAIL/SKIP records and do not appear in `Show-Summary`.
 
 ## Non-interactive mode
 
@@ -389,13 +417,58 @@ Those paths are covered by field testing on representative hardware. See the "Fi
 
 The harness shares code paths with production in the download, extraction, and CPU-generation helpers. It is documented in the file's own docstring which functions are "based on" the production versions and which are harness-specific.
 
-Five known differences:
+Six known differences:
 
 - **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test. As of v17, the harness prints an explicit three-line note before the driver loop explaining this. The state-file parity check (Option S) *does* apply the hardware filter, because it is replicating production's DSI computation and production's DSI includes VMD presence.
 - **The harness does not run production's BitLocker helper functions.** The BitLocker sections in the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and apply the same classification the production guard uses — hazardous, ambiguous, or safe — but they do not call `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`. This is intentional: the harness does not exercise production's BitLocker control flow, and a change to that control flow does not require a harness update to remain correct. The v14 update changed the warning text and added the target-partition state block, but did not change the classifier itself.
 - **`Get-ThisMachineProfile` normalises manufacturer names identically to production, but is otherwise harness-specific.** Since v15 the manufacturer normalisation, the OS-detection method (Caption-based, not build-number-based), and the returned fields (including `Model`) all match production's `Get-HardwareObject` exactly, so the DSI computed by Option S is byte-identical to what production computes for the same inputs. The two helpers differ in that `Get-ThisMachineProfile` reads additional CIM data for the diagnostic and does not cache its result the way production's does.
 - **Network behavior is aligned with production as of v17.** Every `Invoke-RestMethod` and `Invoke-WebRequest` call in the harness carries `-TimeoutSec $NetworkTimeoutSeconds` where `$NetworkTimeoutSeconds = 15`. Before v17, the harness used PowerShell's default ~100-second timeout on each call, so a fully offline machine would take over 10 minutes to fail. The v17 alignment means the harness fails as fast as production does on a bad network. The `Invoke-OemPackDownload` helper's zero-byte check was also restored to match production's ordering: the length check now runs before the hash comparison, so a zero-byte download with an expected hash logs "file is empty" rather than "SHA256 mismatch". Both changes are correctness improvements that make the harness a more faithful replica of production's download path.
-- **VMD query-failure handling and Lenovo resolution are aligned with production as of v18.** The harness's VMD presence check now treats a PnP enumeration error as indeterminate (matching production v44 patch 6), and the harness's `Get-LenovoWinPEPack` now sets `$Script:LenovoPackResolution` to the same five states as production. Before v18, an enumeration error in the harness produced a definitive answer, and a malformed Lenovo map entry looked identical to a legitimate no-pack case. Both were drift risks: the harness could disagree with production about what a live run would do.
+- **VMD query-failure handling, Lenovo resolution, and Option S wording are aligned with production as of v18 and v19.** The harness's VMD presence check now treats a PnP enumeration error as indeterminate (matching production v44 patch 6), and the harness's `Get-LenovoWinPEPack` now sets `$Script:LenovoPackResolution` to the same five states as production. Before v18, an enumeration error in the harness produced a definitive answer, and a malformed Lenovo map entry looked identical to a legitimate no-pack case. Both were drift risks: the harness could disagree with production about what a live run would do. v19 corrected two further Option S wording issues (the state-file-absent-and-VMD-indeterminate case now records `SKIP`; the header and DSI MATCH verdict no longer overstate what DSI equality proves).
+- **The active-location classifier is aligned with production as of v20.** The harness's WinRE classifier now requires a type-coded recovery partition on the OS disk to reach the `DEDICATED` verdict, mirroring production v44 patch 3. Before v20, the classifier promoted a label-only match to `DEDICATED`, which could have reported `DEDICATED` for a machine whose registered location was a Basic Data partition labelled "Recovery" while production would have taken the full-update path. The harness's `LABEL-ONLY` verdict is informational and has no direct production equivalent; production's active-location classifier logs a WARN in the same situation without stopping.
+
+## The encrypted-C: failure-then-fallback test (planned; gating for future destructive-path changes)
+
+Production v44 patch 6 removed the pre-destructive C: guard. That guard had deferred every destructive replacement on every encrypted-C: machine — including the machines where the destructive attempt would have succeeded — in exchange for protecting against one specific corner: a machine whose C: is encrypted and whose destructive attempt fails **after** the existing recovery partition has been deleted. In that corner the OS-fallback gate also refuses (reagentc will not enable WinRE on an encrypted OS volume), so the machine ends up with neither a dedicated recovery partition nor OS-fallback. See the `[v44 patch 7]` CHANGELOG entry and the [architecture.md Step 5 discussion](architecture.md) for the full statement of the residual.
+
+The residual has not been exercised in the field. No logged run has yet shown a destructive attempt that failed **after** deletion with C: encrypted. The correct fix, when one is warranted, is a **post-failure** check in the shrink-failure branch that handles the case **after** the destructive attempt fails — not a reinstatement of the pre-destructive guard, whose predicate ("is C: encrypted?") cannot distinguish a destructive attempt that will succeed from one that will fail. That fix should not ship until the residual has been measured.
+
+**Gating requirement.** Until the deliberate shrink-failure test below is run and its result recorded, no further changes to the destructive path should ship. This applies to the C: guard's eventual replacement, to the planned 2 GiB sanity ceiling, and to any other change that alters the destructive sequence in `Ensure-AdequateRecoveryPartition`.
+
+### What the test measures
+
+Four things, in order:
+
+1. **The destructive attempt fails after deletion.** The test forces the shrink to fail on a machine with an existing type-coded recovery partition, so the partition is already deleted by the time the failure occurs.
+2. **C:'s state at the moment of failure.** The test machine's C: must be encrypted (`ProtectionStatus=On`, or `ProtectionStatus=Off` with a mid-operation `VolumeStatus`) so the OS-fallback gate will refuse.
+3. **The end state.** What the machine is left with after the run exits: no dedicated recovery partition, no OS-fallback, no working recovery route.
+4. **The operator experience.** What the log looks like, whether the exit code matches the documented behavior, and whether the log signature the docs promise (`Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`) actually appears.
+
+### How to run the test
+
+On a test machine whose C: is encrypted and whose only type-coded recovery partition is on the OS disk:
+
+1. Confirm the machine's current state with `Test-WinRE.ps1` Option 1 and Option S. C: should report `ProtectionStatus=On` or a mid-operation `VolumeStatus`. The recovery partition should be type-coded and on the OS disk, and it should be the reagentc-registered location.
+2. Delete the state file at `C:\Recovery\OEM\winre_state.json` to force the full-update path.
+3. Force the shrink to fail. The most reliable way is to shrink C: externally to just above its `SizeMin` so the destructive attempt's shrink cannot fit the bucket. Alternatively, use a test machine whose C: is already close to its `SizeMin` after allowing the recovery-partition deletion and OS-extend steps to run.
+4. Run `WinRE.ps1` and capture the full log.
+5. Verify the log shows the sequence described in "What the test measures" above: deletion, shrink failure after three attempts, `Restore-OSPartitionSize`, OS-fallback gate deferral on encrypted C:, exit code 2.
+6. Record the actual end state of the machine: partition count, WinRE status, and whether any working recovery route exists.
+
+The test is destructive: the machine's existing recovery partition will be deleted, and if the OS-fallback gate refuses on encrypted C:, the machine will end without a recovery route. Do not run this on a production machine. Use a test machine that can be re-imaged.
+
+### What to record when the test is run
+
+Update this document and the `[v44 patch 7]` CHANGELOG entry's "Pending test" section with:
+
+- The machine tested (vendor, model, OS build).
+- C:'s exact encryption state at the time of the run.
+- Whether the destructive attempt failed at the shrink step or at a later step.
+- The end state: partition count, WinRE status, whether the machine has any working recovery route.
+- The exit code.
+- Whether the documented log signature appeared.
+- Whether the operator experience matched what the docs promise.
+
+If the test shows the corner is reachable in practice, the fix is the post-failure check described above, shipped as its own patch. If the test shows the corner is not reachable — for example, because `Restore-OSPartitionSize` reliably re-extends C: and the OS-fallback gate happens to accept the restored state — the corner is still a documented residual but with lower priority.
 
 ## Adding a test
 

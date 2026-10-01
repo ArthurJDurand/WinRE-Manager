@@ -87,7 +87,7 @@ Before running the production script on an unfamiliar machine, run `Test-WinRE.p
 
 ```
   ╔══════════════════════════════════════════════════════════════════╗
-  ║ WinRE Manager Test Harness (v19)                                 ║
+  ║ WinRE Manager Test Harness (v20)                                 ║
   ║ Working directory: C:\Temp\WinRETest                             ║
   ║ Detected: OS=Win11  Vendor=ASUS  MT=Syst  CPU=Intel              ║
   ╚══════════════════════════════════════════════════════════════════╝
@@ -100,7 +100,7 @@ Running Option 1 (System diagnostic) on a healthy ASUS desktop:
   ────────────────────
   Status                Enabled
   Location              \\?\GLOBALROOT\device\harddisk4\partition4\
-  Classification        DEDICATED (WinRE on dedicated recovery partition on the OS disk)
+  Classification        DEDICATED (WinRE on type-coded recovery partition on the OS disk)
 
   OS partition / OS disk
   ──────────────────────
@@ -158,9 +158,9 @@ The program acquires an exclusive file lock before doing anything else, so a sec
 5. Mounts and injects drivers: OEM WinPE pack for the vendor (Lenovo resolution distinguishes five states — a legitimate "no pack" answer is treated differently from a broken map), then Intel VMD pack if VMD hardware is present.
 6. Runs component cleanup and ResetBase (`dism /cleanup-image /StartComponentCleanup /ResetBase`) on the mounted image. ResetBase failure is non-fatal.
 7. Optimizes and exports the WIM (`dism /Export-Image /Compress:max`).
-8. Ensures a correctly-sized recovery partition exists on the **OS disk**: accepts an existing one that meets the 250 MiB free-space policy, or deletes strays, extends, shrinks by the required bucket + 1 MiB, and creates a new partition with the recovery type GUID applied at creation.
+8. Ensures a correctly-sized recovery partition exists on the **OS disk**: accepts an existing **type-coded** one that meets the 250 MiB free-space policy, or deletes strays, extends, shrinks by the required bucket + 1 MiB, and creates a new partition with the recovery type GUID applied at creation. A partition detected only by a Recovery/WINRE volume label is never reused, never counted, and never deleted — a label alone is not sufficient authority for any of those decisions.
 9. Deploys the WIM: prepares the target with `Set-RecoveryPartitionReadyForWinRE` (decrypting in place if needed), copies the WIM, verifies SHA256, sets the recovery type GUID and GPT attributes, registers it with `reagentc /setreimage`, and enables WinRE.
-10. Enforces the invariant "exactly one recovery partition, on the OS disk" by removing any stray type-coded recovery partition on non-OS disks.
+10. Enforces the invariant "exactly one **type-coded** recovery partition, on the OS disk" by removing any stray type-coded recovery partition on non-OS disks.
 11. Writes a state file containing the deployed WIM hash and the `DesiredStateId` so the next run can short-circuit.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full design, [`docs/recovery-partition.md`](docs/recovery-partition.md) for the partition-lifecycle model, and [`docs/state-and-idempotency.md`](docs/state-and-idempotency.md) for the `DesiredStateId` composition and fast-path gates.
@@ -182,6 +182,10 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design, [`docs/r
 > **Before running this script on a machine you did not image yourself**, run `scripts\Test-WinRE.ps1` and inspect the "Recovery partitions" section of the Option 1 diagnostic. It lists every recovery-typed partition on the machine with its size. A recovery-typed partition larger than 2 GiB is a red flag — investigate before proceeding.
 >
 > A 2 GiB sanity ceiling is planned but not yet implemented. When implemented, it must gate **all three** functions above — not only the destructive one. Tracked in the "Known gaps" section of the `.NOTES` block in `scripts/WinRE.ps1`.
+
+> **Known limitation — destructive-rebuild failure on encrypted-C: machines.**
+>
+> Removing the v44 patch 3 pre-destructive C: guard in v44 patch 6 narrowed the safety envelope in a specific corner. On a machine where C: is encrypted **and** a destructive rebuild is required **and** the destructive attempt fails after the existing partition has already been deleted **and** no successful retry occurs before the machine is needed, the machine can end up with neither a dedicated recovery partition nor OS-fallback, because the OS-fallback gate also refuses on encrypted C:. The first two preconditions are common; the last two are the narrow part. The correct fix is a post-failure check in the shrink-failure branch, not a reinstatement of the pre-destructive guard — the guard's predicate cannot distinguish a destructive attempt that will succeed from one that will fail. See the `[v44 patch 7]` CHANGELOG entry for the four preconditions, the log signature (`Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`), and the full reasoning. The corner has not been exercised in the field; a deliberate shrink-failure test on an encrypted-C: machine is documented in `docs/testing.md` as a gating requirement for future destructive-path changes.
 
 ---
 
@@ -210,7 +214,7 @@ See [`docs/exit-codes.md`](docs/exit-codes.md) for the full matrix, including th
 - **`reagentc.exe`** in `PATH` (present on all supported SKUs).
 - **Windows is in a normal-running state.** The script refuses to run before any state-modifying action on a machine that has not yet completed OOBE. See [`docs/deployment.md`](docs/deployment.md#audit-mode-and-oobe).
 
-There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (further revision 5) policy is target-volume-based: the enable-only and dedicated-partition paths do not depend on C:'s BitLocker state at all. If the target recovery partition is encrypted, the script decrypts it in place before calling `reagentc`. The only path that depends on C:'s BitLocker state is the OS-fallback route, because on that route the target volume *is* C:. As of v44 patch 6, the destructive partition path does not consult C:'s state either — the dedicated-partition path's success or failure depends on the partition geometry, not on C:'s encryption state.
+There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (further revision 5) policy is target-volume-based: the enable-only and dedicated-partition paths do not depend on C:'s BitLocker state at all. If the target recovery partition is encrypted, the script decrypts it in place before calling `reagentc`. The only path that depends on C:'s BitLocker state is the OS-fallback route, because on that route the target volume *is* C:. As of v44 patch 6, the destructive partition path does not consult C:'s state either — the dedicated-partition path's success or failure depends on the partition geometry, not on C:'s encryption state. The residual consequence of that change is documented under "Before you run this" above.
 
 ---
 
@@ -218,14 +222,38 @@ There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (furthe
 
 ```
 .
-├── docs/                Design, deployment, and troubleshooting documentation
-├── scripts/             The PowerShell scripts
+├── .github/
+│   ├── FUNDING.yml
+│   ├── PULL_REQUEST_TEMPLATE.md
+│   └── ISSUE_TEMPLATE/
+│       ├── bug_report.md
+│       ├── config.yml
+│       └── feature_request.md
+├── docs/
+│   ├── index.md                     Documentation index
+│   ├── architecture.md              Design, pipeline, invariants
+│   ├── deployment.md                Single-machine and fleet deployment
+│   ├── driver-injection.md          OEM pack + VMD injection, success gate
+│   ├── exit-codes.md                Exit code semantics
+│   ├── recovery-partition.md        Partition lifecycle and sizing
+│   ├── state-and-idempotency.md     DesiredStateId, state file, checkpoints
+│   ├── testing.md                   Harness, parser self-test, field-test procedures
+│   └── troubleshooting.md           Per-symptom playbook
+├── scripts/
 │   ├── WinRE.ps1                    Production deploy / repair
 │   ├── Test-WinRE.ps1               Read-only harness + diagnostic
 │   ├── Build-DellWinPEMap.ps1       Rebuild the Dell map gist
 │   ├── Build-HPWinPEMap.ps1         Rebuild the HP map gist
 │   └── Build-LenovoWinPEMap.ps1     Rebuild the Lenovo map gist
-└── README.md
+├── .editorconfig
+├── .gitattributes
+├── .gitignore
+├── CHANGELOG.md
+├── CODE_OF_CONDUCT.md
+├── CONTRIBUTING.md
+├── LICENSE
+├── README.md
+└── SECURITY.md
 ```
 
 ---
@@ -240,23 +268,23 @@ There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (furthe
 | [`docs/state-and-idempotency.md`](docs/state-and-idempotency.md) | `DesiredStateId`, state file, checkpoint resume, the loop-breaker, the offline fallback's residual risk. |
 | [`docs/recovery-partition.md`](docs/recovery-partition.md) | Sizing policy, geometry, GPT/MBR attributes. |
 | [`docs/driver-injection.md`](docs/driver-injection.md) | OEM pack + VMD injection, INF cross-reference success gate, Lenovo five-state resolution. |
-| [`docs/testing.md`](docs/testing.md) | Using the harness, writing new tests. |
+| [`docs/testing.md`](docs/testing.md) | Using the harness, writing new tests, the encrypted-C: failure-then-fallback test. |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Known failure modes, per-symptom playbook, and recovery procedures. |
 
 ---
 
 ## Version
 
-**Production:** `WinRE.ps1` v44 patch 6.
-**Harness:** `Test-WinRE.ps1` v19.
+**Production:** `WinRE.ps1` v44 patch 7.
+**Harness:** `Test-WinRE.ps1` v20.
 
-`ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM and do not change the `DesiredStateId` ship under the same `ScriptVersion`, so healthy machines do not rebuild unnecessarily. v43 patches 2, 3, 4, and 5 — and the further revisions to patch 5 — all shipped under `ScriptVersion = 43`. v44 patches 2, 3, 4, 5, and 6 all ship under `ScriptVersion = 44` for the same reason: v44 patch 2 added component cleanup and ResetBase; v44 patch 3 added the destructive-path C: encryption guard (removed in v44 patch 6) and the `base.wim` cleanup on injection failure; v44 patch 4 added the program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock`; v44 patch 5 added the offline fallback for the driver manifest fetch and a 15-second network timeout on every call; v44 patch 6 removed the v44 patch 3 C: guard, made Lenovo OEM-pack resolution distinguish five states, made VMD hardware detection fail-closed, added the Step 2 stale-file cleanup on the normal path, and corrected the OS-fallback remediation wording. None of those five changes affects the deployed WIM bytes, the partition layout, or the `DesiredStateId` inputs.
+`ScriptVersion` is deliberately decoupled from deployed-WIM changes: fixes that do not modify the deployed WIM and do not change the `DesiredStateId` ship under the same `ScriptVersion`, so healthy machines do not rebuild unnecessarily. v43 patches 2, 3, 4, and 5 — and the further revisions to patch 5 — all shipped under `ScriptVersion = 43`. v44 patches 2, 3, 4, 5, 6, and 7 all ship under `ScriptVersion = 44` for the same reason: v44 patch 2 added component cleanup and ResetBase; v44 patch 3 added the destructive-path C: encryption guard (removed in v44 patch 6) and the `base.wim` cleanup on injection failure; v44 patch 4 added the program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock`; v44 patch 5 added the offline fallback for the driver manifest fetch and a 15-second network timeout on every call; v44 patch 6 removed the v44 patch 3 C: guard, made Lenovo OEM-pack resolution distinguish five states, made VMD hardware detection fail-closed, added the Step 2 stale-file cleanup on the normal path, and corrected the OS-fallback remediation wording; v44 patch 7 enforced the type-coded-partition classification consistently across the recovery-partition classifier, the fast-path count, the active-location classifier, and the final-verification classifier, cleared the VMD extraction directory before each extraction, and added C:'s actual encryption state to the destructive-replacement WARN. None of those six changes affects the deployed WIM bytes, the partition layout, or the `DesiredStateId` inputs.
 
 The v44 patch 1 revision is the deliberate exception. It changed the `DesiredStateId` inputs — adding CPU vendor/generation and VMD presence — and therefore bumped `ScriptVersion` to 44. Every managed machine performed one full-update pass on the next scheduled run to rebuild the WIM against the new ID, then returned to the fast path permanently. See the migration note in [`CHANGELOG.md`](CHANGELOG.md).
 
-The harness's own version marker moved from v18 to v19 on 2026-09-30. The v19 change is confined to Option S of the parity check; the production `ScriptVersion` and `DesiredStateId` are unaffected, and no managed machine rebuilds.
+The harness's own version marker moved from v18 to v19 on 2026-09-30 (Option S parity-check corrections) and from v19 to v20 on 2026-10-01 (active-location classifier mirrored from production v44 patch 3, and menu box alignment fix). Neither the production `ScriptVersion` nor the `DesiredStateId` is affected by any harness move, and no managed machine rebuilds.
 
-Already-completed machines will not rerun automatically on v44 patches 2 through 6 because `ScriptVersion` and the `DesiredStateId` are unchanged. To exercise the fixes on an already-healthy machine, the deployment mechanism must invoke the script explicitly (for example, by deleting the state file or forcing a full-update pass); the next natural rebuild picks them up regardless.
+Already-completed machines will not rerun automatically on v44 patches 2 through 7 because `ScriptVersion` and the `DesiredStateId` are unchanged. To exercise the fixes on an already-healthy machine, the deployment mechanism must invoke the script explicitly (for example, by deleting the state file or forcing a full-update pass); the next natural rebuild picks them up regardless.
 
 ---
 
@@ -264,16 +292,25 @@ Already-completed machines will not rerun automatically on v44 patches 2 through
 
 | Vendor | Model | OS | Result |
 |---|---|---|---|
+| ASUS | Vivobook X1504VA (i3-1315U) | Win11 26300 | v20 harness — Option 1 diagnostic 2026-10-01 15:11 (all fifteen parser self-test checks PASS); v44 patch 7 — full-update pass 15:12–15:14 (C: at 90.6% `EncryptionInProgress`; clean destructive rebuild — delete, extend, shrink attempt 1, `New-Partition` with recovery GUID at creation, WIM deployed, `reagentc /enable` exit 0, DEDICATED), fast path 15:15:08. New machine; also exercised the v44 patch 7 diagnostic WARN reporting C:'s encryption state before proceeding. |
+| Dell | Latitude 5530 (i5-1245U, 12th Gen) | Win11 26300 | v20 harness — Option 1 diagnostic 2026-10-01 15:07 (all fifteen parser self-test checks PASS); v44 patch 7 — full-update pass 15:08–15:13 (C: at 78.5% `EncryptionInProgress`; clean destructive rebuild — delete, extend, shrink attempt 1, `New-Partition` with recovery GUID at creation, WIM deployed, `reagentc /enable` exit 0, DEDICATED), fast path 15:14:39. Distinct from the i7-1265U Latitude 5530 that motivated the v43 patch 5 (further revision) Audit Mode guard; this unit ran the guard-free destructive path cleanly under v44 patch 7. |
+| Dell | Vostro 16 5640 (Core 7 150U) | Win11 26300 | v20 harness — Option 1 diagnostic 2026-10-01 14:27 (all fifteen parser self-test checks PASS); v44 patch 7 — full-update pass 14:28–14:32 (C: at 94.9% `EncryptionInProgress`; clean destructive rebuild — delete, extend, shrink attempt 1, `New-Partition` with recovery GUID at creation, WIM deployed, `reagentc /enable` exit 0, DEDICATED), fast path 14:32:38. Second confirmation on the same physical machine, now on build 26300; the DSI changed (build component) and the machine correctly rebuilt and re-converged. |
+| ASUS | PRIME H510M-D (i5-11400) | Win11 26300 | v20 harness — Option 1 diagnostic 2026-10-01 14:01 (all fifteen parser self-test checks PASS: 15 passed, 0 failed, 0 skipped; classifier reports `DEDICATED (WinRE on type-coded recovery partition on the OS disk)`) |
+| ASUS | PRIME H510M-D (i5-11400) | Win11 26300 | v44 patch 7 — full-update **reuse** 2026-10-01 14:02–14:04 (existing 1100 MiB recovery partition correctly identified as type-coded and adequate: 1082.2 MiB effective free vs. 1007 MiB required; no delete, no extend, no shrink, no recreate — deploy went into the existing partition; `Operating mode: DEDICATED`), fast path 14:04:12. Concrete demonstration of v44 patch 7's patch 1 (type-coded classifier) doing its job. |
+| Lenovo | V15 G5 IRL (i5-13420H, MT 83GW) | Win11 26200 | v44 patch 6 — full-update pass 2026-10-01 13:11–13:15 (C: at 92.7% `EncryptionInProgress`; clean destructive rebuild — delete, extend, shrink attempt 1, `New-Partition` with recovery GUID at creation, WIM deployed, `reagentc /enable` exit 0, DEDICATED). Lenovo five-state resolution correctly produced `no-entry` for MT 83GW and recorded `OEMPACK=NONE` as a complete run rather than an incomplete one. Second run took the fast path. |
+| Dell | Vostro 16 5640 (Core 7 150U) | Win11 26200 | v44 patch 6 — full-update pass 2026-10-01 12:22–12:30 (C: at 96.6% `EncryptionInProgress`; clean destructive rebuild — delete, extend, shrink attempt 1, `New-Partition` with recovery GUID at creation, WIM deployed, `reagentc /enable` exit 0, DEDICATED; first logged clean destructive run under the guard-free configuration on an encrypted-C: machine), fast path 12:30:47 |
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v44 patch 5 — fast path 2026-09-30 15:08:36 and 15:08:57 (two consecutive runs, `Acquired program lock` / `Released program lock` logged, DSI `62DE5C7D…` matched, `Operating mode: DEDICATED`, exit 0, no drive-letter leaks, no contention) |
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v44 patch 3 — fast path 2026-09-30 12:02 (state file accepted, DSI match, DEDICATED, no machine changes) |
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v44 patch 2 — full-update pass 2026-09-30 02:06 (ResetBase ran, exported WIM 756.1 MiB vs. 756.36 MiB pre-ResetBase, DEDICATED), fast path 02:08 |
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v44 patch 1 — full-update pass 2026-09-30 00:29 (DSI mismatch on the v43 state file, 756.4 MiB WIM rebuilt and deployed, 1100 MiB partition accepted on size), fast path 00:32 |
-| ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v18 harness — Option 1 diagnostic 2026-09-30 (all fifteen parser self-test checks PASS: 15 passed, 0 failed, 0 skipped). v19 changes Option S only; the Option 1 diagnostic is unchanged from v18. |
+| ASUS | PRIME H510M-D (i5-11400) | Win11 26200 | v18 harness — Option 1 diagnostic 2026-09-30 (all fifteen parser self-test checks PASS: 15 passed, 0 failed, 0 skipped). v19 changed Option S only; v20 mirrors the classifier change in Option 1 and fixes menu box alignment. |
 | Dell | Latitude 3550 (Core Ultra 5 125U) | Win11 26200 | v44 patch 3 — full-update pass 2026-09-30 12:29–12:47 (clean partition recreate, `Pre-deletion inventory:` followed by deletion and recreation, `Target partition 0/4 (Z:) is already unencrypted - reagentc /enable can proceed`, `reagentc /enable (exit 0)` Operation Successful, DEDICATED). The machine that motivated the v43 patch 5 investigation now runs cleanly under v44. |
 | Dell | Latitude 3550 (Core Ultra 5 125U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
 | Dell | Pro Slim QCS1250 (Core Ultra 5 235) | Win11 26200 | v43 patch 5 (revised) — startup gate fired correctly, machine left unchanged |
-| Dell | Vostro 16 5640 (Intel Core 7 150U) | Win11 26200 | v43 patch 5 (revised) — startup gate fired correctly, machine left unchanged |
+| Dell | Vostro 16 5640 (Intel Core 7 150U) | Win11 26200 | v43 patch 5 (revised) — startup gate fired correctly, machine left unchanged. (Same machine subsequently rebuilt cleanly under v44 patch 6 and v44 patch 7; see the rows above.) |
 | Dell | Latitude 5530 (i7-1265U) | Win11 26200 | Motivated the v43 patch 5 (further revision) Audit Mode guard. After OOBE, manual `reagentc /enable` succeeded on the first attempt with the same WIM. |
+| Dell | Pro 14 PC14250 (Core 5 120U) | Win11 26200 | v44 patch 5 — OS-fallback deferral under the pre-patch-6 C: guard (C: at 94% `EncryptionInProgress`). Unblocked by the v44 patch 6 guard removal; see the `[v44 patch 7]` CHANGELOG entry. |
+| Dell | 15 DC15250 (i7-1355U) | Win11 26200 | v44 patch 5 — OS-fallback deferral under the pre-patch-6 C: guard (C: at 90% `EncryptionInProgress`). Unblocked by the v44 patch 6 guard removal; see the `[v44 patch 7]` CHANGELOG entry. |
 | HP | ProBook 445 14 inch G10 (Ryzen 5 7530U) | Win11 26200 | DEDICATED after v28 fix |
 | HP | ProBook 450 15.6 inch G10 (i7-1355U) | Win11 26200 | Hit the Device Encryption race pre-patch-5; fixed in v43 patch 5 |
 | HP | ProBook 455 15.6 inch G10 (Ryzen 5 7530U) | Win11 26200 | DEDICATED — full update 2026-09-29 (190 drivers injected, dedicated partition created at 1200 MiB); second run fast path |
@@ -281,7 +318,9 @@ Already-completed machines will not rerun automatically on v44 patches 2 through
 | (VM) | Hyper-V Windows 10 MBR | Win10 | DEDICATED |
 | (VM) | Hyper-V Windows 11 (i5-11400) | Win11 26200 | v44 patch 1 — full-update pass 2026-09-30 00:29 (DSI mismatch, 713.3 MiB WIM rebuilt and deployed), fast path 00:32 |
 
-The two Device Encryption failures pre-patch-5 are documented in [`docs/troubleshooting.md`](docs/troubleshooting.md) with the recovery procedure. The v43 patch 5 series prevents them from recurring.
+The two Device Encryption failures pre-patch-5 are documented in [`docs/troubleshooting.md`](docs/troubleshooting.md) with the recovery procedure. The v43 patch 5 series prevents them from recurring. The two Dell OS-fallback deferrals under v44 patch 5 are documented in the `[v44 patch 7]` CHANGELOG entry; those machines are unblocked by the guard removal and will attempt the destructive path on their next rebuild.
+
+**Four distinct machines now confirm the guard-free destructive path succeeds on encrypted C:** (Vostro 16 5640 on both 26200 and 26300, Latitude 5530 i5-1245U, Lenovo V15 G5 IRL, ASUS Vivobook X1504VA). All four entered the destructive path with C: mid-encryption (`EncryptionInProgress` at 78.5%–96.6%), completed delete/extend/shrink/`New-Partition`/format/attribute, verified the new partition is not encrypted, deployed the WIM, and reached `reagentc /enable` exit 0 with status `Enabled`. The v44 patch 7 diagnostic WARN correctly reported C:'s encryption state in each destructive run. This is the field evidence supporting the v44 patch 6 decision not to reinstate the pre-destructive C: guard. The failure-then-fallback corner remains untested — see the "Known limitation — destructive-rebuild failure on encrypted-C: machines" note above.
 
 ---
 

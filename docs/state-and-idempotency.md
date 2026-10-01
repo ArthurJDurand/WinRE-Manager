@@ -53,13 +53,14 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 ### When it does not change
 
 - Any cosmetic or logging fix shipped without bumping `ScriptVersion`.
-- Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, the further revisions to patch 5 (including further revision 5), and v44 patches 2, 3, 4, 5, and 6 all ship under their respective `ScriptVersion`s without changing the DSI inputs, so the ID is unchanged and healthy machines do not rebuild.
+- Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, the further revisions to patch 5 (including further revision 5), and v44 patches 2, 3, 4, 5, 6, and 7 all ship under their respective `ScriptVersion`s without changing the DSI inputs, so the ID is unchanged and healthy machines do not rebuild.
 - A new WIM hash at the registered location. That is a separate check (see below), not part of the ID.
 - A Windows Update that changes the WIM inside the recovery partition without changing the OS build.
 - A change to the BitLocker policy or the target-preparation logic. The state file does not record BitLocker state; it records the deployment's identity and outcome.
+- A change to the recovery-partition classifier (the v44 patch 7 type-code-authority rule). The classifier affects the fast path's control-flow decision but not the identity of the deployment; a label-only partition on the OS disk changes whether the fast path fires, not what the state file records.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, and the harness's moves to v14, v15, v16, v17, and v18 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
+`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, and the harness's moves to v14, v15, v16, v17, v18, v19, and v20 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
 
 The v44 patch 1 revision is the deliberate exception. It changes the DSI inputs and therefore bumps `ScriptVersion` to 44. Every managed machine performs one full-update pass on the next run and returns to the fast path. See the migration note in `CHANGELOG.md`.
 
@@ -111,7 +112,7 @@ Recomputing the DSI offline would require the OEM pack version, which is resolve
 The local safety checks are still fully enforced and do not depend on the manifest:
 
 - WinRE is `Enabled`
-- Exactly one recovery partition exists on the OS disk
+- Exactly one **type-coded** recovery partition exists on the OS disk (a partition detected only by a Recovery/WINRE volume label is not counted)
 - The deployed WIM hash matches the state file's stored `CurrentImageHash`
 
 If all three pass, the fast path fires and the run exits `EXIT_WARNING` (code 2) because `$Script:offlineFallback = $true` is set. The state file may be rewritten by the fast path to clear stale counters, exactly as it would online; that rewrite preserves the stored `DesiredStateId`. If any of the three checks does not pass, the run exits `EXIT_WARNING` before the full-update pipeline, having done nothing. If the state file does not exist at all, the run throws and exits `EXIT_FATAL` — a first deployment requires the live manifest to compute the initial `DesiredStateId`.
@@ -147,13 +148,13 @@ The fast path fires when:
 
 - WinRE is enabled, AND
 - The state file's `DesiredStateId` matches the current one, AND
-- Exactly one recovery partition exists on the OS disk, AND
-- The currently-registered partition is on the OS disk and is a recovery partition, AND
+- Exactly one **type-coded** recovery partition exists on the OS disk (a partition detected only by a Recovery/WINRE volume label is not counted), AND
+- The currently-registered partition is on the OS disk and is **type-coded** as a recovery partition, AND
 - The deployed WIM hash at the registered location matches `CurrentImageHash`.
 
 If all five conditions hold, the machine is in the correct end state. The fast path runs `Remove-StrayRecoveryPartitions` (a read-only scan when there are no strays), optionally clears stale `PendingReboot` / `RepairAttempts` / `EnableFailureAttempts` flags and a stale `LastEnableResult`, and exits with `EXIT_SUCCESS`.
 
-If any condition fails, the script forces a full rebuild. The conditions above are also the fast-path `elseif` branches — the log records which one failed.
+If any condition fails, the script forces a full rebuild. The conditions above are also the fast-path `elseif` branches — the log records which one failed. The type-coded qualifiers in the third and fourth conditions were added in v44 patch 7: a label-only partition on the OS disk does not satisfy either condition, so a machine whose only recovery-looking partition is label-only never takes the fast path and converges on the full-update path instead. This closes the non-convergence loop described in the `[v44 patch 7]` CHANGELOG entry.
 
 Under the offline fallback (v44 patch 5), the same five conditions apply, but the `DesiredStateId` used for the comparison is the one read directly from the state file, and the run exits `EXIT_WARNING` even if all five conditions hold. See "Offline fallback trust" above.
 

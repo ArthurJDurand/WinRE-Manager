@@ -6,6 +6,120 @@ This file is the authoritative user-facing record of what changed and when. The 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to a `ScriptVersion` + patch-generation scheme rather than strict SemVer — see [docs/state-and-idempotency.md](docs/state-and-idempotency.md) for why.
 
+## [v44 patch 7] — 2026-10-01
+
+Six patches closing a non-convergence loop in the recovery-partition classifier, a VMD extraction-directory cleanup, and a diagnostic-only logging change on the destructive path. `ScriptVersion` remains 44; `DesiredStateId` is unchanged; no fleet-wide rebuild is forced.
+
+The change was driven by a review of the v44 patch 6 code in which ChatGPT identified a real non-convergence defect in the classifier and Claude identified a related narrowing of the destructive-path safety envelope. Both reviewers agreed the trade should not be resolved by reinstating the removed v44 patch 3 C: guard, and that the narrowed safety envelope needed to be documented honestly rather than papered over. The six patches reflect that conclusion.
+
+### Fixed
+
+- **Partition-classifier consistency (patches 1–4).** Only a **type-coded** recovery partition on the OS disk is now authoritative for reuse, fast-path counting, active-location classification, and final verification. A partition detected only by its Recovery/WINRE volume label is not promoted to DEDICATED, is not counted by the fast path, and is not reused by `Find-SuitableRecoveryPartition`.
+
+  Closes a non-convergence loop. `Get-RecoveryPartitions` broad-matches by volume label **or** type code. `Ensure-AdequateRecoveryPartition` already filtered to type code before deleting — a label-only match is never authorized for deletion and the code comment said so — but the fast-path count and the reuse classifier still used the broad result. A Basic Data partition labelled "Recovery" was therefore counted by the fast path (`$existingRecoveryParts.Count` included it, so the "exactly one recovery partition on the OS disk" condition could never be satisfied) while being preserved by the destructive path (which correctly refused to delete it, because the label alone is not sufficient authority). The machine cycled through rebuilds indefinitely without converging.
+
+  The four patches:
+
+  1. **`Find-SuitableRecoveryPartition`** — filter candidates to type-coded recovery partitions only (`GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'` or `MbrType -eq 0x27`), before the size and free-space checks.
+  2. **Main-flow `$existingRecoveryParts`** — count only type-coded recovery partitions on the OS disk, so the fast-path count agrees with what the destructive path is authorized to remove.
+  3. **Active-location classifier** — do not promote a label-only match to DEDICATED. The classifier now distinguishes `$isTypedRecovery` from `$isLabelRecovery`; a label-only match on the OS disk logs a WARN and does not set `$activeOnRecovery`, so the natural rebuild path fires instead of the fast path accepting a route production will not maintain.
+  4. **Final-verification classifier** — require type-coded **and** on-OS-disk for the DEDICATED verdict. A label-only match now falls through to the FATAL "unexpected partition" branch instead of being silently accepted as a healthy end state.
+
+- **VMD extraction directory cleanup (patch 5).** Before each `7z x` invocation in the VMD driver injection loop, the extraction directory is now cleared and recreated (`Remove-ItemIfExist` followed by `New-DirectoryIfNotExists`). Closes a class of failure in which a stale INF from an earlier run could satisfy the INF-basename cross-reference or the third-party-driver-count delta and make a failed extraction look like a success. The Lenovo vendor-extractor path had a similar hazard, but the INF-count branch there is only reached after the extractor itself exits non-zero, which does not occur on the VMD `.7z` path.
+
+### Changed
+
+- **Destructive-replacement logging now reports C:'s actual encryption state (patch 6).** When the destructive path is about to run and the current WinRE route will be destroyed (`$stateBefore.Status -eq "Enabled"` or `$deletableParts.Count -gt 0`), the WARN now includes C:'s measured encryption state:
+
+  - `Test-VolumeEncrypted -MountPoint "C:"` returns `$false` → INFO: `C: is confirmed fully decrypted; proceeding.`
+  - returns `$true` → WARN: `C: encryption state=True; proceeding because C: encryption is not a veto for the dedicated-target path. The OS-fallback path retains its separate C: BitLocker gate.`
+  - returns `$null` → WARN with `C: encryption state=unknown;` and the same rationale text.
+
+  **Diagnostic only.** The decision to proceed is unchanged; no gate was reinstated. The purpose is to make the narrowed safety envelope visible in the log so an operator can recognize the residual failure mode described below.
+
+### Changed (harness)
+
+- **`Test-WinRE.ps1` moved to v20.** Two changes.
+
+  The active-location classifier in `Show-SystemDiagnostic` now requires a **type-coded** recovery partition on the OS disk to reach the DEDICATED verdict, mirroring production's v44 patch 3 change. The previous logic computed a single `$isRec` flag and fell back to a `Get-Volume -Partition` label check that promoted a label-only match to `$isRec = $true`. The classifier now computes `$isTypedRecovery` and `$isLabelRecovery` separately, and the branches report:
+
+  - `OS-FALLBACK` — the WinRE location resolves to the OS partition.
+  - `DEDICATED` — the location is both type-coded and on the OS disk.
+  - `RECOVERY-ON-SECONDARY` — type-coded but on a non-OS disk (production forces a full rebuild).
+  - `LABEL-ONLY` — on the OS disk with a Recovery/WINRE label but not type-coded (production does **not** treat as DEDICATED).
+  - `UNEXPECTED` — otherwise.
+
+  This closes a false-positive that could have misled an operator: pre-v20, a machine whose reagentc-registered WinRE location was a Basic Data partition labelled "Recovery" would have been reported as `DEDICATED` by the harness, while production would have taken the full-update path. Production's final-verification classifier (v44 patch 4) has no direct harness equivalent and is not claimed; the harness classifies the reagentc-registered location, which is the active-location decision point, not the post-deploy verification decision point.
+
+  The menu box alignment is also fixed. The menu's top border is 66 columns wide interior (plus the two `╔`/`╗` characters and two leading spaces). The title row was padded to 33 columns, the working-directory row to a length-relative value, and the detected row to 64 — none of which equals the interior width minus the leading space. All three rows now pad their content to exactly 65 columns with the working-directory and detected rows truncating at 65 with an ellipsis if content overflows. Purely cosmetic; no functional change.
+
+### Changed (docs)
+
+- **`docs/architecture.md`** — added Invariant 16 (only a type-coded recovery partition on the OS disk is authoritative). The Step 5 discussion now names the safety property's two ordinary cases (the destructive attempt succeeds, or it fails before deletion) and the one narrow corner where it does not hold, with a cross-reference to this entry and to `docs/testing.md`. The "shared shape" narrative adds the classifier as a sixth instance of the same wrong-question pattern. The fast-path and full-update entry conditions and the Step 5 acceptance criteria are qualified with the type-coded rule.
+- **`docs/recovery-partition.md`** — the invariant now says "exactly one **type-coded** recovery partition, on the OS disk" and lists the four places a label-only partition is rejected. The existing-partition acceptance criteria adds "It is type-coded" as a prerequisite. The pre-check `R` computation and the delete loop now count type-coded partitions only. The OS-shrink failure section names the failure-then-fallback corner explicitly, with a cross-reference to `docs/architecture.md` Step 5 and to this entry.
+- **`docs/state-and-idempotency.md`** — the fast-path conditions and the offline-fallback local safety check now say "type-coded" for the recovery-partition-count and registered-partition conditions. The "when the ID does not change" list adds v44 patch 7 to the same-version roll call, and the harness-move list extends through v19 and v20.
+- **`docs/testing.md`** — added a "v20 changes" subsection and a "v19 changes" subsection above the existing v18 subsection. Option 1's classifier verdict list now includes `LABEL-ONLY`. Added a new top-level section on the encrypted-C: failure-then-fallback test: the four preconditions, how to run it, what to record, and the gating requirement on future destructive-path changes.
+- **`docs/troubleshooting.md`** — added a new section on the label-only non-convergence loop, with the classifier WARN as the diagnostic and the two convergence outcomes. The OS-fallback BitLocker section adds the compound log signature (`Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`) for the failure-then-fallback corner. The bug-report guidance adds that compound signature to the list of data to include.
+- **`docs/index.md`** — the "If something is broken" section converted to a bullet list and extended with the label-only non-convergence loop and the compound-signature corner. The reference-table descriptions for `architecture.md` and `recovery-partition.md` name the type-coded authority rule and the residual corner respectively. Versioning updated to production v44 patch 7 and harness v20.
+- **`docs/deployment.md`** — the "Later v44 patches" list, the "Rollback for the later v44 patches" list, and the "Canary and ring deployment" guidance are extended to cover patch 7. The canary section describes the convergence change for machines whose only recovery-looking partition was label-only.
+- **`docs/driver-injection.md`** — the extraction section documents the v44 patch 7 VMD extraction-directory cleanup alongside the existing OEM cleanup. The "Why this matters" discussion of the INF-basename cross-reference explains why the extraction directory must be fresh. A "Related to the VMD extraction cleanup (v44 patch 7)" paragraph sits in the pipeline-gate discussion.
+- **`README.md`** — production marker bumped to v44 patch 7, harness to v20. The "What it does, in order" step 8 and step 10 name the type-coded qualification. A new "Known limitation" block under "Before you run this" documents the failure-then-fallback corner with the combined log signature. Field-tested hardware table adds the ASUS v44 patch 7 run, the Lenovo V15 G5 IRL, and the Dell Vostro 16 5640. Version section extended through patch 7 and the harness move list extended through v20.
+- **`.github/ISSUE_TEMPLATE/bug_report.md`** — the example version string updated from v44 patch 6 to v44 patch 7.
+
+`docs/exit-codes.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, and the remaining `.github/` files (PULL_REQUEST_TEMPLATE, FUNDING, feature_request, config) were reviewed and required no changes for patch 7.
+
+### Known limitation (documented; not fixed in this revision)
+
+Removing the v44 patch 3 pre-destructive C: guard in v44 patch 6 narrows the safety envelope in one specific corner. On a machine where **all four** of the following hold:
+
+1. C: is encrypted (common on Win11 24H2+ with Device Encryption).
+2. Destructive replacement of the existing recovery partition is required — natural on any rebuild: a `DesiredStateId` change, a manifest bump, a partition-size shortfall, or a CPU/VMD presence change.
+3. The destructive attempt fails **after** the existing recovery partition has already been deleted — e.g. `New-Partition` failing, the shrink not fitting even after the defrag retry, or `Format-Volume` failing.
+4. No successful retry occurs before the machine is needed.
+
+...the machine ends up with neither a dedicated recovery partition nor OS-fallback, because the OS-fallback gate also refuses on an encrypted C: (reagentc refuses to enable WinRE on an encrypted OS volume regardless of protector state). Under the pre-v44-patch-6 guard, the same machine deferred **before** touching the current route, leaving the existing route intact.
+
+Preconditions 1 and 2 are common. Preconditions 3 and 4 are the narrow part. On a machine with reasonable free space, the destructive path succeeds and the corner does not fire. The failure mode is real but it is a corner, not the main path.
+
+**The correct response is not to reinstate the guard.** The guard's predicate — "is C: encrypted?" — cannot distinguish a destructive attempt that will succeed from one that will fail, and the field evidence below shows the destructive path succeeding cleanly on multiple encrypted-C: machines. A pre-destructive guard on C: encryption defers every destructive replacement on every encrypted-C: machine, including the ones that would have succeeded. That is the over-deferral the v43 patch 5 (further revision 5) target-volume finding already corrected, in exchange for suppressing a double failure (the destructive attempt fails **and** the OS-fallback gate refuses) that only manifests after the first failure has already occurred.
+
+The correct response is a **post-failure** check in the shrink-failure branch that handles the case *after* the destructive attempt fails, not a pre-destructive veto. Such a check can distinguish "the attempt failed" from "the attempt might fail" — which is exactly what the guard's predicate cannot do. That work is tracked for a future patch and gated on the test documented below.
+
+**Log signature.** An operator can recognize the corner from the log: a `Pre-deletion inventory:` block followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`. `docs/troubleshooting.md` carries the combined signature and its interpretation.
+
+### Field verification
+
+- **Dell Vostro 16 5640 (Core 7 150U, Win 11 26200), 2026-10-01 12:22–12:30.** v44 patch 6. C: was `ProtectionStatus=Off`, `VolumeStatus=EncryptionInProgress` at 96.6%, no key protectors. The destructive path entered, WinRE was disabled, the existing 1000 MiB recovery partition was deleted, the OS partition was extended, the shrink succeeded on attempt 1 with no defrag retry, `New-Partition` succeeded with the recovery GUID applied at creation, the new partition was verified not encrypted, the WIM was deployed, and `reagentc /enable` returned exit 0 with status Enabled. The second run at 12:30:47 took the fast path — state file accepted, `Operating mode: DEDICATED`, no repeated work. This was the earliest of the four clean destructive runs on encrypted C: now on record; see the four-machine summary at the end of this section.
+
+- **Lenovo V15 G5 IRL (i5-13420H, MT=83GW, Win 11 26200), 2026-10-01 13:11–13:15.** v44 patch 6. C: was `ProtectionStatus=Off`, `VolumeStatus=EncryptionInProgress` at 92.7%, no key protectors. Same clean destructive sequence: delete, extend, shrink attempt 1, `New-Partition` with the recovery GUID at creation, WIM deployed, `reagentc /enable` exit 0. The second run took the fast path. This run also exercised the v44 patch 6 Lenovo five-state resolution: the machine type 83GW has no published WinPE pack, the map resolution correctly produced `no-entry`, and the run was recorded as complete with `OEMPACK=NONE` rather than being marked incomplete.
+
+- **ASUS desktop (PRIME H510M-D, i5-11400, Win 11 26300), 2026-10-01 14:02–14:04.** v44 patch 7. The first run took the **reuse** path: `Find-SuitableRecoveryPartition: candidate 4 on disk 4 is suitable (letter Z:)`. The existing 1100 MiB recovery partition was correctly identified as type-coded and adequate — 1082.2 MiB effective free against 1007 MiB required — and the deploy went into it with no delete, no extend, no shrink, and no recreate. This is the concrete demonstration that patch 1 does what it was designed to do: reuse an adequate recovery partition rather than churn the disk. The second run took the fast path.
+
+- **Dell Vostro 16 5640 (Core 7 150U, Win 11 26300), 2026-10-01 14:28–14:32.** v44 patch 7. Second run on this physical machine, now on build 26300. C: was `ProtectionStatus=Off`, `VolumeStatus=EncryptionInProgress` at 94.9%. The `DesiredStateId` changed (build component), so the machine correctly rebuilt and re-converged rather than taking the fast path: clean destructive sequence — delete, extend, shrink attempt 1, `New-Partition` with the recovery GUID applied at creation, new partition verified not encrypted, WIM deployed, `reagentc /enable` exit 0 with status Enabled, `Operating mode: DEDICATED`. The second run at 14:32:38 took the fast path.
+
+- **Dell Latitude 5530 (i5-1245U, 12th Gen, Win 11 26300), 2026-10-01 15:08–15:13.** v44 patch 7. C: was `ProtectionStatus=Off`, `VolumeStatus=EncryptionInProgress` at 78.5%. Same clean destructive sequence — delete, extend, shrink attempt 1, `New-Partition` with the recovery GUID applied at creation, new partition verified not encrypted, WIM deployed, `reagentc /enable` exit 0 with status Enabled, `Operating mode: DEDICATED`. Fast path at 15:14:39. This unit is **distinct from** the i7-1265U Latitude 5530 that motivated the v43 patch 5 (further revision) Audit Mode guard — the two are different machines and must not be conflated.
+
+- **ASUS Vivobook X1504VA (i3-1315U, 13th Gen, Win 11 26300), 2026-10-01 15:12–15:14.** v44 patch 7. C: was `ProtectionStatus=Off`, `VolumeStatus=EncryptionInProgress` at 90.6%. Clean destructive rebuild — delete, extend, shrink attempt 1, `New-Partition` with the recovery GUID applied at creation, new partition verified not encrypted, WIM deployed, `reagentc /enable` exit 0 with status Enabled, `Operating mode: DEDICATED`. Fast path on the second run at 15:15:08. This run also exercised the v44 patch 7 diagnostic WARN reporting C:'s encryption state before proceeding.
+
+- **Dell Latitude 3550 (Core Ultra 5 125U, Win 11 26200), 2026-09-28, v43.** C: was `ProtectionStatus=Off`, `VolumeStatus=EncryptionInProgress` at 94.2%, no key protectors. Across four logged runs on that date, the destructive path completed delete, OS extend, OS shrink (attempt 1, no defrag), `New-Partition`, and `Set-PartitionAttributes`. The failure was isolated to the newly created partition being auto-encrypted by Device Encryption — the problem v43 patch 5 subsequently addressed by applying the recovery GUID at creation. This is the field evidence that the destructive path reaches and completes every pre-create step on an encrypted-C: machine; the create-step failure was a separate problem, not a consequence of C:'s state.
+
+- **Dell Pro 14 PC14250 (Core 5 120U) and Dell 15 DC15250 (i7-1355U), 2026-09-30, v44 patch 5.** Both machines had encrypted C: (94% and 90% `EncryptionInProgress` at time of diagnostic). Both deferred under the pre-v44-patch-6 guard with the log line `Destructive recovery-partition replacement would remove the current WinRE route, and C: is not confirmed fully decrypted (Test-VolumeEncrypted=True). Deferring to preserve the current recovery environment.` These are the machines the guard removal unblocks: on the next rebuild they will attempt the destructive path instead of deferring.
+
+**Four distinct machines now confirm the guard-free destructive path succeeds on encrypted C:** the Dell Vostro 16 5640 (on both 26200 and 26300), the Dell Latitude 5530 (i5-1245U), the Lenovo V15 G5 IRL, and the ASUS Vivobook X1504VA. All four entered the destructive path with C: mid-encryption (`EncryptionInProgress` at 78.5%–96.6%), completed delete/extend/shrink/`New-Partition`/format/attribute, verified the new partition not encrypted, deployed the WIM, and reached `reagentc /enable` exit 0 with status `Enabled`. The v44 patch 7 diagnostic WARN correctly reported C:'s encryption state in each destructive run. This is the field evidence supporting the v44 patch 6 decision not to reinstate the pre-destructive C: guard. The failure-then-fallback corner remains untested — see the "Known limitation" section above and the pending-test note below.
+
+### Pending test (gating future destructive-path changes)
+
+The failure-then-fallback corner has not been exercised in the field. No logged run has yet shown a destructive attempt that failed **after** deletion with C: encrypted. Until such a test runs — ideally a deliberate shrink failure on an encrypted-C: machine, or a naturally-occurring one on a constrained disk — no further changes to the destructive path should ship. The test is documented in `docs/testing.md`.
+
+### Unchanged
+
+`ScriptVersion` remains 44. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. Healthy machines continue to take the fast path. A machine that is already healthy will not rerun automatically; the deployment mechanism must invoke the script explicitly to pick up the patch-7 changes. A machine whose next natural rebuild is already due (manifest bump, OEM pack version change, Windows build change, or CPU/VMD presence change) picks up the patch-7 changes on that rebuild.
+
+### Notes
+
+- **Label-only recovery partitions on the OS disk are no longer reused but also not deleted.** A label alone is not sufficient authority for deletion — consistent with the existing policy in `Remove-StrayRecoveryPartitions` and `Ensure-AdequateRecoveryPartition`. Label-only partitions may therefore persist across runs as clutter on the OS disk. This is intentional design, not an oversight: the alternative (deleting them) would require relaxing the type-code gate that every deletion decision in the script depends on.
+- **`Test-WinRE.ps1` moves from v19 to v20** in the same window. The classifier mirror is the substantive change; the menu-box alignment is cosmetic.
+
 ## [harness v19] — 2026-09-30
 
 Two Option S corrections in the read-only harness. Production `WinRE.ps1` is unaffected; this entry is the harness's own version marker.
@@ -29,6 +143,8 @@ The harness's extraction cleanup, user-supplied `TestDir` protection, VMD-indete
 
 ## [v44 patch 6] — 2026-09-30
 
+> **Note.** The claim in this entry that "the safety property — never leave a machine with no working recovery route — is preserved end-to-end without the guard" was found to be inaccurate on review. Removing the guard narrows the safety envelope in a specific corner: C: encrypted, destructive replacement needed, destructive attempt fails after deletion, no successful retry. The correct response is a post-failure check in the shrink-failure branch, not a reinstatement of the guard. See [v44 patch 7](#v44-patch-7--2026-10-01) for the corrected statement, the field evidence, and the residual failure mode.
+
 Removes the v44 patch 3 destructive-path C: guard, makes Lenovo OEM-pack resolution distinguish five states, makes VMD hardware detection fail-closed, closes a Step 2 wedge left by interrupted runs, corrects the OS-fallback remediation wording, and mirrors the production changes into the harness as v18.
 
 The change was driven by a review of the v44 patch 3 guard in light of the v43 patch 5 (further revision 5) target-volume policy that the guard was built on top of. The guard was correct in spirit — prevent the destructive path from leaving a machine with no working recovery route — but it applied an OS-fallback precondition to the dedicated-partition path. The dedicated-partition path does not depend on C:'s BitLocker state at all; reagentc's check is on the **target** volume, and on the dedicated-partition path the target is the recovery partition. The guard was deferring runs that would have succeeded.
@@ -37,7 +153,7 @@ The change was driven by a review of the v44 patch 3 guard in light of the v43 p
 
 - **C:'s encryption state is no longer a veto for the dedicated-recovery-partition path.** The v44 patch 3 destructive-path C: guard inside `Ensure-AdequateRecoveryPartition` has been removed. When the destructive path is about to run and the run will destroy the current recovery route (WinRE `Enabled` or a non-empty deletable-part set), the function still logs the `Destructive recovery-partition replacement will remove the current WinRE route` WARN, but it no longer calls `Test-VolumeEncrypted -MountPoint "C:"`, no longer returns `$null` on a non-`FullyDecrypted` result, and no longer defers via the OS-fallback machinery. The destructive sequence proceeds.
 
-  **Why the guard was removed.** The v44 patch 3 guard was added preemptively on the reasoning that the destructive path could disable WinRE and delete a recovery partition on a machine whose C: was not in a state where the OS-fallback route — the path the destructive attempt falls through to on shrink failure — could itself complete. That reasoning over-applied the OS-fallback precondition to the dedicated-partition path. The dedicated-partition path's objective is to **create** a dedicated partition; it succeeds or fails on the partition geometry, not on C:'s BitLocker state. If the dedicated-partition path succeeds, C:'s state never matters. If it fails at the shrink step, the run falls through to OS-fallback, and *there* the OS-fallback gate checks C: and defers as designed. The safety property — never leave a machine with no working recovery route — is preserved end-to-end without the guard.
+  **Why the guard was removed.** The v44 patch 3 guard was added preemptively on the reasoning that the destructive path could disable WinRE and delete a recovery partition on a machine whose C: was not in a state where the OS-fallback route — the path the destructive attempt falls through to on shrink failure — could itself complete. That reasoning over-applied the OS-fallback precondition to the dedicated-partition path. The dedicated-partition path's objective is to **create** a dedicated partition; it succeeds or fails on the partition geometry, not on C:'s BitLocker state. If the dedicated-partition path succeeds, C:'s state never matters. If it fails at the shrink step, the run falls through to OS-fallback, and *there* the OS-fallback gate checks C: and defers as designed.
 
   The only place C:'s BitLocker state is now consulted is the OS-fallback route: the fast-path OS-fallback re-verification, the full-update deploy step's OS-fallback branch, and the pending-reboot OS-fallback branch. All three exist because on the OS-fallback route the target volume *is* the OS volume, and reagentc refuses to enable WinRE on an encrypted OS volume. The dedicated-partition path — including the destructive sequence — does not consult C:'s state at any point.
 

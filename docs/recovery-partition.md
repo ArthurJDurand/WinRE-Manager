@@ -4,11 +4,13 @@ This document covers how WinRE Manager decides what size a recovery partition sh
 
 ## The invariant
 
-**Exactly one recovery partition exists, on the OS disk, correctly type-coded.**
+**Exactly one type-coded recovery partition exists, on the OS disk.**
+
+The type code is the partition's identity: GPT GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type code `0x27`. A partition detected only by its `Recovery` or `WINRE` volume label is not a recovery partition for any decision the script makes — the label is a hint, not an identity.
 
 The script enforces this on:
 
-- The idempotent fast path (read-only scan for strays).
+- The idempotent fast path (read-only scan for strays, and type-coded count for the "exactly one" condition).
 - The enable-only path (before the success or reboot-required exit).
 - The pending-reboot repair success exit.
 - The pending-reboot reboot-required exit.
@@ -16,7 +18,16 @@ The script enforces this on:
 
 Any type-coded recovery partition (GPT GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27`) on any non-OS disk is deleted. A partition on a non-OS disk that carries a `Recovery` or `WINRE` label but no type code is logged and skipped — a label-only match on a secondary disk is not sufficient authority to delete.
 
-The invariant exists because Windows Setup and Startup Repair scan all attached volumes for WinRE-capable partitions. A stray recovery partition on a secondary or USB-attached disk can cause the BCD to be pointed at the wrong WinRE image during repair, which fails the repair.
+The same rule applies symmetrically on the OS disk, and the OS-disk side is the one that matters for convergence. A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is:
+
+- **Not counted** by the fast path's "exactly one recovery partition on the OS disk" condition.
+- **Not reused** by `Find-SuitableRecoveryPartition`.
+- **Not deleted** by the destructive path in `Ensure-AdequateRecoveryPartition` — a label alone never authorizes deletion.
+- **Not classified as DEDICATED** by the active-location classifier or the final-verification classifier.
+
+The last two were always true; the first two were made true in v44 patch 7. Before patch 7, the fast-path count and the active-location classifier accepted a label-only match as evidence of a recovery partition, while the destructive path correctly refused to delete one. The asymmetry meant a Basic Data partition labelled "Recovery" on the OS disk would be counted by the fast path (so the "exactly one recovery partition" condition could never be satisfied) while being preserved by the destructive path (so it was never removed). The machine cycled through rebuilds indefinitely without converging. Patch 7 unified the authority rule: type code everywhere, label nowhere.
+
+The invariant exists because Windows Setup and Startup Repair scan all attached volumes for WinRE-capable partitions. A stray recovery partition on a secondary or USB-attached disk can cause the BCD to be pointed at the wrong WinRE image during repair, which fails the repair. A label-only partition on the OS disk is not a stray in that sense — it never becomes a WinRE target — but it does break the fast path's convergence check, and that is what patch 7 fixes.
 
 ## The sizing policy
 
@@ -30,7 +41,10 @@ On the enable-only path no WIM is rebuilt — the existing deployed WIM's size i
 
 The script uses two separate free-space thresholds, and it is important not to confuse them.
 
-**Existing-partition acceptance.** An existing recovery partition is accepted only if:
+**Existing-partition acceptance.** An existing recovery partition is accepted only if **both** of the following hold:
+
+- **It is type-coded** — GPT recovery GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27`. A partition detected only by a `Recovery`/`WINRE` volume label is not a candidate for reuse. See "The invariant" above for the reasoning and the v44 patch 7 non-convergence loop this closes.
+- Its effective free space is sufficient:
 
 ```
 (partition.SizeRemaining + existingWinreWimSize) >= (sourceWimSize + 250 MiB)
@@ -67,7 +81,7 @@ Until the ceiling ships:
 - The `.NOTES` block in `scripts/WinRE.ps1` carries a "Known gaps" section describing the limitation, again naming all three functions.
 - Operators deploying to machines they did not image themselves should run the harness Option 1 diagnostic and inspect the "Recovery partitions" section before proceeding. A recovery-typed partition larger than 2 GiB is a red flag.
 
-The ceiling is planned as its own version boundary and will ship with a fresh CHANGELOG entry and a `ScriptVersion` decision. It is not a v44 patch 3 change; v44 patch 3 extended this section to name the reuse path, and v44 patch 6 extended it again to name the stray-cleanup path.
+The ceiling is planned as its own version boundary and will ship with a fresh CHANGELOG entry and a `ScriptVersion` decision. It is not a v44 patch 7 change; v44 patch 3 extended this section to name the reuse path, and v44 patch 6 extended it again to name the stray-cleanup path. Patch 7 did not change the ceiling's scope — it changed the classifier that decides which partitions are recovery partitions in the first place.
 
 ### Worked examples
 
@@ -99,16 +113,16 @@ Under the v43 patch 5 (further revision 5) policy there is **no startup BitLocke
 
 The consequence for this document is that the resize sequence below is only entered on machines whose `ImageState` is `IMAGE_STATE_COMPLETE` (or absent). No other startup check gates the destructive partition path.
 
-**As of v44 patch 6, the destructive partition path does not consult C:'s BitLocker state.** The resize sequence is entered on machines that have passed the Audit Mode guard, and no additional C: check runs before the destructive sequence begins. If the destructive sequence fails at the shrink step and the run falls through to OS-fallback, the OS-fallback gate checks C: at that point and defers as designed. The safety property — never leave a machine with no working recovery route — is preserved by the OS-fallback gate alone.
+**As of v44 patch 6, the destructive partition path does not consult C:'s BitLocker state.** The resize sequence is entered on machines that have passed the Audit Mode guard, and no additional C: check runs before the destructive sequence begins. If the destructive sequence fails at the shrink step and the run falls through to OS-fallback, the OS-fallback gate checks C: at that point and defers as designed. The safety property — never leave a machine with no working recovery route — is preserved by the OS-fallback gate alone in the two ordinary cases (the destructive attempt succeeds, or it fails before deletion). The narrow corner where it is not preserved — a destructive attempt that fails after deletion on an encrypted-C: machine — is documented in [architecture.md](architecture.md) under Step 5 and in the `[v44 patch 7]` CHANGELOG entry.
 
 ### 1. Pre-checks
 
-Read the current OS partition size `S`, the required bucket size `B`, and the OS partition's `SizeMin` `M`. Compute the reclaimable recovery space `R`.
+Read the current OS partition size `S`, the required bucket size `B`, and the OS partition's `SizeMin` `M`. Compute the reclaimable recovery space `R` — the sum of the sizes of every **type-coded** recovery partition on the OS disk that the destructive path is authorized to delete. A label-only partition is not counted toward `R` and is not deleted, exactly as in the invariant above.
 
 Two arithmetic checks are logged:
 
 - **Safe path**: `S - B >= M`. The OS partition can shrink by the bucket size without reclaiming any recovery space.
-- **Fatal-warning path**: `S + R - B < M`. Even after deleting all recovery partitions and reclaiming their space, the OS partition might not be able to shrink enough.
+- **Fatal-warning path**: `S + R - B < M`. Even after deleting all type-coded recovery partitions and reclaiming their space, the OS partition might not be able to shrink enough.
 
 Since v38, the pre-check is **advisory**. The script proceeds with the destructive repartitioning attempt regardless of the arithmetic. Rationale: `SizeMin` is a conservative hint and can be wrong; `defrag /x` may free enough space. The trade is: try hard for the dedicated partition, fall back honestly if the attempt fails.
 
@@ -120,7 +134,9 @@ This step runs **before** any partition is deleted. If it fails, no partition wo
 
 ### 3. Delete existing recovery partitions
 
-For each recovery partition on the OS disk, `Remove-Partition`. If that fails, retry with `diskpart delete partition override`. If the partition survives both attempts, abort with `FATAL`.
+For each **type-coded** recovery partition on the OS disk — GPT GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27` — `Remove-Partition`. If that fails, retry with `diskpart delete partition override`. If the partition survives both attempts, abort with `FATAL`.
+
+A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is **not** in this loop. The type-code gate is applied before the loop and again inside it, as a redundant check. A label-only match is logged with the message "Skipping label-only recovery match on disk N partition M: recovery label alone does not authorize deletion." and the loop continues. A label is never sufficient authority for deletion, on any disk. This is the same rule that governs Step 7's stray cleanup on non-OS disks.
 
 **Note: this is a point of no return.** The script logs this explicitly before the first delete. If a subsequent step fails and the script falls back to OS-fallback, the deleted partitions are gone. The script does not attempt to restore them; the OS-fallback path deploys the WIM to `C:\Recovery\WindowsRE` instead.
 
@@ -152,6 +168,8 @@ If all three attempts fail, the script:
 4. Returns `$null` from `Ensure-AdequateRecoveryPartition`.
 
 The main flow then sets `$Script:UsedOSFallback = $true` and `$Script:nonFatalWarning = $true`, and proceeds with the OS-fallback deployment. The run exits with code 2.
+
+**This is the point where the safety-property corner is entered on an encrypted-C: machine.** The OS-fallback gate checks C: and defers unless C: is `FullyDecrypted`. If C: is encrypted, the run exits `EXIT_WARNING` with neither a dedicated recovery partition nor OS-fallback, because the type-coded partition was already deleted in step 3 above. See [architecture.md](architecture.md) Step 5 for the full statement and the residual discussion.
 
 If `Restore-OSPartitionSize` itself fails (either the resize or the post-resize verification), `$Script:GeometryRestoreFailed = $true` is set. That has two effects:
 

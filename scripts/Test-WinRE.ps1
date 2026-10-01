@@ -41,7 +41,22 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 19
+    Version : 20
+
+    v20 changes vs v19:
+    1. Classifier mirrored from production v44 patch 7. The active-
+       location classifier now requires a type-coded recovery partition
+       on the OS disk to reach the DEDICATED verdict. A label-only
+       match (Recovery/WINRE label without the recovery GPT type code)
+       gets its own LABEL-ONLY verdict instead of being promoted to
+       DEDICATED. Mirrors production's active-location classifier
+       (v44 patch 3). Production's final-verification classifier
+       (v44 patch 4) has no direct harness equivalent.
+    2. Menu box alignment fixed. The top border is 66 columns wide;
+       the title, working-directory, and detected rows now all pad
+       their content to 65 columns so the closing box character
+       aligns. Working-directory and Detected rows truncate at 65
+       columns with an ellipsis.
 
     v19 changes vs v18:
     1. Option S reports SKIP (not PASS) when the state file is absent
@@ -830,21 +845,24 @@ function Show-SystemDiagnostic {
         $isActiveOSPart = ($osPart -and
                            $activePart.DiskNumber -eq $osPart.DiskNumber -and
                            $activePart.PartitionNumber -eq $osPart.PartitionNumber)
-        $isRec = ($activePart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($activePart.MbrType -eq 0x27)
-        if (-not $isRec) {
+        $isTypedRecovery = ($activePart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($activePart.MbrType -eq 0x27)
+        $isLabelRecovery = $false
+        if (-not $isTypedRecovery) {
             try {
                 $v = Get-Volume -Partition $activePart -ErrorAction SilentlyContinue
-                if ($v -and ($v.FileSystemLabel -eq 'Recovery' -or $v.FileSystemLabel -eq 'WINRE')) { $isRec = $true }
+                $isLabelRecovery = ($v -and ($v.FileSystemLabel -eq 'Recovery' -or $v.FileSystemLabel -eq 'WINRE'))
             } catch { }
         }
         $isActiveOSDisk = ($osPart -and $activePart.DiskNumber -eq $osPart.DiskNumber)
 
         if ($isActiveOSPart) {
             Write-KV "Classification" "OS-FALLBACK (WinRE is on the OS partition)" "Yellow"
-        } elseif ($isRec -and $isActiveOSDisk) {
-            Write-KV "Classification" "DEDICATED (WinRE on dedicated recovery partition on the OS disk)" "Green"
-        } elseif ($isRec) {
-            Write-KV "Classification" "RECOVERY-ON-SECONDARY (recovery partition on a non-OS disk - production forces a full rebuild)" "Yellow"
+        } elseif ($isTypedRecovery -and $isActiveOSDisk) {
+            Write-KV "Classification" "DEDICATED (WinRE on type-coded recovery partition on the OS disk)" "Green"
+        } elseif ($isTypedRecovery) {
+            Write-KV "Classification" "RECOVERY-ON-SECONDARY (type-coded recovery partition on a non-OS disk - production forces a full rebuild)" "Yellow"
+        } elseif ($isLabelRecovery -and $isActiveOSDisk) {
+            Write-KV "Classification" "LABEL-ONLY (Recovery/WINRE label but not type-coded - production does NOT treat as DEDICATED)" "Yellow"
         } else {
             Write-KV "Classification" "UNEXPECTED (WinRE is on neither the OS partition nor a recovery partition)" "Red"
         }
@@ -2371,19 +2389,22 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    Write-Host "WinRE Manager Test Harness (v19)" -NoNewline -ForegroundColor Cyan
-    Write-Host (" " * 33) -NoNewline
+    $titleContent = "WinRE Manager Test Harness (v20)"
+    Write-Host $titleContent -NoNewline -ForegroundColor Cyan
+    Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    Write-Host "Working directory: $TestDir" -NoNewline -ForegroundColor Gray
-    Write-Host (" " * [Math]::Max(0, 48 - $TestDir.Length)) -NoNewline
+    $wdContent = "Working directory: $TestDir"
+    if ($wdContent.Length -gt 65) { $wdContent = $wdContent.Substring(0, 62) + "..." }
+    Write-Host $wdContent -NoNewline -ForegroundColor Gray
+    Write-Host (" " * [Math]::Max(0, 65 - $wdContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
     $p = Get-ThisMachineProfile
     $detected = "Detected: OS=$($p.OS)  Vendor=$($p.Vendor)  MT=$($p.MachineType)  CPU=$($p.CPUVendor)"
-    $detectedTrim = if ($detected.Length -gt 64) { $detected.Substring(0, 61) + "..." } else { $detected }
+    $detectedTrim = if ($detected.Length -gt 65) { $detected.Substring(0, 62) + "..." } else { $detected }
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
     Write-Host $detectedTrim -NoNewline -ForegroundColor Gray
-    Write-Host (" " * [Math]::Max(0, 64 - $detectedTrim.Length)) -NoNewline
+    Write-Host (" " * [Math]::Max(0, 65 - $detectedTrim.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
     Write-Host "  ╚" -NoNewline -ForegroundColor DarkGray
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
@@ -2416,7 +2437,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v19"
+Rule "WinRE Manager test harness v20"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

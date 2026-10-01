@@ -166,7 +166,7 @@ Every network call in `Invoke-OemPackDownload` carries `-TimeoutSec $NetworkTime
 
 ## Extraction
 
-Extraction is per-vendor.
+Extraction is per-vendor. The OEM pack's extraction destination (`$WorkDir\oem_extract`) is cleared and recreated before each extraction. As of **v44 patch 7**, the VMD extraction path does the same for each driver's destination (`$WorkDir\drv_extract_<name>`). Before patch 7, an interrupted earlier run could leave INFs in the VMD directory, and those stale INFs could satisfy the INF-basename cross-reference or contribute to the third-party-driver-count delta and mask a failed VMD extraction.
 
 ### Lenovo (Inno Setup EXE)
 
@@ -250,6 +250,8 @@ The two conditions together avoid both false negatives ("the injection worked bu
 
 A base image carrying unrelated third-party drivers would pass a count-based gate even if the OEM package failed entirely. The cross-reference catches that: if the OEM package's INFs are absent and no new drivers were added, the injection failed, regardless of how many drivers the base image already contains.
 
+The cross-reference also depends on the extraction directory being **fresh**. A stale INF left in the extraction directory by an interrupted earlier run would show up in `$extractedInfNames` and could satisfy the basename match even if the current extraction failed. The OEM path was already protected against this by clearing its fixed `$WorkDir\oem_extract` before each extraction; the VMD path was not, until v44 patch 7.
+
 ## The VMD injection path
 
 VMD injection uses the same success gate but runs after OEM injection, so `$preVmdThirdParty` is captured after the OEM injection result. This is deliberate: the VMD gate's job is to verify that the VMD package contributed drivers, not that the image has any third-party drivers at all.
@@ -257,7 +259,7 @@ VMD injection uses the same success gate but runs after OEM injection, so `$preV
 For each manifest driver that matches (OS, Intel CPU, CPU generation, VMD hardware present):
 
 - Download `driverUrl` to `$WorkDir\driver_<name>.7z`.
-- Extract with 7-Zip to `$WorkDir\drv_extract_<name>`.
+- Clear `$WorkDir\drv_extract_<name>` and recreate it, then extract with 7-Zip. As of v44 patch 7, the extraction directory is removed and recreated before each extraction, so a stale INF from an earlier run cannot satisfy the INF-basename cross-reference or contribute to the third-party-driver-count delta and mask a failed extraction.
 - Collect INF basenames.
 
 Then `Add-WindowsDriver -Driver $allDirs -Recurse` in one call.
@@ -294,6 +296,8 @@ The machine is left exactly as it was before the run — WinRE is still in whate
 **Related to the offline fallback (v44 patch 5).** When the manifest fetch fails and the offline fallback engages, the entire driver-resolution pipeline is skipped: no OEM pack resolution, no VMD detection, no required-driver resolution, no download, no injection. The full-update path is not reachable offline. A machine on the offline fallback either takes the fast path (state file valid, all local safety checks pass) or exits `EXIT_WARNING` before the full-update pipeline. It never reaches Step 3. This is by design: the driver set is a function of the manifest, and without the manifest there is no safe way to determine which drivers to inject. A machine in this state does not lose its existing WinRE; it simply defers the injection work to a future run with network. See the "Offline behavior" section in [deployment.md](deployment.md) for the operator-facing description of the three cases.
 
 **Related to the VMD fail-closed guard (v44 patch 6).** When the VMD hardware presence check is indeterminate, the run defers with `EXIT_WARNING` **before** reaching Step 3. The full-update path is not reached. The machine is unchanged and the next run retries the enumeration.
+
+**Related to the VMD extraction cleanup (v44 patch 7).** The VMD injection path clears each extraction directory before extracting into it. Before patch 7, an interrupted previous run could leave INFs in `$WorkDir\drv_extract_<name>`, and those stale INFs could satisfy the INF-basename cross-reference or contribute to the third-party-driver-count delta, making a failed VMD extraction look like a success. The OEM path uses a single fixed extraction directory (`$WorkDir\oem_extract`) that was already cleared before each use; the VMD path did not, until patch 7. The Lenovo "non-zero exit but INFs present" branch on the OEM path was the sharpest case for this class of hazard: it treats an INF-count greater than zero as success regardless of the extractor's exit code, so a stale INF could hide a genuine extraction failure.
 
 **Before v44 patch 1** the pipeline continued to Step 4 and beyond even when injection failed, and relied on the state-write gate to prevent the state file from recording the run. That was not sufficient for the reasons above. The v44 patch 1 gate is the correction. The `base.wim` cleanup on the abort branch is the v44 patch 3 follow-up, and the Step 2 stale-file cleanup on the normal path is the v44 patch 6 follow-up.
 
