@@ -50,8 +50,9 @@
        match (Recovery/WINRE label without the recovery GPT type code)
        gets its own LABEL-ONLY verdict instead of being promoted to
        DEDICATED. Mirrors production's active-location classifier
-       (v44 patch 3). Production's final-verification classifier
-       (v44 patch 4) has no direct harness equivalent.
+       (patch 3 of the v44 patch 7 cycle). Production's final-
+       verification classifier (patch 4 of the v44 patch 7 cycle)
+       has no direct harness equivalent.
     2. Menu box alignment fixed. The top border is 66 columns wide;
        the title, working-directory, and detected rows now all pad
        their content to 65 columns so the closing box character
