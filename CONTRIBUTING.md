@@ -38,7 +38,7 @@ Before you write code:
 
 - PowerShell 5.1-compatible syntax. Do not use operators or cmdlets introduced in 7.x without a fallback.
 - 4-space indentation (see `.editorconfig`).
-- CRLF line endings for `.ps1`. UTF-8 with BOM for `.ps1`, `.psm1`, and `.psd1`.
+- CRLF line endings and UTF-8 with BOM for `.ps1`, `.psm1`, and `.psd1`.
 - Functions are verb-first (`Get-`, `Set-`, `Test-`, `Invoke-`, `Remove-`, `Resolve-`).
 - `[CmdletBinding()]` on any function with parameters that benefit from pipeline input.
 - Parameter blocks in `[Parameter(Mandatory)]` form for required parameters.
