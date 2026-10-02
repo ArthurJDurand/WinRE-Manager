@@ -410,9 +410,34 @@ Two cases handled without operator attention:
 
 Change `$ScriptVersion` back to 44. The state file written under the v45 DSI becomes stale, the next run takes the full-update path under the older behavior, and the pipeline falls back to the pre-v45 destructive sequence. No data is lost; another fleet-wide rebuild occurs on the next run.
 
-## Later v44 patches
+## v46 patch 1 migration
 
-The subsequent v44 patches do **not** bump `ScriptVersion` and do **not** change the `DesiredStateId`. They apply to every subsequent run without a state-file action. A machine that is already healthy continues to take the fast path. A machine that was mid-deployment when the patch rolled out continues from where it was — the checkpoint and state-file schemas are unchanged.
+The v46 patch 1 revision clamps `tailEnd` to `diskSize − 1 MiB` before aligning in `Get-PartitionPlan`. It bumps `ScriptVersion` from 45 to 46, which changes the `SCRIPT` component of the `DesiredStateId` and forces one full-update pass per managed machine on the next scheduled run — the same shape as the v44 patch 1 and v45 patch 1 migrations.
+
+The v46 pass is **not** slower on a healthy machine than any other full-update pass. The clamp changes the plan computation only when the last partition on the disk ends at `diskSize` (equivalently, at the disk-end reserve boundary); on every other layout, the plan is identical to v45's. Machines with a suitable existing recovery partition reuse it and perform no destructive work.
+
+The distinguishing behaviour of this migration is what happens to machines that v45 patch 1 left in OS-fallback because of the plan-clamp bug. Under v45, the plan was rejected after the old recovery partition had already been deleted, and the machine fell back to OS-fallback. The state file recorded the failing `DesiredStateId` and was accepted on every subsequent run, so the machine stayed in OS-fallback and did not retry. The v46 patch 1 `ScriptVersion` bump clears that state automatically: the state file is stale under the new DSI, the next run takes the full-update path, and the plan-clamp fix makes the plan valid on the same layout v45 rejected. The machine reaches `DEDICATED` on the first full-update pass.
+
+Concretely, on the first run after the update, every machine will:
+
+1. Compute the new `DesiredStateId` (with `SCRIPT=46`).
+2. Compare it to the state file written by v45 patch 1.
+3. Find a mismatch, set `needInject = $true`, and take the full-update path.
+4. Rebuild the WIM, deploy it, and write a state file under the new ID.
+5. Return to the fast path on the second run.
+
+Two cases handled without operator attention:
+
+- **Machines in OS-fallback from the v45 plan-rejection corner.** As above, the DSI mismatch invalidates the state file, the plan is re-evaluated under the clamp, and the machine converges.
+- **Machines carrying a v45 deferral marker at `C:\Recovery\OEM\winre_partition_deferred.json`.** The marker is keyed by `DesiredStateId`; it is stale under the v46 DSI and is cleared on read by `Read-PartitionDeferral`. No operator action is needed.
+
+### Rollback
+
+Change `$ScriptVersion` back to 45. The state file written under the v46 DSI becomes stale, the next run takes the full-update path under v45's behavior, and the pipeline is once again vulnerable to the plan-clamp bug on machines whose last partition ends at `diskSize`. No data is lost; another fleet-wide rebuild occurs on the next run.
+
+## Later patches (no ScriptVersion bump)
+
+The v44 patches 2 through 8 and the v46 patch 2 additions do **not** bump `ScriptVersion` and do **not** change the `DesiredStateId`. They apply to every subsequent run without a state-file action. A machine that is already healthy continues to take the fast path. A machine that was mid-deployment when the patch rolled out continues from where it was — the checkpoint and state-file schemas are unchanged.
 
 - **v44 patch 2** adds `dism /cleanup-image /StartComponentCleanup /ResetBase` to the full-update pipeline; the size reduction materialises on the next natural rebuild, not immediately.
 - **v44 patch 3** adds the destructive-path C: encryption guard inside `Ensure-AdequateRecoveryPartition` (removed in v44 patch 6) and a `base.wim` cleanup on the injection-failure abort branch (retained).
@@ -421,18 +446,20 @@ The subsequent v44 patches do **not** bump `ScriptVersion` and do **not** change
 - **v44 patch 6** removes the v44 patch 3 destructive-path C: guard; makes Lenovo OEM-pack resolution distinguish five states; makes VMD hardware detection fail-closed; adds the Step 2 stale-file cleanup on the normal path; and corrects the OS-fallback remediation wording.
 - **v44 patch 7** closes a non-convergence loop by making the type-coded classifier authoritative across every recovery-partition decision — the fast-path count, the active-location classifier, the final-verification classifier, and `Find-SuitableRecoveryPartition`. It also clears the VMD extraction directory before each extraction, and adds C:'s actual encryption state to the destructive-replacement WARN (diagnostic only; the decision to proceed is unchanged).
 - **v44 patch 8** reorders workspace initialization so that healthy fast-path runs, enable-only repairs, and offline deferrals no longer validate checkpoints, wipe stale scratch files, or create the workspace. Full-update checkpoint and resume behavior is otherwise unchanged.
+- **v46 patch 2** adds three log lines that record the registered WinRE version, the source WIM build, and the post-deploy WIM build on every run, and guards the two `Get-Partition -DiskNumber` calls in `Get-RecoveryPartitions` against the empty-disk read that throws `CmdletizationQuery_NotFound_DiskNumber` on machines with an SD/MMC card reader. The build-logging values do not enter the `DesiredStateId`; the read guard silences a cosmetic error.
 
 Because none of these patches changes `ScriptVersion` or the `DesiredStateId`, an already-completed machine will not rerun automatically; the deployment mechanism must invoke the script explicitly to pick the fixes up. The next natural rebuild (manifest bump, OEM pack version change, Windows build change, or CPU/VMD presence change) picks them up regardless.
 
-### Rollback for the later v44 patches
+### Rollback for later non-bumping patches
 
-- **Patch 2**: remove the `dism /cleanup-image /StartComponentCleanup /ResetBase` invocation from Step 3.
-- **Patch 3**: the C: guard is already removed; the `base.wim` cleanup on the abort branch is retained and does not need rollback.
-- **Patch 4**: remove the lock acquisition block at the top of the main `try` block and the corresponding release in the `finally` block.
-- **Patch 5**: remove the offline fallback branch and revert `$NetworkTimeoutSeconds` to its absence on each call.
-- **Patch 6**: restore the v44 patch 3 destructive-path C: guard inside `Ensure-AdequateRecoveryPartition`; revert `Get-LenovoWinPEPack` to a two-state return; revert the VMD presence check to treat enumeration errors as absent; remove the Step 2 stale-file cleanup; restore the earlier OS-fallback remediation wording.
-- **Patch 7**: revert the classifier changes — `Find-SuitableRecoveryPartition` and the main-flow `$existingRecoveryParts` back to accepting label-OR-type; the active-location classifier and the final-verification classifier back to promoting a label-only match to DEDICATED — remove the VMD extraction directory cleanup, and remove the C: encryption-state lookup from the destructive-replacement WARN.
-- **Patch 8**: restore the pre-patch-8 workspace-initialization ordering.
+- **v44 patch 2**: remove the `dism /cleanup-image /StartComponentCleanup /ResetBase` invocation from Step 3.
+- **v44 patch 3**: the C: guard is already removed; the `base.wim` cleanup on the abort branch is retained and does not need rollback.
+- **v44 patch 4**: remove the lock acquisition block at the top of the main `try` block and the corresponding release in the `finally` block.
+- **v44 patch 5**: remove the offline fallback branch and revert `$NetworkTimeoutSeconds` to its absence on each call.
+- **v44 patch 6**: restore the v44 patch 3 destructive-path C: guard inside `Ensure-AdequateRecoveryPartition`; revert `Get-LenovoWinPEPack` to a two-state return; revert the VMD presence check to treat enumeration errors as absent; remove the Step 2 stale-file cleanup; restore the earlier OS-fallback remediation wording.
+- **v44 patch 7**: revert the classifier changes — `Find-SuitableRecoveryPartition` and the main-flow `$existingRecoveryParts` back to accepting label-OR-type; the active-location classifier and the final-verification classifier back to promoting a label-only match to DEDICATED — remove the VMD extraction directory cleanup, and remove the C: encryption-state lookup from the destructive-replacement WARN.
+- **v44 patch 8**: restore the pre-patch-8 workspace-initialization ordering.
+- **v46 patch 2**: remove the three build-drift log lines (`WinRE status: ..., Version: ...`, `Source WIM build: ...`, `Post-deploy WIM build: ...`) from the startup, force-upgrade, and post-deploy paths; remove the `Version` extraction from `Get-WinREState`; remove the `-ErrorAction SilentlyContinue` guard from the two `Get-Partition -DiskNumber` calls in `Get-RecoveryPartitions`.
 
 None of these rollbacks affects the state-file schema or the `DesiredStateId`.
 
@@ -551,6 +578,25 @@ Watch for:
 - **Exit code 3 with `Refusing to retry reagentc /enable`** — the enable-failure loop-breaker fired. Do not retry automatically; the same guard will fire because the state file still records the counter. Resolve the underlying enable failure (see `troubleshooting.md`), delete `C:\Recovery\OEM\winre_state.json`, then re-run.
 - **Exit code 3 with `Driver manifest unavailable and no state file exists`** — the machine is offline and has no state file. A first deployment requires a live manifest. Retry when the network is available.
 
+### v46 patch 1 specifically
+
+The v46 patch 1 revision clamps `tailEnd` to `diskSize − 1 MiB` before aligning in `Get-PartitionPlan`, and bumps `ScriptVersion` from 45 to 46. It forces one full-update pass per managed machine on the next scheduled run — the same shape as the v44 patch 1 and v45 patch 1 migrations. The pass itself is not slower than a normal full-update pass.
+
+The v46 patch 1 canary is primarily about confirming that machines the v45 plan-clamp bug left in OS-fallback recover. Watch for:
+
+- **Machines that exit 0 after the first full-update pass.** The normal case. The machine may be recovering from a v45 OS-fallback state (the DSI mismatch invalidates the old state file and the plan-clamp fix makes the plan valid), or it may be a healthy machine taking the standard migration pass. Either way, `Operating mode: DEDICATED` in the log is the confirmation.
+- **Machines that stay in OS-fallback after the first v46 pass.** This should not happen on any layout the v45 plan-clamp bug could produce; if it does, the machine has a different post-delete failure. Capture the log and check the plan summary line for the `alignment reserve` value and the post-delete check for `overlapCount=0`. See [troubleshooting.md](troubleshooting.md) for the plan-rejection corner and its fall-through conditions.
+- **Machines that exit 2 with `Dedicated replacement deferred before partition deletion (<Reason>)`.** A pre-shrink deferral fired during the v46 migration pass. The old recovery partition is preserved and the machine is unchanged. Investigate the `<Reason>`, resolve the constraint, and delete `C:\Recovery\OEM\winre_partition_deferred.json` to force a retry.
+- **Machines that exit 2 with a `Source WIM build` line and no `Post-deploy WIM build` line.** The full-update pass ran but the post-deploy line did not fire. This is a signal that the run aborted between force-upgrade detection and the state write; investigate the log for the earlier error.
+
+### v46 patch 2 specifically
+
+The v46 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId`. It adds three build-drift log lines and a small read guard in `Get-RecoveryPartitions`. The canary is primarily observational:
+
+- **Confirm the three new log lines appear on a canary full-update pass.** The startup line reads `WinRE status: ..., Location: ..., Version: <version>`; the force-upgrade detection line reads `Source WIM build: <build> (path: <path>)`; the post-deploy line reads `Post-deploy WIM build: <build> (source: <path>)`. On a fast-path run, the first two lines appear and the third does not — that is expected, because the fast path does not deploy a WIM.
+- **Confirm the `CmdletizationQuery_NotFound_DiskNumber` error is silent on machines with an SD/MMC card reader or an empty USB enclosure.** Before v46 patch 2, such a machine produced three copies of the error in the harness diagnostic and one per `Get-RecoveryPartitions` invocation in the production log. After v46 patch 2, the same machine produces no such error. If it still appears, the log's version banner will tell you whether the machine is running the patched build.
+- **Do not expect any change to the fast-path behaviour or the state-file schema.** v46 patch 2 is observational only.
+
 ## Rolling back
 
 The script does not have an uninstall path. To disable it:
@@ -564,7 +610,7 @@ The state file, deferral marker, log, lock file, and any deployed recovery parti
 
 If you need to revert a machine to its pre-WinRE-Manager state, restore the partition layout from a backup. The script does not create one.
 
-To revert a `DesiredStateId` change specifically, see the "Rollback" subsections under "v44 patch 1 migration" and "v45 patch 1 migration" above. To revert the later v44 patch code, see the "Rollback for the later v44 patches" subsection above.
+To revert a `DesiredStateId` change specifically, see the "Rollback" subsections under "v44 patch 1 migration", "v45 patch 1 migration", and "v46 patch 1 migration" above. To revert code from a patch that does not change the `DesiredStateId`, see the "Rollback for later non-bumping patches" subsection above.
 
 ## Related documents
 

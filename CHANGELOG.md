@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Current status
 
-**Production:** `WinRE.ps1` **v45 patch 1** (`ScriptVersion = 45`).
-**Harness:** `Test-WinRE.ps1` **v21**.
+**Production:** `WinRE.ps1` **v46 patch 2** (`ScriptVersion = 46`).
+**Harness:** `Test-WinRE.ps1` **v22**.
 
 The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker. Production and harness are deliberately decoupled: a harness move never forces a managed-machine rebuild.
 
@@ -21,7 +21,7 @@ These are the limitations that are still live in the shipping code. Each is docu
 
 2. **Offline-fallback DSI trust.** When the driver manifest fetch fails after its retry budget, the script trusts the state file's stored `DesiredStateId` without recomputing it from the machine's current hardware. A machine whose hardware changed while offline could take the fast path with a stale DSI. A `LocalInputsId` field would close this and is planned as its own version boundary. See [v44 patch 5](#v44-patch-5--2026-09-30).
 
-3. **Unverified v45 failure paths.** The v45 destructive path's happy case (plan → pre-shrink → delete → create → layout assertion → deploy → enable) is verified end-to-end on a VM; the failure branches (extension fallback, deferral returns, the fail-closed C: read refuse branch, shrink retries 2–3, the MBR destructive path, and the post-deletion corner above) remain covered only by parser and mocked-geometry tests. See [v45 patch 1](#v45-patch-1--2026-10-01).
+3. **Unverified v45 failure paths.** The v45 destructive path's happy case (plan → pre-shrink → delete → create → layout assertion → deploy → enable) is verified end-to-end on a VM and on physical hardware. The whole-layout assertion path has now been exercised in the field — see [v46 patch 1](#v46-patch-1--2026-10-02) — and it correctly caught the plan-clamp bug that this cycle fixes. The remaining failure branches (extension fallback, deferral returns, the fail-closed C: read refuse branch, shrink retries 2–3, the MBR destructive path, and the post-deletion corner above) remain covered only by parser and mocked-geometry tests. See [v45 patch 1](#v45-patch-1--2026-10-01).
 
 ### Resolved limitations
 
@@ -38,6 +38,85 @@ These limitations were documented in a release entry and have since been closed.
 
 - **Post-deletion segment of `Ensure-AdequateRecoveryPartition`.** Changes to the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths are gated on the deliberate post-deletion failure test running and its result being recorded. See [CONTRIBUTING.md](CONTRIBUTING.md) for the scope of the gate.
 - **Pre-shrink segment (plan, pre-shrink, verification, deferral) is not gated.** The v45 reorder placed the risky step in the reversible window, which closes the v44 residual for the shrink case.
+
+---
+
+## [v46 patch 2] — 2026-10-02
+
+Build-drift observability and a small read-guard fix in `Get-RecoveryPartitions`. `ScriptVersion` remains 46; `ScriptPatchLevel` moves from 1 to 2. No `DesiredStateId` change; no fleet-wide rebuild is forced.
+
+The change adds three log lines that together record the build numbers of the recovery image the machine is running, the source WIM the plan is about to work against, and the WIM that was actually deployed. The purpose is empirical, not behavioural: over time the fleet logs answer whether Windows Update is updating the registered WinRE between our runs, and whether our rebuilds ever replace a newer registered image with an older one. No gate reads these values.
+
+### Changed
+
+- **Registered WinRE version logged at startup.** `Get-WinREState` now extracts `Windows RE Version` from `reagentc /info` and returns it as `Version`. The startup line reads `WinRE status: <status>, Location: <location>, Version: <version>`. The version line is absent when WinRE is Disabled or reagentc suppresses it; the log shows `unknown` in that case. Informational only — the value does not enter `DesiredStateId` and no gate reads it.
+- **Source WIM build logged during force-upgrade detection.** When a candidate WIM is evaluated, its build is logged as `Source WIM build: <build> (path: <path>)`. If `Get-WimBuild` cannot read the image, the line reads `Source WIM build: unknown (path: <path>)` at WARN. This runs on every pass — full-update and fast-path — so every run records the WIM it considered.
+- **Post-deploy WIM build logged before the state write.** After a successful deployment and before the state file is written, the build of the deployed WIM is logged as `Post-deploy WIM build: <build> (source: <path>)`. Combined with the startup line, this records both sides of any build drift on the same run.
+- **`.NOTES` design invariant added.** The design-invariants block now carries: *"Build-drift observability: every run logs the registered WinRE version (pre-touch, from reagentc), the source WIM build, and the post-deploy WIM build. Logged for evidence only; no gate reads these values and none enters DesiredStateId."*
+- **`Get-RecoveryPartitions` guards against empty-disk reads.** Both `Get-Partition -DiskNumber $diskNum` calls now carry `-ErrorAction SilentlyContinue`. On a machine with a disk that exposes no partitions — an SD/MMC card reader, an empty USB enclosure, a disk with no recognised partition table — `Get-Partition -DiskNumber N` throws `CmdletizationQuery_NotFound_DiskNumber`. The error is non-terminating at the current call sites but pollutes the log on every full update and would abort a caller wrapped in `-ErrorAction Stop`. Guarded in both `WinRE.ps1` and `Test-WinRE.ps1`.
+
+### Changed (harness)
+
+- **`Test-WinRE.ps1` moved to v22.** Three changes, all downstream of this cycle.
+
+  - **Mirror of production's `Get-WinREState` version parsing.** The harness's parsed-state block now reports `Version` alongside `Status` and `Location`, and the Option 1 diagnostic renders a new "Build numbers" section showing registered WinRE, active WIM build, and (when present) the `C:\Recovery\WindowsRE\winre.wim` backup build.
+  - **New parser self-test check for the version regex.** `Parser: reagentc version` reports `[OK]` when the version line matches, `[FAIL]` when WinRE is Enabled and the line is missing, and `[SKIP]` when WinRE is Disabled or reagentc suppressed the line. The self-test total moves from 15 to 16.
+  - **`$ProductionScriptVersion` default bumped 45 → 46.** The harness's `Get-DesiredStateId` mirror carries this default to track production's `$ScriptVersion`. Left at 45 it would report a false `DSI MISMATCH` for every state file v46 production writes, exactly the drift v21 corrected the 44 → 45 case for.
+
+### Migration Note
+
+`ScriptVersion` is unchanged at 46, so the `SCRIPT` component of `DesiredStateId` is unchanged and no machine rebuilds on this patch. `ScriptPatchLevel` moves from 1 to 2, visible in the startup banner (`WinRE Manager Started (v46 patch 2)`) and in the harness menu (`WinRE Manager Test Harness (v22)`). A machine already on v46 patch 1 continues on the fast path; the only behavioural change is the three new log lines and the guarded read in `Get-RecoveryPartitions`.
+
+### Field verification
+
+- **HP EliteBook 8 G1i 16 inch Notebook AI PC (MT SBKP, Core Ultra 5 235U, Win 11 26300, 237 GiB C:), 2026-10-02 15:22–15:26.** First v46 patch 2 run on physical hardware, and the machine whose SD/MMC card reader surfaced the `CmdletizationQuery_NotFound_DiskNumber` read error under the pre-fix build. Two-run sequence: full update at 15:22 (DSI `20DF9C9A…`, `WinRE ... Version: 10.0.26100.9545`, `Source WIM build: 26100`, old 1000 MiB recovery partition short of the 1191 MiB required, plan `recovery reclaim 1000 MiB, shrink 201 MiB, bucket 1200 MiB, planned offset 242997 MiB`, shrink 242809 → 242608 MiB verified, `New-Partition` and `Assert-RecoveryPartitionLayout` both passed with the partition end exactly 1 MiB inside the disk end, 911.95 MiB WIM deployed with SHA256 verified, `reagentc /setreimage` and `/enable` both exit 0, `Post-deploy WIM build: 26100`, `Operating mode: DEDICATED`), then fast path at 15:26 (state file accepted, no rebuild, `Operating mode: DEDICATED`). All three build-logging lines fired on the full-update run; the two upstream lines fired on the fast-path run as well. The SD/MMC card reader (disk 1, no MSFT_Partition objects) was present and `Get-RecoveryPartitions` completed without a throw. The corresponding harness v22 diagnostics on the same machine returned `Passed 16, failed 0, skipped 0 (of 16)` before and after the production run; the "Build numbers" section correctly showed the backup WIM as absent before the run and `26100` after.
+
+### Known limitations
+
+The three live limitations carried by the project are unchanged in this patch:
+
+- **Post-deletion create/format failure on encrypted C: (still open).** A `New-Partition` or `Format-Volume` failure **after** the old recovery partition has been deleted, on encrypted C:, with no successful retry. Gated on the deliberate post-deletion failure test in `docs/testing.md`. Full text under [Current known limitations](#current-known-limitations) item 1.
+- **Offline-fallback DSI trust (still open).** When the manifest fetch fails after its retry budget, the script trusts the state file's stored `DesiredStateId` without recomputing it. A `LocalInputsId` field would close the residual hardware-drift risk and is planned as its own version boundary. Full text under [Current known limitations](#current-known-limitations) item 2.
+- **Unverified v45 failure paths (still open).** The whole-layout assertion path is now field-verified; the remaining failure branches (extension fallback, deferral returns, the fail-closed C: read refuse branch, shrink retries 2–3, the MBR destructive path, and the post-deletion corner above) are covered only by parser and mocked-geometry tests. Full text under [Current known limitations](#current-known-limitations) item 3.
+
+### Unchanged
+
+`ScriptVersion` remains 46. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. Healthy machines continue to take the fast path. No change to the deployed WIM, the driver-selection inputs, the OEM-provider resolution, or the partition-plan geometry.
+
+---
+
+## [v46 patch 1] — 2026-10-02
+
+Plan-clamp fix in `Get-PartitionPlan`. `ScriptVersion` moves from 45 to 46; every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path.
+
+The change was driven by the first v45 destructive-path failure on physical hardware — a Lenovo IdeaPad 3 15IAU7 whose factory layout placed a partition exactly 1 MiB past the disk-end reserve. The plan's `tailEnd` was not clamped against the reserve before aligning, so the aligned managed extent end landed 1 MiB past the reserve, the post-delete geometry check correctly rejected the plan, and the machine fell into OS-fallback with a matching `DesiredStateId` — and stayed there until an operator manually deleted the state file. The fix clamps `tailEnd` to `diskSize − 1 MiB` before aligning, on both branches of the plan.
+
+### Fixed
+
+- **`Get-PartitionPlan` clamps `tailEnd` to `diskSize − 1 MiB` before aligning, on both branches.** `$usableEnd` is `$diskSize − 1 MiB`. The blocking-partition branch now takes `[Math]::Min([int64]$blockingPartition.Offset, $usableEnd)` instead of the partition's offset alone; the no-blocking-partition branch takes `$usableEnd` directly. The clamp runs before `$alignedManagedExtentEnd = Floor($tailEnd / 1 MiB) × 1 MiB`, so no partition — blocking or reclaimable — can push the aligned boundary past the reserve. A factory partition ending exactly 1 MiB past the reserve no longer produces a plan the post-delete geometry check always rejects.
+
+### Changed
+
+- **`.NOTES` design invariant updated.** The geometry-planning bullet now carries: *"The plan clamps the usable extent end to diskSize − 1 MiB before aligning, so no partition (blocking or reclaimable) can push the aligned boundary past the disk-end reserve."*
+- **`.NOTES` critical lesson updated.** The recovery-offsets-round-up bullet now names the clamp explicitly: *"Clamp the usable extent to diskSize − 1 MiB before aligning: a factory partition that ends 1 MiB past the reserve would otherwise push the aligned boundary past the reserve and the post-delete geometry check would reject the plan."*
+
+### Migration Note
+
+`ScriptVersion` moves from 45 to 46, so the `SCRIPT` component of `DesiredStateId` changes. Every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. No driver-manifest, OEM-map, or driver-selection inputs changed. The DSI bump is intentional: it is the version boundary that clears the OS-fallback state on machines that v45 patch 1 left in the failing branch. A machine whose state file records `OS-fallback` under a v45 `DesiredStateId` sees the state file rejected as stale on its next run, takes the full-update path, and rebuilds — the tailEnd clamp makes the plan valid on the same layout v45 rejected. A machine already on a healthy dedicated-partition route under v45 patch 1 rebuilds once and converges normally.
+
+### Field verification
+
+- **Lenovo IdeaPad 3 15IAU7 (MT 82RK, Win 11 build 26200, Samsung SSD 980 500GB, GPT), 2026-10-02.** The motivating failure under v45 patch 1. A factory-provided partition ended exactly 1 MiB past the disk-end reserve. `Get-PartitionPlan` computed `tailEnd` from that partition's offset without clamping to the reserve; `$alignedManagedExtentEnd` landed 1 MiB past `$diskSizeNow − 1 MiB`; the post-delete geometry check (`$plannedEnd -gt ($diskSizeNow - 1MB)`) correctly rejected the plan. The machine fell into OS-fallback with a state file that matched the failing `DesiredStateId`, so subsequent scheduled runs accepted the state and did not retry — the machine stayed in OS-fallback until an operator manually deleted the state file. Under v46 patch 1, the clamp makes the plan valid on the same layout; the second full-update run (after the manual state-file reset) took the dedicated-partition path and reached `Operating mode: DEDICATED`. This is the first v45 destructive-path failure on physical hardware.
+- **Dell Latitude 3540 (Win 11 build 26300, PM9B1 NVMe, GPT), 2026-10-02 14:48–14:53.** Clean-path verification of v46 patch 1 on Dell hardware. Two-run sequence: full update at 14:48 (DSI `4D89C1FD…`, old 1000 MiB recovery partition short of the 1039 MiB required, plan `recovery reclaim 1000 MiB, shrink 101 MiB, bucket 1100 MiB, planned offset 487285 MiB, alignment reserve 344 KiB`, shrink 486997 → 486896 MiB verified, `New-Partition` and `Assert-RecoveryPartitionLayout` both passed, 789.4 MiB WIM deployed with SHA256 verified, `reagentc /setreimage` and `/enable` both exit 0, `Operating mode: DEDICATED`), then fast path at 14:53 (same DSI, state file accepted, no rebuild). `Add-WindowsDriver`'s return-shape filter returned 0 added drivers while the delta/matched-INF gate correctly judged success (64 delta, 49 of 49 INF matches). C: was `EncryptionInProgress` at 90% with `ProtectionStatus=Off`; the dedicated path proceeded, confirming again that C: encryption is not a veto for that path.
+- **HP EliteBook 6 G1i 16 inch Notebook AI PC (MT SBKP, Core Ultra 7 255U, Win 11 26300, GPT), 2026-10-02 14:57–15:01.** Second clean-path verification of v46 patch 1 on a different vendor. Two-run sequence: full update at 14:57 (DSI `4EDB8635…`, WIM grew from 763.2 MiB pre-injection to 911.3 MiB post-injection, bucket 1200 MiB, plan `recovery reclaim 1000 MiB, shrink 201 MiB, planned offset 487185 MiB`, shrink 486997 → 486796 MiB verified, `Assert-RecoveryPartitionLayout` passed with the partition end exactly 1 MiB inside the disk end, `Operating mode: DEDICATED`), then fast path at 15:00. Incidental confirmations: the HP SoftPaq extractor returned exit code 1168 but produced 195 INFs — the INF-count gate correctly treated the extraction as a success; the Core Ultra 7 255U parsed to Intel generation 15 via the seriesMap branch, first field exercise of that branch; HP machine type `SBKP` was extracted from `Product Version`.
+
+### Known limitations
+
+**Post-deletion create/format failure on encrypted C: (still open).** The v45 patch 1 residual corner — a `New-Partition` or `Format-Volume` failure **after** the old recovery partition has been deleted, on encrypted C:, with no successful retry — is not touched by this patch. It remains gated on the deliberate post-deletion failure test in `docs/testing.md`. See [v45 patch 1](#v45-patch-1--2026-10-01) for the current scope and the narrowing that superseded the v44 residual.
+
+### Unchanged
+
+No change to the deployed WIM, the driver-selection inputs, the OEM-provider resolution, the workspace selection policy, or the post-deletion segment of `Ensure-AdequateRecoveryPartition`. The clamp is confined to `Get-PartitionPlan`.
 
 ---
 

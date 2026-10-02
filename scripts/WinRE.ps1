@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 45 (v45 patch 1)
+    Version : 46 (v46 patch 2)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -16,9 +16,12 @@
                 Partitions over 2 GiB are preserved for operator review.
             - Read-only geometry planning precedes partition changes. C: is resized
                 to end where the recovery partition begins; the recovery partition
-                fills the aligned extent up to that boundary. Shrink runs before
-                route destruction; extend runs after the old recovery partitions
-                are gone. Rollback targets the original C: size, never SizeMax.
+                fills the aligned extent up to that boundary. The plan clamps the
+                usable extent end to diskSize - 1 MiB before aligning, so no
+                partition (blocking or reclaimable) can push the aligned boundary
+                past the disk-end reserve. Shrink runs before route destruction;
+                extend runs after the old recovery partitions are gone. Rollback
+                targets the original C: size, never SizeMax.
             - Pre-shrink deferral preserves the old route. Its sidecar marker only
                 suppresses retries while that route and its registered WIM are valid.
             - Checkpoint advancement requires successful injection. Step 4 records
@@ -26,6 +29,10 @@
             - Scratch uses fixed NTFS volumes on allowlisted internal/virtual buses.
                 USB, SD/MMC, network, FireWire, Fibre Channel, and unknown buses are out.
             - Indeterminate VMD detection defers. Network requests use the timeout.
+            - Build-drift observability: every run logs the registered WinRE
+                version (pre-touch, from reagentc), the source WIM build, and
+                the post-deploy WIM build. Logged for evidence only; no gate
+                reads these values and none enters DesiredStateId.
 
         Known gap:
             - Offline fallback trusts stored DesiredStateId; LocalInputsId would
@@ -47,7 +54,11 @@
             - Recovery offsets round UP to 1 MiB. The plan computes the aligned
                 managed extent end and places the recovery partition as the last
                 bucketSize bytes up to it; C: is resized to end at that boundary.
-                Plan before destroying the old route; never roll back to SizeMax.
+                Clamp the usable extent to diskSize - 1 MiB before aligning: a
+                factory partition that ends 1 MiB past the reserve would otherwise
+                push the aligned boundary past the reserve and the post-delete
+                geometry check would reject the plan. Plan before destroying the
+                old route; never roll back to SizeMax.
       - Audit Mode guard runs before any state-modifying action.
       - A partition claimed by Device Encryption does not re-encrypt
         after manage-bde -off. Decrypt in place.
@@ -69,8 +80,8 @@ $EXIT_REBOOT_REQUIRED  = 1
 $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
-$ScriptVersion    = 45
-$ScriptPatchLevel = "1"
+$ScriptVersion    = 46
+$ScriptPatchLevel = "2"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -227,7 +238,14 @@ function Get-WinREState {
         $regPath  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WinRE"
         $location = (Get-ItemProperty -Path $regPath -Name "WinRELocation" -ErrorAction SilentlyContinue).WinRELocation
     }
-    return @{ Status = $status; Location = $location }
+    # v46 patch 2: extract Windows RE Version so the caller can log which
+    # build is currently registered before any destructive work happens.
+    # Absent when WinRE is Disabled or reagentc suppresses the line.
+    # Informational only - not part of DesiredStateId and not used in any
+    # gate.
+    $versionLine = $info | Select-String -Pattern 'Windows RE Version:\s*([\d\.]+)' | Select-Object -First 1
+    $version = if ($versionLine) { $versionLine.Matches.Groups[1].Value } else { $null }
+    return @{ Status = $status; Location = $location; Version = $version }
 }
 
 function Resolve-WinRELocationToPartition {
@@ -667,11 +685,15 @@ function Get-RecoveryPartitions {
         $diskNum = $disk.Number
         $byLabel = Get-Volume | Where-Object { $_.FileSystemLabel -eq "Recovery" -or $_.FileSystemLabel -eq "WINRE" } |
                    Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DiskNumber -eq $diskNum }
+        # -ErrorAction SilentlyContinue: a disk with no partitions (e.g.
+        # an empty SD/MMC card reader) makes Get-Partition -DiskNumber
+        # throw CmdletizationQuery_NotFound_DiskNumber. That is absence,
+        # not failure.
         $byGpt = if ($disk.PartitionStyle -eq 'GPT') {
-                     Get-Partition -DiskNumber $diskNum | Where-Object { $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' }
+                     Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object { $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' }
                  } else { @() }
         $byMbr = if ($disk.PartitionStyle -eq 'MBR') {
-                     Get-Partition -DiskNumber $diskNum | Where-Object { $_.MbrType -eq 0x27 }
+                     Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object { $_.MbrType -eq 0x27 }
                  } else { @() }
         $allParts += @($byLabel) + @($byGpt) + @($byMbr) |
                      Where-Object { $_.PartitionNumber -gt 0 } |
@@ -1060,7 +1082,13 @@ function Get-PartitionPlan {
         }
     }
 
-    $tailEnd = if ($blockingPartition) { [int64]$blockingPartition.Offset } else { [Math]::Max($cursor, ($diskSize - 1MB)) }
+    # Usable extent end = diskSize - 1 MiB. Clamp both branches before
+    # aligning so no partition (blocking or last reclaimable) can push
+    # tailEnd past the disk-end reserve. A factory partition that ends
+    # exactly 1 MiB past the reserve would otherwise produce a plan the
+    # post-delete geometry check always rejects.
+    $usableEnd = [int64]($diskSize - 1MB)
+    $tailEnd = if ($blockingPartition) { [Math]::Min([int64]$blockingPartition.Offset, $usableEnd) } else { $usableEnd }
     if (-not $blockingPartition -and $cursor -lt $tailEnd) {
         $unallocatedBytes += ($tailEnd - $cursor)
     }
@@ -2861,7 +2889,7 @@ try {
     }
 
     $WinREState = Get-WinREState
-    Write-Log "WinRE status: $($WinREState.Status), Location: $($WinREState.Location)"
+    Write-Log "WinRE status: $($WinREState.Status), Location: $($WinREState.Location), Version: $(if ($WinREState.Version) { $WinREState.Version } else { 'unknown' })"
 
     $state = Read-WinREState -CurrentDesiredStateId $DesiredStateId
     $storedHash = $state.CurrentImageHash
@@ -3045,8 +3073,11 @@ try {
     if ($imageToCheck) {
         $wimBuild = Get-WimBuild -WimPath $imageToCheck
         if ($wimBuild) {
+            Write-Log "Source WIM build: $wimBuild (path: $imageToCheck)"
             if ($Hardware.IsWin10 -and $wimBuild -ge 22000) { $forceUpgrade = $true }
             elseif ($Hardware.IsWin11 -and $wimBuild -lt 22000) { $forceUpgrade = $true }
+        } else {
+            Write-Log "Source WIM build: unknown (path: $imageToCheck)" -Level WARN
         }
     }
 
@@ -4057,6 +4088,12 @@ try {
 
     # ---- State write ----
     $finalHash = Get-LiveWimHash $SourceWim
+    # v46 patch 2: log the build of the WIM that was actually deployed.
+    # Compare against the pre-touch "WinRE ... Version:" startup line to
+    # see whether this run replaced a newer registered build with an
+    # older one. Informational only.
+    $deployedWimBuild = Get-WimBuild -WimPath $SourceWim
+    Write-Log "Post-deploy WIM build: $(if ($deployedWimBuild) { $deployedWimBuild } else { 'unknown' }) (source: $SourceWim)"
     if ($Script:ImageInjectionComplete -and $finalHash) {
         $deployedDisk = if ($recoveryPartition) { $recoveryPartition.DiskNumber } else { -1 }
         $deployedPart = if ($recoveryPartition) { $recoveryPartition.PartitionNumber } else { -1 }

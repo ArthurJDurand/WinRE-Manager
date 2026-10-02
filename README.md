@@ -48,7 +48,7 @@ The harness shows what production would see, without changing anything:
 
 ```
   ╔══════════════════════════════════════════════════════════════════╗
-  ║ WinRE Manager Test Harness (v21)                                 ║
+  ║ WinRE Manager Test Harness (v22)                                 ║
   ║ Working directory: C:\Temp\WinRETest                             ║
   ║ Detected: OS=Win11  Vendor=ASUS  MT=Syst  CPU=Intel              ║
   ╚══════════════════════════════════════════════════════════════════╝
@@ -61,6 +61,7 @@ Option 1 (System diagnostic) on a healthy ASUS desktop:
   ────────────────────
   Status                Enabled
   Location              \\?\GLOBALROOT\device\harddisk4\partition4\
+  Version               10.0.26100.9545
   Resolved to           Disk 4 Part 4
   Classification        DEDICATED (WinRE on type-coded recovery partition on the OS disk)
 
@@ -139,16 +140,20 @@ Full matrix and orchestration policy in [`docs/exit-codes.md`](docs/exit-codes.m
 
 ## Version
 
-**Production:** `WinRE.ps1` v45 patch 1. **Harness:** `Test-WinRE.ps1` v21.
+**Production:** `WinRE.ps1` v46 patch 2. **Harness:** `Test-WinRE.ps1` v22.
 
-The v45 `ScriptVersion` bump changes the `DesiredStateId`, so every managed machine performs one full update on its next run, then returns to the fast path. Rolling back to v44 also triggers a one-time rebuild under the older layout behavior. See the migration note in [`CHANGELOG.md`](CHANGELOG.md).
+The v46 patch 1 `ScriptVersion` bump (45 → 46) changes the `DesiredStateId`, so every managed machine performs one full update on its next scheduled run, then returns to the fast path. v46 patch 2 is patch-level only and does not change the `DesiredStateId`; a machine already on v46 patch 1 stays on the fast path. The v46 patch 1 bump clears the OS-fallback state on machines that the v45 plan bug left in the failing branch. See the migration notes in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Field-test status.** The v45 classifier, reuse path, workspace selection, and WIM servicing are verified on physical GPT hardware and on VM GPT and MBR. The v45 destructive path (single-boundary planning, pre-shrink, delete, create-with-type-at-creation, whole-layout assertion) has completed end-to-end on a disposable VM, and the equivalent code path was field-verified on physical hardware under v44 patch 7 across eight machines. The v45-specific *failure* paths — post-delete extension fallback, all ten deferral reasons, the fail-closed C: volume-read refuse branch, the shrink retry branches, and the post-deletion failure corner — are covered by parser and mocked-geometry tests but have not been exercised on physical hardware. Canary and use a disposable VM for destructive end-to-end testing before broad rollout.
+**Field-test status.** The v46 plan-clamp fix is verified on physical hardware — a Lenovo IdeaPad 3 15IAU7 whose factory layout placed a partition 1 MiB past the disk-end reserve was the motivating v45 failure, and the same machine reached `DEDICATED` under v46 patch 1 after the state file was reset. Clean-path verification of the destructive pipeline under v46 patch 1 is on record for the Dell Latitude 3540 and the HP EliteBook 6 G1i 16". The v46 patch 2 build-drift log lines and the guarded `Get-RecoveryPartitions` read are verified on the HP EliteBook 8 G1i 16". The v46-specific *failure* paths — post-delete extension fallback, all ten deferral reasons, the fail-closed C: volume-read refuse branch, the shrink retry branches, and the post-deletion failure corner — are covered by parser and mocked-geometry tests but have not been exercised on physical hardware. Canary and use a disposable VM for destructive end-to-end testing before broad rollout.
 
 ## Field-tested hardware
 
 | Vendor | Model | OS | Result |
 |---|---|---|---|
+| Lenovo | IdeaPad 3 15IAU7 (MT 82RK) | Win11 26200 | **v46 patch 1** — motivating failure of the plan-clamp fix (factory partition 1 MiB past reserve, plan rejected post-delete, OS-fallback); after state-file reset, second full-update reached DEDICATED |
+| Dell | Latitude 3540 | Win11 26300 | **v46 patch 1** — clean destructive rebuild; `Assert-RecoveryPartitionLayout` PASS; fast path next run |
+| HP | EliteBook 6 G1i 16" (MT SBKP, Core Ultra 7 255U) | Win11 26300 | **v46 patch 1** — clean destructive rebuild; first field exercise of the Core Ultra seriesMap branch; fast path next run |
+| HP | EliteBook 8 G1i 16" (MT SBKP, Core Ultra 5 235U) | Win11 26300 | **v46 patch 2** — clean destructive rebuild on a machine with an SD/MMC card reader; first field exercise of the build-drift log lines and the guarded `Get-RecoveryPartitions` read; fast path next run |
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26300 | **v45 patch 1** — reuse path 2026-10-01 23:48 (internal workspace on E:, WIM serviced and optimized, existing 1000 MiB type-coded partition reused, DEDICATED); fast path 2026-10-02 08:50 |
 | (VM) | Hyper-V Windows 11 (i5-11400) | Win11 26300 | **v45 patch 1** — destructive rebuild 2026-10-02 08:56 (plan → pre-shrink → delete → `New-Partition` with recovery GUID at creation → whole-layout assertion PASS → WIM deployed → `reagentc /enable` exit 0 → DEDICATED); fast path 08:58 |
 | (VM) | Hyper-V Windows 10 MBR (i5-11400) | Win10 19045 | **v45 patch 1** — first MBR field data 2026-10-02 09:41 (MBR-type recovery partition reused, `set id=27` applied, `reagentc /enable` exit 0, DEDICATED); fast path 09:43; program-lock contention correctly deferred a second concurrent instance at 09:47 |
@@ -160,7 +165,7 @@ The v45 `ScriptVersion` bump changes the `DesiredStateId`, so every managed mach
 | HP | ProBook 450 G9 (i5-1235U) | Win11 26300 | v44 patch 7 — first 1200 MiB bucket in the field |
 | HP | Laptop 15-fc0xxx (Ryzen 5 7520U) | Win11 26300 | v44 patch 7 — first AMD CPU in the field |
 
-The v44 patch 7 guard-free destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis). The v45 VM runs additionally confirmed the single-boundary destructive path end-to-end, and the MBR VM run confirmed the MBR partition-attribute path and the program lock. Full history and per-machine evidence are in the [changelog](CHANGELOG.md).
+The v44 patch 7 guard-free destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis). The v45 VM runs additionally confirmed the single-boundary destructive path end-to-end, and the MBR VM run confirmed the MBR partition-attribute path and the program lock. The v46 patch 1 plan-clamp fix is field-verified on the Lenovo IdeaPad 3 15IAU7 that motivated it, and clean-path verification of v46 patch 1 and v46 patch 2 is on record for the Dell Latitude 3540 and two HP EliteBook G1i models. Full history and per-machine evidence are in the [changelog](CHANGELOG.md).
 
 ## Documentation
 

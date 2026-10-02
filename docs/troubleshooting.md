@@ -25,6 +25,8 @@ Every line is `yyyy-MM-dd HH:mm:ss [LEVEL] message`. Levels are `INFO`, `WARN`, 
 
 The first line is `========== WinRE Manager Started (v<version> patch <level>) ==========`. The last line names the outcome and, if applicable, the exit code.
 
+As of v46 patch 2, every run logs three build numbers: the registered WinRE version (`WinRE status: ..., Location: ..., Version: <x>`), the source WIM build (`Source WIM build: <build> (path: <path>)` during force-upgrade detection), and the post-deploy WIM build (`Post-deploy WIM build: <build> (source: <path>)` immediately before the state write). None of the three affects control flow; they are logged for evidence. A run whose `Source WIM build` or `Post-deploy WIM build` is older than the registered `Version` is a candidate signal for base-image drift, not a fault.
+
 The program lock is acquired first, immediately after the banner. The log records `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on success, `Another WinRE Manager instance is already running (program lock file is exclusively held). …` if a second instance is running, and `Could not set up program lock at <path> : <error> - proceeding without single-instance protection; concurrent runs may collide` if the lock could not be acquired for a non-contention reason. Under `-DryRun` the lock is skipped and the log records `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances`. See "The script exited with a rename error (concurrent instance)" below for the full discussion.
 
 One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. As of v44 patch 6, the destructive path no longer consults C:'s BitLocker state at all — only the OS-fallback route does, because on that route the target volume *is* C:.
@@ -199,6 +201,27 @@ Common causes of the enumeration error:
 5. **Re-run `WinRE.ps1`.** Once the PnP enumeration is healthy, the run proceeds normally.
 
 **Do not disable the fail-closed check.** The check exists because guessing wrong on VMD presence produces a recovery image that cannot see the OS disk. The cost of a deferral is one pipeline run; the cost of bypassing the check is a machine with a non-functional recovery environment. If the check is firing repeatedly, the underlying PnP service issue is the problem to solve.
+
+## The log shows `CmdletizationQuery_NotFound_DiskNumber` (v46 patch 2)
+
+**Symptom.** The production log or the harness Option 1 diagnostic shows one or more lines reading:
+
+```
+Get-Partition : No MSFT_Partition objects found with property 'DiskNumber' equal to 'N'.  Verify the value of the property and retry.
+At C:\Users\...\Downloads\Test-WinRE.ps1:NNN char:NN
++                      Get-Partition -DiskNumber $diskNum | Where-Objec ...
++                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+The error is non-terminating, so the run continues and completes normally; the summary and every subsequent section of the diagnostic are unaffected.
+
+**Cause.** A disk that exposes no MSFT_Partition objects — typically an empty SD/MMC card reader, an empty USB enclosure, or a disk with no recognized partition table — causes `Get-Partition -DiskNumber N` to throw `CmdletizationQuery_NotFound_DiskNumber`. The disk is reported by `Get-Disk` (so it enters the loop in `Get-RecoveryPartitions`), but it has no partitions (so the `Get-Partition -DiskNumber` call finds nothing and throws). The error surfaces on every `Get-RecoveryPartitions` invocation — three times in the reference diagnostic.
+
+Field case: **HP EliteBook 8 G1i 16 inch Notebook AI PC** with an SD/MMC card reader (disk 1, no partitions), 2026-10-02 15:20. The error appeared three times in the pre-fix harness diagnostic on that machine.
+
+**Resolution.** Upgrade to v46 patch 2 (production) or harness v22 or later. Both add `-ErrorAction SilentlyContinue` to the two `Get-Partition -DiskNumber $diskNum` calls inside `Get-RecoveryPartitions`. The behaviour on disks that do expose partitions is unchanged; the guard only silences the throw on disks that expose none.
+
+**Is this a problem on a pre-v46-patch-2 build?** No. The error is cosmetic — the diagnostic continues after each occurrence, the machine state is not affected, and no decision the script makes depends on the missing partitions. The correct response, if you see it, is to note the disk number the error names (it is a disk with no partitions) and confirm the rest of the diagnostic is complete.
 
 ## The destructive replacement was deferred before partition deletion (v45 patch 1)
 
@@ -1016,6 +1039,50 @@ To make an OS-fallback machine attempt the dedicated path again:
 
 4. Re-run `WinRE.ps1`. The next run will compute a new `DesiredStateId` and take the full-update path. If the underlying cause is resolved, the destructive replacement succeeds and the machine ends in a `DEDICATED` state. If a pre-shrink deferral fires instead, the machine stays in OS-fallback — the pre-shrink deferral preserves whatever route is currently registered, which in this case is the OS-fallback route. Address the pre-shrink constraint named in the log, then delete the marker file to retry.
 
+### The v45 plan-rejection corner (fixed in v46 patch 1)
+
+**Symptom.** Under v45 patch 1, the machine falls into OS-fallback on the full-update path and stays there. The state file records a matching `DesiredStateId`; subsequent scheduled runs accept the state and do not retry. The machine is stable but degraded — WinRE is registered on the OS partition rather than on a dedicated recovery partition.
+
+**Log signature.** The v45 run that produced the OS-fallback state contains:
+
+```
+[INFO] Partition plan: recovery reclaim N MiB, contiguous free M MiB, shrink S MiB, extend E MiB, bucket B MiB, planned offset O MiB, alignment reserve 344 KiB
+...
+[INFO] Confirmed deletion of partition 4 on disk 0
+...
+[ERROR] Planned recovery extent is no longer free after deletion (offset=... size=... overlapCount=0); restoring original C: size
+```
+
+Two features distinguish this from other post-delete failures: the `alignment reserve 344 KiB` value in the plan summary line, and `overlapCount=0` in the post-delete check. Other post-delete failures produce different messages (`New-Partition` failure, `Format-Volume` failure, and so on) and are documented under their own sections above.
+
+If C: is encrypted, the failure is followed by the compound OS-fallback deferral:
+
+```
+[WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=True). ...
+```
+
+If C: is fully decrypted, the run reaches OS-fallback successfully and logs `Operating mode: OS-FALLBACK (WinRE on OS partition...) - degraded but functional`.
+
+**Cause.** This is the v45 plan-clamp bug fixed by v46 patch 1. On a machine whose factory layout places the last partition exactly 1 MiB past the disk-end reserve, `Get-PartitionPlan` computes `tailEnd` from that partition's offset without clamping to `diskSize − 1 MiB`. The aligned managed extent end (`floor(tailEnd / 1 MiB) × 1 MiB`) therefore lands 1 MiB past the reserve. The post-delete geometry check (`$plannedEnd -gt ($diskSizeNow - 1MB)`) correctly rejects the plan, but the plan it rejected is wrong in the first place.
+
+The machine fell into OS-fallback with a state file that matched the failing `DesiredStateId`, so subsequent scheduled runs accepted the state and did not retry. The machine stayed in OS-fallback until an operator manually deleted the state file.
+
+Field case: **Lenovo IdeaPad 3 15IAU7** (MT 82RK, Win 11 build 26200, GPT, Samsung SSD 980 500GB), 2026-10-02. This is the first v45 destructive-path failure on physical hardware, and the first time the post-delete geometry check fired outside a test harness.
+
+**Resolution.** Update to v46 patch 1 or later. The clamp is applied before aligning `tailEnd`, on both the blocking-partition branch and the no-blocking-partition branch. The same factory layout now produces a valid plan; the post-delete geometry check passes with the partition end exactly 1 MiB inside the disk end.
+
+`ScriptVersion` moves from 45 to 46, so the `DesiredStateId` changes and the machine performs one full-update pass on its next scheduled run. The OS-fallback state is cleared by the DSI mismatch automatically. On v46 patch 1 the machine reaches `DEDICATED` on the first full-update pass after the state file is invalidated.
+
+**If you cannot update immediately,** manually delete the state file to force a retry on the next run with whichever version is currently deployed:
+
+```powershell
+Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force
+```
+
+Under v45 the retry will hit the same plan rejection and fall back to OS-fallback again. Under v46 the retry will succeed. The Lenovo field case reached `DEDICATED` on the second full-update run under v46 patch 1, after the state file was manually deleted.
+
+**If you see this on a v46 patch 1 or later build,** the plan-clamp fix is not the explanation. Check the log for the specific post-delete failure that produced the OS-fallback outcome — the plan-clamp symptom specifically shows `alignment reserve 344 KiB` in the plan summary and `overlapCount=0` in the post-delete check. Any other combination points at a different cause; see the compound-signature discussion in [The OS-fallback route deferred because C: is encrypted](#the-os-fallback-route-deferred-because-c-is-encrypted) or [The machine has no recovery partition and WinRE is disabled](#the-machine-has-no-recovery-partition-and-winre-is-disabled).
+
 ## The machine keeps rebuilding and never takes the fast path (label-only recovery partition)
 
 **Symptom.** The machine runs the full-update path on every scheduled run. The state file is written successfully, the machine reports `DEDICATED` (or falls through to OS-fallback), and the fast path never fires. If you inspect the machine's partitions, there is a partition on the OS disk whose volume label is `Recovery` (or `WINRE`) but whose GPT type is not `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (or whose MBR type is not `0x27`).
@@ -1172,6 +1239,8 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - If the run exited with code 2 and the log shows `Extension-failure fallback: creating recovery partition` or `Extension-failure fallback unavailable`, this is a v45 post-delete extension failure. Include the machine's disk layout from `Test-WinRE.ps1` Option 1, the plan's bucket size, and the current C: end and disk end.
 - If the run exited with code 2 and the log shows the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`, this is the post-deletion residual that the `[v45 patch 1]` CHANGELOG entry documents. Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run. The project wants field data on this corner — see the "The OS-fallback route deferred because C: is encrypted" section above.
 - If the run exited with code 3 and the log ends with `Cannot rename because item at '<workspace>\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
+- If the log contains `CmdletizationQuery_NotFound_DiskNumber` or `No MSFT_Partition objects found with property 'DiskNumber'`, note the disk number the error names and whether the machine has a card reader or an empty USB enclosure attached. As of v46 patch 2 (production) and v22 (harness), the guard silences the error; include the exact text and the version banner so the reporter can confirm the fix applies.
+- If the log shows `Planned recovery extent is no longer free after deletion (offset=... size=... overlapCount=0)` following the deletion of the old recovery partition, and the plan summary line shows an `alignment reserve` value, this is the v45 plan-rejection corner fixed by v46 patch 1. Include the version banner from the top of the log (v45 patch 1 or later), the `alignment reserve` value, and the state file's `DesiredStateId` at the time of the failure. See [The v45 plan-rejection corner](#the-v45-plan-rejection-corner-fixed-in-v46-patch-1).
 - The relevant slice of the log — not the whole file unless asked.
 - The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes the BitLocker, Windows Setup state, target-partition state, and classifier verdicts. If the report is about the fast path or the state file, also include the output of Option S.
 

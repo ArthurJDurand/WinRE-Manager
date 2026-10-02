@@ -43,7 +43,23 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 21
+    Version : 22
+
+    v22 changes vs v21:
+    1. Mirrored production v46 patch 2's Get-WinREState version parsing.
+       The harness now extracts Windows RE Version from reagentc /info
+       and displays it in the parsed-state block and in a new Build
+       numbers block alongside the active WIM build and (when present)
+       the C:\Recovery\WindowsRE\winre.wim fallback build. Answers
+       "what builds are we about to replace?" before any destructive
+       operation.
+    2. New parser self-test for the version regex. Reports SKIP when
+       reagentc does not emit a Windows RE Version line (expected when
+       WinRE is Disabled).
+    3. $ProductionScriptVersion default bumped 45 -> 46 to track
+       production's ScriptVersion. Without this bump, Option S
+       reported a false DSI MISMATCH for every state file v46
+       production writes.
 
     v21 changes vs v20:
     1. Fixed a DSI drift that produced false Option-S mismatches.
@@ -660,7 +676,7 @@ function Get-IntelProcessorGeneration {
 }
 
 function Get-DesiredStateId {
-    # Mirror of production v45 patch 1's Get-DesiredStateId. The
+    # Mirror of production v46 patch 2's Get-DesiredStateId. The
     # $ProductionScriptVersion default MUST track production's
     # $ScriptVersion. If it falls behind, Show-StateFileParity reports
     # a false DSI MISMATCH for every state file production has written.
@@ -669,7 +685,7 @@ function Get-DesiredStateId {
         $OEMPackage,
         [Parameter(Mandatory)][string]$ExpectedDriverSetVersion,
         [bool]$VMDPresent = $false,
-        [int]$ProductionScriptVersion = 45
+        [int]$ProductionScriptVersion = 46
     )
     $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
     $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
@@ -746,7 +762,11 @@ function Get-WinREState {
         $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WinRE"
         $location = (Get-ItemProperty -Path $regPath -Name "WinRELocation" -ErrorAction SilentlyContinue).WinRELocation
     }
-    return @{ Status = $status; Location = $location; RawInfo = $info }
+    # Mirrors production v46 patch 2. Version line absent when WinRE is
+    # Disabled or suppressed. Informational only - not part of DSI.
+    $versionLine = $info | Select-String -Pattern 'Windows RE Version:\s*([\d\.]+)' | Select-Object -First 1
+    $version = if ($versionLine) { $versionLine.Matches.Groups[1].Value } else { $null }
+    return @{ Status = $status; Location = $location; Version = $version; RawInfo = $info }
 }
 
 function Resolve-WinRELocationToPartition {
@@ -786,11 +806,15 @@ function Get-RecoveryPartitions {
         $diskNum = $disk.Number
         $byLabel = Get-Volume | Where-Object { $_.FileSystemLabel -eq "Recovery" -or $_.FileSystemLabel -eq "WINRE" } |
                    Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DiskNumber -eq $diskNum }
+        # -ErrorAction SilentlyContinue: a disk with no partitions (e.g.
+        # an empty SD/MMC card reader) makes Get-Partition -DiskNumber
+        # throw CmdletizationQuery_NotFound_DiskNumber. That is absence,
+        # not failure.
         $byGpt = if ($disk.PartitionStyle -eq 'GPT') {
-                     Get-Partition -DiskNumber $diskNum | Where-Object { $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' }
+                     Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object { $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' }
                  } else { @() }
         $byMbr = if ($disk.PartitionStyle -eq 'MBR') {
-                     Get-Partition -DiskNumber $diskNum | Where-Object { $_.MbrType -eq 0x27 }
+                     Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object { $_.MbrType -eq 0x27 }
                  } else { @() }
         $allParts += @($byLabel) + @($byGpt) + @($byMbr) |
                      Where-Object { $_.PartitionNumber -gt 0 } |
@@ -849,6 +873,7 @@ function Show-SystemDiagnostic {
     $statusColor = if ($wreState.Status -eq 'Enabled') { "Green" } elseif ($wreState.Status -eq 'Disabled') { "Yellow" } else { "Red" }
     Write-KV "Status"   "$($wreState.Status)" $statusColor
     Write-KV "Location" "$($wreState.Location)" "White"
+    Write-KV "Version"  "$(if ($wreState.Version) { $wreState.Version } else { 'unknown (absent from reagentc output)' })" "White"
 
     $activePart = $null
     if ($wreState.Location) {
@@ -1145,6 +1170,31 @@ function Show-SystemDiagnostic {
         Write-Diag "  (could not read active WIM at the reagentc-registered location)" "Yellow"
     }
 
+    # ---- Build numbers (v22) ----
+    # Answers the operator question "what builds are we about to replace?"
+    # before any destructive operation. Registered WinRE comes from
+    # reagentc /info; active WIM and fallback WIM builds come from
+    # Get-WindowsImage against the actual files.
+    Write-Diag ""
+    Write-Diag "  Build numbers" "Cyan"
+    Write-Diag "  ─────────────" "DarkGray"
+    Write-KV "Registered WinRE" "$(if ($wreState.Version) { $wreState.Version } else { 'unknown (reagentc emitted no version line)' })" "White"
+    if ($activeWimPath) {
+        $activeBuild = $null
+        try { $activeBuild = (Get-WindowsImage -ImagePath $activeWimPath -Index 1 -ErrorAction Stop).Build } catch { }
+        Write-KV "Active WIM build" "$(if ($activeBuild) { $activeBuild } else { 'unknown (could not read)' })" "White"
+    } else {
+        Write-KV "Active WIM build" "unknown (active WIM not locatable)" "Gray"
+    }
+    $backupWimPath = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
+    if (Test-Path -LiteralPath $backupWimPath) {
+        $backupBuild = $null
+        try { $backupBuild = (Get-WindowsImage -ImagePath $backupWimPath -Index 1 -ErrorAction Stop).Build } catch { }
+        Write-KV "Backup WIM build" "$(if ($backupBuild) { $backupBuild } else { 'unknown (could not read)' })  $backupWimPath" "White"
+    } else {
+        Write-KV "Backup WIM build" "(none present at $backupWimPath)" "Gray"
+    }
+
     # ---- Windows Setup state ----
     Write-Diag ""
     Write-Diag "  Windows Setup state" "Cyan"
@@ -1315,6 +1365,29 @@ function Show-SystemDiagnostic {
         Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
         Write-Host " reagentc location regex did not match any line" -ForegroundColor Gray
         Record "Parser: reagentc location" $false "no match"
+    }
+
+    # Check 2b (v22): reagentc Windows RE Version regex, mirrors
+    # production v46 patch 2. SKIP when reagentc emitted no version
+    # line - that is expected when WinRE is Disabled.
+    $verPattern = 'Windows RE Version:\s*([\d\.]+)'
+    $verHits = @($wreState.RawInfo | Select-String -Pattern $verPattern)
+    if ($verHits.Count -gt 0) {
+        $matchedVer = ($verHits | Select-Object -First 1).Matches.Groups[1].Value
+        Write-Host "  " -NoNewline
+        Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+        Write-Host "reagentc version regex matched '$matchedVer'" -ForegroundColor Gray
+        Record "Parser: reagentc version" $true "matched '$matchedVer'"
+    } elseif ($wreState.Status -eq 'Enabled') {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " reagentc version regex did not match any line (WinRE is Enabled)" -ForegroundColor Gray
+        Record "Parser: reagentc version" $false "no match while Enabled"
+    } else {
+        Write-Host "  " -NoNewline
+        Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+        Write-Host " reagentc version line not present (WinRE status=$($wreState.Status))" -ForegroundColor Gray
+        Record "Parser: reagentc version" $false -State "SKIP" -Detail "no version line (WinRE $($wreState.Status))"
     }
 
     # Checks 3 & 4: manage-bde -status C: raw dump and regex verification
@@ -2408,7 +2481,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v21)"
+    $titleContent = "WinRE Manager Test Harness (v22)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -2456,7 +2529,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v21"
+Rule "WinRE Manager test harness v22"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

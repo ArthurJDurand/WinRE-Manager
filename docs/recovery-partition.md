@@ -1,6 +1,6 @@
 # Recovery partition lifecycle
 
-This document covers how WinRE Manager decides what size a recovery partition should be, how it replaces one that is inadequate, and how it recovers if the destructive operations fail. The current design is the v45 patch 1 shrink-first pipeline.
+This document covers how WinRE Manager decides what size a recovery partition should be, how it replaces one that is inadequate, and how it recovers if the destructive operations fail. The current design is the v45 patch 1 shrink-first pipeline, with the v46 patch 1 disk-end clamp applied to the geometry plan.
 
 ## The invariant
 
@@ -106,7 +106,7 @@ AlignedManagedExtentEnd = floor(tailEnd / 1 MiB) × 1 MiB
 TargetRecoveryStart     = AlignedManagedExtentEnd - BucketSizeBytes
 ```
 
-where `tailEnd` is the start of the first blocking non-recovery partition after C:, or `diskSize − 1 MiB` if no such partition exists. C: is resized so it ends exactly at `TargetRecoveryStart`; the recovery partition of size exactly `BucketSizeBytes` fills the space up to `AlignedManagedExtentEnd`.
+where `tailEnd` is `min(blockingPartition.Offset, diskSize − 1 MiB)` when a blocking non-recovery partition exists after C:, or `diskSize − 1 MiB` when none does. The `diskSize − 1 MiB` clamp is a v46 patch 1 addition: the disk-end reserve is a fixed Windows convention, and the v45 planner could exceed it on a factory layout whose last partition ended at `diskSize` (equivalently, 1 MiB past the usable end). Without the clamp, `AlignedManagedExtentEnd` landed 1 MiB past the reserve and the post-delete geometry check rejected the plan. See "The v46 patch 1 plan clamp" below. C: is resized so it ends exactly at `TargetRecoveryStart`; the recovery partition of size exactly `BucketSizeBytes` fills the space up to `AlignedManagedExtentEnd`.
 
 Bytes between the raw extent end and the aligned end are the **alignment reserve**. They are logged, not treated as a defect. In the common case the reserve is zero and the recovery partition ends exactly at `diskSize − 1 MiB`.
 
@@ -128,6 +128,16 @@ ActualPartitionSize  = ActualPartitionEnd - ActualPartitionStart
 If the actual post-resize geometry leaves less space than the plan's bucket size (`ActualPartitionSize < PlannedPartitionSize`), the script restores C: to its original size and defers. This protects against a resize that rounded in the wrong direction by more than an alignment block.
 
 In the common case, the actual geometry matches the plan exactly and the recovery partition is exactly `BucketSizeBytes` with no trailing gap.
+
+### The v46 patch 1 plan clamp
+
+The v45 planner computed `tailEnd` from the last relevant partition's end, or from `diskSize` when no blocking partition existed, and then aligned down to 1 MiB — without first clamping to `diskSize − 1 MiB`. On a machine whose last partition ended at `diskSize` (equivalently, 1 MiB past the usable end), `AlignedManagedExtentEnd` landed 1 MiB past the reserve, and the post-delete geometry check in `Ensure-AdequateRecoveryPartition` (`$plannedEnd -gt ($diskSizeNow - 1MB)`) always rejected the plan.
+
+The bug was first seen on physical hardware: a Lenovo IdeaPad 3 15IAU7 (MT 82RK) whose factory layout placed a partition exactly 1 MiB past the reserve. The plan was rejected, and the machine fell into OS-fallback with a matching `DesiredStateId`, so subsequent scheduled runs accepted the state file and did not retry — the machine stayed in OS-fallback until an operator manually deleted the state file.
+
+The v46 patch 1 fix clamps `tailEnd` to `diskSize − 1 MiB` before aligning, on both branches of the plan (blocking partition and no blocking partition). The same layout that v45 rejected now produces a valid plan; the post-delete geometry check passes with the partition end exactly 1 MiB inside the disk end. This is a `ScriptVersion` bump (45 → 46), so every managed machine performs one full update on its next scheduled run.
+
+The clamp is stated in [architecture.md](architecture.md) invariant 18 and its reasoning is documented as the "eighth direction" of the wrong-question pattern in the same document.
 
 ## The OS partition resize sequence (v45 patch 1)
 
@@ -452,7 +462,9 @@ The script handles both partition styles.
 
 The script determines the style from `Get-OSDisk`'s `PartitionStyle` property and passes the appropriate value to both `New-Partition` and `Set-RecoveryPartitionAttributes`.
 
-**Field coverage.** The v45 patch 1 GPT destructive path was exercised end-to-end on a disposable Hyper-V VM on 2026-10-02 08:56. The MBR attribute-application path (`set id=27` on an existing MBR partition) was exercised on a Win10 MBR VM on 2026-10-02 09:41. The MBR destructive path (`New-Partition -MbrType 0x27` at a planned offset) has not yet been exercised on any storage — the Win10 MBR VM run took the reuse path. This is documented in the field-gap list in [testing.md](testing.md).
+**Field coverage.** The v45 patch 1 GPT destructive path was exercised end-to-end on a disposable Hyper-V VM on 2026-10-02 08:56. The MBR attribute-application path (`set id=27` on an existing MBR partition) was exercised on a Win10 MBR VM on 2026-10-02 09:41. The MBR destructive path (`New-Partition -MbrType 0x27` at a planned offset) has not yet been exercised on any storage — the Win10 MBR VM run took the reuse path.
+
+The v46 patch 1 plan clamp has been exercised on physical hardware in both directions: the Lenovo IdeaPad 3 15IAU7 that motivated the fix (plan rejected pre-clamp, accepted post-clamp, reached DEDICATED after a state-file reset), and clean-path verification on a Dell Latitude 3540 and an HP EliteBook 6 G1i 16" whose layouts took the no-blocking-partition branch without triggering the clamp. See [architecture.md](architecture.md) for the full per-machine record.
 
 ## Related documents
 
