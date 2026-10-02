@@ -30,14 +30,32 @@
 - [ ] Field-tested on a GPT machine
 - [ ] Field-tested on an MBR machine
 - [ ] If the shrink path is touched: tested on hardware with OS partition at `SizeMin`
-- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test documented in `docs/testing.md` has been run and its result is recorded. Changes to this segment are gated on that test — see CONTRIBUTING.md for the scope.
 - [ ] If the BitLocker handling is touched: verified that the harness's Option 1 "Target recovery partition state" block reflects the state production would prepare, and that the code path for both an unencrypted target and an encrypted target is reachable
 - [ ] If the `DesiredStateId` inputs are touched: verified that the harness's Option S "State file parity check" recomputes the same ID production computes on this machine, and that a machine whose previous state file is stale is correctly predicted to rebuild
 
+### If this PR touches the destructive sequence
+
+The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPartition`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, the `New-Partition` / `Format-Volume` / `Set-RecoveryPartitionAttributes` calls, `Remove-OrphanPartition`, `Restore-OSPartitionSize`, `Restore-PreviousWinRERoute`, `Assert-RecoveryPartitionLayout`, `Remove-StrayRecoveryPartitions`, and any caller of those functions. **Delete this subsection if it does not apply.**
+
+- [ ] I have named **which of the four design invariants this PR preserves** — see below for the four rules, and [`docs/architecture.md`](docs/architecture.md) for the full hierarchy and the enforcement tables.
+- [ ] I have named **which of the four design invariants this PR strengthens**.
+- [ ] I confirm this PR **does not weaken any of rules 1–3**.
+- [ ] I have included the **test result that demonstrates the change behaves as claimed** — or, if the required test is the post-deletion failure test described in [`docs/testing.md`](docs/testing.md), I have said so explicitly and noted that this PR is **blocked until that test runs and its result is recorded**.
+- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings sit inside this gate.
+
 ## Invariants
 
-- [ ] I have read the "CRITICAL LESSONS LEARNED" section in `scripts/WinRE.ps1`
-- [ ] This change does not weaken any invariant listed there without a new field case
+WinRE Manager's design is organized around four rules, in this order. See [`docs/architecture.md`](docs/architecture.md) for the hierarchy, the enforcement tables, and the reasoning behind each.
+
+1. **Never break Windows RE.**
+2. **Never leave a machine without a working recovery route** — to the extent the machine, its OS, and its storage stack allow.
+3. **Minimize the `reagentc /disable` → `reagentc /enable` window.**
+4. **Do no work unless needed. When work is needed, prepare everything before touching anything.**
+
+Rules 1–3 are invariants: no PR may weaken them. Rule 4 is the working rule by which 1–3 are enforced on the fast path, the enable-only path, and the destructive path.
+
+- [ ] I have read the four design invariants in [`docs/architecture.md`](docs/architecture.md) and the "CRITICAL LESSONS LEARNED" section in `scripts/WinRE.ps1`
+- [ ] This change does not weaken any invariant without a new field case
 - [ ] Any destructive operation either verifies preconditions and restores geometry on failure, or sets `$Script:GeometryRestoreFailed`
 - [ ] Any `try/catch` either logs, sets a state flag, or both
 

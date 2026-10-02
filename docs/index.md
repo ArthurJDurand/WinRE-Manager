@@ -106,23 +106,26 @@ flowchart TD
 
 ---
 
-## The golden rule: no work unless needed
+## Design principles
 
-WinRE Manager is **idempotent by design**, and idempotence is a discipline about *work*, not just about outcomes. Every run follows the same rule:
+WinRE Manager's design is organized around four rules, in this order — see [Architecture](architecture.md) for the full hierarchy, the enforcement tables, and the reasoning behind each.
 
-> **Do nothing unless something is wrong. When something is wrong, prepare everything before touching anything.**
+1. **Never break Windows RE.**
+2. **Never leave a machine without a working recovery route** — to the extent the machine, its OS, and its storage stack allow.
+3. **Minimize the `reagentc /disable` → `reagentc /enable` window.**
+4. **Do no work unless needed. When work is needed, prepare everything before touching anything.**
 
-### Tier 1 — nothing to do
+Rules 1–3 are **invariants**: no code change may weaken them. Rule 4 is the **working rule** — the discipline by which rules 1–3 are enforced on the fast path, the enable-only path, and the destructive path.
 
-Fast path. Health checks pass, the state file matches the current inputs, the image is current, the partition is correct. The run exits in under a second. No WIM is mounted, no partition is touched, no `reagentc` call is made.
+### Rule 4 in practice: no work unless needed
 
-### Tier 2 — minimal work
+Rule 4 has three tiers of work. A healthy machine takes Tier 1; a machine with an enable-only repair takes Tier 2; only a machine that needs a full update takes Tier 3.
 
-Enable-only repair. The image is current, but WinRE is disabled. The script prepares the target recovery partition, re-registers the image, and calls `reagentc /enable`. No partition geometry change, no image rebuild, no C: shrink.
+**Tier 1 — nothing to do.** Fast path. Health checks pass, the state file matches the current inputs, the image is current, the partition is correct. The run exits in under a second. No WIM is mounted, no partition is touched, no `reagentc` call is made.
 
-### Tier 3 — full update
+**Tier 2 — minimal work.** Enable-only repair. The image is current, but WinRE is disabled. The script prepares the target recovery partition, re-registers the image, and calls `reagentc /enable`. No partition geometry change, no image rebuild, no C: shrink.
 
-The image is missing, stale, or the recovery partition is wrong-sized. This is the only path that does destructive work.
+**Tier 3 — full update.** The image is missing, stale, or the recovery partition is wrong-sized. This is the only path that does destructive work.
 
 **Even on Tier 3, the work is conditional and ordered.** Before the first byte of the recovery partition is touched, every preparation must complete:
 

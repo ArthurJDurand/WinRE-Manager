@@ -32,6 +32,67 @@ Run `WinRE.ps1` as `NT AUTHORITY\SYSTEM` from a scheduled task, triggered **at b
 
 Do **not** run it from a user logon script. It modifies partition tables and the BitLocker state of the target recovery partition; those operations require SYSTEM.
 
+## Design invariants at deployment time
+
+The script's design is organized around four rules, in this order — see [`docs/architecture.md`](architecture.md) for the full hierarchy.
+
+1. **Never break Windows RE.**
+2. **Never leave a machine without a working recovery route** — to the extent the machine, its OS, and its storage stack allow.
+3. **Minimize the `reagentc /disable` → `reagentc /enable` window.**
+4. **Do no work unless needed. When work is needed, prepare everything before touching anything.**
+
+Rules 1–3 are invariants: no deployment scenario should weaken them. Rule 4 is the working rule: the discipline that makes the fast path and the enable-only path free of side effects, and that makes the destructive path fail safe.
+
+Each rule has a direct operational translation for a fleet operator.
+
+### Rule 1 — never break Windows RE: canary, do not bulk-push
+
+The script's destructive sequence is protected by a read-only plan, a fail-closed layout assertion, and a reversible shrink window. It does not need to be bullet-proof to be deployed; it needs to be **canaried** so that any regression is caught on one machine, not a thousand.
+
+Before pushing to a fleet, run on one machine end-to-end:
+
+```powershell
+.\scripts\Test-WinRE.ps1            # read-only, no elevation
+.\scripts\WinRE.ps1 -DryRun          # walk the flow, log every decision, change nothing
+.\scripts\WinRE.ps1                  # actually deploy
+```
+
+Confirm exit 0 and `Operating mode: DEDICATED` in the log. Only then expand the ring.
+
+### Rule 2 — never leave a machine without a working recovery route: do not interfere with the recovery window
+
+The one case in which the script cannot guarantee a working recovery route on a single run is the post-deletion residual corner: a `New-Partition` or `Format-Volume` failure after the old recovery partition has been deleted, on a machine whose C: is encrypted. The correct operational response is **not to interrupt the script while it is inside the destructive window** — every interruption between the delete and the enable is an opportunity for the machine to land in that corner.
+
+Concretely:
+
+- **Do not kill the `WinRE.ps1` process** if it appears to be slow. A full-update pass on an NVMe machine takes 3–5 minutes of I/O; the destructive window is a small fraction of that. If you kill the process inside the window, the recovery route is not restored by the script and the next run must recover from whatever state the interruption left.
+- **Do not delete the state file** while a run is in progress. The state file is what the next run uses to identify the deployment identity and the pending state.
+- **Do not delete the deferral marker** while a run is in progress. The marker is what the next run uses to decide whether to suppress a retry of the pre-shrink deferral.
+- **Do not use a forced reboot** inside the window. A forced reboot between the delete and the enable leaves WinRE disabled and the recovery partition possibly partial.
+
+The scheduled task's own `ExecutionTimeLimit = PT6H` and the script's internal timeouts (300-second BitLocker polling, 5-second sleeps, 15-second network timeout) are the effective limits inside that. Nothing outside the script needs to enforce a shorter one.
+
+### Rule 3 — minimize the `reagentc /disable` → `reagentc /enable` window: do not schedule around it
+
+The window is the interval during which WinRE is not registered and the recovery partition is in the process of being replaced. On a modern SSD the window is typically **15–45 seconds** for the delete / create / format / deploy / `reagentc /setreimage` / `reagentc /enable` sequence. On a spinning disk or a very large WIM it can be longer.
+
+Rule 3 is enforced by the script's own ordering — every preparatory step that does not require a disabled WinRE runs before the disable. Your scheduling decisions should not undo that.
+
+- **Do not schedule a mandatory reboot** to fire during a run. The scheduled task's boot trigger fires on the machine's own reboots; a fleet-wide reboot campaign that overlaps with a weekly run can terminate the script inside the window.
+- **Do not use a "stop task if it runs longer than X" setting** on the scheduled task or in an MDM-side policy that could fire inside the window. The scheduled task's own `ExecutionTimeLimit` is the correct upper bound; a second, shorter policy that runs in parallel can kill the run at the worst possible moment.
+- **Do not use an orchestration layer that kills the process after a fixed timeout** shorter than the scheduled task's own limit. An RMM tool or an MDM remediation platform with a 60-second or 120-second timeout will kill the script inside the window on a machine where the destructive sequence actually runs; the same tool on a healthy machine will see the fast path complete in under a second and never trigger its timeout.
+
+The single-run recovery story is: `Restore-PreviousWinRERoute` on delete failure, `Remove-OrphanPartition` plus `Restore-OSPartitionSize` on create failure, and the enable-only path on a clean-but-disabled state. These handle every ordinary failure. They do not handle a process kill inside the window.
+
+### Rule 4 — do no work unless needed: trust the fast path; do not force reruns
+
+Rule 4 has three concrete operational consequences.
+
+- **Healthy machines exit in under a second.** A fast-path run performs a read-only scan of the recovery partitions on non-OS disks and, if needed, one small state-file write to clear stale counters. There is no reason to tune the schedule around the cost of a healthy run.
+- **Do not force a full update on a healthy machine.** Deleting the state file, bumping the manifest version, or bumping `ScriptVersion` forces one full-update pass per machine. Do it only when there is a reason — the migration sections below describe the three version boundaries that do this deliberately.
+- **Do not retry a deferral.** The script's deferrals are protective. An Audit Mode deferral, a VMD-query-indeterminate deferral, an OS-fallback BitLocker deferral, a v45 pre-shrink deferral, an offline-fallback deferral — none is improved by running the script again before the underlying condition changes. The correct response is to resolve the condition, then re-run.
+- **The enable-failure counter is a feature, not a bug.** A machine that fails the enable step three times in a row hits the loop-breaker and exits `EXIT_FATAL` with a "manual intervention required" message. Retrying automatically produces the same result. Resolve the underlying enable failure, delete the state file, then re-run.
+
 ## Preconditions
 
 Before the first run on any machine, confirm:
@@ -124,7 +185,7 @@ Save as `WinRE-Manager.xml` and register with `schtasks /Create /XML WinRE-Manag
 Notes on the settings:
 
 - `MultipleInstancesPolicy = IgnoreNew` prevents two **scheduled** runs from overlapping. A long `defrag /x` on a nearly-full volume can take 30+ minutes. It has no effect on processes launched outside the scheduled task — see "One instance per machine" below for how the script defends itself against manual invocations.
-- `ExecutionTimeLimit = PT6H` gives the run enough headroom; the script's own internal timeouts (300-second BitLocker polling, 5-second sleeps, 15-second network timeout) are the effective limit inside that.
+- `ExecutionTimeLimit = PT6H` gives the run enough headroom; the script's own internal timeouts (300-second BitLocker polling, 5-second sleeps, 15-second network timeout) are the effective limit inside that. Do not add a shorter limit at the orchestrator level — see Rule 3 above.
 - `RunOnlyIfNetworkAvailable = false` is deliberate as of v44 patch 5. The script now has an offline fallback: when the manifest fetch fails, it trusts the state file's stored `DesiredStateId` and takes the fast path if the local safety checks pass. With `true`, the task would not fire when the network is down, so the fallback would only help manual invocations — not the scheduled path where the machine actually needs it. The offline fallback is self-limiting (`EXIT_WARNING` when a full update is needed, never a silent partial deployment) and safe on a machine whose state file is valid. A first deployment on a machine with no state file will still exit `EXIT_FATAL` when offline, which is correct: the live manifest is required to compute the initial `DesiredStateId`. See the "Offline behavior" section below.
 - `StartWhenAvailable = true` handles missed triggers after a cold boot.
 
@@ -286,7 +347,7 @@ Windows 11 24H2+ enables Device Encryption by default on hardware meeting TPM 2.
 The v43 patch 5 (further revision 5) policy addresses this by acting on the volume reagentc will enable, not on the OS volume. Concretely:
 
 - **The target recovery partition must be unencrypted before `reagentc /enable` is called.** `Set-RecoveryPartitionReadyForWinRE` prepares it: if the partition is already clean it returns immediately, otherwise it runs `manage-bde -off` against the partition and polls for completion at 5-second intervals up to a 300-second timeout. This is called on the enable-only path, the full-update path with an existing recovery partition, the full-update path with a newly created partition, and the pending-reboot repair path.
-- **The OS volume's BitLocker state is consulted only on the OS-fallback route.** On that route the target volume *is* C:, and reagentc refuses to enable WinRE on an encrypted OS volume. The gate checks C:'s `VolumeStatus` before deploying and defers unless it is `FullyDecrypted`. The script never modifies C:'s state. As of v44 patch 6, the destructive partition path does not consult C:'s state either — the dedicated-partition path's success or failure depends on the partition geometry, not on C:'s encryption state, and the safety property is preserved by the OS-fallback gate alone.
+- **The OS volume's BitLocker state is consulted only on the OS-fallback route.** On that route the target volume *is* C:, and reagentc refuses to enable WinRE on an encrypted OS volume. The gate checks C:'s `VolumeStatus` before deploying and defers unless it is `FullyDecrypted`. The script never modifies C:'s state. As of v44 patch 6, the destructive partition path does not consult C:'s state either — the dedicated-partition path's success or failure depends on the partition geometry, not on C:'s encryption state.
 - **New partitions are created with the recovery type GUID applied at `New-Partition` time.** This closes the window between partition creation and `Set-RecoveryPartitionAttributes` during which a plain Basic Data partition could be claimed by the Device Encryption service.
 - **No BitLocker suspension.** The v43 patch 5 function `Suspend-BitLockerForWinRE` was deleted. Suspension does not prevent Device Encryption from claiming new partitions — proven in the field — and it is useless for OS-fallback, where reagentc refuses regardless.
 
@@ -446,7 +507,7 @@ The v44 patches 2 through 8 and the v46 patch 2 additions do **not** bump `Scrip
 - **v44 patch 6** removes the v44 patch 3 destructive-path C: guard; makes Lenovo OEM-pack resolution distinguish five states; makes VMD hardware detection fail-closed; adds the Step 2 stale-file cleanup on the normal path; and corrects the OS-fallback remediation wording.
 - **v44 patch 7** closes a non-convergence loop by making the type-coded classifier authoritative across every recovery-partition decision — the fast-path count, the active-location classifier, the final-verification classifier, and `Find-SuitableRecoveryPartition`. It also clears the VMD extraction directory before each extraction, and adds C:'s actual encryption state to the destructive-replacement WARN (diagnostic only; the decision to proceed is unchanged).
 - **v44 patch 8** reorders workspace initialization so that healthy fast-path runs, enable-only repairs, and offline deferrals no longer validate checkpoints, wipe stale scratch files, or create the workspace. Full-update checkpoint and resume behavior is otherwise unchanged.
-- **v46 patch 2** adds three log lines that record the registered WinRE version, the source WIM build, and the post-deploy WIM build on every run, and guards the two `Get-Partition -DiskNumber` calls in `Get-RecoveryPartitions` against the empty-disk read that throws `CmdletizationQuery_NotFound_DiskNumber` on machines with an SD/MMC card reader. The build-logging values do not enter the `DesiredStateId`; the read guard silences a cosmetic error.
+- **v46 patch 2** adds three log lines that record the registered WinRE version, the source WIM build, and the post-deploy WIM build on every run, and guards the two `Get-Partition -DiskNumber` calls in `Get-RecoveryPartitions` against the empty-disk read that throws `CmdletizationQuery_NotFound_DiskNumber` on machines with an SD/MMC card reader. It also applies four post-review hardenings of `Ensure-AdequateRecoveryPartition` — the pre-deletion resolver guard, the extension-fallback bucket cap, the layout-assertion fail-closed branch, and the deletion-failure partial-rollback reporting. The build-logging values do not enter the `DesiredStateId`; the read guard silences a cosmetic error; the four hardenings change only the failure behaviour of the destructive sequence.
 
 Because none of these patches changes `ScriptVersion` or the `DesiredStateId`, an already-completed machine will not rerun automatically; the deployment mechanism must invoke the script explicitly to pick the fixes up. The next natural rebuild (manifest bump, OEM pack version change, Windows build change, or CPU/VMD presence change) picks them up regardless.
 
@@ -459,7 +520,7 @@ Because none of these patches changes `ScriptVersion` or the `DesiredStateId`, a
 - **v44 patch 6**: restore the v44 patch 3 destructive-path C: guard inside `Ensure-AdequateRecoveryPartition`; revert `Get-LenovoWinPEPack` to a two-state return; revert the VMD presence check to treat enumeration errors as absent; remove the Step 2 stale-file cleanup; restore the earlier OS-fallback remediation wording.
 - **v44 patch 7**: revert the classifier changes — `Find-SuitableRecoveryPartition` and the main-flow `$existingRecoveryParts` back to accepting label-OR-type; the active-location classifier and the final-verification classifier back to promoting a label-only match to DEDICATED — remove the VMD extraction directory cleanup, and remove the C: encryption-state lookup from the destructive-replacement WARN.
 - **v44 patch 8**: restore the pre-patch-8 workspace-initialization ordering.
-- **v46 patch 2**: remove the three build-drift log lines (`WinRE status: ..., Version: ...`, `Source WIM build: ...`, `Post-deploy WIM build: ...`) from the startup, force-upgrade, and post-deploy paths; remove the `Version` extraction from `Get-WinREState`; remove the `-ErrorAction SilentlyContinue` guard from the two `Get-Partition -DiskNumber` calls in `Get-RecoveryPartitions`.
+- **v46 patch 2**: remove the three build-drift log lines (`WinRE status: ..., Version: ...`, `Source WIM build: ...`, `Post-deploy WIM build: ...`) from the startup, force-upgrade, and post-deploy paths; remove the `Version` extraction from `Get-WinREState`; remove the `-ErrorAction SilentlyContinue` guard from the two `Get-Partition -DiskNumber` calls in `Get-RecoveryPartitions`; revert the four `Ensure-AdequateRecoveryPartition` hardenings to their pre-v46-patch-2 form.
 
 None of these rollbacks affects the state-file schema or the `DesiredStateId`.
 
@@ -478,7 +539,7 @@ For MDM / orchestration:
 
 Do **not** treat exit code 2 as success. A machine in OS-fallback is intentionally reported as a warning; it will be treated as a healthy machine by the fast path only if the state file records `UsedOSFallback = true` for the current `DesiredStateId`. A machine on which the Audit Mode guard or a v45 pre-shrink deferral fired will have an unchanged (or absent) state file and a single deferral line in the log. See [exit-codes.md](exit-codes.md) for how to distinguish the nine cases.
 
-Do **not** configure retry loops that ignore the exit code and re-run unconditionally. Deferrals are not improved by retrying — the same gate will fire on the next run. Enable failures are handled by the counter; after three consecutive failures the loop-breaker fires and requires manual intervention. The concurrent-instance deferral is not a failure at all; retrying while the other instance is still running will simply produce another `EXIT_WARNING`. The VMD-query-indeterminate deferral is not improved by retrying — the underlying PnP service issue must be resolved. The v45 pre-shrink deferral is not improved by retrying until the constraint is resolved (free space on C:, disk layout, oversized recovery partition, transient volume read, or shrink failure). Resolve the underlying condition, then re-run.
+Do **not** configure retry loops that ignore the exit code and re-run unconditionally. Deferrals are not improved by retrying — the same gate will fire on the next run (Rule 4). Enable failures are handled by the counter; after three consecutive failures the loop-breaker fires and requires manual intervention. The concurrent-instance deferral is not a failure at all; retrying while the other instance is still running will simply produce another `EXIT_WARNING`. The VMD-query-indeterminate deferral is not improved by retrying — the underlying PnP service issue must be resolved. The v45 pre-shrink deferral is not improved by retrying until the constraint is resolved (free space on C:, disk layout, oversized recovery partition, transient volume read, or shrink failure). Resolve the underlying condition, then re-run.
 
 ## MDM / Intune
 
@@ -591,11 +652,12 @@ The v46 patch 1 canary is primarily about confirming that machines the v45 plan-
 
 ### v46 patch 2 specifically
 
-The v46 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId`. It adds three build-drift log lines and a small read guard in `Get-RecoveryPartitions`. The canary is primarily observational:
+The v46 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId`. It adds three build-drift log lines, a small read guard in `Get-RecoveryPartitions`, and four post-review hardenings of `Ensure-AdequateRecoveryPartition`. The canary is primarily observational:
 
 - **Confirm the three new log lines appear on a canary full-update pass.** The startup line reads `WinRE status: ..., Location: ..., Version: <version>`; the force-upgrade detection line reads `Source WIM build: <build> (path: <path>)`; the post-deploy line reads `Post-deploy WIM build: <build> (source: <path>)`. On a fast-path run, the first two lines appear and the third does not — that is expected, because the fast path does not deploy a WIM.
 - **Confirm the `CmdletizationQuery_NotFound_DiskNumber` error is silent on machines with an SD/MMC card reader or an empty USB enclosure.** Before v46 patch 2, such a machine produced three copies of the error in the harness diagnostic and one per `Get-RecoveryPartitions` invocation in the production log. After v46 patch 2, the same machine produces no such error. If it still appears, the log's version banner will tell you whether the machine is running the patched build.
-- **Do not expect any change to the fast-path behaviour or the state-file schema.** v46 patch 2 is observational only.
+- **Do not expect any change to the fast-path behaviour or the state-file schema.** v46 patch 2 is observational only, except for the four hardenings, which change only the failure behaviour of the destructive sequence.
+- **If a canary machine exits 2 with `Dedicated replacement deferred before partition deletion (active WinRE location could not be resolved)`.** The v46 patch 2 pre-deletion resolver guard fired. The old recovery partition is intact but WinRE is left `Disabled` — the guard fires after `reagentc /disable` has already run. This is a code-review hardening that has not been exercised in the field; if you see it, please capture the full log and file a bug per the [Reporting a bug](../CONTRIBUTING.md#bug-reports) section. See [troubleshooting.md](troubleshooting.md) for the re-registration procedure.
 
 ## Rolling back
 
@@ -614,6 +676,7 @@ To revert a `DesiredStateId` change specifically, see the "Rollback" subsections
 
 ## Related documents
 
+- [architecture.md](architecture.md) — the four design invariants that this document translates into deployment-time guidance, plus the pipeline, the control-flow invariants, and the state-carrying artifacts.
 - [self-hosting.md](self-hosting.md) — how to replace the driver manifest, OEM maps, and base WIM repository with your own hosting, including the trust model and the air-gapped deployment procedure.
 - [exit-codes.md](exit-codes.md) — how to interpret the exit codes, including the nine cases for code 2.
 - [state-and-idempotency.md](state-and-idempotency.md) — what the state file records, the deferral marker's relationship to the deployment identity, and the offline fallback's residual risk.

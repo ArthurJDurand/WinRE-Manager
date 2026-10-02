@@ -7,6 +7,8 @@ WinRE Manager injects two kinds of drivers into the base WIM:
 
 Both injections run inside Step 3 (mount, inject, dismount). This document covers the manifest schema, the source URLs, the extraction per vendor, and the success gate.
 
+The injection step is the deepest embodiment of two of the project's four design invariants, which [`architecture.md`](architecture.md) states in this order. **Rule 4 — do no work unless needed; prepare everything before touching anything** — is the reason every driver artifact must be resolved, downloaded, extracted, and verified *before* the destructive sequence begins; a rebuild that would have failed at the injection step never touches a partition. **Rule 1 — never break Windows RE** — is the reason injection failure is fatal-on-progression rather than a degraded-success: a WIM that cannot see the OS disk is actively misleading, and the pipeline gate exists to make sure such a WIM never reaches a recovery partition.
+
 ## The manifest
 
 The manifest is a JSON file hosted on GitHub Gist. `WinRE.ps1` reads it from `$DriverManifestUrl` at the top of the script.
@@ -274,7 +276,7 @@ The same INF cross-reference gate applies. A failure sets `$Script:ImageInjectio
 
 When `$Script:ImageInjectionComplete` is `$false` after Step 3, the pipeline **exits with `EXIT_WARNING` immediately**. It does not proceed to Step 4 (`dism /Export-Image`), Step 5 (partition work), Step 6 (deployment), or any `reagentc` call. This is the v44 patch 1 pipeline gate.
 
-The gate exists because a WIM with no OEM or VMD drivers is broken on hardware whose storage controller requires those drivers. On a VMD-based system the resulting WinRE cannot see the OS disk at all, and the deployed recovery environment is worse than useless — it is actively misleading. The state-write gate alone would not have prevented this: it stops the state file from recording the run, but does not prevent the deployment of the broken WIM. The explicit pipeline gate closes that gap.
+The gate exists because a WIM with no OEM or VMD drivers is broken on hardware whose storage controller requires those drivers. On a VMD-based system the resulting WinRE cannot see the OS disk at all, and the deployed recovery environment is worse than useless — it is actively misleading. The state-write gate alone would not have prevented this: it stops the state file from recording the run, but does not prevent the deployment of the broken WIM. The explicit pipeline gate closes that gap. This is a **Rule 1** protection in the terms of [`architecture.md`](architecture.md): the pipeline refuses to deploy a recovery environment that cannot see the OS disk, rather than deploying it and reporting a warning afterwards.
 
 **What the gate does:**
 
@@ -293,11 +295,13 @@ The gate exists because a WIM with no OEM or VMD drivers is broken on hardware w
 
 The machine is left exactly as it was before the run — WinRE is still in whatever state it started, the recovery partition is untouched, and the next scheduled run retries from Step 2 with a clean `WorkDir`.
 
+**Related to Rule 4 (prepare everything before touching anything).** The pipeline gate is the operational enforcement of Rule 4 at the injection boundary. Every driver artifact is prepared, verified, and injected into the mounted image **before** the destructive sequence begins. A failure at any point in the preparation phase stops the run in a state where the machine's existing recovery route is untouched. Rule 4's guarantee — "the destructive sequence is only reachable through a chain of successful preparations" — is what makes the pipeline gate a clean stop rather than an emergency rollback.
+
 **Related to ResetBase (v44 patch 2).** Component cleanup and ResetBase run inside Step 3, after injection, but only when `$Script:ImageInjectionComplete` is `$true`. When injection fails, ResetBase is skipped — the pipeline aborts before that point, so running the reset would only waste CPU on an image whose driver state is already invalid.
 
 **Related to the offline fallback (v44 patch 5).** When the manifest fetch fails and the offline fallback engages, the entire driver-resolution pipeline is skipped: no OEM pack resolution, no VMD detection, no required-driver resolution, no download, no injection. The full-update path is not reachable offline. A machine on the offline fallback either takes the fast path (state file valid, all local safety checks pass) or exits `EXIT_WARNING` before the full-update pipeline. It never reaches Step 3. This is by design: the driver set is a function of the manifest, and without the manifest there is no safe way to determine which drivers to inject. A machine in this state does not lose its existing WinRE; it simply defers the injection work to a future run with network. See the "Offline behavior" section in [deployment.md](deployment.md) for the operator-facing description of the three cases.
 
-**Related to the VMD fail-closed guard (v44 patch 6).** When the VMD hardware presence check is indeterminate, the run defers with `EXIT_WARNING` **before** reaching Step 3. The full-update path is not reached. The machine is unchanged and the next run retries the enumeration.
+**Related to the VMD fail-closed guard (v44 patch 6).** When the VMD hardware presence check is indeterminate, the run defers with `EXIT_WARNING` **before** reaching Step 3. The full-update path is not reached. The machine is unchanged and the next run retries the enumeration. This is a **Rule 4** protection: the driver set is not guessed on indeterminate input.
 
 **Related to the VMD extraction cleanup (v44 patch 7).** The VMD injection path clears each extraction directory before extracting into it. Before patch 7, an interrupted previous run could leave INFs in `$WorkDir\drv_extract_<name>`, and those stale INFs could satisfy the INF-basename cross-reference or contribute to the third-party-driver-count delta, making a failed VMD extraction look like a success. The OEM path uses a single fixed extraction directory (`$WorkDir\oem_extract`) that was already cleared before each use; the VMD path did not, until patch 7. The Lenovo "non-zero exit but INFs present" branch on the OEM path was the sharpest case for this class of hazard: it treats an INF-count greater than zero as success regardless of the extractor's exit code, so a stale INF could hide a genuine extraction failure.
 
@@ -305,7 +309,8 @@ The machine is left exactly as it was before the run — WinRE is still in whate
 
 ## Related documents
 
-- [architecture.md](architecture.md) — where Step 3 fits in the pipeline, the "pipeline stops before deployment when injection fails" invariant, the offline fallback's effect on driver resolution, and the VMD fail-closed guard.
+- [architecture.md](architecture.md) — the four design invariants, the pipeline and where Step 3 fits in it, and the control-flow invariants that the injection gate and the VMD fail-closed guard enforce. The injection step is the deepest embodiment of Rule 4 and the sharpest instance of Rule 1.
 - [state-and-idempotency.md](state-and-idempotency.md) — how `ImageInjectionComplete` gates the state write and the checkpoint writes, the offline fallback's residual risk, and how the Lenovo five-state resolution feeds the `OEMPACK` field of the `DesiredStateId`.
+- [self-hosting.md](self-hosting.md) — how to host your own manifest and OEM maps if you do not want to rely on the maintainer's gists.
 - [troubleshooting.md](troubleshooting.md) — diagnosing injection failures and the VMD-query-indeterminate deferral.
 - [deployment.md](deployment.md) — the operator-facing description of offline behavior, including why an offline machine never reaches Step 3.

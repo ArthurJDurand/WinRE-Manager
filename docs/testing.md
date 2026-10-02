@@ -2,6 +2,11 @@
 
 `Test-WinRE.ps1` is WinRE Manager's read-only test harness. It shows you what the production script would see on a machine, without changing anything, so you can confirm the machine is in a state production can work with before you deploy. This document explains how to run it, what each menu option does, and what the results mean.
 
+The harness exists to serve the project's four design invariants, which [`architecture.md`](architecture.md) states in this order: **never break Windows RE**, **never leave a machine without a working recovery route**, **minimize the `reagentc /disable` → `reagentc /enable` window**, and **do no work unless needed; prepare everything before touching anything**. Two of those rules bear directly on the harness:
+
+- **Rule 4 — do no work unless needed.** A read-only diagnostic is the lowest-work thing anyone can do to a machine. The harness exists so that a field engineer or a fleet operator can answer "is this machine healthy?" and "what would production do?" without mounting a WIM, touching a partition, or making a `reagentc` call. Rule 4 is the reason the harness is a first-class tool in the project, not a debugger.
+- **Rule 1 — never break Windows RE.** The v45 and v46 destructive-path regression tests documented in this file exist to catch a regression before it reaches a fleet. A canary machine, a disposable VM, and a read-only harness are the three layers that make Rule 1 operational. The **post-deletion failure test** (gating) is the mechanism that will eventually close the one residual corner where Rule 2 — never leave a machine without a working recovery route — cannot be guaranteed.
+
 ## When to run the harness
 
 Run `Test-WinRE.ps1` in any of the following situations:
@@ -488,23 +493,22 @@ The v46 patch 1 cycle added two physical-hardware exercises on top of the VM run
 
 **The plan-rejection check has been exercised in the rejecting case.** The Lenovo IdeaPad 3 15IAU7 that motivated v46 patch 1 took the v45 patch 1 pipeline on physical hardware and the post-delete geometry check in `Ensure-AdequateRecoveryPartition` (`$plannedEnd -gt ($diskSizeNow - 1MB)`) correctly rejected the plan: `Get-PartitionPlan` had computed `tailEnd` from a factory-provided partition ending exactly 1 MiB past the disk-end reserve, `AlignedManagedExtentEnd` landed 1 MiB past the reserve, and the post-delete check refused to proceed. The machine fell into OS-fallback with a state file that matched the failing `DesiredStateId`, so subsequent scheduled runs accepted the state and did not retry — the machine stayed in OS-fallback until an operator manually deleted the state file. Under v46 patch 1's clamp the same layout produces a valid plan; the second full-update run (after the state-file reset) reached `DEDICATED`. This is the first physical-hardware failure of the v45 destructive path, and the first time the post-delete check fired outside a test harness.
 
-The tests below split into two groups. The seven listed under "Paths that need coverage" are **recommended regression tests** — the shrink-first reorder closed the v44 residual for the shrink trigger, so these test behavior that is now expected to be safe, not a gate on shipping. The eighth test — "The post-deletion failure test" — exercises the one residual corner the project has not closed. It is a **gating test**: no future change to the post-deletion segment of `Ensure-AdequateRecoveryPartition` should ship until it has been run and its result recorded. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the gate's scope.
+### v46 patch 2 hardenings (inside the post-deletion gate)
 
-See the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries and [architecture.md](architecture.md).
+The v46 patch 2 cycle added four post-review hardenings of `Ensure-AdequateRecoveryPartition`. Per [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-remaining-gated-scope), they sit **inside** the post-deletion gate — no future change to the post-deletion segment of the destructive sequence should ship until the post-deletion failure test below runs and its result is recorded. The four hardenings:
 
-### Paths that need coverage
+- **Pre-deletion resolver guard.** Refuses the destructive sequence when WinRE was `Enabled` and its registered location cannot be resolved to a partition. Fires after `reagentc /disable`, before any partition deletion.
+- **Extension-fallback bucket cap.** Caps the extension-failure fallback at the plan's bucket size, not the full remaining extent, preserving the 2 GiB managed-recovery ceiling.
+- **Layout-assertion fail-closed branch.** `Assert-RecoveryPartitionLayout` returns `$false` when `Get-OSPartition` returns nothing, rather than skipping the C: adjacency check.
+- **Deletion-failure partial-rollback reporting.** The deletion-failure branch captures the `Restore-OSPartitionSize` and `Restore-PreviousWinRERoute` results separately, and reports a distinct reason when the route is restored but C: geometry is not verified.
 
-- **Pre-shrink failure.** All three shrink attempts fail; the script restores C: to its recorded original size, returns `Deferred` with `RetrySuppressible = $true`, preserves the existing route, and writes the deferral marker.
-- **Post-delete extension failure.** The plan calls for extension into the freed space; the extension fails after three tries; the safe fallback places the recovery partition at the current C: end, sets `$Script:nonFatalWarning`, and continues with WinRE deployable. If the fallback size is too small, C: is restored and the function returns `$null`.
-- **Whole-layout assertion.** `New-Partition` returns success but the actual geometry does not match the plan (wrong offset, wrong size, overlap, or a trailing extent that exceeds one alignment block); `Assert-RecoveryPartitionLayout` fires, `Remove-OrphanPartition` deletes the newly created partition, and the function returns `$null`.
-- **Deletion-failure route restoration.** A deletion fails mid-loop while WinRE is disabled; the script restores C: to its original size, calls `Restore-PreviousWinRERoute`, and either returns `Deferred` (route restored) or `$null` (route not restorable). `Test-WinRELocationMatches` handles the GLOBALROOT-vs-Volume-GUID form difference.
-- **Plan validation edge cases.** Each rejected layout (blocking non-recovery partition after C:, non-contiguous recovery partition, recovery-typed partition over 2 GiB, cross-disk inventory, insufficient aligned space) returns `Deferred` without touching WinRE or any partition.
-- **Deferral marker lifecycle.** The marker is written on a retry-suppressible deferral; a subsequent run honors it while the route is functional and does not repeat the pre-shrink retries; a run where the fast path would fire clears the marker and exits `EXIT_SUCCESS`; a `DesiredStateId` change clears the marker on read.
-- **MBR support.** The destructive path on an MBR disk uses `-MbrType 0x27` at creation and `set id=27` in `Set-RecoveryPartitionAttributes`. The MBR attribute-application branch was exercised on a Win10 MBR VM (2026-10-02 09:41, reuse path); the MBR destructive path has not been exercised on any storage.
+**None of the four has been exercised in the field.** They were code-review hardenings in the v46 patch 2 cycle, not field-driven fixes. They are covered by parser and mocked-geometry tests, and by the same post-deletion failure test that gates the rest of the post-deletion segment. When that test runs, its recorded result must list which of the four hardenings it exercised and which it did not; that is the right moment to revisit the gate's scope.
 
 ### The post-deletion failure test (gating)
 
 This test exercises the one residual corner the project has not closed: a failure of `New-Partition` or `Format-Volume` **after** the existing recovery partition has been deleted, on a machine whose C: is encrypted, with no successful retry. In that corner, `Remove-OrphanPartition` cleans up the newly created partition, `Restore-OSPartitionSize` restores C:'s geometry, the run falls through to OS-fallback, and the OS-fallback gate defers because C: is encrypted. The machine ends with neither a dedicated recovery partition nor OS-fallback.
+
+The corner is the one place where **Rule 1 (never break Windows RE)** and **Rule 2 (never leave a machine without a working recovery route)** conflict. Rule 2 cannot be *guaranteed* in this case; it holds in the two ordinary cases (the destructive attempt succeeds, or it fails before deletion), but a post-deletion failure on an encrypted-C: machine reaches the corner. The v45 shrink-first reorder narrowed the trigger set — a shrink failure no longer reaches the corner because the shrink runs before deletion — but the corner itself is not closed. Closing it is the eventual post-failure check, gated on this test.
 
 The corner is documented in the `[v45 patch 1]` CHANGELOG entry, in [troubleshooting.md](troubleshooting.md) under "The OS-fallback route deferred because C: is encrypted", and in [architecture.md](architecture.md) as the residual failure mode the eventual post-failure check will close. **No future change to the post-deletion segment of `Ensure-AdequateRecoveryPartition` should ship until this test has been run and its result recorded.** See [CONTRIBUTING.md](../CONTRIBUTING.md) for the scope of the gate.
 
@@ -574,6 +578,18 @@ In both cases, `Restore-OSPartitionSize` runs after the failure and restores C: 
 
 **If the failure injection does not reach the corner** — the run succeeds despite the injection, or fails earlier in the pipeline — the injection was not effective at the intended failure point. Adjust the injection and re-run.
 
+### Paths that need coverage
+
+- **Pre-shrink failure.** All three shrink attempts fail; the script restores C: to its recorded original size, returns `Deferred` with `RetrySuppressible = $true`, preserves the existing route, and writes the deferral marker.
+- **Post-delete extension failure.** The plan calls for extension into the freed space; the extension fails after three tries; the safe fallback places the recovery partition at the current C: end, sets `$Script:nonFatalWarning`, and continues with WinRE deployable. If the fallback size is too small, C: is restored and the function returns `$null`.
+- **Whole-layout assertion.** `New-Partition` returns success but the actual geometry does not match the plan (wrong offset, wrong size, overlap, or a trailing extent that exceeds one alignment block); `Assert-RecoveryPartitionLayout` fires, `Remove-OrphanPartition` deletes the newly created partition, and the function returns `$null`.
+- **Deletion-failure route restoration.** A deletion fails mid-loop while WinRE is disabled; the script restores C: to its original size, calls `Restore-PreviousWinRERoute`, and either returns `Deferred` (route restored) or `$null` (route not restorable). `Test-WinRELocationMatches` handles the GLOBALROOT-vs-Volume-GUID form difference.
+- **Plan validation edge cases.** Each rejected layout (blocking non-recovery partition after C:, non-contiguous recovery partition, recovery-typed partition over 2 GiB, cross-disk inventory, insufficient aligned space) returns `Deferred` without touching WinRE or any partition.
+- **Deferral marker lifecycle.** The marker is written on a retry-suppressible deferral; a subsequent run honors it while the route is functional and does not repeat the pre-shrink retries; a run where the fast path would fire clears the marker and exits `EXIT_SUCCESS`; a `DesiredStateId` change clears the marker on read.
+- **MBR support.** The destructive path on an MBR disk uses `-MbrType 0x27` at creation and `set id=27` in `Set-RecoveryPartitionAttributes`. The MBR attribute-application branch was exercised on a Win10 MBR VM (2026-10-02 09:41, reuse path); the MBR destructive path has not been exercised on any storage.
+
+Each of these tests exists to protect a specific invariant from `architecture.md`. The pre-shrink and deletion-failure tests are direct exercises of **Rule 2** — a failing pre-shrink must leave the old recovery route intact, and a failing deletion must attempt to restore it. The whole-layout assertion and the plan-validation edge cases are **Rule 1** tests — the destructive sequence must refuse to proceed on a layout it cannot prove safe. The deferral marker lifecycle is a **Rule 4** test — the marker is the mechanism by which "do no work unless needed" is enforced across a run that has deferred. The MBR test confirms **Rule 1** on a partition style that has not yet seen a field exercise.
+
 ### How to run these tests
 
 Each test needs a different starting state. Use a snapshot-restorable VM; the destructive path is only safe in a disposable context.
@@ -617,9 +633,10 @@ Do not add tests that modify the machine's state. The harness's contract with th
 
 ## Related documents
 
+- [architecture.md](architecture.md) — the four design invariants, the control-flow invariants, the wrong-question narrative, and the sequencing-pattern note that the v45 reorder is the first instance of. The gating post-deletion test exists to close the one corner where Rule 2 cannot be guaranteed.
+- [CONTRIBUTING.md](../CONTRIBUTING.md) — the four-bullet requirement for any PR that touches the destructive sequence, and the scope of the post-deletion gate that this document's gating test unblocks.
 - [troubleshooting.md](troubleshooting.md) — how to use the diagnostic output to diagnose a failure, including the BitLocker hazard, VMD-query-indeterminate, and target-partition recovery procedures, plus the compound signature of the post-deletion corner.
+- [deployment.md](deployment.md) — the deployment-time translation of the four invariants, the Audit Mode precondition for production deployment, and the one-instance-per-machine program lock.
 - [driver-injection.md](driver-injection.md) — what the injection tests are actually testing.
-- [deployment.md](deployment.md) — the Audit Mode precondition for production deployment and the one-instance-per-machine program lock.
 - [state-and-idempotency.md](state-and-idempotency.md) — the `DesiredStateId` composition that Option S recomputes, the deferral marker's relationship to the deployment identity, and the offline fallback's residual risk.
 - [recovery-partition.md](recovery-partition.md) — the full partition lifecycle that the v45 destructive-path regression tests exercise.
-- [architecture.md](architecture.md) — the invariant list, the wrong-question narrative, and the sequencing-pattern note that the v45 reorder is the first instance of.

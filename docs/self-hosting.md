@@ -2,6 +2,8 @@
 
 WinRE Manager depends on five external artifacts that are hosted on GitHub by the project maintainer. All five can be replaced with self-hosted equivalents. This document explains the trust model, walks through each artifact, and gives the exact edit needed to point the scripts at your own hosting.
 
+Self-hosting matters to the project's design for a specific reason. [`docs/architecture.md`](architecture.md) opens with four design invariants — *never break Windows RE*, *never leave a machine without a working recovery route*, *minimize the `reagentc /disable` → `reagentc /enable` window*, and *do no work unless needed; prepare everything before touching anything*. The **third** invariant is enforced by the script's own ordering, not by anything external. The **fourth** invariant is where self-hosting enters the picture: "prepare everything before touching anything" means the driver manifest, the OEM maps, and the base WIM must all be reachable and trustworthy **before** the destructive sequence begins. If your fleet's network cannot reach the maintainer's gists, or your security policy does not extend trust to third-party content hosted outside your perimeter, the fourth invariant is not satisfied by the shipped default. Self-hosting is the fix. See [`docs/deployment.md`](deployment.md#design-invariants-at-deployment-time) for how the four rules translate into operational guidance for a fleet operator.
+
 ## Do you need to self-host?
 
 | Situation | Recommendation |
@@ -172,7 +174,8 @@ None of these are part of the shipped design. Adding them is a fork-level change
 
 ## Related documents
 
+- [architecture.md](architecture.md) — the four design invariants, the enforcement tables, and the reasoning behind each. The fourth invariant is the one this document serves.
+- [deployment.md](deployment.md) — the operator-facing deployment story, including the deployment-time translation of the four invariants and the exit-code matrix for a fleet.
 - [driver-injection.md](driver-injection.md) — the manifest and map schemas that a self-hosted deployment must conform to.
-- [deployment.md](deployment.md) — the operator-facing deployment story, including the exit-code matrix for a fleet.
 - [state-and-idempotency.md](state-and-idempotency.md) — the `DesiredStateId` inputs, including which of the artifacts above are DSI inputs and which are not.
 - [testing.md](testing.md) — how to validate a self-hosted configuration with the read-only harness before pushing it to a fleet.
