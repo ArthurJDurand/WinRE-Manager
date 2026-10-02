@@ -3,13 +3,60 @@
 > Rebuild broken Windows recovery environments — on one machine, or ten thousand.
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207.x-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
-[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue.svg)]()
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
+[![Version](https://img.shields.io/badge/version-v46%20patch%202-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ArthurJDurand)
 
 📖 **[Full documentation →](https://ArthurJDurand.github.io/WinRE-Manager/)**
 
-WinRE Manager repairs the Windows Recovery Environment (WinRE) on Windows 10 and 11. It services `winre.wim`, injects OEM and Intel VMD storage drivers, verifies the registered recovery route, and maintains a correctly sized recovery partition. Safe to re-run: healthy machines take an idempotent fast path and exit in under a second.
+WinRE Manager is a self-healing Windows Recovery Environment manager for Windows 10 and 11. It repairs and maintains the Windows Recovery Environment (WinRE / Windows RE): it services `winre.wim`, injects OEM and Intel VMD storage drivers, verifies the registered recovery route, and maintains a correctly sized recovery partition. It runs on one machine, or as a scheduled SYSTEM task across a managed fleet. Safe to re-run — healthy machines take an idempotent fast path and exit in under a second.
+
+If you landed here searching for **"fix Windows RE"**, **"fix Windows Recovery Environment"**, **"WinRE is not enabled"**, **"Windows RE is disabled"**, **"Unable to reset, no recovery image"**, **"recovery image not found"**, or **"`reagentc /enable` failed with `0x4c7`"**, jump to [What it handles](#what-it-handles).
+
+## Who it's for
+
+Two audiences. Both drive the same control flow.
+
+```mermaid
+flowchart TD
+    Start["Windows 10 / 11 machine<br/>with a broken or missing<br/>recovery environment"]
+
+    Start --> Who{"Who is running<br/>WinRE Manager?"}
+
+    Who -->|"Single-machine user"| Single["One-off repair<br/>on your own laptop"]
+    Who -->|"IT admin / sysadmin"| Fleet["Scheduled deployment<br/>across a fleet"]
+
+    Single --> RunOne["Run WinRE.ps1 elevated, once"]
+    Fleet --> RunFleet["Deploy as a SYSTEM<br/>scheduled task<br/>(or via Intune / RMM)"]
+
+    RunOne --> Flow["Same control flow<br/>on every machine"]
+    RunFleet --> Flow
+
+    Flow --> Fast{"What does the<br/>script find?"}
+    Fast -->|"Nothing to fix"| FP["Fast path<br/>exits in seconds"]
+    Fast -->|"WinRE registered, disabled"| EO["Enable-only repair"]
+    Fast -->|"WinRE missing or broken"| FU["Full update<br/>plan · shrink · rebuild · deploy"]
+
+    FP --> End["DEDICATED WinRE<br/>on a dedicated recovery partition"]
+    EO --> End
+    FU --> End
+
+    Fleet -.->|"optional"| SH["Self-hosting"]
+    SH --> SH1["Own driver manifest"]
+    SH --> SH2["Own OEM driver maps"]
+    SH --> SH3["Own base WIM repository"]
+
+    style Start fill:#1f6feb,stroke:#1f6feb,color:#fff
+    style End fill:#238636,stroke:#238636,color:#fff
+    style SH fill:#8957e5,stroke:#8957e5,color:#fff
+```
+
+| You are | Start here |
+|---|---|
+| **A single-machine user**, repairing your own laptop | [Start safely](#start-safely) below |
+| **An IT admin or sysadmin**, deploying to a managed fleet | [`docs/deployment.md`](docs/deployment.md) |
+| **An MSP or sysadmin hosting your own inputs** | [`docs/self-hosting.md`](docs/self-hosting.md) |
 
 ## Start safely
 
@@ -35,12 +82,15 @@ Fleet deployment: run `WinRE.ps1` as `NT AUTHORITY\SYSTEM` on a scheduled task t
 | You are seeing | What WinRE Manager does |
 |---|---|
 | **"Could not find the recovery environment"** on Startup Repair, or `reagentc` registered to the wrong location | Classifies the current route, services a fresh image, restores registration |
+| **"Unable to reset, no recovery image" / "Recovery image not found"** | Rebuilds the WIM from a known-good base, injects OEM and VMD drivers, re-deploys the image |
 | **Recovery partition too small** after a Windows Update | Sizes the replacement from the actual serviced WIM plus the Microsoft 250 MiB servicing margin |
+| **A missing or undersized recovery partition** | Plans the geometry, shrinks C: minimally, replaces the partition with a correctly sized one |
 | **`reagentc /enable` fails** with *"cannot be enabled on a volume with BitLocker Drive Encryption"* | Decrypts the target volume in place if Device Encryption claimed it; never modifies C:'s state |
 | **`reagentc /enable` fails with `0x4c7`** (`ERROR_CANCELLED`) | Defers; retries after OOBE completes. Audit Mode, OOBE, and sysprep block `/enable` regardless of WIM correctness |
 | **WinRE cannot see the storage controller** (missing OEM WinPE pack or Intel VMD driver) | Injects applicable drivers, verified by INF-basename cross-reference and third-party driver delta |
 | **Hardware or deployment inputs changed** (CPU swap, BIOS VMD flip, Windows build change) | Recomputes `DesiredStateId` and rebuilds the WIM against the new inputs |
 | **A stray recovery partition exists on a secondary disk** | Removes type-coded recovery partitions from non-OS disks, enforcing one recovery partition per machine |
+| **An OEM factory-restore volume carrying the recovery type code** | Recovery-typed partitions over 2 GiB are preserved for operator review — never deleted, never reused |
 
 ## See it in action
 
@@ -99,11 +149,13 @@ That machine is in a healthy `DEDICATED` end state. Production takes the fast pa
 - **Workspace selection is restricted to fixed NTFS volumes on internal/virtual buses.** USB, SD/MMC, network, FireWire, Fibre Channel, unknown-bus disks, and reparse-point workspace paths are excluded.
 - **Servicing requires 3 GiB free.** Resuming a verified optimized WIM requires 200 MiB.
 - **Stale workspace cleanup is scoped to the script's own `X:\Temp\WinREWork` directories** on eligible internal volumes. User files elsewhere are not touched.
-- **Partition geometry is planned read-only before any change.** Non-contiguous or uncertain layouts defer rather than being guessed at.
+- **Partition geometry is planned read-only before any change.** Non-contiguous or uncertain layouts defer rather than being guessed at. The plan clamps to the disk-end reserve and enforces a 2 GiB ceiling on managed recovery partitions.
 - **The pre-shrink runs before WinRE is disabled and before any recovery partition is deleted.** Its immediate, sleep, and defrag retries all happen in the reversible window. If the shrink fails, the old route is preserved and the run defers.
 - **C: is never expanded to `SizeMax` to stage a replacement.** Failed-shrink recovery targets the exact pre-attempt size.
 - **Recovery-typed partitions larger than 2 GiB are preserved** for operator review; they are neither reused nor deleted.
 - **A deferral marker suppresses identical retries** while the old route is verified healthy and no fast-path exit is available. If the machine converges on its own, the marker is cleared automatically.
+- **Fail-closed on the destructive sequence.** If the active WinRE route cannot be resolved to a partition, or the OS partition cannot be resolved for the layout assertion, the sequence stops before touching the disk.
+- **C:'s BitLocker state is never changed by the script.** WinRE is prepared on its *target* volume; the OS volume is only ever read.
 
 **Known limitation — destructive failure after deletion on encrypted C:.** In v45 the pre-shrink is outside the destructive window, so a shrink failure no longer reaches this corner. A failure of `New-Partition` or `Format-Volume` **after** the old recovery partition has already been deleted, on a machine whose C: is encrypted, can still leave the machine with neither a dedicated recovery partition nor OS-fallback — the OS-fallback gate refuses on encrypted C:. The correct fix is a post-failure check in the post-deletion segment, tracked for a future patch. The corner has not been exercised in the field. See [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
@@ -144,7 +196,7 @@ Full matrix and orchestration policy in [`docs/exit-codes.md`](docs/exit-codes.m
 
 The v46 patch 1 `ScriptVersion` bump (45 → 46) changes the `DesiredStateId`, so every managed machine performs one full update on its next scheduled run, then returns to the fast path. v46 patch 2 is patch-level only and does not change the `DesiredStateId`; a machine already on v46 patch 1 stays on the fast path. The v46 patch 1 bump clears the OS-fallback state on machines that the v45 plan bug left in the failing branch. See the migration notes in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Field-test status.** The v46 plan-clamp fix is verified on physical hardware — a Lenovo IdeaPad 3 15IAU7 whose factory layout placed a partition 1 MiB past the disk-end reserve was the motivating v45 failure, and the same machine reached `DEDICATED` under v46 patch 1 after the state file was reset. Clean-path verification of the destructive pipeline under v46 patch 1 is on record for the Dell Latitude 3540 and the HP EliteBook 6 G1i 16". The v46 patch 2 build-drift log lines and the guarded `Get-RecoveryPartitions` read are verified on the HP EliteBook 8 G1i 16". The v46-specific *failure* paths — post-delete extension fallback, all ten deferral reasons, the fail-closed C: volume-read refuse branch, the shrink retry branches, and the post-deletion failure corner — are covered by parser and mocked-geometry tests but have not been exercised on physical hardware. Canary and use a disposable VM for destructive end-to-end testing before broad rollout.
+**Field-test status.** The v46 plan-clamp fix is verified on physical hardware — a Lenovo IdeaPad 3 15IAU7 whose factory layout placed a partition 1 MiB past the disk-end reserve was the motivating v45 failure, and the same machine reached `DEDICATED` under v46 patch 1 after the state file was reset. Clean-path verification of the destructive pipeline under v46 patch 1 is on record for the Dell Latitude 3540 and the HP EliteBook 6 G1i 16". The v46 patch 2 build-drift log lines and the guarded `Get-RecoveryPartitions` read are verified on the HP EliteBook 8 G1i 16". The v46-specific *failure* paths — post-delete extension fallback, the pre-shrink deferrals, the fail-closed C: volume-read refuse branch, the shrink retry branches, and the post-deletion failure corner — are covered by parser and mocked-geometry tests but have not been exercised on physical hardware. Canary and use a disposable VM for destructive end-to-end testing before broad rollout.
 
 ## Field-tested hardware
 

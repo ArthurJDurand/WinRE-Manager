@@ -13,7 +13,11 @@
             - Dedicated WinRE is primary. OS-fallback requires C: FullyDecrypted.
                 Prepare the target before reagentc; never change C:'s BitLocker state.
             - Only type-coded recovery partitions qualify for reuse/deletion.
-                Partitions over 2 GiB are preserved for operator review.
+                Partitions over 2 GiB are preserved for operator review. The
+                post-delete extension-failure fallback preserves this ceiling:
+                it sizes the replacement partition to the planned bucket, not
+                to the full remaining extent, and logs any trailing
+                unallocated extent explicitly.
             - Read-only geometry planning precedes partition changes. C: is resized
                 to end where the recovery partition begins; the recovery partition
                 fills the aligned extent up to that boundary. The plan clamps the
@@ -24,6 +28,16 @@
                 targets the original C: size, never SizeMax.
             - Pre-shrink deferral preserves the old route. Its sidecar marker only
                 suppresses retries while that route and its registered WIM are valid.
+            - The destructive sequence fails closed before deletion if the active
+                WinRE route is Enabled but its registered location cannot be
+                resolved to a partition. Delete-last ordering and route
+                restoration both depend on identifying the active target;
+                without it, no partition is protected and a mid-loop failure
+                could leave the machine with no working recovery route.
+            - The whole-layout assertion fails closed when the OS partition cannot
+                be resolved, rather than skipping the C: adjacency check. A layout
+                that cannot be verified against C: is not accepted; the assertion
+                is the last check before Format-Volume.
             - Checkpoint advancement requires successful injection. Step 4 records
                 WIM_READY before base.wim cleanup; partition/deploy work is not resumed.
             - Scratch uses fixed NTFS volumes on allowlisted internal/virtual buses.
@@ -874,7 +888,14 @@ function Assert-RecoveryPartitionLayout {
             return $false
         }
         $osPart = Get-OSPartition
-        if ($osPart -and $osPart.DiskNumber -eq $DiskNumber) {
+        if (-not $osPart) {
+            # The OS partition could not be resolved. Fail closed rather
+            # than skip the C: adjacency check: a layout that cannot be
+            # verified against C: must not be accepted.
+            Write-Log "Assert-RecoveryPartitionLayout: could not resolve the OS partition; refusing to accept the layout without the C: adjacency check" -Level ERROR
+            return $false
+        }
+        if ($osPart.DiskNumber -eq $DiskNumber) {
             $osEnd = [int64]$osPart.Offset + [int64]$osPart.Size
             if ($osEnd -gt [int64]$part.Offset) {
                 Write-Log "Assert-RecoveryPartitionLayout: OS partition end $([math]::Round($osEnd/1MB,2)) MiB overlaps recovery start $([math]::Round($part.Offset/1MB,2)) MiB" -Level ERROR
@@ -1427,6 +1448,18 @@ function Ensure-AdequateRecoveryPartition {
     $activePartForInventory = $null
     if ($stateBefore.Location) {
         $activePartForInventory = Resolve-WinRELocationToPartition -Location $stateBefore.Location
+        if (-not $activePartForInventory -and $stateBefore.Status -eq "Enabled") {
+            # The active WinRE route is Enabled, but its registered location
+            # could not be resolved to a partition. Delete-last ordering
+            # depends on knowing which partition is active so the previous
+            # route's target survives a mid-loop failure; without it, no
+            # partition is protected, and Restore-PreviousWinRERoute has no
+            # target to re-enable if a later deletion fails. Defer before
+            # any destructive change rather than proceeding without that
+            # protection.
+            Write-Log "WinRE is Enabled but its registered location ($($stateBefore.Location)) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made." -Level ERROR
+            return @{ Status = "Deferred"; Reason = "active WinRE location could not be resolved" }
+        }
     }
     foreach ($rp in $deletableParts) {
         $rpLabel = "(no label)"
@@ -1499,12 +1532,17 @@ function Ensure-AdequateRecoveryPartition {
         $stillThere = Get-Partition -DiskNumber $rp.DiskNumber -PartitionNumber $rp.PartitionNumber -ErrorAction SilentlyContinue
         if ($stillThere) {
             Write-Log "FATAL: recovery partition $($rp.DiskNumber)/$($rp.PartitionNumber) could not be deleted" -Level ERROR
-            Restore-OSPartitionSize -Reason "recovery partition deletion failure" -TargetSizeBytes $initialOSSize | Out-Null
+            $sizeRestoreOk = Restore-OSPartitionSize -Reason "recovery partition deletion failure" -TargetSizeBytes $initialOSSize
             # WinRE was disabled earlier in this routine. The active
             # partition (deleted last) is still present, so the previous
             # route may be restorable. Attempt it before returning.
-            if (Restore-PreviousWinRERoute -PreviousState $stateBefore) {
+            $routeRestoreOk = Restore-PreviousWinRERoute -PreviousState $stateBefore
+            if ($routeRestoreOk -and $sizeRestoreOk) {
                 return @{ Status = "Deferred"; Reason = "recovery partition deletion failed; previous route restored" }
+            }
+            if ($routeRestoreOk -and -not $sizeRestoreOk) {
+                Write-Log "Recovery partition deletion failed and the previous WinRE route was restored, but C: could not be verified at its original size. The geometry-restore flag is set; the state file will be invalidated so the next run retries from clean. Report this as a partial rollback." -Level ERROR
+                return @{ Status = "Deferred"; Reason = "recovery partition deletion failed; previous route restored but C: geometry restore unverified" }
             }
             Write-Log "Previous WinRE route could not be restored after deletion failure; WinRE will remain disabled until the next run or manual intervention" -Level ERROR
             return $null
@@ -1540,12 +1578,26 @@ function Ensure-AdequateRecoveryPartition {
                     $fallbackEnd = [int64]$plan.AlignedManagedExtentEnd
                     $fallbackSize = [int64]($fallbackEnd - $fallbackStart)
                     if ($fallbackSize -ge $plan.PlannedPartitionSize) {
-                        Write-Log "Extension-failure fallback: creating recovery partition at $([math]::Round($fallbackStart/1MB,3)) MiB with size $([math]::Round($fallbackSize/1MB,3)) MiB (no trailing gap; the C: extension was not performed)"
+                        # Create only the planned bucket size; the remainder
+                        # between the new partition's end and the aligned
+                        # managed extent end is an explicitly logged trailing
+                        # unallocated extent. It is not assigned to the
+                        # recovery partition, because doing so could exceed
+                        # the 2 GiB managed-recovery ceiling when the plan
+                        # reclaimed multiple recovery partitions whose
+                        # combined size exceeds the bucket. Exact-fit
+                        # geometry is preferred when the C: extension
+                        # succeeds; when it fails, a correctly sized WinRE
+                        # partition takes precedence over consuming the
+                        # residual space.
+                        $fallbackTrailingExtent = [int64]($fallbackEnd - ($fallbackStart + $plan.PlannedPartitionSize))
+                        Write-Log "Extension-failure fallback: creating recovery partition at $([math]::Round($fallbackStart/1MB,3)) MiB with size $([math]::Round($plan.PlannedPartitionSize/1MB,3)) MiB (bucket size, not full extent; $([math]::Round($fallbackTrailingExtent/1MB,3)) MiB trailing unallocated extent will remain between the recovery partition end and the aligned managed extent end; the C: extension was not performed)"
                         $plan.PlannedOSPartitionSize = [int64]$fallbackOSPart.Size
                         $plan.PlannedOSPartitionEnd = $fallbackOSEnd
                         $plan.PlannedPartitionStart = $fallbackStart
-                        $plan.PlannedPartitionSize = $fallbackSize
-                        $plan.PlannedAvailableBytes = $fallbackSize
+                        # PlannedPartitionSize is left at the bucket size.
+                        $plan.PlannedAvailableBytes = $plan.PlannedPartitionSize
+                        $plan.FallbackTrailingExtentBytes = $fallbackTrailingExtent
                         $Script:nonFatalWarning = $true
                         $fallbackUsable = $true
                     } else {

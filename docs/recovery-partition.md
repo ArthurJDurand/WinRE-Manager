@@ -1,6 +1,6 @@
 # Recovery partition lifecycle
 
-This document covers how WinRE Manager decides what size a recovery partition should be, how it replaces one that is inadequate, and how it recovers if the destructive operations fail. The current design is the v45 patch 1 shrink-first pipeline, with the v46 patch 1 disk-end clamp applied to the geometry plan.
+This document covers how WinRE Manager decides what size a recovery partition should be, how it replaces one that is inadequate, and how it recovers if the destructive operations fail. The current design is the v45 patch 1 shrink-first pipeline, with the v46 patch 1 disk-end clamp applied to the geometry plan and the v46 patch 2 pre-deletion resolver guard and extension-fallback bucket cap applied to the destructive sequence.
 
 ## The invariant
 
@@ -74,6 +74,8 @@ The bucket size has an upper bound, `$MaxManagedRecoveryPartitionMiB = 2048`. Th
 The ceiling exists because Windows Setup and Windows in-place upgrade create recovery partitions under 1.5 GiB, while OEM factory recovery volumes — the Dell / HP / Lenovo image-restore volumes that hold the OEM's factory Windows image and utilities — can be 7–20 GiB and may carry the same recovery type code. Without the ceiling, the destructive path would delete an OEM volume, the reuse path would re-register WinRE against one, and the stray-cleanup path would delete one on a secondary disk.
 
 Until v45 patch 1, none of the three functions checked size. The `.NOTES` block in `scripts/WinRE.ps1` named all three in its "Known gaps" section. The v45 patch 1 implementation closes that gap.
+
+**The ceiling is also preserved by the extension-failure fallback (v46 patch 2).** When the post-delete C: extension fails, the fallback path sizes the replacement partition to the plan's bucket rather than to the full remaining extent — see step 5 below. Before v46 patch 2, the fallback assigned the entire remaining extent to the replacement partition, which on a layout that reclaimed multiple recovery partitions whose combined size exceeded the bucket could produce a partition larger than 2 GiB. The cap enforces the same ceiling on the fallback path that the plan already enforces everywhere else.
 
 Operators deploying to machines they did not image themselves should still run the harness Option 1 diagnostic and inspect the "Recovery partitions" section before proceeding. A recovery-typed partition larger than 2 GiB will now be preserved rather than acted on, but it is still worth knowing it is there — it may indicate an OEM factory recovery volume the operator wants to keep, or a layout that warrants manual review.
 
@@ -213,37 +215,57 @@ If WinRE is currently `Enabled`, `reagentc /disable` runs. The script then verif
 
 This step runs **after** the pre-shrink, in the reversible window's tail. If the disable fails, the script restores C: to its original size and calls `Restore-PreviousWinRERoute -PreviousState $stateBefore`. If the previous route is confirmed restored, the function returns `Deferred` with `Reason = "WinRE disable failed before deletion"` or `Reason = "WinRE disable verification failed before deletion"`. Otherwise it returns `$null` and the main flow falls through to OS-fallback. Neither deferral is retry-suppressed — the failure indicates a storage-level or OS-level condition, not a transient constraint.
 
+### 3a. Pre-deletion resolver guard (v46 patch 2)
+
+Immediately after the disable block and before the pre-deletion inventory, the script resolves the previously-active WinRE location to a partition. If WinRE was `Enabled` before the disable and the location cannot be resolved, the function returns `Deferred` with `Reason = "active WinRE location could not be resolved"`.
+
+The guard exists because both the delete-last ordering (step 4) and `Restore-PreviousWinRERoute` depend on knowing which partition is active. Without it, no partition is protected by delete-last ordering, and if a later deletion fails there is no target to re-enable — the machine could be left with no working recovery route. The guard is fail-closed: it refuses to begin the destructive sequence rather than proceed with an unprotected active route.
+
+The guard fires **after** `reagentc /disable` has already run, so a machine that reaches this deferral is left with WinRE `Disabled` and the old recovery partition intact. This is narrower than the pre-shrink deferrals, which leave the old route `Enabled`. A subsequent run sees WinRE `Disabled` and either re-registers the existing partition or — if the resolver still cannot map the location — hits the same guard. See [troubleshooting.md](troubleshooting.md) for the re-registration recovery procedure.
+
+`RetrySuppressible` is not set for this deferral — the condition requires operator action to resolve, and retrying would produce the same rejection.
+
+**Field status.** This guard is a v46 patch 2 code-review hardening. It has not been exercised in the field.
+
 ### 4. Delete existing recovery partitions (active last)
 
 For each type-coded recovery partition the plan marked as deletable — GPT GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27` — `Remove-Partition`. If that fails, retry with `diskpart delete partition override`.
 
-**Delete-active-last ordering.** The currently active recovery partition — the one `$stateBefore.Location` resolves to — is moved to the end of the deletion list. If a mid-loop failure occurs, the active partition is still present and `Restore-PreviousWinRERoute` can try to re-enable it.
+**Delete-active-last ordering.** The currently active recovery partition — the one `$stateBefore.Location` resolves to — is moved to the end of the deletion list. If a mid-loop failure occurs, the active partition is still present and `Restore-PreviousWinRERoute` can try to re-enable it. This ordering depends on the pre-deletion resolver guard (step 3a) having successfully identified the active partition; the guard exists precisely to ensure that ordering is meaningful.
 
 A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is **not** in this loop. The type-code gate is applied before the loop and again inside it, as a redundant check. A label-only match is logged with the message "Skipping label-only recovery match on disk N partition M: recovery label alone does not authorize deletion." and the loop continues.
 
-If a deletion fails, the script calls `Restore-OSPartitionSize -TargetSizeBytes $initialOSSize` and then `Restore-PreviousWinRERoute -PreviousState $stateBefore`. If the route is restored, the function returns `Deferred` with `Reason = "recovery partition deletion failed; previous route restored"`. Otherwise it returns `$null` and the main flow falls through to OS-fallback. Neither deferral is retry-suppressed.
+If a deletion fails, the script calls `Restore-OSPartitionSize -TargetSizeBytes $initialOSSize` and then `Restore-PreviousWinRERoute -PreviousState $stateBefore`, capturing both results separately (v46 patch 2). Three return shapes are possible:
+
+- **Both restores succeed** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored"`.
+- **Route restored, C: geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but C: geometry restore unverified"`, and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. This is a partial rollback and is reported honestly rather than being flattened into the success case.
+- **Route not restored** — `$null`, and the main flow falls through to OS-fallback. This is the post-deletion residual corner.
+
+None of the deletion-failure deferrals is retry-suppressed.
 
 ### 5. Post-delete extension
 
 If `ExtendBytes > 0`, the script now extends C: into the space the deleted recovery partitions occupied. `Invoke-OSPartitionExtend` runs three attempts with 5-second spacing between them.
 
-**Extension-failure safe fallback.** If all three attempts fail, the script does not fall through to OS-fallback. It re-queries C:'s actual end and computes:
+**Extension-failure safe fallback (v45 patch 1; capped at bucket size in v46 patch 2).** If all three attempts fail, the script does not fall through to OS-fallback. It re-queries C:'s actual end and computes:
 
 ```
 FallbackStart = ceil(ActualOSEnd / 1 MiB) × 1 MiB
 FallbackEnd   = AlignedManagedExtentEnd
-FallbackSize  = FallbackEnd - FallbackStart
+AvailableSize = FallbackEnd - FallbackStart
 ```
 
-If `FallbackSize >= Plan.PlannedPartitionSize`, the script places the recovery partition at `FallbackStart` with size `FallbackSize`, sets `$Script:nonFatalWarning = $true`, and continues. The machine ends with a working dedicated recovery partition and a slight geometric difference from the plan: the partition starts at the current C: end instead of the planned boundary, and the surplus space that would have gone to C: stays unallocated.
+If `AvailableSize >= Plan.PlannedPartitionSize`, the script places the recovery partition at `FallbackStart` with size `Plan.PlannedPartitionSize` — **the plan's bucket size, not `AvailableSize`** — sets `$Script:nonFatalWarning = $true`, and continues. The space between the new partition's end and `FallbackEnd` remains an intentional trailing unallocated extent, logged explicitly.
 
-If `FallbackSize < Plan.PlannedPartitionSize`, the script restores C: to its original size and returns `$null`, and the main flow falls through to OS-fallback.
+Before v46 patch 2 the fallback assigned the entire `AvailableSize` to the replacement partition, filling from `FallbackStart` to `FallbackEnd`. On a layout that reclaimed multiple recovery partitions whose combined size exceeded the bucket, that could produce a partition larger than the 2 GiB managed-recovery ceiling. The v46 patch 2 cap sizes the replacement partition to the plan's bucket and logs the residual as the trailing unallocated extent. The cap enforces the same ceiling on the fallback path that the plan already enforces everywhere else, at the cost of a slightly larger unallocated gap on the disk.
 
-The fallback exists because exact geometry is a goal, not a reason to leave WinRE disabled. A machine with a working dedicated recovery partition that starts at a slightly different offset is in a better state than a machine in OS-fallback, and it converges on the next full-update pass.
+If `AvailableSize < Plan.PlannedPartitionSize`, the script restores C: to its original size and returns `$null`, and the main flow falls through to OS-fallback.
+
+The fallback exists because exact geometry is a goal, not a reason to leave WinRE disabled. A machine with a working dedicated recovery partition that starts at a slightly different offset and carries a trailing unallocated extent is in a better state than a machine in OS-fallback, and it converges on the next full-update pass.
 
 ### 6. Create the new partition at the aligned boundary
 
-The new partition is created at `Plan.PlannedPartitionStart` with size `Plan.PlannedPartitionSize` — the exact values the plan computed and, where the pre-shrink ran, the values recomputed from the actual post-resize geometry. No rounding at creation time; the plan already aligned to 1 MiB.
+The new partition is created at `Plan.PlannedPartitionStart` with size `Plan.PlannedPartitionSize` — the exact values the plan computed and, where the pre-shrink ran, the values recomputed from the actual post-resize geometry. Where the extension-failure fallback ran, `PlannedPartitionStart` is the fallback start and `PlannedPartitionSize` remains the plan's bucket size. No rounding at creation time; the plan already aligned to 1 MiB.
 
 `New-Partition` is called with the recovery type code applied at creation: `-GptType {de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (GPT) or `-MbrType 0x27` (MBR). Before v43 patch 5, the partition was created as a Basic Data partition and its type was changed minutes later by `Set-RecoveryPartitionAttributes`. On a machine with Device Encryption actively encrypting, the encryption service could claim that Basic Data partition during the window and start encrypting it. Applying the recovery type at creation makes that window zero-width.
 
@@ -259,6 +281,8 @@ The new partition is created at `Plan.PlannedPartitionStart` with size `Plan.Pla
 - **No overlap with C:** — C:'s end is at or before the partition's start.
 - **C:-to-recovery gap within tolerance** — the gap between C:'s end and the partition's start is within one alignment block. A gap within tolerance is logged; a gap beyond tolerance is a fatal geometry mismatch.
 - **End at `AlignedManagedExtentEnd`** — the partition's end is within one alignment block of the aligned managed extent end. The same log-or-fail policy applies.
+
+**Fail-closed on an unresolvable OS partition (v46 patch 2).** Before the C:-adjacency checks, the assertion re-resolves the OS partition via `Get-OSPartition`. If that returns nothing, the assertion returns `$false` rather than skipping the adjacency check. The layout cannot be verified against C:, so it is not accepted. This is the last check before `Format-Volume`; failing closed here prevents a partition that cannot be validated against C: from being formatted and registered.
 
 On success, the script logs:
 
@@ -317,6 +341,8 @@ When the pre-shrink sequence (or the pre-flight geometry plan) returns `Deferred
 
 The marker's purpose is to suppress identical retries. A machine whose destructive replacement deferred because C: has insufficient free space will defer again the next run if the constraint has not been resolved. The marker records that fact so the next run can skip the same retries and exit cleanly with `EXIT_WARNING` rather than spending a full-update pass on a plan that will fail the same way.
 
+The marker is written only for `RetrySuppressible = $true` deferrals. The v46 patch 2 pre-deletion resolver deferral (`active WinRE location could not be resolved`) is not retry-suppressed: the condition requires operator action to resolve, and the machine is in a state (WinRE `Disabled` with the old partition intact) where the next run must re-evaluate the registration rather than skip. The same applies to the `WinRE disable failed before deletion` and `recovery partition deletion failed` deferrals.
+
 On each subsequent run, the marker is honored only when both of the following hold:
 
 - **The old route is verified functional.** `Test-DeferredWinRERouteFunctional` checks that WinRE is `Enabled`, the registered WIM is readable, and the active location is either a type-coded recovery partition on the OS disk or OS-fallback on a `FullyDecrypted` C:. If any of those conditions is not met, the marker is not honored.
@@ -343,7 +369,9 @@ The marker deletion clears the suppression record; the state-file deletion clear
 
 ## Restoring the previous route on deletion failure
 
-When a recovery partition deletion fails after WinRE has already been disabled, the previous route's target is the only one that can be re-enabled. Two mechanisms protect that outcome:
+When a recovery partition deletion fails after WinRE has already been disabled, the previous route's target is the only one that can be re-enabled. Three mechanisms protect that outcome:
+
+**Pre-deletion resolver guard (v46 patch 2).** Before any deletion begins, the script resolves the active WinRE location to a partition. If it cannot, the destructive sequence is refused — see step 3a above. Without the guard, the deletion loop would treat every deletable partition as non-active and could destroy the only partition the previous route could be re-enabled on.
 
 **Delete-active-last ordering.** The active partition — resolved from `$stateBefore.Location` — is moved to the end of the deletion loop. If a mid-loop failure occurs, the active partition is still present.
 
@@ -355,9 +383,11 @@ When a recovery partition deletion fails after WinRE has already been disabled, 
 4. If the previous target is a recovery partition, it calls `Set-RecoveryPartitionReadyForWinRE` to prepare the target. If preparation fails, it returns `$false`. Otherwise it re-enables via the dedicated-partition path.
 5. Confirms the now-Enabled WinRE location matches the previous location via `Test-WinRELocationMatches`.
 
-If the function returns `$true`, the main flow returns `Deferred` with the corresponding reason (`recovery partition deletion failed; previous route restored`) and the machine is left in a functional state — WinRE is `Enabled` on the same partition it was registered to before the run started.
+The deletion-failure branch captures the size-restore result and the route-restore result separately (v46 patch 2). The three return shapes are:
 
-If the function returns `$false`, the main flow returns `$null` with an ERROR log stating that the route could not be restored. The machine ends without a working recovery route, and manual intervention is required.
+- **Both restores succeed** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored"`. The machine is left in a functional state — WinRE is `Enabled` on the same partition it was registered to before the run started, and C: is at its original size.
+- **Route restored, C: geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but C: geometry restore unverified"`, and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. The partial rollback is reported as such; the previous code could report "previous route restored" while C: remained shrunken.
+- **Route not restored** — `$null` with an ERROR log stating that the route could not be restored. The machine ends without a working recovery route, and manual intervention is required.
 
 **`Test-WinRELocationMatches`.** reagentc may report the same volume in either the GLOBALROOT form (`\\?\GLOBALROOT\device\harddiskN\partitionM\`) or the Volume-GUID form (`\\?\Volume{guid}\`), and the form can change across a disable/enable cycle. The function compares the two locations by:
 
@@ -404,6 +434,8 @@ Every failure path sets:
 
 The four failure paths are: OS partition not found, resize threw an exception, post-resize verification failed, and (for the parameterless legacy call) `Get-PartitionSupportedSize` failed.
 
+The v46 patch 2 deletion-failure branch captures the helper's return value explicitly and propagates it into the deferral reason when the restore did not verify. A failed C: geometry restore after a deletion failure no longer reports as "previous route restored" while leaving C: shrunken; the state file is invalidated and the next run retries from clean.
+
 ## `Remove-OrphanPartition`
 
 A helper that deletes a partition the script created but could not complete. Used when `Format-Volume` fails, when drive-letter assignment fails after creating a partition, when the helper could not make a newly created partition unencrypted, and when `Assert-RecoveryPartitionLayout` fails.
@@ -442,6 +474,8 @@ A deletion failure sets `$Script:nonFatalWarning = $true` and returns `$false`.
 
 The function is called from the fast path, the enable-only path, both pending-reboot exits, and Step 7 of the full-update path. In every case the call is the same; the read-only scan cost when there are no strays is a single `Get-Disk` and a few `Get-Partition` calls per non-OS disk.
 
+**The `Get-RecoveryPartitions` reads are guarded against empty-disk errors (v46 patch 2).** Both `Get-Partition -DiskNumber $diskNum` calls carry `-ErrorAction SilentlyContinue`. On a machine with a disk that exposes no partitions — an SD/MMC card reader, an empty USB enclosure, a disk with no recognized partition table — the call would otherwise throw `CmdletizationQuery_NotFound_DiskNumber`. The error is non-terminating at the current call sites but pollutes the log on every run and would abort a caller wrapped in `-ErrorAction Stop`. The guard silences the throw only for disks that expose no partitions; behaviour on disks that do expose partitions is unchanged.
+
 ## GPT vs MBR
 
 The script handles both partition styles.
@@ -464,7 +498,9 @@ The script determines the style from `Get-OSDisk`'s `PartitionStyle` property an
 
 **Field coverage.** The v45 patch 1 GPT destructive path was exercised end-to-end on a disposable Hyper-V VM on 2026-10-02 08:56. The MBR attribute-application path (`set id=27` on an existing MBR partition) was exercised on a Win10 MBR VM on 2026-10-02 09:41. The MBR destructive path (`New-Partition -MbrType 0x27` at a planned offset) has not yet been exercised on any storage — the Win10 MBR VM run took the reuse path.
 
-The v46 patch 1 plan clamp has been exercised on physical hardware in both directions: the Lenovo IdeaPad 3 15IAU7 that motivated the fix (plan rejected pre-clamp, accepted post-clamp, reached DEDICATED after a state-file reset), and clean-path verification on a Dell Latitude 3540 and an HP EliteBook 6 G1i 16" whose layouts took the no-blocking-partition branch without triggering the clamp. See [architecture.md](architecture.md) for the full per-machine record.
+The v46 patch 1 plan clamp has been exercised on physical hardware in both directions: the Lenovo IdeaPad 3 15IAU7 that motivated the fix (plan rejected pre-clamp, accepted post-clamp, reached DEDICATED after a state-file reset), and clean-path verification on a Dell Latitude 3540 and an HP EliteBook 6 G1i 16" whose layouts took the no-blocking-partition branch without triggering the clamp.
+
+The v46 patch 2 pre-deletion resolver guard and the extension-fallback bucket cap are code-review hardenings. Neither has been exercised in the field. They remain gated on the same tests that gate the rest of the post-deletion segment, per [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Related documents
 

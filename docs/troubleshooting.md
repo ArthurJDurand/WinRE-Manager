@@ -35,7 +35,7 @@ One further check that runs early and can defer the run is the VMD hardware pres
 
 One classifier message that fires early, without stopping the run, is the label-only classifier WARN (v44 patch 7). When the active WinRE location resolves to a partition whose GPT type is not the recovery GUID and whose MBR type is not `0x27`, but whose volume label is `Recovery` or `WINRE`, the classifier logs a WARN and does **not** treat the partition as a recovery partition. See "The machine keeps rebuilding and never takes the fast path (label-only recovery partition)" below.
 
-One further class of deferrals was introduced in v45 patch 1: the pre-shrink deferrals from `Ensure-AdequateRecoveryPartition`. The function returns a `Deferred` result with a specific `Reason`, and when `RetrySuppressible = $true` the main flow writes the deferral sidecar at `C:\Recovery\OEM\winre_partition_deferred.json`. See "The destructive replacement was deferred before partition deletion" below for the full list of reasons and their resolutions.
+One further class of deferrals was introduced in v45 patch 1: the pre-shrink deferrals from `Ensure-AdequateRecoveryPartition`. The function returns a `Deferred` result with a specific `Reason`, and when `RetrySuppressible = $true` the main flow writes the deferral sidecar at `C:\Recovery\OEM\winre_partition_deferred.json`. v46 patch 2 added two further reasons to this set. See "The destructive replacement was deferred before partition deletion" below for the full list of reasons and their resolutions.
 
 ## The machine has no recovery partition and WinRE is disabled
 
@@ -223,9 +223,9 @@ Field case: **HP EliteBook 8 G1i 16 inch Notebook AI PC** with an SD/MMC card re
 
 **Is this a problem on a pre-v46-patch-2 build?** No. The error is cosmetic — the diagnostic continues after each occurrence, the machine state is not affected, and no decision the script makes depends on the missing partitions. The correct response, if you see it, is to note the disk number the error names (it is a disk with no partitions) and confirm the rest of the diagnostic is complete.
 
-## The destructive replacement was deferred before partition deletion (v45 patch 1)
+## The destructive replacement was deferred before partition deletion (v45 patch 1; v46 patch 2 added reasons)
 
-**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: the old recovery partition is still present, WinRE is still `Enabled` and registered to it, no partition was deleted, and the run did not attempt OS-fallback. The deferral is protective: the destructive sequence was about to run, the read-only plan or the pre-shrink check determined that it could not safely complete, and the script stepped back before destroying anything.
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: the old recovery partition is still present, no partition was deleted, and the run did not attempt OS-fallback. The deferral is protective: the destructive sequence was about to run, the read-only plan or the pre-shrink check determined that it could not safely complete, and the script stepped back before destroying anything. In one v46 patch 2 sub-case — the pre-deletion resolver guard — WinRE is left `Disabled` because `reagentc /disable` has already run; see "The active WinRE route could not be resolved to a partition" below. In every other reason, WinRE stays `Enabled` and registered to the old recovery partition.
 
 **Log signature.** The last lines of the run before exit are:
 
@@ -234,16 +234,19 @@ Field case: **HP EliteBook 8 G1i 16 inch Notebook AI PC** with an SD/MMC card re
 [WARN] Recorded retry-suppressing deferral for DesiredStateId <id>; next run will verify the existing route before skipping identical retries. Delete C:\Recovery\OEM\winre_state.json and C:\Recovery\OEM\winre_partition_deferred.json to force a retry.
 ```
 
-The most common `<Reason>` values are the following. Each has a distinct resolution. [exit-codes.md](exit-codes.md) carries the full list, including the internal failure reasons (`partition geometry unavailable`, `WinRE disable failed before deletion`, `WinRE disable verification failed before deletion`, and `recovery partition deletion failed; previous route restored`); those indicate storage-level or OS-level conditions rather than operator-actionable constraints, and are diagnosable from the surrounding log lines.
+The second line appears only when the deferral is retry-suppressible; the first appears for every reason.
 
-- **`Dedicated recovery partition plan rejected: <specific reason>. No partition or WinRE changes were made.`** — The read-only geometry plan rejected the layout. The `RetrySuppressible` flag is not set; the marker is not written. The nested `<specific reason>` is one of: cross-disk inventory, OS-partition overlap, recovery-typed partition over 2 GiB, recovery-typed partition preceding C:, non-contiguous recovery partition, `SizeMin` unavailable, bucket size invalid, or insufficient contiguous space after the planned resize.
+The most common `<Reason>` values are the following. Each has a distinct resolution. [exit-codes.md](exit-codes.md) carries the full list, including the internal failure reasons (`partition geometry unavailable`, `WinRE disable failed before deletion`, `WinRE disable verification failed before deletion`, `active WinRE location could not be resolved`, and the two `recovery partition deletion failed` variants); those indicate storage-level or OS-level conditions rather than operator-actionable constraints, and are diagnosable from the surrounding log lines.
+
+- **`Dedicated recovery partition plan rejected: <specific reason>. No partition or WinRE changes were made.`** — The read-only geometry plan rejected the layout. The `RetrySuppressible` flag is not set; the marker is not written. The nested `<specific reason>` is one of thirteen: the partition inventory contains entries from another disk; another partition overlaps the OS partition geometry; the OS partition's supported-size bounds are unavailable; the requested recovery bucket size is invalid; the requested recovery bucket size exceeds the 2 GiB safety ceiling; the OS partition's geometry is inconsistent with the disk size; a recovery-typed partition exceeds the 2 GiB safety ceiling; a recovery-typed partition overlaps the OS partition geometry; a recovery-typed partition precedes the OS partition; partition extents overlap or are not ordered consistently; a recovery-typed partition is separated from C: by a non-recovery partition; the planned OS partition size would be zero or negative; or the aligned managed extent end precedes the OS partition start.
 - **`Pre-shrink free-space check could not read the C: volume (Get-Volume -DriveLetter C returned nothing). Refusing to shrink C: without verifying the 3 GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed.`** — Fail-closed C: volume-read check. `RetrySuppressible = $false`; the marker is not written; the next run retries naturally.
 - **`Pre-shrink free-space check failed: shrinking C: by <n> MiB would leave only <m> GiB free, below the 3 GiB minimum. …`** — The measured projected free space on C: after the planned shrink would fall below 3 GiB. `RetrySuppressible = $true`; the marker is written.
 - **`Pre-destructive shrink failed after all retries. Existing WinRE registration and recovery partitions remain intact; deferring without OS-fallback.`** — All three shrink attempts (immediate, sleep-10s, defrag) failed. `RetrySuppressible = $true`; the marker is written.
 - **`OS partition did not land at the planned size; preserving the old recovery route and deferring`** — The shrink returned success but the post-resize verification failed. `RetrySuppressible = $true`; the marker is written.
 - **`Resize rounding leaves only <n> MiB for a <m> MiB bucket; preserving the old route and deferring`** — The actual post-resize geometry leaves less space than the plan's bucket needs. `RetrySuppressible = $true`; the marker is written.
+- **`WinRE is Enabled but its registered location (<location>) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made.`** (v46 patch 2) — The active WinRE route could not be resolved to a partition. `Reason = "active WinRE location could not be resolved"`. Delete-last ordering and route restoration both depend on knowing which partition is active; without it, no partition is protected and a mid-loop failure could leave the machine with no working recovery route. The guard fires **after** `reagentc /disable` has already run, so the machine is left with WinRE `Disabled` and the old recovery partition intact. `RetrySuppressible = $false`; the marker is not written. See "The active WinRE route could not be resolved to a partition" below.
 
-**Cause.** The v45 patch 1 pipeline runs the risky operation — the shrink — in the reversible window, before `reagentc /disable` and before any partition deletion. The read-only geometry plan checks the layout before any change. Any of the conditions above stops the run before the destructive sequence begins. The old recovery route is left intact.
+**Cause.** The v45 patch 1 pipeline runs the risky operation — the shrink — in the reversible window, before `reagentc /disable` and before any partition deletion. The read-only geometry plan checks the layout before any change. Any of the conditions above stops the run before the destructive sequence begins. Except for the v46 patch 2 resolver deferral, the old recovery route is left intact.
 
 The most common causes:
 
@@ -252,6 +255,7 @@ The most common causes:
 - **Blocking layout.** A non-recovery partition after C:, a non-contiguous recovery partition, or a recovery-typed partition preceding C:. The disk layout requires manual review.
 - **Oversized recovery partition.** A recovery-typed partition over 2 GiB is present, and the plan refuses to reuse or delete it. Preserve it or use the harness Option 1 to inspect it.
 - **Shrink failure.** C: cannot be shrunk by the required amount even after the sleep-and-defrag retries. Free space on C:, defragment the drive, or reduce the required bucket (which depends on the WIM size).
+- **Unresolvable active route (v46 patch 2).** WinRE is `Enabled` but `reagentc /info` reports a Location that cannot be resolved to a partition on the machine. This is rare; it usually means the registration is stale or the reported location format is not one the resolver understands. See "The active WinRE route could not be resolved to a partition" below.
 
 **The retry-suppressing marker.** When the deferral is retry-suppressible, the main flow writes a sidecar at `C:\Recovery\OEM\winre_partition_deferred.json` containing the current `DesiredStateId` and a `Since` timestamp. On subsequent runs, the marker is honored only if:
 
@@ -268,7 +272,8 @@ If both hold, the run exits `EXIT_WARNING` without repeating the same pre-shrink
 4. **For an oversized recovery-typed partition:** the partition is being preserved for operator review because it may be an OEM factory recovery volume. Run the harness Option 1 to identify it, and either move it, label it away from `Recovery`/`WINRE`, or leave it as clutter — the script will not delete a recovery-typed partition over 2 GiB.
 5. **For a transient volume-read failure:** re-run. The deferral is not retry-suppressed, so the next run attempts the pre-shrink again.
 6. **For a genuine shrink failure:** free space on C:, run `defrag C: /x` manually from an elevated shell, and re-run.
-7. **After resolving the underlying cause, delete both files to force a retry:**
+7. **For an unresolvable active route (v46 patch 2):** see "The active WinRE route could not be resolved to a partition" below.
+8. **After resolving the underlying cause, delete both files to force a retry:**
 
    ```powershell
    Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force
@@ -279,7 +284,75 @@ If both hold, the run exits `EXIT_WARNING` without repeating the same pre-shrink
 
    If you want to force a retry *without* losing the recorded state, delete only the marker file. The next run will re-attempt the pre-shrink; if it succeeds, the run proceeds; if it fails again, the marker is re-written with a fresh `Since` timestamp.
 
-8. **If the marker is present on a later run and you want to know whether it will be honored,** check the log for the line `Dedicated recovery creation was deferred for this DesiredStateId on <Since>. Existing WinRE route is Enabled and its registered WIM is readable; not repeating the same pre-shrink retries (<staged note>).` — that line confirms the marker was honored.
+9. **If the marker is present on a later run and you want to know whether it will be honored,** check the log for the line `Dedicated recovery creation was deferred for this DesiredStateId on <Since>. Existing WinRE route is Enabled and its registered WIM is readable; not repeating the same pre-shrink retries (<staged note>).` — that line confirms the marker was honored.
+
+### The active WinRE route could not be resolved to a partition (v46 patch 2)
+
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the log shows the v46 patch 2 pre-deletion resolver guard firing. The old recovery partition is intact — no partition was deleted — but the machine is left with WinRE `Disabled`, because `reagentc /disable` has already run by the time this guard fires.
+
+**Log signature.**
+
+```
+[INFO] Disabling WinRE before partition recreation
+[INFO] reagentc /disable: exit=0, output=REAGENTC.EXE: Operation Successful.
+[INFO] WinRE disable verified
+[INFO] Pre-deletion inventory:
+[ERROR] WinRE is Enabled but its registered location (<location>) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made.
+[WARN] Dedicated replacement deferred before partition deletion (active WinRE location could not be resolved). The existing WinRE route was preserved; not attempting OS-fallback.
+```
+
+Note the ordering: the guard fires **after** the `/disable` block, not before it. The machine is left with WinRE `Disabled` and the old recovery partition intact and unregistered.
+
+**Cause.** `Get-WinREState` returned `Status = Enabled` but `Resolve-WinRELocationToPartition` could not map the registered location to a partition. Delete-last ordering depends on identifying the active partition so the previous route's target survives a mid-loop failure; route restoration depends on knowing which partition to re-enable. Without either, the script refuses to begin a destructive sequence that could leave the machine with no working recovery route. The guard fires after `/disable` because the resolver is only needed once the script is about to touch partitions.
+
+Causes of an unresolvable location:
+
+- **The Location string format is not one the resolver understands.** `Resolve-WinRELocationToPartition` handles `\\?\GLOBALROOT\device\harddisk<X>\partition<Y>\...` and `\\?\Volume{<GUID>}\...`. A Location that matches neither form returns `$null`.
+- **The referenced partition no longer exists.** The registration is stale — the partition it names was deleted by some other tool, or a Windows Update changed the disk layout.
+- **The referenced disk or volume is offline or unreadable.** Rare; usually transient.
+- **`Get-Partition`/`Get-Volume` failed on the referenced object.** Also rare.
+
+**Field status.** This guard is a v46 patch 2 code-review hardening. It has not been exercised in the field — no logged run has reached it. If you see this signature, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section: the project wants field data on which of the four causes above actually fires.
+
+**Resolution.**
+
+1. **Inspect the current registration.**
+
+   ```powershell
+   reagentc /info
+   ```
+
+   Note the `Windows RE location:` line. If it is empty or absent, the registration is already broken.
+
+2. **Re-enable WinRE against the existing recovery partition** (the partition was not deleted). From an elevated PowerShell:
+
+   ```powershell
+   # Identify the type-coded recovery partition on the OS disk.
+   Get-Partition | Where-Object {
+       $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' -or $_.MbrType -eq 0x27
+   } | Select-Object DiskNumber, PartitionNumber, Size, DriveLetter
+
+   # Re-register and enable against the correct disk/partition.
+   reagentc /setreimage /path \\?\GLOBALROOT\device\harddisk<X>\partition<Y>\Recovery\WindowsRE
+   reagentc /enable
+   ```
+
+   Replace `<X>` and `<Y>` with the disk and partition from the first command. If the partition carries a `Recovery`-typed partition but a `winre.wim` no longer exists at `\Recovery\WindowsRE\winre.wim`, the copy at `C:\Recovery\WindowsRE\winre.wim` (if present) is a source the script would use on the next full-update pass.
+
+3. **If `/enable` succeeds**, delete the state file to reset the loop so the next run does not see a stale DSI:
+
+   ```powershell
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force -ErrorAction SilentlyContinue
+   ```
+
+   Then re-run `WinRE.ps1`. The next run re-registers the correct route, then — depending on the plan — either converges on the existing partition or retries the destructive sequence.
+
+4. **If the location string format is the cause**, run `scripts\Test-WinRE.ps1` Option 1. The parser self-test checks the reagentc location regex; a `[FAIL]` there confirms the format changed and `Resolve-WinRELocationToPartition` needs to be extended. File a bug with the raw `reagentc /info` output.
+
+5. **If no type-coded recovery partition exists on the OS disk**, the machine is in the state described in ["The machine has no recovery partition and WinRE is disabled"](#the-machine-has-no-recovery-partition-and-winre-is-disabled). Follow that recovery procedure.
+
+**Do not re-run the script without re-registering WinRE first.** The next run will see WinRE `Disabled` and may take the enable-only or full-update path; the enable-only path cannot succeed without a partition to register against, and the full-update path may attempt the destructive sequence again and hit the same guard.
 
 ## The script exited with a rename error (concurrent instance)
 
@@ -506,7 +579,7 @@ As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` in
 [WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=<state>). reagentc will refuse to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state.
 ```
 
-**The compound signature — post-deletion failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The most common post-deletion failure points under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure. The corner is also reachable when the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, or the delete loop itself fails and the previous route could not be restored. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section above.) The full sequence for the post-deletion case is:
+**The compound signature — post-deletion failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The most common post-deletion failure points under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure. The corner is also reachable when the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, or the delete loop itself fails and the previous route could not be restored. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-added-reasons) section above.) The full sequence for the post-deletion case is:
 
 ```
 [INFO] Pre-deletion inventory:
@@ -563,7 +636,7 @@ Read the `Conversion Status:` line and act accordingly:
 
   Note that **adding a key protector or arming protection does not resolve this state** — those actions make C: *more* protected, not less. The OS-fallback route requires `FullyDecrypted`.
 
-  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed, which is why it fell back to OS-fallback. The way to use the dedicated-partition route is to resolve whatever caused the destructive failure (insufficient space on C:, a layout problem, etc.) and free the constraint so a retry can succeed. See the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section above for the constraint-specific resolutions.
+  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed, which is why it fell back to OS-fallback. The way to use the dedicated-partition route is to resolve whatever caused the destructive failure (insufficient space on C:, a layout problem, etc.) and free the constraint so a retry can succeed. See the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-added-reasons) section above for the constraint-specific resolutions.
 
 - **`Fully Encrypted` with `Protection Off`** — the machine is in a suspended or Waiting-for-Activation state. To use the OS-fallback route you must still decrypt C: (`manage-bde -off C:`), because reagentc refuses on a `FullyEncrypted` volume regardless of protection state.
 
@@ -881,9 +954,9 @@ If C: is encrypted, the OS-fallback gate defers and the machine ends with **neit
 
 If `Restore-OSPartitionSize` also fails, `$Script:GeometryRestoreFailed` is set and the state file is deleted. The next run will re-attempt the destructive path from scratch.
 
-## The post-delete extension failed (v45 patch 1)
+## The post-delete extension failed (v45 patch 1; capped at bucket size in v46 patch 2)
 
-**Symptom.** The plan called for C: to grow into the space the old recovery partitions occupied (the surplus case). The extension ran after the deletions and failed after all retries. The script used its safe fallback and continued with a slightly different recovery partition layout than the plan intended — the recovery partition starts at the current (un-extended) C: end instead of the planned offset.
+**Symptom.** The plan called for C: to grow into the space the old recovery partitions occupied (the surplus case). The extension ran after the deletions and failed after all retries. The script used its safe fallback and continued with a slightly different recovery partition layout than the plan intended — the recovery partition starts at the current (un-extended) C: end instead of the planned offset, and is sized to the plan's bucket rather than to the full remaining extent.
 
 **Log signature.** The run continues past the extension failure:
 
@@ -892,7 +965,7 @@ If `Restore-OSPartitionSize` also fails, `$Script:GeometryRestoreFailed` is set 
 [WARN] Post-delete extend attempt 2 failed: ...
 [WARN] Post-delete extend attempt 3 failed: ...
 [WARN] Post-delete C: extension failed after all retries; attempting the safe fallback (recovery partition at the current C: end) so WinRE remains deployable.
-[INFO] Extension-failure fallback: creating recovery partition at <offset> MiB with size <size> MiB (no trailing gap; the C: extension was not performed)
+[INFO] Extension-failure fallback: creating recovery partition at <offset> MiB with size <size> MiB (bucket size, not full extent; <trailing> MiB trailing unallocated extent will remain between the recovery partition end and the aligned managed extent end; the C: extension was not performed)
 ```
 
 The run then proceeds to create, format, and deploy into the fallback partition. The exit code is 2 (`EXIT_WARNING`) because `$Script:nonFatalWarning` is set.
@@ -905,11 +978,13 @@ If the fallback also fails — the remaining extent after the current C: end is 
 
 **Cause.** `Invoke-OSPartitionExtend` runs three times with 5-second spacing between attempts. It fails when the storage stack refuses to grow C: into the freed space — typically because a file on the volume is unmovable, because a temporary lock is held by a system service, or because the disk has a physical constraint. The extension is a real operation on physical storage, and its failure is a storage-stack condition, not a script bug.
 
-**Why the safe fallback exists.** Exact geometry — C: ending exactly at the planned boundary, recovery partition of exactly the planned size — is a goal, not a reason to leave WinRE disabled. When the extension fails, the script computes the largest recovery partition that fits between the current C: end and `AlignedManagedExtentEnd`. If that is at least the plan's bucket size, it creates the partition there. The trade is a small residual unallocated gap after the recovery partition; the benefit is that WinRE is deployable and functional. The alternative — restore C:, return `$null`, fall through to OS-fallback on an encrypted C: — leaves the machine degraded when a working dedicated recovery partition was one step away.
+**Why the safe fallback exists.** Exact geometry — C: ending exactly at the planned boundary, recovery partition of exactly the planned size — is a goal, not a reason to leave WinRE disabled. When the extension fails, the script computes the largest recovery partition that fits between the current C: end and `AlignedManagedExtentEnd`. If that is at least the plan's bucket size, it creates the partition there, sized to the bucket. The trade is a trailing unallocated extent between the new recovery partition's end and the aligned managed-extent end; the benefit is that WinRE is deployable and functional. The alternative — restore C:, return `$null`, fall through to OS-fallback on an encrypted C: — leaves the machine degraded when a working dedicated recovery partition was one step away.
+
+**v46 patch 2 change.** Before v46 patch 2 the fallback assigned the entire remaining extent — from the current C: end to the aligned managed-extent end — to the replacement partition. On a layout with a large surplus that could exceed the 2 GiB managed-recovery ceiling. The v46 patch 2 cap sizes the replacement partition to the plan's bucket instead, and logs the residual as the trailing unallocated extent named in the log line above. The cap enforces the same policy the rest of the script follows.
 
 **Resolution.**
 
-1. **If the run continued past the extension failure** (the log shows `Extension-failure fallback: creating recovery partition`), nothing needs to be done. The machine is in a functional dedicated-recovery state; the trailing gap is cosmetic. The next full-update pass — triggered by a DSI change — will re-plan the layout from the plan's perspective.
+1. **If the run continued past the extension failure** (the log shows `Extension-failure fallback: creating recovery partition`), nothing needs to be done. The machine is in a functional dedicated-recovery state; the trailing unallocated extent is intentional. The next full-update pass — triggered by a DSI change — will re-plan the layout from the plan's perspective.
 2. **If the run did not continue** (the log shows `Extension-failure fallback unavailable`), the machine is on the OS-fallback route or has no working recovery route. Check the machine's end state with the harness Option 1. If a recovery route exists, no action needed. If neither route exists, follow the ["The machine has no recovery partition and WinRE is disabled"](#the-machine-has-no-recovery-partition-and-winre-is-disabled) section.
 3. **If extension failures are recurring** on the same machine, the freed space after the old recovery partitions may be partially occupied by unmovable files or by a stale temporary allocation. Run `defrag C: /x` from an elevated shell and re-run.
 
@@ -998,7 +1073,7 @@ If the state file is repeatedly disappearing on a machine that has already taken
 2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
 3. Whether the loop-breaker is firing because the enable-failure counter reached 3. The state file is deliberately left in place in that case (the operator deletes it manually to reset the counter), but if a cleanup tool is configured to remove anything in `C:\Recovery\OEM\` on a schedule, it will also remove the state file for this reason.
 
-**Not to be confused with the Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink deferral, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation. The pre-shrink deferral additionally writes the sidecar marker at `C:\Recovery\OEM\winre_partition_deferred.json` — see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section.
+**Not to be confused with the Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink deferral, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation. The pre-shrink deferral additionally writes the sidecar marker at `C:\Recovery\OEM\winre_partition_deferred.json` — see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-added-reasons) section.
 
 **Not to be confused with the enable-only failure path either.** The enable-only failure path **writes** the state file with a non-`"ok"` `LastEnableResult` and an incremented counter. The state file's `LastUpdated` timestamp will be newer than the run start, and its `EnableFailureAttempts` will be non-zero. If you were expecting the state file to be absent, this is what happened.
 
@@ -1235,8 +1310,8 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - If the run exited with code 2 and the log shows `Another WinRE Manager instance is already running (program lock file is exclusively held)`, note whether any other `WinRE.ps1` process (scheduled task, manual invocation, RMM tool, Intune remediation) was running at the same time. As of v44 patch 4, this is not a failure — the other instance is doing the work — but the reporter should confirm they are not looking at a machine with a scheduled task stuck in a running state. Check the scheduled task's "Last Run Result" via `Get-ScheduledTaskInfo`.
 - If the run exited with code 2 and the log shows `VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined`, include the raw PnP enumeration error from the line above it (`VMD hardware detection reported N error(s) during PnP enumeration: …`). The specific error text is what distinguishes a service issue from an antivirus/EDR block from a device in an error state.
 - If the run exited with code 2 and the log shows `Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable` or `Offline fallback: using state file's stored DesiredStateId`, note whether the machine was actually offline (no network, DNS failure, proxy) and what the state file's `LastUpdated` timestamp is. This discriminates the offline-fallback deferral (machine unchanged, next scheduled run with network completes the work) from the fast-path-under-offline case (degraded-success, exit 2).
-- If the run exited with code 2 and the log shows `Dedicated replacement deferred before partition deletion`, this is a v45 pre-shrink deferral. Include the `<Reason>` string from that log line, the current free space on C:, and the total size of C:. See "The destructive replacement was deferred before partition deletion" above for the full list of reasons and their resolutions.
-- If the run exited with code 2 and the log shows `Extension-failure fallback: creating recovery partition` or `Extension-failure fallback unavailable`, this is a v45 post-delete extension failure. Include the machine's disk layout from `Test-WinRE.ps1` Option 1, the plan's bucket size, and the current C: end and disk end.
+- If the run exited with code 2 and the log shows `Dedicated replacement deferred before partition deletion`, this is a v45 pre-shrink deferral (v46 patch 2 added two reasons). Include the `<Reason>` string from that log line, the current free space on C:, and the total size of C:. If the reason is `active WinRE location could not be resolved`, include the raw `reagentc /info` output — the Location line is what `Resolve-WinRELocationToPartition` could not map. See "The destructive replacement was deferred before partition deletion" above for the full list of reasons and their resolutions.
+- If the run exited with code 2 and the log shows `Extension-failure fallback: creating recovery partition` or `Extension-failure fallback unavailable`, this is a v45 patch 1 / v46 patch 2 post-delete extension failure. Include the machine's disk layout from `Test-WinRE.ps1` Option 1, the plan's bucket size, the trailing unallocated extent size (if the fallback fired), and the current C: end and disk end.
 - If the run exited with code 2 and the log shows the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`, this is the post-deletion residual that the `[v45 patch 1]` CHANGELOG entry documents. Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run. The project wants field data on this corner — see the "The OS-fallback route deferred because C: is encrypted" section above.
 - If the run exited with code 3 and the log ends with `Cannot rename because item at '<workspace>\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
 - If the log contains `CmdletizationQuery_NotFound_DiskNumber` or `No MSFT_Partition objects found with property 'DiskNumber'`, note the disk number the error names and whether the machine has a card reader or an empty USB enclosure attached. As of v46 patch 2 (production) and v22 (harness), the guard silences the error; include the exact text and the version banner so the reporter can confirm the fix applies.
@@ -1251,4 +1326,4 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - [testing.md](testing.md) — how to use the harness to diagnose, including the v45 destructive-path regression test plan.
 - [deployment.md](deployment.md) — the "One instance per machine" precondition for manual invocations and the offline behavior of the scheduled task.
 - [state-and-idempotency.md](state-and-idempotency.md) — the deferral marker's relationship to the deployment identity and the operator reset procedure.
-- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 pre-shrink deferral reasons.
+- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 patch 1 and v46 patch 2 pre-shrink deferral reasons.

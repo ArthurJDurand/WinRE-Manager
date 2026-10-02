@@ -59,9 +59,10 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 - A change to the BitLocker policy or the target-preparation logic. The state file does not record BitLocker state; it records the deployment's identity and outcome.
 - A change to the recovery-partition classifier (the v44 patch 7 type-code-authority rule). The classifier affects the fast path's control-flow decision but not the identity of the deployment; a label-only partition on the OS disk changes whether the fast path fires, not what the state file records.
 - A change to the shrink-first ordering or the single-boundary geometry model (v45 patch 1). These change *how* the destructive path produces the target state, not *what* the target state is. The state file does not record partition-layout details.
+- A change to the pre-deletion resolver guard, the extension-failure fallback bucket cap, the deletion-failure rollback reporting, or the layout assertion's fail-closed branch (all v46 patch 2). These change *how* the destructive path fails and recovers, not *what* the target state is. The state file's schema and the fast path's conditions are unchanged.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, the v46 patch 2 build-drift logging and the empty-disk read guard, and the harness's moves from v14 through v22 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
+`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, the v46 patch 2 build-drift logging and the empty-disk read guard and the four post-review hardenings of `Ensure-AdequateRecoveryPartition`, and the harness's moves from v14 through v22 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
 
 The v44 patch 1, v45 patch 1, and v46 patch 1 revisions are the deliberate exceptions. Each changes an input the `DesiredStateId` recipe depends on: v44 added `CPU` and `VMD` to the field list; v45 and v46 patch 1 each changed the value of the `SCRIPT` field. Because the ID includes those inputs, the ID changes on every managed machine, and every managed machine performs one full-update pass on its next run before returning to the fast path. See the migration notes in `CHANGELOG.md`; rolling back any of these three revisions to the preceding one likewise causes a one-time DSI mismatch and rebuild under the older behavior.
 
@@ -91,6 +92,8 @@ Path: `C:\Recovery\OEM\winre_state.json`.
 
 `LastEnableResult` records the outcome of the last `reagentc /enable` attempt that reached a state-write point. Its values are `"ok"` (exit 0 and status confirmed `Enabled`), `"reboot"` (registration succeeded but a reboot is required), `"failed"` (generic hard failure), and `"bitlocker"` (the target recovery partition was BitLocker-protected, even after `Set-RecoveryPartitionReadyForWinRE` prepared it). `EnableFailureAttempts` counts *consecutive* terminal outcomes — both `"failed"` and `"bitlocker"` increment the counter. Both fields default to `"ok"` / `0` when absent, so a state file written by an earlier version of the script is accepted without triggering a rebuild.
 
+The v46 patch 2 hardenings do not change the schema. None of the new deferral reasons writes a new field; the reasons flow through the existing `Deferred` return path and, where applicable, through the existing `GeometryRestoreFailed` flag and state-file-invalidation mechanism.
+
 ### Read semantics
 
 `Read-WinREState` is called once, near the top of the main flow, with the current `DesiredStateId`.
@@ -108,7 +111,7 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 `C:\Recovery\OEM\winre_partition_deferred.json` records a pre-shrink deferral separately from the deployment state. It stores the `DesiredStateId` under which the deferral was written and a `Since` timestamp. The sidecar is not part of the deployment identity, and it is not what the fast path validates against — it is a temporary suppression record that prevents the script from re-attempting the same failing destructive sequence on every scheduled run while an operator resolves the underlying constraint.
 
-`Ensure-AdequateRecoveryPartition` can return `Deferred` for ten distinct reasons. Only four of them write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
+`Ensure-AdequateRecoveryPartition` can return `Deferred` for twelve distinct reasons. Only four of them write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
 
 - `post-shrink free space below minimum` — C: does not have enough free space to absorb the planned shrink.
 - `pre-shrink failed` — the shrink operation failed all three attempts.
@@ -117,16 +120,18 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 These four set `RetrySuppressible = $true`, and the main flow writes the marker.
 
-The remaining six `Deferred` reasons do **not** set `RetrySuppressible`, and no marker is written:
+The remaining eight `Deferred` reasons do **not** set `RetrySuppressible`, and no marker is written:
 
 - `partition geometry unavailable` — the pre-flight `Get-PartitionSupportedSize` or disk-layout read failed. Storage-level condition; retrying is reasonable.
-- Any of the twelve plan-rejection reasons (`Dedicated recovery partition plan rejected: ...`). These indicate a layout the planner cannot prove safe; a retry will produce the same rejection. Operator review is required.
+- Any of the thirteen plan-rejection reasons (`Dedicated recovery partition plan rejected: ...`). These indicate a layout the planner cannot prove safe; a retry will produce the same rejection. Operator review is required.
 - `C: volume could not be read for free-space check` — `Get-Volume -DriveLetter C` returned nothing. Explicitly `RetrySuppressible = $false` because the read may be transient and the operator should not need to delete the marker to retry.
 - `WinRE disable failed before deletion` — `reagentc /disable` returned non-zero.
 - `WinRE disable verification failed before deletion` — the post-disable status check did not report `Disabled`.
-- `recovery partition deletion failed; previous route restored` — a mid-loop deletion failure; the previous route was successfully restored.
+- `active WinRE location could not be resolved` (v46 patch 2) — WinRE was `Enabled` before the disable, but the registered location could not be resolved to a partition. The destructive sequence is refused before any deletion; because the guard fires after `reagentc /disable` has already run, the machine is left with WinRE `Disabled` and the old recovery partition intact. Operator action is required to re-register the route before a retry makes sense — retrying with the same unresolvable location would produce the same refusal, so the deferral is not retry-suppressed.
+- `recovery partition deletion failed; previous route restored` (v46 patch 2) — a mid-loop deletion failure; `Restore-OSPartitionSize` verified C: at its original size and `Restore-PreviousWinRERoute` confirmed the previous route was restored. The machine is functional again; no suppression is needed.
+- `recovery partition deletion failed; previous route restored but C: geometry restore unverified` (v46 patch 2) — a mid-loop deletion failure; the previous route was restored but `Restore-OSPartitionSize` could not verify C: at its original size. `$Script:GeometryRestoreFailed` is set, so the state file is invalidated and the next run retries from a clean slate. The deferral is not retry-suppressed because the state-file deletion already forces the retry; the sidecar would be redundant.
 
-For these six, the deferral is not a stable operator-actionable condition. A retry may succeed without any operator action, and suppressing it would be wrong. The sidecar is not written; the next run retries naturally.
+For these eight, the deferral is not a stable operator-actionable condition that a marker would help suppress. A retry may succeed without any operator action, or — in the two v46 patch 2 cases — the state-file invalidation already forces the retry from clean. The sidecar is not written; the next run retries naturally.
 
 On each subsequent run, the main flow reads the marker and evaluates two conditions:
 
@@ -176,9 +181,11 @@ The consequence is that a machine with a valid state file that takes the VMD-que
 
 The enable-failure counter is incremented on both terminal outcomes. The distinction between `"failed"` and `"bitlocker"` is preserved in the state file so the operator can see *why* the enable step is failing, but the counter treats them the same way — a machine that keeps failing on the BitLocker error is in the same kind of loop as a machine failing generically, and both need the same manual intervention.
 
-Before writing, the function checks `$Script:GeometryRestoreFailed`. If that flag is set — meaning a post-shrink failure left C: shrunken and `Restore-OSPartitionSize` could not verify the geometry was restored — the function **deletes** the state file (if it exists) and returns without writing.
+Before writing, the function checks `$Script:GeometryRestoreFailed`. If that flag is set — meaning a post-shrink or post-delete failure left C: at a geometry the restore helper could not verify — the function **deletes** the state file (if it exists) and returns without writing.
 
-The deletion is deliberate. Skipping the write would not be enough: if the previous state file's `DesiredStateId` matched the current one, the next run's `Read-WinREState` would accept it, the count=0 exemption would fire, and C: would stay shrunken indefinitely. Deleting the file forces the next run to treat the state as absent, set `needInject = $true`, and re-run the full-update path, which re-extends C: as part of the destructive attempt.
+The deletion is deliberate. Skipping the write would not be enough: if the previous state file's `DesiredStateId` matched the current one, the next run's `Read-WinREState` would accept it, the count=0 exemption would fire, and C: would stay at the unverified geometry indefinitely. Deleting the file forces the next run to treat the state as absent, set `needInject = $true`, and re-run the full-update path, which re-extends C: as part of the destructive attempt.
+
+The v46 patch 2 deletion-failure branch makes the flag's meaning more precise: the branch captures the `Restore-OSPartitionSize` result and the `Restore-PreviousWinRERoute` result separately and returns the distinct reason `recovery partition deletion failed; previous route restored but C: geometry restore unverified` when only the route restored. The flag is set in that sub-case (by `Restore-OSPartitionSize`), the state file is deleted on write, and the operator sees an accurate reason string rather than a flattened "previous route restored".
 
 If the deletion itself fails, the failure is logged as an error. Manual intervention is then required to force a retry.
 

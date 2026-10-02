@@ -43,16 +43,27 @@ These limitations were documented in a release entry and have since been closed.
 
 ## [v46 patch 2] — 2026-10-02
 
-Build-drift observability and a small read-guard fix in `Get-RecoveryPartitions`. `ScriptVersion` remains 46; `ScriptPatchLevel` moves from 1 to 2. No `DesiredStateId` change; no fleet-wide rebuild is forced.
+Build-drift observability, a read guard in `Get-RecoveryPartitions`, and four post-review hardenings of `Ensure-AdequateRecoveryPartition`. `ScriptVersion` remains 46; `ScriptPatchLevel` moves from 1 to 2. No `DesiredStateId` change; no fleet-wide rebuild is forced.
 
 The change adds three log lines that together record the build numbers of the recovery image the machine is running, the source WIM the plan is about to work against, and the WIM that was actually deployed. The purpose is empirical, not behavioural: over time the fleet logs answer whether Windows Update is updating the registered WinRE between our runs, and whether our rebuilds ever replace a newer registered image with an older one. No gate reads these values.
+
+### Fixed
+
+- **Extension-failure fallback is capped at the bucket size.** When C: extension fails after the old recovery partitions have been deleted, the safe fallback now creates only the planned bucket size at the current aligned C: end and logs the residual space between the new partition's end and the aligned managed-extent end as an intentional trailing unallocated extent. The previous code assigned the entire remaining extent — from the current C: end to the aligned managed-extent end — to the replacement partition, which on a layout with a large surplus could exceed the 2 GiB managed-recovery ceiling. The cap enforces the same policy the rest of the script follows. Exact-fit geometry remains the goal when the extension succeeds.
+- **`Assert-RecoveryPartitionLayout` fails closed when the OS partition cannot be resolved.** The C: adjacency check previously skipped silently when its own `Get-OSPartition` query returned nothing. The assertion is the last check before `Format-Volume`; a layout that cannot be verified against C: is now rejected rather than accepted.
+- **The destructive sequence fails closed before deletion when the active WinRE route cannot be resolved.** `Ensure-AdequateRecoveryPartition` now returns `Deferred` with `Reason = "active WinRE location could not be resolved"` when `$stateBefore.Status -eq "Enabled"` but `Resolve-WinRELocationToPartition` returns nothing for the registered location. Delete-last ordering and route restoration both depend on knowing which partition is active; without it, the deletion loop would place every deletable partition in the early-deletion list and a mid-loop failure could leave the machine with no working recovery route.
+- **Deletion-failure rollback reports partial outcomes honestly.** The recovery-partition deletion-failure branch now captures the `Restore-OSPartitionSize` result and the `Restore-PreviousWinRERoute` result separately. When the route is restored but C: could not be verified at its original size, the function returns `Deferred` with the distinct reason `"recovery partition deletion failed; previous route restored but C: geometry restore unverified"` and sets `$Script:GeometryRestoreFailed`, so the state file is invalidated and the next run retries from clean. The previous code discarded the size-restoration result and could report "previous route restored" while C: remained shrunken.
 
 ### Changed
 
 - **Registered WinRE version logged at startup.** `Get-WinREState` now extracts `Windows RE Version` from `reagentc /info` and returns it as `Version`. The startup line reads `WinRE status: <status>, Location: <location>, Version: <version>`. The version line is absent when WinRE is Disabled or reagentc suppresses it; the log shows `unknown` in that case. Informational only — the value does not enter `DesiredStateId` and no gate reads it.
 - **Source WIM build logged during force-upgrade detection.** When a candidate WIM is evaluated, its build is logged as `Source WIM build: <build> (path: <path>)`. If `Get-WimBuild` cannot read the image, the line reads `Source WIM build: unknown (path: <path>)` at WARN. This runs on every pass — full-update and fast-path — so every run records the WIM it considered.
 - **Post-deploy WIM build logged before the state write.** After a successful deployment and before the state file is written, the build of the deployed WIM is logged as `Post-deploy WIM build: <build> (source: <path>)`. Combined with the startup line, this records both sides of any build drift on the same run.
-- **`.NOTES` design invariant added.** The design-invariants block now carries: *"Build-drift observability: every run logs the registered WinRE version (pre-touch, from reagentc), the source WIM build, and the post-deploy WIM build. Logged for evidence only; no gate reads these values and none enters DesiredStateId."*
+- **`.NOTES` design invariants updated.** The design-invariants block now carries:
+  - *"Build-drift observability: every run logs the registered WinRE version (pre-touch, from reagentc), the source WIM build, and the post-deploy WIM build. Logged for evidence only; no gate reads these values and none enters DesiredStateId."*
+  - The 2 GiB ceiling bullet now records that the post-delete extension-failure fallback preserves the ceiling by sizing the replacement partition to the planned bucket rather than to the full remaining extent, and logs any trailing unallocated extent explicitly.
+  - *"The destructive sequence fails closed before deletion if the active WinRE route is Enabled but its registered location cannot be resolved to a partition. Delete-last ordering and route restoration both depend on identifying the active target; without it, no partition is protected and a mid-loop failure could leave the machine with no working recovery route."*
+  - *"The whole-layout assertion fails closed when the OS partition cannot be resolved, rather than skipping the C: adjacency check. A layout that cannot be verified against C: is not accepted; the assertion is the last check before Format-Volume."*
 - **`Get-RecoveryPartitions` guards against empty-disk reads.** Both `Get-Partition -DiskNumber $diskNum` calls now carry `-ErrorAction SilentlyContinue`. On a machine with a disk that exposes no partitions — an SD/MMC card reader, an empty USB enclosure, a disk with no recognised partition table — `Get-Partition -DiskNumber N` throws `CmdletizationQuery_NotFound_DiskNumber`. The error is non-terminating at the current call sites but pollutes the log on every full update and would abort a caller wrapped in `-ErrorAction Stop`. Guarded in both `WinRE.ps1` and `Test-WinRE.ps1`.
 
 ### Changed (harness)
@@ -81,7 +92,11 @@ The three live limitations carried by the project are unchanged in this patch:
 
 ### Unchanged
 
-`ScriptVersion` remains 46. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. Healthy machines continue to take the fast path. No change to the deployed WIM, the driver-selection inputs, the OEM-provider resolution, or the partition-plan geometry.
+`ScriptVersion` remains 46. `DesiredStateId` is unchanged. No fleet-wide rebuild is forced. Healthy machines continue to take the fast path. No change to the deployed WIM, the driver-selection inputs, or the OEM-provider resolution. The partition-plan geometry on the successful path is unchanged; the four `Fixed` entries above tighten behaviour in the extension-failure fallback, the whole-layout assertion, the pre-deletion guard, and the deletion-failure rollback. None of those paths is exercised on a healthy machine.
+
+### Field-testing status of the v46 patch 2 fixes
+
+The build-drift log lines and the `Get-RecoveryPartitions` read guard are field-verified on the HP EliteBook 8 G1i 16" run recorded above. The four `Fixed` entries are code-review hardenings, not field-exercised changes: they apply to the extension-failure fallback, the whole-layout assertion's fail-closed path, the pre-deletion resolver-guard, and the deletion-failure rollback, none of which was reached on that run. They are covered by inspection and by the mocked-geometry test plan in `docs/testing.md`, and remain gated on the same tests that gate the post-deletion segment.
 
 ---
 
