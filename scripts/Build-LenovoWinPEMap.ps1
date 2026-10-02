@@ -15,7 +15,27 @@ $ProgressPreference    = "SilentlyContinue"
 $WorkDir    = "C:\Temp\LenovoMapBuild"
 $ArchiveDir = Join-Path $WorkDir "curl-archive"
 $CiExe      = Join-Path $ArchiveDir "curl-impersonate.exe"
-$OutputFile = "F:\Downloads\LenovoWinPEMap.json"
+# Output directory: prefer ./Maps next to this script, fall back to C:\Temp\Maps.
+# Created here so the Set-Content at the end of the run cannot fail on a missing parent.
+$MapsDir = $null
+if ($PSScriptRoot) {
+    $candidate = Join-Path $PSScriptRoot "Maps"
+    try {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+            New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop | Out-Null
+        }
+        $MapsDir = $candidate
+    } catch {
+        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Could not use $candidate ($_) - falling back to C:\Temp\Maps" -ForegroundColor Yellow
+    }
+}
+if (-not $MapsDir) {
+    $MapsDir = "C:\Temp\Maps"
+    if (-not (Test-Path -LiteralPath $MapsDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $MapsDir -Force | Out-Null
+    }
+}
+$OutputFile = Join-Path $MapsDir "LenovoWinPEMap.json"
 $ResolveDelay = 2
 
 $RecipeCardUrl = "https://download.lenovo.com/cdrt/ddrc/recipecard.json"

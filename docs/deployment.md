@@ -302,7 +302,7 @@ The scheduled task does not need to be aware of the machine's encryption state. 
 
 - **On a dedicated-partition machine, the first run may take up to 5 minutes longer than usual if the target recovery partition is encrypted.** The helper will spend up to 300 seconds decrypting it. A 1 GB recovery partition decrypts in well under a minute on NVMe, so the timeout is generous; but if you are benchmarking or scheduling tightly, expect the possibility.
 - **On a machine that falls back to OS-fallback, the run defers if C: is not `FullyDecrypted`.** The log names the C: state and tells the operator what to do: complete decryption of C: (`manage-bde -off C:`) or wait for an in-progress decryption to finish. Actions that complete encryption, add a protector, or enable protection do **not** resolve the state — they make C: more protected, not less. This deferral does not consume the enable-failure counter.
-- **On a machine whose destructive attempt fails at the shrink step, the run falls through to OS-fallback.** No C: pre-check runs on this path. If the OS-fallback route is then blocked because C: is encrypted, the OS-fallback gate defers cleanly with a message naming C:'s state. The machine is left exactly as it was found.
+- **On a machine whose destructive attempt fails after the old recovery partition has been deleted** — specifically a `New-Partition` or `Format-Volume` failure — **the run falls through to OS-fallback.** The OS-fallback gate then consults C: and defers cleanly if C: is encrypted. As of v45 patch 1 the shrink is no longer inside the destructive window: a failed pre-shrink returns `Deferred` with the old route preserved and never reaches OS-fallback, so the shrink case no longer produces this fall-through.
 
 If you are deploying to a fresh fleet and want the first run to succeed rather than defer on the OS-fallback route, wait until `manage-bde -status C:` shows `Fully Decrypted` before pushing the task. On a modern SSD, decrypting C: from a mid-encryption state typically takes 30–90 minutes.
 
@@ -403,7 +403,7 @@ Concretely, on the first run after the update, every machine will:
 
 Two cases handled without operator attention:
 
-- **Machines with a stale deferral marker at `C:\Recovery\OEM\winre_partition_deferred.json`.** The marker is keyed by `DesiredStateId`. A marker written under v44 has a different DSI than the v45 run computes, so it is treated as stale and cleared on read. No operator action is needed.
+- **Machines carrying a deferral marker at `C:\Recovery\OEM\winre_partition_deferred.json`.** The marker was introduced in v45 patch 1 and is keyed by `DesiredStateId`; it is honored only when the current run computes the same DSI. No operator action is needed on the v44→v45 transition, because no v44-era marker can exist.
 - **Machines with `PendingReboot = true` or `EnableFailureAttempts >= 3`.** Handled the same way as in the v44 patch 1 migration: the DSI mismatch is detected before the pending-reboot and loop-breaker blocks.
 
 ### Rollback
@@ -467,36 +467,11 @@ When using Intune to push a remediation, be aware that the remediation script ma
 
 **Do not disable the lock to "fix" the remediation.** Before patch 4, the same collision caused an `EXIT_FATAL` (code 3) with a rename error. Some Intune remediation pipelines treated that as a hard failure and retried aggressively, which could produce a cascade of colliding runs. The lock converts the collision into a clean, self-limiting `EXIT_WARNING`. If your Intune pipeline retries on any non-zero exit, adjust it to treat code 2 as a soft failure (route to a queue) and code 3 as a hard failure (investigate). See [exit-codes.md](exit-codes.md) for the recommended orchestration policy.
 
-## Hosting your own maps
+## Hosting your own maps, manifest, and base WIM repository
 
-The default configuration points at the maintainer's public gists:
+By default, WinRE Manager fetches the driver manifest, the three OEM maps, and the base WIM repository from the project maintainer's GitHub account. All five artifacts can be replaced with self-hosted equivalents so your fleet does not depend on those external endpoints.
 
-- `$DriverManifestUrl = "https://gist.github.com/52250179/..."`
-- `$DellWinPEMapUrl   = "https://gist.github.com/52250179/..."`
-- `$HPWinPEMapUrl     = "https://gist.github.com/52250179/..."`
-- `$LenovoWinPEMapUrl = "https://gist.github.com/52250179/..."`
-
-The maintainer accepts no responsibility for their accuracy or availability. For a production fleet:
-
-1. Fork the three map builders and the manifest.
-2. Rebuild the maps on your own cadence (weekly is plenty — Dell, HP, and Lenovo do not update their WinPE driver packs more often than that in practice).
-3. Host the JSON files somewhere you control (an internal HTTPS endpoint, an Azure Blob Storage static website, S3, or your own Gist).
-4. Edit the four URLs near the top of `scripts/WinRE.ps1` and `scripts/Test-WinRE.ps1`.
-5. Sign the resulting JSON with a code-signing key if you want to defend against a compromise of the hosting endpoint.
-
-The map builders themselves are documented in the individual `.SYNOPSIS` blocks. The Dell builder downloads and extracts `DriverPackCatalog.cab`; the HP builder scrapes the HP WinPE driver page; the Lenovo builder downloads `recipecard.json`, resolves DS IDs by scraping the Lenovo support site (with `curl-impersonate` because the site blocks the PowerShell User-Agent), and emits the final map.
-
-### Rebuilding the maps on a schedule
-
-```powershell
-# Weekly refresh, run from a machine that has 7-Zip and internet access.
-.\scripts\Build-DellWinPEMap.ps1
-.\scripts\Build-HPWinPEMap.ps1
-.\scripts\Build-LenovoWinPEMap.ps1
-# Then upload the three JSON files to your hosting endpoint.
-```
-
-The Lenovo builder is the slow one — it makes one HTTPS request per unique DS ID with a 2-second delay between requests. On a fresh run with 200 DS IDs that is ~7 minutes.
+See [self-hosting.md](self-hosting.md) for the trust model, the exact URLs and variables to change, the map-builder scripts, and the air-gapped deployment procedure.
 
 ## Log collection
 
@@ -559,10 +534,10 @@ The v45 revision bumps `ScriptVersion` and forces one full-update pass per manag
 
 Watch for:
 
-- **Exit code 2 with `UsedOSFallback = true` in the state file and a state file `LastUpdated` timestamp newer than the run's start time** — the machine cannot shrink the OS and deliberately ended in OS-fallback. The log will show the `Dedicated recovery partition creation failed after all attempts.` banner.
+- **Exit code 2 with `UsedOSFallback = true` in the state file and a state file `LastUpdated` timestamp newer than the run's start time** — the post-delete partition creation could not complete and the run deliberately ended in OS-fallback. (As of v45 patch 1, a shrink failure no longer reaches this path — the pre-shrink runs in the reversible window and defers with the old route preserved.) The log will show the `Dedicated recovery partition creation failed after all attempts.` banner.
 - **Exit code 2 with `Setup\State\ImageState=…` in the log and the state file absent or unchanged** — the Audit Mode / OOBE guard fired. The machine has not finished OOBE. This is expected on freshly imaged machines that are still pre-first-sign-in; wait for the machine to reach a normal desktop and re-run on the next scheduled trigger.
 - **Exit code 2 with `VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined.` in the log and the state file unchanged (or the state file absent)** — the VMD hardware presence check could not complete because of a PnP enumeration error. No WIM was deployed, no partition was touched, no `reagentc` call was made. Resolve the PnP service issue and re-run. Do not retry immediately; the same check will fire.
-- **Exit code 2 with `OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=…)` in the log and the state file's `LastUpdated` timestamp unchanged (or the state file absent)** — the machine cannot shrink the OS, and the OS-fallback target (C:) is not confirmed fully decrypted. No WIM was deployed and no `reagentc` call was made. Wait for C: to reach `FullyDecrypted`, or complete decryption of C: with `manage-bde -off C:`, then re-run on the next scheduled trigger. Do not retry immediately.
+- **Exit code 2 with `OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=…)` in the log and the state file's `LastUpdated` timestamp unchanged (or the state file absent)** — the dedicated replacement could not complete and the run fell through to the OS-fallback route, whose target (C:) is not confirmed fully decrypted. No WIM was deployed and no `reagentc` call was made. Wait for C: to reach `FullyDecrypted`, or complete decryption of C: with `manage-bde -off C:`, then re-run on the next scheduled trigger. Do not retry immediately.
 - **Exit code 2 with `Dedicated replacement deferred before partition deletion (<Reason>)` in the log and the state file unchanged** — the v45 pre-shrink deferral fired. The old recovery partition is still present and WinRE is still registered to it. Free space on C:, correct the disk layout, address the oversized partition, retry a transient volume read, or investigate the shrink or route-restore failure as appropriate, then delete `C:\Recovery\OEM\winre_partition_deferred.json` (and, if you also want to clear the deployment identity, `C:\Recovery\OEM\winre_state.json`) to force a retry.
 - **Exit code 2 with `Image injection did not complete. Stopping before Step 4 and before any deployment.` in the log** — OEM or VMD injection failed and the pipeline gate stopped the run before deployment. The WIM was not deployed, the partition was not touched, and WinRE was not disabled. The checkpoint was set back to 2. The next run retries from step 2. Investigate the injection failure (OEM pack download, extraction, INF validation, or VMD driver download).
 - **Exit code 2 with `Enable-only /enable failed (attempt N of 3)` or `Enable-only /enable refused with the BitLocker error after the target partition was confirmed unencrypted (attempt N of 3)` in the log and a non-`"ok"` `LastEnableResult` in the state file** — the enable step failed on a machine whose deployment is current. The counter incremented. Investigate the enable failure itself (ReAgent.xml corruption, missing registration, a Windows component problem, an antivirus product holding a file). The next run retries enable-only. If the counter reaches 3, the loop-breaker fires on the following run and the exit code becomes 3.
@@ -593,6 +568,7 @@ To revert a `DesiredStateId` change specifically, see the "Rollback" subsections
 
 ## Related documents
 
+- [self-hosting.md](self-hosting.md) — how to replace the driver manifest, OEM maps, and base WIM repository with your own hosting, including the trust model and the air-gapped deployment procedure.
 - [exit-codes.md](exit-codes.md) — how to interpret the exit codes, including the nine cases for code 2.
 - [state-and-idempotency.md](state-and-idempotency.md) — what the state file records, the deferral marker's relationship to the deployment identity, and the offline fallback's residual risk.
 - [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 single-boundary geometry and pre-shrink deferral reasons.

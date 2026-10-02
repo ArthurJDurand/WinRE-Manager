@@ -61,7 +61,7 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 - A change to the shrink-first ordering or the single-boundary geometry model (v45 patch 1). These change *how* the destructive path produces the target state, not *what* the target state is. The state file does not record partition-layout details.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, and the harness's moves to v14, v15, v16, v17, v18, v19, and v20 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
+`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, and the harness's moves from v14 through v21 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
 
 The v44 patch 1 and v45 patch 1 revisions are the deliberate exceptions. Each changes an input the `DesiredStateId` recipe depends on: v44 added `CPU` and `VMD` to the field list, and v45 changed the value of the `SCRIPT` field. Because the ID includes those inputs, the ID changes on every managed machine, and every managed machine performs one full-update pass on its next run before returning to the fast path. See the migration notes in `CHANGELOG.md`; v45 rollback by redeploying v44 likewise causes a one-time DSI mismatch and rebuild under the older behavior.
 
@@ -108,7 +108,25 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 `C:\Recovery\OEM\winre_partition_deferred.json` records a pre-shrink deferral separately from the deployment state. It stores the `DesiredStateId` under which the deferral was written and a `Since` timestamp. The sidecar is not part of the deployment identity, and it is not what the fast path validates against — it is a temporary suppression record that prevents the script from re-attempting the same failing destructive sequence on every scheduled run while an operator resolves the underlying constraint.
 
-The marker is written by the main flow when `Ensure-AdequateRecoveryPartition` returns `Deferred` with `RetrySuppressible = $true`. Every pre-shrink deferral uses `RetrySuppressible = $true` except one: the fail-closed C: volume-read failure (`"C: volume could not be read for free-space check"`) uses `$false`, because an indeterminate read may clear on its own and the operator should not need to delete the marker to retry a transient condition. A `RetrySuppressible = $false` deferral exits `EXIT_WARNING` without writing the sidecar.
+`Ensure-AdequateRecoveryPartition` can return `Deferred` for ten distinct reasons. Only four of them write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
+
+- `post-shrink free space below minimum` — C: does not have enough free space to absorb the planned shrink.
+- `pre-shrink failed` — the shrink operation failed all three attempts.
+- `pre-shrink verification failed` — the shrink returned success but the post-resize geometry did not land at the target.
+- `resize rounding reduced planned extent` — the actual post-resize geometry leaves less room than the plan's bucket needs.
+
+These four set `RetrySuppressible = $true`, and the main flow writes the marker.
+
+The remaining six `Deferred` reasons do **not** set `RetrySuppressible`, and no marker is written:
+
+- `partition geometry unavailable` — the pre-flight `Get-PartitionSupportedSize` or disk-layout read failed. Storage-level condition; retrying is reasonable.
+- Any of the twelve plan-rejection reasons (`Dedicated recovery partition plan rejected: ...`). These indicate a layout the planner cannot prove safe; a retry will produce the same rejection. Operator review is required.
+- `C: volume could not be read for free-space check` — `Get-Volume -DriveLetter C` returned nothing. Explicitly `RetrySuppressible = $false` because the read may be transient and the operator should not need to delete the marker to retry.
+- `WinRE disable failed before deletion` — `reagentc /disable` returned non-zero.
+- `WinRE disable verification failed before deletion` — the post-disable status check did not report `Disabled`.
+- `recovery partition deletion failed; previous route restored` — a mid-loop deletion failure; the previous route was successfully restored.
+
+For these six, the deferral is not a stable operator-actionable condition. A retry may succeed without any operator action, and suppressing it would be wrong. The sidecar is not written; the next run retries naturally.
 
 On each subsequent run, the main flow reads the marker and evaluates two conditions:
 
@@ -118,7 +136,7 @@ On each subsequent run, the main flow reads the marker and evaluates two conditi
 The decision tree:
 
 - **The deferred route is functional and the fast path would not fire.** The marker is honored. The run exits `EXIT_WARNING` with a log message naming the marker file and, if a staged `WIM_READY` image is present in the recorded workspace, stating that it is available for immediate reuse. The staged workspace and checkpoint are preserved — the eventual successful run can resume from them. The marker alone suppresses identical retries.
-- **The fast path would fire.** The marker is obsolete: the machine has converged on its own, and there is nothing left to suppress. The marker is cleared and the run falls through to the fast path, exiting `EXIT_SUCCESS` rather than being pinned at `EXIT_WARNING`. This is the v45 patch 1 "Patch 9" behavior.
+- **The fast path would fire.** The marker is obsolete: the machine has converged on its own, and there is nothing left to suppress. The marker is cleared and the run falls through to the fast path, exiting `EXIT_SUCCESS` rather than being pinned at `EXIT_WARNING`. This is the v45 patch 1 marker-obsolescence behavior.
 - **The deferred route is not functional.** The marker is cleared and normal repair evaluation continues.
 
 A marker whose `DesiredStateId` does not match the current one is stale and is cleared on read.
@@ -243,13 +261,20 @@ A separate guard runs after `$needInject` has been fully determined:
 
 ```powershell
 if ($step -ge 4 -and $needInject) {
-    $step = 2
+    if ($cp.WimReady -and (Test-Path "$WorkDir\winre_optimized.wim")) {
+        Write-Log "Checkpoint step $step confirms a completed image export; resuming with the optimized WIM"
+    } else {
+        Write-Log "Checkpoint step $step lacks the current WIM_READY marker while a rebuild is required - resetting to step 2 to retry injection" -Level WARN
+        $step = 2
+    }
 }
 ```
 
 This handles the case where a **prior** run failed injection and left a checkpoint at step ≥ 4 with a valid (but stale) state file. Without the guard, the new run would skip step 3 (`$step -le 3` is false for `$step >= 4`), initialize a fresh `$Script:ImageInjectionComplete = $true`, deploy the un-injected WIM, and commit state for it.
 
 The placement matters: the guard runs after `$needInject` is decided, so it catches both the "no state file" case and the "valid-but-stale state file" case. An earlier placement (immediately after the state read) would only catch the former.
+
+The `WIM_READY` carve-out is deliberate. A step ≥ 4 checkpoint **with** the `WIM_READY` flag and an existing `winre_optimized.wim` is a valid, resumable checkpoint even when `$needInject` is true: the rebuild that `$needInject` implies has already been completed at the image level, and the remaining work is the same partition-and-deploy sequence the checkpoint was protecting. Resetting to step 2 in that case would discard a valid optimized WIM and re-serialize the whole image for no reason. Only a step ≥ 4 checkpoint **without** the `WIM_READY` flag — a legacy checkpoint from a pre-v45 run, or a run whose export did not verify — is treated as untrustworthy and reset.
 
 ### Checkpoint advance gating (v43 patch 4)
 

@@ -31,7 +31,7 @@ One startup guard then runs before any state-modifying action: the Audit Mode gu
 
 One further check that runs early and can defer the run is the VMD hardware presence detection. As of v44 patch 6 it is fail-closed: a PnP enumeration error is treated as indeterminate rather than as VMD hardware absent. See "VMD hardware detection was indeterminate" below.
 
-One classifier message that fires early, without stopping the run, is the label-only classifier WARN (v44 patch 3). When the active WinRE location resolves to a partition whose GPT type is not the recovery GUID and whose MBR type is not `0x27`, but whose volume label is `Recovery` or `WINRE`, the classifier logs a WARN and does **not** treat the partition as a recovery partition. See "The machine keeps rebuilding and never takes the fast path (label-only recovery partition)" below.
+One classifier message that fires early, without stopping the run, is the label-only classifier WARN (v44 patch 7). When the active WinRE location resolves to a partition whose GPT type is not the recovery GUID and whose MBR type is not `0x27`, but whose volume label is `Recovery` or `WINRE`, the classifier logs a WARN and does **not** treat the partition as a recovery partition. See "The machine keeps rebuilding and never takes the fast path (label-only recovery partition)" below.
 
 One further class of deferrals was introduced in v45 patch 1: the pre-shrink deferrals from `Ensure-AdequateRecoveryPartition`. The function returns a `Deferred` result with a specific `Reason`, and when `RetrySuppressible = $true` the main flow writes the deferral sidecar at `C:\Recovery\OEM\winre_partition_deferred.json`. See "The destructive replacement was deferred before partition deletion" below for the full list of reasons and their resolutions.
 
@@ -71,7 +71,7 @@ Two field failures, both on Windows 11 build 26200:
 - **Dell Latitude 3550** (Intel Core Ultra 5 125U) — 2026-09-28, `VolumeStatus=EncryptionInProgress` at 73.6%.
 - **HP ProBook 450 15.6 inch G10** (Intel Core i7-1355U) — 2026-09-28, same state.
 
-**A related but distinct failure mode.** The post-deletion create/format corner described under ["The OS-fallback route deferred because C: is encrypted"](#the-os-fallback-route-deferred-because-c-is-encrypted) also produces a machine with no dedicated recovery partition and no working WinRE registration. It is a different root cause — a `New-Partition` or `Format-Volume` failure after deletion on an encrypted-C: machine, not the pre-patch-5 Device Encryption race — but the end state looks similar. If the machine's log shows `Pre-deletion inventory:` followed later in the same run by `OS-fallback deferred:`, see that section instead of this one. If the machine's log shows `Newly created recovery partition is BitLocker-encrypted - attempting delete and recreate after suspend`, this section applies.
+**A related but distinct failure mode.** The post-deletion create/format corner described under ["The OS-fallback route deferred because C: is encrypted"](#the-os-fallback-route-deferred-because-c-is-encrypted) also produces a machine with no dedicated recovery partition and no working WinRE registration. It is a different root cause — a post-delete failure on an encrypted-C: machine, not the pre-patch-5 Device Encryption race — but the end state looks similar. If the machine's log shows `Pre-deletion inventory:` followed later in the same run by `OS-fallback deferred:`, see that section instead of this one. If the machine's log shows `Newly created recovery partition is BitLocker-encrypted - attempting delete and recreate after suspend`, this section applies.
 
 **Recovery procedure.** Wait for the encryption to finish or abort it, then re-run with patch 5 or later.
 
@@ -211,7 +211,7 @@ Common causes of the enumeration error:
 [WARN] Recorded retry-suppressing deferral for DesiredStateId <id>; next run will verify the existing route before skipping identical retries. Delete C:\Recovery\OEM\winre_state.json and C:\Recovery\OEM\winre_partition_deferred.json to force a retry.
 ```
 
-The `<Reason>` is one of the following. Each has a distinct resolution.
+The most common `<Reason>` values are the following. Each has a distinct resolution. [exit-codes.md](exit-codes.md) carries the full list, including the internal failure reasons (`partition geometry unavailable`, `WinRE disable failed before deletion`, `WinRE disable verification failed before deletion`, and `recovery partition deletion failed; previous route restored`); those indicate storage-level or OS-level conditions rather than operator-actionable constraints, and are diagnosable from the surrounding log lines.
 
 - **`Dedicated recovery partition plan rejected: <specific reason>. No partition or WinRE changes were made.`** — The read-only geometry plan rejected the layout. The `RetrySuppressible` flag is not set; the marker is not written. The nested `<specific reason>` is one of: cross-disk inventory, OS-partition overlap, recovery-typed partition over 2 GiB, recovery-typed partition preceding C:, non-contiguous recovery partition, `SizeMin` unavailable, bucket size invalid, or insufficient contiguous space after the planned resize.
 - **`Pre-shrink free-space check could not read the C: volume (Get-Volume -DriveLetter C returned nothing). Refusing to shrink C: without verifying the 3 GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed.`** — Fail-closed C: volume-read check. `RetrySuppressible = $false`; the marker is not written; the next run retries naturally.
@@ -483,7 +483,7 @@ As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` in
 [WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=<state>). reagentc will refuse to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state.
 ```
 
-**The compound signature — post-deletion create/format failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The two remaining triggers under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure, both of which occur after deletion. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section above.) The full sequence for the post-deletion case is:
+**The compound signature — post-deletion failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The most common post-deletion failure points under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure. The corner is also reachable when the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, or the delete loop itself fails and the previous route could not be restored. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section above.) The full sequence for the post-deletion case is:
 
 ```
 [INFO] Pre-deletion inventory:
@@ -510,7 +510,7 @@ or the analogous sequence for `Format-Volume`:
 
 followed by the OS-fallback deferral.
 
-This compound signature means the machine is now in the **post-deletion residual corner**: the existing type-coded recovery partition has been deleted, and the OS-fallback route has refused because C: is encrypted. The machine ends this run with neither a dedicated recovery partition nor a working OS-fallback registration — the residual failure mode that the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries document. The v45 reorder narrowed the corner: only post-deletion `New-Partition` or `Format-Volume` failures now reach it, whereas v44 also reached it via shrink failures after deletion.
+This compound signature means the machine is now in the **post-deletion residual corner**: the existing type-coded recovery partition has been deleted, and the OS-fallback route has refused because C: is encrypted. The machine ends this run with neither a dedicated recovery partition nor a working OS-fallback registration — the residual failure mode that the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries document. The v45 reorder narrowed the corner: only post-deletion failures now reach it, whereas v44 also reached it via shrink failures after deletion.
 
 **This corner has not been exercised in the field.** No logged run has yet shown a destructive attempt that failed *after* deletion with C: encrypted. [testing.md](testing.md) documents the deliberate post-deletion failure test that will gate any future change to the destructive path. **If you see this signature on a machine, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — it is a case the project wants field data on.** Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run.
 
@@ -852,7 +852,9 @@ New-Partition failed after 3 attempts
 
 **Cause.** The disk geometry changed between the read-only plan and creation, or a disk error prevented creation at the planned extent.
 
-**Resolution.** Automatic. The script calls `Restore-OSPartitionSize` to restore C: to its recorded original size and returns a creation failure. The main flow may use OS-fallback if C: is confirmed fully decrypted. The run exits with `EXIT_WARNING` when fallback succeeds.
+**Resolution.** The script calls `Restore-OSPartitionSize` to restore C: to its recorded original size and returns a creation failure. The main flow may use OS-fallback if C: is confirmed fully decrypted. The run exits with `EXIT_WARNING` when fallback succeeds.
+
+If C: is encrypted, the OS-fallback gate defers and the machine ends with **neither** a dedicated recovery partition **nor** a working OS-fallback registration — the post-deletion residual corner documented in the ["The OS-fallback route deferred because C: is encrypted"](#the-os-fallback-route-deferred-because-c-is-encrypted) section above. The log shows the compound signature: `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`. Capture the full log and file a bug.
 
 If `Restore-OSPartitionSize` also fails, `$Script:GeometryRestoreFailed` is set and the state file is deleted. The next run will re-attempt the destructive path from scratch.
 
@@ -983,7 +985,7 @@ If the state file is repeatedly disappearing on a machine that has already taken
 
 **Symptom.** The state file records `UsedOSFallback: true` and the script keeps exiting with code 2 without re-attempting the dedicated partition.
 
-**Cause.** This is deliberate. The `DesiredStateId`-scoped retry policy (v41) preserves the OS-fallback outcome for the current state so that a machine that cannot shrink the OS does not re-run the destructive path on every run.
+**Cause.** This is deliberate. The `DesiredStateId`-scoped retry policy (v41) preserves the OS-fallback outcome for the current state so that a machine that cannot complete the destructive path does not re-run it on every run. Under v45 patch 1 the trigger set for reaching OS-fallback has narrowed: the shrink runs in the reversible window and a failed pre-shrink now returns a retry-suppressed `Deferred` with the old route preserved, so it no longer reaches OS-fallback. The v45 causes for OS-fallback are post-delete failures where the previous route could not be restored, or where the post-delete extension fallback was unavailable.
 
 **Resolution.** If you want the machine to retry:
 
@@ -999,19 +1001,20 @@ Do not edit the state file's `UsedOSFallback` field and leave the rest in place;
 
 ### OS-fallback, retrying the dedicated path
 
-If the machine is stuck in OS-fallback because the OS partition could not be shrunk enough to create a dedicated recovery partition, the fix is to free up space on C: so that the shrink can succeed on the next full-update attempt.
+In v44 the path into OS-fallback was a failed OS shrink. In v45 patch 1 the shrink runs in the reversible window: a failed pre-shrink now returns a retry-suppressed `Deferred` with the old route preserved and no longer reaches OS-fallback. A machine that reaches OS-fallback under v45 has done so because a post-delete step failed and the run could not recover the previous dedicated-partition route. Freeing C: space may still help — a plan-time rejection is one possible cause of a post-delete failure — but the primary diagnostic is the log line naming the specific post-delete failure.
 
-1. Free up space on C:. The script attempts to shrink by the required bucket size (`WIM size + 250 MiB + 30 MiB`, rounded up to the next 100 MiB boundary, minimum 1000 MiB). Free at least that much plus a margin.
-2. Delete both the state file and the deferral marker (if present) to force the next run to re-attempt:
+To make an OS-fallback machine attempt the dedicated path again:
+
+1. Read the log for the specific post-delete failure that produced the OS-fallback outcome. The compound-signature section above and the `New-Partition` and `Format-Volume` sections name the common causes and their resolutions.
+2. Free up space on C: if the machine has less than the required bucket size plus a margin. The bucket size is `WIM size + 250 MiB + 30 MiB`, rounded up to the next 100 MiB boundary, minimum 1000 MiB.
+3. Delete both the state file and the deferral marker (if present) to force the next run to re-attempt:
 
    ```powershell
    Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
    Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force -ErrorAction SilentlyContinue
    ```
 
-3. Re-run `WinRE.ps1`. It will re-attempt the destructive path with the newly freed space. If the shrink succeeds, the machine ends in a `DEDICATED` end state.
-
-If the shrink still fails, the v45 pre-shrink deferral writes the marker again and preserves the old route. Free space on C: or address the blocking layout, then delete the marker file to retry.
+4. Re-run `WinRE.ps1`. The next run will compute a new `DesiredStateId` and take the full-update path. If the underlying cause is resolved, the destructive replacement succeeds and the machine ends in a `DEDICATED` state. If a pre-shrink deferral fires instead, the machine stays in OS-fallback — the pre-shrink deferral preserves whatever route is currently registered, which in this case is the OS-fallback route. Address the pre-shrink constraint named in the log, then delete the marker file to retry.
 
 ## The machine keeps rebuilding and never takes the fast path (label-only recovery partition)
 
@@ -1167,7 +1170,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - If the run exited with code 2 and the log shows `Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable` or `Offline fallback: using state file's stored DesiredStateId`, note whether the machine was actually offline (no network, DNS failure, proxy) and what the state file's `LastUpdated` timestamp is. This discriminates the offline-fallback deferral (machine unchanged, next scheduled run with network completes the work) from the fast-path-under-offline case (degraded-success, exit 2).
 - If the run exited with code 2 and the log shows `Dedicated replacement deferred before partition deletion`, this is a v45 pre-shrink deferral. Include the `<Reason>` string from that log line, the current free space on C:, and the total size of C:. See "The destructive replacement was deferred before partition deletion" above for the full list of reasons and their resolutions.
 - If the run exited with code 2 and the log shows `Extension-failure fallback: creating recovery partition` or `Extension-failure fallback unavailable`, this is a v45 post-delete extension failure. Include the machine's disk layout from `Test-WinRE.ps1` Option 1, the plan's bucket size, and the current C: end and disk end.
-- If the run exited with code 2 and the log shows the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`, this is the post-deletion create/format residual that the `[v45 patch 1]` CHANGELOG entry documents. Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run. The project wants field data on this corner — see the "The OS-fallback route deferred because C: is encrypted" section above.
+- If the run exited with code 2 and the log shows the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`, this is the post-deletion residual that the `[v45 patch 1]` CHANGELOG entry documents. Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run. The project wants field data on this corner — see the "The OS-fallback route deferred because C: is encrypted" section above.
 - If the run exited with code 3 and the log ends with `Cannot rename because item at '<workspace>\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
 - The relevant slice of the log — not the whole file unless asked.
 - The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes the BitLocker, Windows Setup state, target-partition state, and classifier verdicts. If the report is about the fast path or the state file, also include the output of Option S.

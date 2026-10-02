@@ -11,6 +11,8 @@ Both injections run inside Step 3 (mount, inject, dismount). This document cover
 
 The manifest is a JSON file hosted on GitHub Gist. `WinRE.ps1` reads it from `$DriverManifestUrl` at the top of the script.
 
+For how to host your own manifest and OEM maps, see [self-hosting.md](self-hosting.md).
+
 ### Schema
 
 ```json
