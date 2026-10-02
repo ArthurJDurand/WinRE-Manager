@@ -14,7 +14,9 @@
 
     Mirrored from production (kept in lockstep):
       - Get-IntelProcessorGeneration
-      - Get-DesiredStateId (seven-field recipe, production ScriptVersion)
+      - Get-DesiredStateId (seven-field recipe, production ScriptVersion
+        - the $ProductionScriptVersion default tracks production's
+        $ScriptVersion and must be bumped whenever production bumps)
       - Get-DriverManifest retry policy (2 attempts, 2s sleep, WARN log)
       - VMD detection (fail-closed on PnP enumeration error)
       - Lenovo map resolution status machine (5 states)
@@ -41,7 +43,19 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 20
+    Version : 21
+
+    v21 changes vs v20:
+    1. Fixed a DSI drift that produced false Option-S mismatches.
+       Get-DesiredStateId's $ProductionScriptVersion default was
+       pinned at 44 while production advanced to 45, so the parity
+       check reported "DSI MISMATCH" for every state file v45
+       production had written. The default now tracks production.
+       The parameter comment and the top-of-file mirror list now
+       state that this value must be bumped whenever production's
+       $ScriptVersion is bumped.
+    2. Show-StateFileParity now displays the state file's
+       RepairAttempts field, matching the v44 patch 6 write side.
 
     v20 changes vs v19:
     1. Classifier mirrored from production v44 patch 7. The active-
@@ -646,13 +660,16 @@ function Get-IntelProcessorGeneration {
 }
 
 function Get-DesiredStateId {
-    # Mirror of production v44 patch 6's Get-DesiredStateId.
+    # Mirror of production v45 patch 1's Get-DesiredStateId. The
+    # $ProductionScriptVersion default MUST track production's
+    # $ScriptVersion. If it falls behind, Show-StateFileParity reports
+    # a false DSI MISMATCH for every state file production has written.
     param(
         [Parameter(Mandatory)]$Hardware,
         $OEMPackage,
         [Parameter(Mandatory)][string]$ExpectedDriverSetVersion,
         [bool]$VMDPresent = $false,
-        [int]$ProductionScriptVersion = 44
+        [int]$ProductionScriptVersion = 45
     )
     $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
     $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
@@ -1778,6 +1795,7 @@ function Show-StateFileParity {
     Write-KV "LastUpdated"           "$($state.LastUpdated)" "Gray"
     Write-KV "PendingReboot"         "$($state.PendingReboot)" $(if ($state.PendingReboot) { "Yellow" } else { "Gray" })
     Write-KV "UsedOSFallback"        "$($state.UsedOSFallback)" $(if ($state.UsedOSFallback) { "Yellow" } else { "Gray" })
+    Write-KV "RepairAttempts"        "$($state.RepairAttempts)" $(if ([int]$state.RepairAttempts -gt 0) { "Yellow" } else { "Gray" })
     Write-KV "LastEnableResult"      "$($state.LastEnableResult)" $(if ($state.LastEnableResult -eq 'ok') { "Green" } else { "Yellow" })
     Write-KV "EnableFailureAttempts" "$($state.EnableFailureAttempts)" $(if ([int]$state.EnableFailureAttempts -gt 0) { "Yellow" } else { "Gray" })
 
@@ -2390,7 +2408,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v20)"
+    $titleContent = "WinRE Manager Test Harness (v21)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -2438,7 +2456,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v20"
+Rule "WinRE Manager test harness v21"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

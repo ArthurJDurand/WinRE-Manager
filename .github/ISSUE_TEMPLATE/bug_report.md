@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v44 patch 7, from the .NOTES block -->
+- **WinRE.ps1 version:** <!-- e.g. v45 patch 1, from the .NOTES block -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
@@ -27,6 +27,8 @@ labels: ['bug', 'needs-triage']
 - **State file fields:** <!-- if C:\Recovery\OEM\winre_state.json exists, paste: DesiredStateId, LastEnableResult, and EnableFailureAttempts -->
   <!-- LastEnableResult and EnableFailureAttempts are optional in the JSON and default to "ok" / 0 if absent. DesiredStateId is required for the maintainer to check whether the state file would be accepted on this machine. -->
   <!-- If you can run the harness, Option S "State file parity check" reports whether the on-disk state file matches the ID production would compute right now. -->
+- **Partition deferral marker:** <!-- if C:\Recovery\OEM\winre_partition_deferred.json exists, paste its contents (the DesiredStateId and Since fields). If it does not exist, say so. -->
+  <!-- The marker is written when a pre-shrink deferral suppresses identical retries across runs. Its presence explains why a subsequent run exited EXIT_WARNING without re-attempting the pre-shrink. -->
 - **Elevation:** <!-- Running as SYSTEM, as admin, unelevated -->
 - **7-Zip present:** <!-- yes/no -->
 

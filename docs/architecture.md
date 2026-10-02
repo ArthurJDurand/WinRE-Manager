@@ -1,196 +1,3 @@
-# Architecture
-
-WinRE Manager is a single-file production script plus a read-only harness and three map builders. This document explains the design — why the script makes the choices it does, what invariants it maintains, and what state it carries between runs.
-
-If you are new to the project, start with the [README](../README.md). That page explains what the tool does, who it is for, and how to run it. This document assumes you already know those things and want to understand how the tool works under the hood.
-
-## What problem it solves
-
-Windows' recovery environment is fragile. The seven common failure modes are:
-
-1. **Partition too small.** A Windows Update replaces `winre.wim` with a newer, larger one; the recovery partition no longer has room for it plus the Microsoft-documented servicing margin.
-2. **BitLocker auto-encryption.** On Windows 11 24H2+ with TPM 2.0 and Secure Boot, `Device Encryption` auto-encrypts newly created partitions, including recovery partitions. `reagentc /enable` then refuses with *"Windows RE cannot be enabled on a volume with BitLocker Drive Encryption enabled."*
-3. **Device Encryption in progress.** A volume can be actively encrypting (`VolumeStatus=EncryptionInProgress`) while `ProtectionStatus` reads `Off`. In that state the encryption service is running and will claim any new partition created on the disk, before the recovery type GUID can be applied. This is the failure mode fixed in v43 patch 5; the pre-patch-5 code treated `ProtectionStatus=Off` as sufficient evidence that BitLocker was not a factor, and two machines were damaged by it on the same day. See [troubleshooting.md](troubleshooting.md) for the recovery procedure.
-4. **Missing storage drivers.** OEM WinPE driver packs and Intel VMD storage drivers are required for the recovery image to see the storage controller. Without them, recovery cannot find the OS.
-5. **VMD hardware present but not in the deployed driver set.** A BIOS or firmware update can flip VMD on or off, or a CPU or motherboard swap can change the storage configuration, without changing `Manufacturer` / `Model` / `MachineType`. Under the v43 `DesiredStateId`, the machine would take the fast path with a stale driver set. The v44 patch 1 revision adds CPU vendor/generation and VMD presence to the `DesiredStateId` inputs so the machine rebuilds automatically. The v44 patch 6 revision makes the VMD hardware presence check itself fail-closed: if the check cannot be completed, the run defers rather than guessing that VMD is absent.
-6. **Stale registration.** A disk migration, clone, or manual `reagentc` operation leaves the registration pointing at a partition that no longer exists. Windows might silently fall back to `C:\Recovery\WindowsRE` (OS-fallback) — a functional but degraded state.
-7. **Audit Mode / OOBE / sysprep.** A freshly imaged machine that has not yet reached a normal desktop is in a transitional state where `reagentc /enable` is blocked with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM. The v43 patch 5 (further revision) startup guard detects this and defers — the script does not repair Audit Mode, it steps back from it. Without the guard, the deployment ran successfully, failed at `/enable`, wrote a state file recording the deployment as complete, and looped on every subsequent run.
-
-WinRE Manager addresses all seven idempotently. The two hard requirements are:
-
-- **Correct end state**: a single dedicated recovery partition, on the OS disk, **type-coded as a recovery partition**, containing the right WIM, with `reagentc` registered to it.
-- **Do not disturb a healthy machine.** Running the script on a machine already in the correct end state must be a no-op.
-
-Everything below is designed around those two requirements.
-
-## The pipeline
-
-The production script runs one of four control-flow paths. Three of them are short-circuits; the full-update path is the long one.
-
-Before any of those paths is chosen, three things happen in order: the program lock is acquired, one startup guard runs, and one normalisation step runs. The lock is a mutual-exclusion primitive; the guard is read-only and can terminate the run early; the normalisation step is not a gate and does not defer.
-
-The **program lock** is acquired first, immediately after the startup banner, before the Audit Mode guard and before any state-modifying action. `WinRE.ps1` opens `C:\ProgramData\OEM\Logs\WinREManager.lock` with an exclusive handle via `[System.IO.File]::Open($path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)`. The Windows kernel enforces the exclusive handle, so cross-session and cross-privilege exclusion are guaranteed by the OS. The handle is released automatically when the process exits, cleanly or after a crash — there is no stale-lock recovery logic. The lock is **not** acquired under `-DryRun`, because a dry run is read-only and safe to run concurrently with a live deployment. A second instance that cannot acquire the lock logs `Another WinRE Manager instance is already running (program lock file is exclusively held)` and exits `EXIT_WARNING` (code 2) without touching anything. If the lock cannot be acquired for a non-contention reason — a permission error, a missing `Logs` directory, or a transient filesystem issue — the script logs a WARN and proceeds without protection; the lock is defensive, and a broken lock must not prevent a legitimate deployment. See the "Control-flow invariants" section for the full discussion.
-
-The **Audit Mode / OOBE / sysprep guard** runs second, before the hardware check. It reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and defers with `EXIT_WARNING` when the value is present and is not `IMAGE_STATE_COMPLETE`. During Audit Mode, OOBE, sysprep generalize, and sysprep specialize, `reagentc /enable` is blocked by the OS regardless of what the script has done; running the destructive partition path in these states accomplishes nothing and leaves a state file that would loop on every subsequent run. The guard is deliberately conservative: any value other than `IMAGE_STATE_COMPLETE` defers, and absence of the key is treated as safe (some SKUs omit it). Under `-DryRun` the guard logs `Would defer …` and continues.
-
-The **drive-letter cleanup** then runs: any volume labelled `Recovery` or `WINRE` whose partition is not the boot or system partition and whose root does not contain a `Windows` directory has its drive letter removed. This is a defensive normalisation — those letters should never be persistent — and it is a no-op on a healthy machine.
-
-BitLocker state is not consulted at startup. The v43 patch 5 (further revision 5) policy is target-volume-based, and the target volume is not known until the classifier has resolved the reagentc-registered location. The BitLocker decision is therefore made where the action is taken, not at startup. This is a deliberate departure from the v43 patch 5 (further revision) design, which had a startup BitLocker gate; that gate deferred on the OS volume state, and the OS volume state is irrelevant to the enable-only and dedicated-partition paths. The only place C:'s state is consulted is the OS-fallback route, because on that route the target volume *is* the OS volume. As of v44 patch 6, the destructive partition path does not consult C:'s state at all: the dedicated-partition path's objective is to create a dedicated partition, and it succeeds or fails on the partition geometry, not on C:'s encryption state. If the destructive attempt fails at the shrink step, the run falls through to OS-fallback, and the OS-fallback gate then checks C: and defers as designed. The residual corner in which this ordering loses the safety property is documented in the Step 5 discussion below.
-
-### Fast path (idempotent)
-
-Entered when: WinRE is enabled, the state file matches, the currently-registered recovery partition is **type-coded and** on the OS disk, exactly one **type-coded** recovery partition exists on the OS disk, and the deployed WIM hash matches the stored hash.
-
-Effect: `Remove-StrayRecoveryPartitions` enforces the "no recovery partition on non-OS disks" invariant, any stale `PendingReboot` / `RepairAttempts` / `EnableFailureAttempts` counters and a stale `LastEnableResult` are cleared by a single state-file rewrite, and the script exits. This is a read-only scan plus, if needed, one small state-file write on a healthy machine.
-
-If the manifest fetch failed and the state file's local safety checks pass, the fast path can also fire under the **offline fallback** (v44 patch 5). The script trusts the state file's stored `DesiredStateId` directly, skips the OEM pack resolution and VMD detection (both require the manifest), and exits `EXIT_WARNING` because `$Script:offlineFallback = $true`. The machine is unchanged; the exit code signals that the fast path was taken without a live manifest fetch. See the "Control-flow invariants" section and [state-and-idempotency.md](state-and-idempotency.md) for the residual risk.
-
-### Enable-only path
-
-Entered when: WinRE is disabled but the current WIM is already correct (the state file matches and the WIM is present at the registered location).
-
-Effect: **prepare the target recovery partition first** via `Set-RecoveryPartitionReadyForWinRE`. This is the v43 patch 5 (further revision 5) change: reagentc's BitLocker check is on the target volume, not on C:, so the target must be unencrypted by the time `/enable` runs. The helper decrypts the target in place with `manage-bde -off` and polls for completion if needed, up to a 300-second timeout. It does not touch C:'s BitLocker state.
-
-If the target cannot be made unencrypted, the enable-only path records the failure, increments the state file's `EnableFailureAttempts` counter, writes `LastEnableResult = "failed"`, removes the checkpoint file, and exits `EXIT_WARNING`. Otherwise it proceeds to `reagentc /setreimage` followed by `reagentc /enable`. Four possible outcomes from that call:
-
-- **`"ok"`** — enable succeeded, no reboot required. Exit `EXIT_SUCCESS` (or `EXIT_WARNING` if a non-fatal warning was set).
-- **`"reboot"`** — enable succeeded but requires a reboot. Write the state file with `PendingReboot = true` and exit `EXIT_REBOOT_REQUIRED` (code 1).
-- **`"failed"`** — generic hard failure. Increment the state file's `EnableFailureAttempts` counter, write `LastEnableResult = "failed"`, remove the checkpoint file, and exit `EXIT_WARNING` (code 2). **The enable-only path deliberately does not fall through to full update on this outcome.** The deployment is already current; a rebuild would not change the outcome of the enable step. The next run will retry enable-only. After three consecutive failures the loop-breaker fires (see below).
-- **`"bitlocker"`** — reagentc refused because the target volume is BitLocker-protected, even after the helper prepared it. Increment the counter with `LastEnableResult = "bitlocker"`, remove the checkpoint file, and exit `EXIT_WARNING`. This is rare under the new policy: it means either the Device Encryption service re-claimed the volume between preparation and `/enable`, or the target reagentc is checking is not the partition the helper prepared. The loop-breaker counts this alongside `"failed"`.
-
-### Full-update path
-
-Entered when: anything has changed — new Windows build, new driver manifest version, new OEM pack version, current WIM hash differs from stored, no state, a change in CPU generation or VMD presence that has moved the `DesiredStateId`, a classifier-detected problem such as a recovery partition on a secondary disk, or a label-only recovery partition on the OS disk that no longer qualifies as DEDICATED.
-
-Effect: the eight-step pipeline. This is the long path. At the end of Step 6 the state file is written with a `LastEnableResult` and `EnableFailureAttempts` that reflect the run's `$enableResult`; on a `"failed"` or `"bitlocker"` outcome the counter is incremented, on any other outcome it resets to 0.
-
-### Pending-reboot path
-
-Entered at the top of the run when the state file says `PendingReboot = true` and the state file's `DesiredStateId` matches the current one.
-
-Effect: prepare the target recovery partition via `Set-RecoveryPartitionReadyForWinRE`, then re-run `reagentc /enable` against the WIM path recorded in the state file. If the target cannot be prepared, defer with `EXIT_WARNING`. If `reagentc /enable` succeeds, clear the flag and exit. If it fails, increment `RepairAttempts` and either retry (up to 3 attempts) or exit fatally. The pending-reboot path resets the enable-failure counter to 0 on every write, because it represents a different failure mode tracked by a separate counter. The two counters are independent.
-
-A **target-preparation failure** on the pending-reboot path does **not** increment `EnableFailureAttempts`. The exclusion is deliberate. Immediately after a reboot, the target partition's encryption state may be transiently indeterminate: the BitLocker service may not have finished enumerating the volume, the Device Encryption service may still be arming protection, or `manage-bde` may not yet report a stable state. A preparation failure that would resolve on its own within one poll cycle must not be counted against the enable-failure threshold, because the loop-breaker's purpose is to catch machines that are stuck on a genuine `/enable` failure, not machines that were polled a moment too early. The pending-reboot path is tracked exclusively by `RepairAttempts`; a preparation failure there defers the run and leaves the state file's enable-failure counter untouched.
-
-### Loop-breaker
-
-A separate check runs after the pending-reboot block and before the classifier. When the state file records `EnableFailureAttempts >= 3` **and** `LastEnableResult` is `"failed"` or `"bitlocker"` **and** WinRE is still `Disabled`, the script logs a "manual intervention required" message, removes the checkpoint file, and exits `EXIT_FATAL` (code 3). The state file is left in place; the log message names it and instructs the operator to delete it to reset the counter, once the underlying cause is resolved.
-
-The predicate is deliberately narrow. `"bitlocker"` is included because a machine that keeps failing the enable step on the BitLocker error — even after the helper prepared the target — is in the same kind of loop as a machine failing generically, and the same manual intervention is required. `"blunsafe"` no longer exists as a return value; the fail-closed check that produced it is now the helper's job, and a failure to prepare the target is recorded as `"failed"`.
-
-Under `-DryRun` the loop-breaker logs `Would refuse to retry …` and continues, matching the pattern used by the Audit Mode guard.
-
-### Offline guard
-
-When the manifest fetch fails after its retry budget, the script engages the **offline fallback** (v44 patch 5). It reads the state file's stored `DesiredStateId`, sets `$Script:offlineFallback = $true`, and skips the OEM pack resolution, the VMD detection, and the required-driver resolution, because all three depend on the manifest.
-
-If the fast path fires under the offline fallback, the machine is validated and the run exits `EXIT_WARNING`. If the fast path does not fire — because the state file indicates a full update is needed — the run exits `EXIT_WARNING` before the full-update pipeline, having done nothing. If there is no state file at all, the run throws and exits `EXIT_FATAL`; a first deployment requires the live manifest.
-
-The offline fallback trusts the state file's stored `DesiredStateId` **without verifying that the machine's local hardware still matches the inputs that produced it.** This is the residual risk. On a machine whose hardware changed while offline — a CPU swap, a BIOS update that flipped VMD, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — the offline run could take the fast path with a stale DSI. The next successful manifest fetch detects the drift and forces a rebuild. A `LocalInputsId` field in the state file would close this; it is planned as its own version boundary. See [state-and-idempotency.md](state-and-idempotency.md) for the full discussion.
-
-### VMD fail-closed guard (v44 patch 6)
-
-When the manifest is available, the script determines VMD hardware presence by enumerating present PnP devices that match the union of the manifest's `requiredDevices` patterns. As of v44 patch 6 the enumeration is fail-closed: if `Get-PnpDevice` reports an error during the query, the run treats VMD presence as **indeterminate** rather than as absent.
-
-An indeterminate result means the correct driver set cannot be determined. Proceeding on a guess would risk selecting a driver set that omits the VMD package on a machine that has VMD hardware; the resulting WinRE would not be able to see the OS disk, which is exactly the failure mode the v44 patch 1 `DesiredStateId` change was designed to prevent. The run logs the enumeration error, sets `$Script:nonFatalWarning = $true`, removes the checkpoint file, and exits `EXIT_WARNING` **before** committing any state. No WIM is deployed, no partition is touched, no `reagentc` call is made. The next run retries the enumeration.
-
-Under `-DryRun` the check logs the enumeration error and continues; the exit is not predicted. See [troubleshooting.md](troubleshooting.md) for the resolution.
-
-## The eight steps
-
-The full-update path.
-
-**Step 1 — Wipe WorkDir.**
-Delete `C:\Temp\WinREWork\mount` and `C:\Temp\WinREWork\base.wim`. Checkpoint as `Step=1`.
-
-**Step 2 — Obtain base WIM.**
-If the current registered WIM is usable (present and readable at the reagentc-registered location, or a fallback), copy it to `WorkDir\base.wim`. Otherwise download from GitHub: fetch `winre.7z.NNN` parts, extract with 7-Zip, rename to `base.wim`. Checkpoint as `Step=2`.
-
-As of v44 patch 6, the GitHub download path removes any stale `winre.wim` at `$WorkDir\winre.wim` before invoking 7-Zip, verifies that 7-Zip produced `winre.wim` after extraction, and removes any stale `base.wim` at `$WorkDir\base.wim` before the `Rename-Item` call. Before patch 6, an interrupted previous run could leave a `base.wim` in place at the moment the next run reached the rename; the rename would fail and the machine would not progress past Step 2 until an operator deleted `WorkDir` by hand. The v44 patch 3 fix added the same cleanup to the injection-failure abort branch; patch 6 extends it to the normal Step 2 path.
-
-**Step 3 — Mount, inject, dismount.**
-Mount `base.wim` with `Mount-WindowsImage`. Capture the pre-injection third-party driver count via `Get-WindowsDriver`. Download the OEM pack (vendor-specific: CAB for Dell, EXE for Lenovo, SoftPaq EXE for HP), extract to a temp dir, `Add-WindowsDriver -Recurse`. Then, if VMD hardware is present and manifest VMD drivers match the CPU generation, download each VMD pack, extract, `Add-WindowsDriver`. Success gate: the package's INF basenames must appear in the mounted image's third-party drivers after injection, OR the pre/post delta must be > 0. See [driver-injection.md](driver-injection.md).
-
-Lenovo OEM pack resolution distinguishes five states as of v44 patch 6: `unknown-mt`, `map-unavailable`, `no-entry`, `malformed-entry`, and `resolved`. `unknown-mt` and `no-entry` are legitimate "no pack available for this machine" answers and let the run proceed with `OEMPACK=NONE`. `map-unavailable` and `malformed-entry` mark the run with `$Script:ImageInjectionComplete = $false`. The distinction matters because Lenovo does not publish WinPE driver packs for every model; before patch 6 a malformed map entry looked identical to a legitimate no-pack case, and the machine would silently complete without OEM driver injection.
-
-Once injection is confirmed complete (`$Script:ImageInjectionComplete = $true`), run `dism /image:<MountDir> /cleanup-image /StartComponentCleanup /ResetBase` on the mounted image. ResetBase removes superseded components from the WinSxS store inside the image; the size reduction it represents does not appear in the `.wim` file on disk until the image is re-exported in Step 4. ResetBase failure is non-fatal: the log records a WARN with the DISM exit code and the pipeline continues. When injection failed, ResetBase is skipped — the pipeline aborts before Step 4 anyway, so the reset would only waste CPU.
-
-Dismount with `-Save` to commit both the injected drivers and the ResetBase changes to `base.wim`. Checkpoint as `Step=3` **only if** `$Script:ImageInjectionComplete` is `$true` (v43 patch 4). After this block, if `$Script:ImageInjectionComplete` is `$false`, the pipeline exits with `EXIT_WARNING` before Step 4 (the v44 patch 1 pipeline gate), and the abort branch removes both `winre_optimized.wim` (stale from a previous run) and `base.wim` from `WorkDir`. Removing `base.wim` is the v44 patch 3 fix: without it, the next run's Step 2 would fail at `Rename-Item "$WorkDir\winre.wim" "base.wim"` because the destination file still exists, and the machine would not progress past Step 2 until an operator deleted `WorkDir` by hand.
-
-**Step 4 — Optimize.**
-`dism /Export-Image /Compress:max` to `winre_optimized.wim`. This is where the ResetBase savings from Step 3 are materialised on disk as a smaller file — ResetBase alone does not shrink the `.wim` because the export writes a fresh WIM from the modified component store. The exit code is checked; a non-zero exit is fatal. Checkpoint as `Step=4` **only if** `$Script:ImageInjectionComplete` is `$true`.
-
-**Step 5 — Ensure a suitable recovery partition.**
-Two-step decision:
-
-1. `Find-SuitableRecoveryPartition` scans the OS disk for existing recovery partitions. It accepts the candidate only if:
-   - There is exactly one.
-   - It is not the OS partition.
-   - **It is type-coded** — GPT recovery GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27`. A partition detected only by a `Recovery` / `WINRE` volume label is not accepted, is not counted toward the "exactly one" condition, and is not reused.
-   - Its total size is at least `WIM + 250 MiB`.
-   - Its effective free space (current free + existing WIM size) is at least `WIM + 250 MiB`.
-
-   Encryption state is **not** a rejection criterion. The target-volume policy means an existing encrypted recovery partition is usable — `Set-RecoveryPartitionReadyForWinRE` will decrypt it in place before reagentc is called.
-
-2. If no candidate passes, `Ensure-AdequateRecoveryPartition` performs the destructive path. It disables WinRE, deletes every **type-coded** recovery partition on the OS disk (label-only matches are never deleted — the type code gate is applied both before the loop and inside it, as a redundant check), extends the OS partition to its `SizeMax`, shrinks it by `(bucketSizeMiB + 1) MiB`, creates a new partition at the aligned offset with the recovery type GUID or type code already applied, formats as NTFS with label `Recovery`, verifies no auto-encryption occurred, decrypts in place if the Device Encryption service claimed the partition anyway, and returns.
-
-   C:'s encryption state is **not** consulted. The dedicated-partition path's objective is to create a dedicated partition; it succeeds or fails on the partition geometry, not on C:'s BitLocker state. If the destructive attempt fails at the shrink step, the run falls through to OS-fallback, and there the OS-fallback gate checks C: and defers as designed — that is the point at which C:'s state actually matters.
-
-   **The safety property** — never leave a machine with no working recovery route — holds in the two ordinary cases:
-
-   - **The destructive attempt succeeds.** The machine ends up with a working dedicated recovery partition; the OS-fallback gate is never reached and C:'s state is irrelevant.
-   - **The destructive attempt fails before deletion.** No partition was destroyed; the existing recovery route is intact.
-
-   It does not hold in one narrow corner: **a destructive attempt that fails *after* the existing recovery partition has already been deleted, on a machine whose C: is encrypted.** The shrink failure is the realistic trigger (shrink not fitting even after the defrag retry), but the corner also applies if `New-Partition` fails or `Format-Volume` fails after deletion. In that corner, `Restore-OSPartitionSize` restores C:'s geometry and the run falls through to OS-fallback, where the OS-fallback gate checks C:, finds it encrypted, and defers. The machine ends with neither a dedicated recovery partition nor OS-fallback. Under the pre-v44-patch-6 guard, the same machine deferred before touching the current route, leaving the existing route intact.
-
-   This is a documented residual, not a design intention. The correct fix is a **post-failure** check in the shrink-failure branch that handles the corner after the destructive attempt fails, not a reinstatement of the pre-destructive guard — the guard's predicate ("is C: encrypted?") cannot distinguish a destructive attempt that will succeed from one that will fail, and the field evidence shows the destructive path succeeding cleanly on encrypted-C: machines. See the `[v44 patch 7]` CHANGELOG entry for the four preconditions and the log signature (`Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`). The corner has not been exercised in the field; [testing.md](testing.md) documents the deliberate shrink-failure test that will gate any future change to the destructive path.
-
-   If the shrink fails after three attempts (immediate, after 10s sleep, after `defrag C: /x`), the OS partition size is restored via `Restore-OSPartitionSize`, the destructive attempt is abandoned, and the script falls through to OS-fallback — WinRE deployed to `C:\Recovery\WindowsRE` instead of a dedicated partition, with exit code 2.
-
-**Step 6 — Deploy the WIM.**
-First, prepare the target: `Set-RecoveryPartitionReadyForWinRE` on the recovery partition, or — for the OS-fallback route — a check on C:'s `VolumeStatus` that defers unless it is `FullyDecrypted`. The OS-fallback check exists because reagentc refuses to enable WinRE on an encrypted OS volume, always. The script never modifies C:'s BitLocker state.
-
-Then: copy the source WIM to the target directory. Verify SHA256. Set the file hidden + system. Call `reagentc /setreimage /path \\?\GLOBALROOT\device\harddiskX\partitionY\Recovery\WindowsRE`, then `reagentc /enable`. Write the state file with the deployed WIM hash **and** the enable outcome (`LastEnableResult`, `EnableFailureAttempts`). Clear the checkpoint.
-
-**Step 7 — Enforce the single-recovery-partition invariant.**
-`Remove-StrayRecoveryPartitions` deletes any type-coded recovery partition (GPT GUID `{de94bba4-...}` or MBR type `0x27`) on any non-OS disk. A partition on a non-OS disk that carries only a `Recovery` *label* but no type code is logged and skipped — label-only matches are not sufficient authority to delete on a secondary disk.
-
-**Step 8 — Final verification.**
-Re-read WinRE state. Classify the registered location:
-
-- `DEDICATED` — the location resolves to a **type-coded** recovery partition on the OS disk.
-- `OS-FALLBACK` — the location resolves to the OS partition. `$Script:UsedOSFallback` must be `$true`, otherwise the run is treated as a FATAL inconsistency.
-- `UNEXPECTED` — neither of the above; the run is treated as a FATAL inconsistency.
-
-A partition detected only by a `Recovery`/`WINRE` volume label — with no matching type code — does not reach the `DEDICATED` verdict; it falls through to `UNEXPECTED` and the run is treated as a failure. This mirrors the active-location classifier's rule (v44 patch 3): the classifier and the final verification use the same authority standard.
-
-If dedicated, remove any temporary drive letter that the script assigned during the pipeline. If OS-fallback, warn that the run is degraded but functional.
-
-## The five state-carrying artifacts
-
-| Artifact | Path | Purpose | Lifetime |
-|---|---|---|---|
-| **State file** | `C:\Recovery\OEM\winre_state.json` | Records the deployed WIM hash, `DesiredStateId`, and the enable outcome (`LastEnableResult`, `EnableFailureAttempts`). | Persists across runs. |
-| **Checkpoint file** | `C:\ProgramData\OEM\Logs\winre_checkpoint.txt` | Records the highest completed step of the current pipeline. | Deleted at end of run. |
-| **Log file** | `C:\ProgramData\OEM\Logs\WinRE-Manager.log` | Append-only event log. | Rotated by the operator, not by the script. |
-| **Program lock file** | `C:\ProgramData\OEM\Logs\WinREManager.lock` | Exclusive-handle target for the single-instance guarantee (v44 patch 4). | Persists across runs; the file's existence is not the lock, the open handle is. |
-| **WorkDir** | `C:\Temp\WinREWork` | Scratch space for mounts, downloads, and intermediate WIMs. | Deleted at Step 6. |
-
-See [state-and-idempotency.md](state-and-idempotency.md) for the schemas and the crash-consistency model.
-
-## The idempotency key
-
-`DesiredStateId` is a SHA256 over a deterministic set of inputs:
-
-```
-HW=<Manufacturer>|<Model>|<MachineType>
-OS=<Build>
-CPU=<vendor>|<generation or N>
-VMD=<present|absent>
-MANIFEST=<manifest.version>
-OEMPACK=<resolved OEM pack version or NONE>
-SCRIPT=<ScriptVersion>
-```
 
 Any change to any of those seven fields changes the ID. When the ID differs from the stored state file's ID, the state file is treated as stale and the script rebuilds. When the ID matches, the fast path can fire.
 
@@ -199,6 +6,8 @@ The `CPU` and `VMD` inputs were added in v44 patch 1. They capture the two hardw
 The design deliberately excludes things that change frequently but should not trigger a rebuild: the current date, the current WIM hash at the registered location (that's a separate check), and the machine's serial number. It also deliberately does not hash the actual resolved driver list, on the reasoning that the manifest `version` field plays that role and the resolved-inputs approach would be a larger change that deserves its own version boundary.
 
 `LastEnableResult` and `EnableFailureAttempts` are *not* part of the `DesiredStateId` — they are runtime counters that affect the control-flow decision, not the identity of the deployment. A machine with a non-zero counter is still "the current deployment" as far as the state-file comparison is concerned; the counter tracks the *enable* step's history, not the *deploy* step's identity.
+
+The deferral marker (v45 patch 1) is also *not* part of the `DesiredStateId`. Its `DesiredStateId` field records the DSI under which the deferral was written, but the marker's presence does not change the DSI. A machine with a marker written under the current DSI is treated as "the current deployment, but the destructive sequence failed for it" — the marker suppresses retries without redefining the deployment identity.
 
 The offline fallback (v44 patch 5) does **not** recompute the DSI from cached inputs; it trusts the state file's stored value. This is documented in [state-and-idempotency.md](state-and-idempotency.md) as the residual risk that the planned `LocalInputsId` field would close.
 
@@ -248,15 +57,31 @@ These are the invariants the script maintains. Each one has a real field failure
 
 16. **Only a type-coded recovery partition on the OS disk is authoritative.** Every decision the script makes about recovery partitions — reuse, fast-path counting, active-location classification, final verification, deletion authorization, stray cleanup — reads from a single rule: the partition must carry the recovery GPT type GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or the MBR type code `0x27`. A partition detected only by its `Recovery` or `WINRE` volume label is not promoted to DEDICATED, is not counted by the fast path, is not reused by `Find-SuitableRecoveryPartition`, and is not deleted by any code path. This is the v44 patch 7 addition. Before patch 7, the classifier used by the active-location check and the count used by the fast path both accepted label-only matches; the destructive path, which had always correctly refused to delete label-only matches, was the only consumer that applied the type-code gate. The asymmetry meant a Basic Data partition labelled "Recovery" on the OS disk would be counted by the fast path (so the "exactly one recovery partition on the OS disk" condition could never be satisfied) while being preserved by the destructive path (so it was never removed). The machine cycled through rebuilds indefinitely without converging. Patch 7 enforces the same authority rule everywhere: the type code is the partition's identity, the label is only a hint.
 
+17. **The shrink runs in the reversible window, before route destruction.** The v45 patch 1 reorder moves the pre-shrink (with its sleep and defrag retries) ahead of `reagentc /disable` and ahead of any partition deletion. A shrink failure at this point returns `Deferred` with the old route intact. The pre-shrink free-space check is fail-closed: if C:'s volume cannot be read, the run defers rather than proceeding on the assumption that the partition supported-size preflight is sufficient. The check treats an indeterminate read as a distinct condition from a measured shortfall and does not retry-suppress it, because the read may clear on its own. This invariant closes the v44 patch 7 residual for the shrink failure trigger specifically.
+
+18. **The plan computes a single boundary; the recovery partition fills exactly the space between that boundary and C:'s end.** The planner derives `AlignedManagedExtentEnd = floor(tailEnd / 1 MiB) × 1 MiB` and `TargetRecoveryStart = AlignedManagedExtentEnd - B`. C: is resized so it ends exactly at `TargetRecoveryStart`, and the recovery partition of size exactly `B` fills the space up to `AlignedManagedExtentEnd`. Bytes between the raw extent end and the aligned end are the alignment reserve and are logged, not treated as a defect. This eliminates the trailing gap left by the previous deficit-plus-slack model. The whole-layout assertion (`Assert-RecoveryPartitionLayout`) re-queries the newly created partition and confirms identity, exact offset, size within one alignment block, no overlap with C:, C:-to-recovery gap within one alignment block, and end at `AlignedManagedExtentEnd`. This is the v45 patch 1 addition.
+
+19. **Post-delete extension has a safe fallback that prioritizes WinRE deployability over exact geometry.** When the plan calls for extending C: into the space the old recovery partitions occupied, the extension runs after deletion. If extension fails, the script re-queries C:'s current end, computes the largest recovery partition that fits between the current C: end and `AlignedManagedExtentEnd`, and — if that is at least the plan's bucket size — places the recovery partition there with a non-fatal warning. Exact geometry is a goal, not a reason to leave WinRE disabled. If the fallback size is too small, the script restores C: to its original size and returns `$null` so the main flow falls through to OS-fallback. This is the v45 patch 1 addition.
+
+20. **The pre-shrink deferral marker suppresses retries only while the old route is verified functional.** When `Ensure-AdequateRecoveryPartition` returns `Deferred` with `RetrySuppressible = $true`, the main flow writes `C:\Recovery\OEM\winre_partition_deferred.json`. On the next run, the marker is honored only if the old route is verified functional (WinRE `Enabled`, registered WIM readable, and either the active partition is a type-coded recovery partition on the OS disk or the OS-fallback route is on a `FullyDecrypted` C:) and the fast path would not fire. If the fast path would fire — the machine has converged on its own — the marker is cleared and the run exits `EXIT_SUCCESS`. If the old route is not functional, the marker is cleared and normal repair evaluation continues. This is the v45 patch 1 addition.
+
+21. **A deletion failure restores the previous route when possible.** The currently active recovery partition is deleted last, so a mid-loop failure leaves it available. On any deletion failure, the script restores C: to its original size and attempts `Restore-PreviousWinRERoute`. If the previous route is confirmed restored — WinRE `Enabled` and the registered location matches the previous location per `Test-WinRELocationMatches` — the run returns `Deferred`. Otherwise it returns `$null` with an ERROR log stating that the route could not be restored. `Test-WinRELocationMatches` string-compares the locations first, then falls back to disk/partition identity comparison, because reagentc may report the same volume in either the GLOBALROOT or the Volume-GUID form after a disable/enable cycle. This is the v45 patch 1 addition.
+
 ## Where the design choices bite
 
-The eleven most consequential decisions in the whole script are:
+The fourteen most consequential decisions in the whole script are:
+
+- **Shrink-first replacement (v45 patch 1).** The risky operation — the shrink — runs in the reversible window, before any partition is destroyed. A failed shrink now returns `Deferred` with the old route intact, closing the v44 residual for the shrink trigger. The pipeline reorders the pipeline relative to v44, but the total work is unchanged: the shrink, disable, delete, extend, create, format sequence ends in the same state. What changed is when each step runs and what happens if it fails.
+
+- **Single-boundary geometry with whole-layout assertion (v45 patch 1).** The planner computes a target boundary rather than a shrink amount, and the post-creation assertion re-queries the partition to confirm it landed exactly where the plan intended. The alternative — trust `New-Partition`'s success return and let subsequent failures surface later — was the pre-v45 behaviour and produced at least one class of unverified geometry outcomes.
+
+- **Post-delete extension uses a safe fallback (v45 patch 1).** When the plan calls for extending C: into the space the old recovery partitions occupied, extension runs after deletion. If extension fails, the safe fallback places the recovery partition at the current C: end and continues. Exact geometry is a goal, not a reason to leave WinRE disabled. The trade: on an extension failure, the machine ends with a recovery partition that starts slightly earlier than the plan intended, at the cost of not consuming the surplus space. The alternative — restore C:, return `$null`, fall through to OS-fallback on encrypted C: — leaves the machine degraded when a working dedicated recovery partition was one step away.
 
 - **Dedicated recovery partition is the primary objective; OS-fallback is the failure outcome.** The script will attempt the destructive repartitioning path even when the pre-check suggests the OS cannot shrink enough. If the attempt fails, the OS is restored and OS-fallback is used with exit code 2. This is a deliberate trade: try hard for the good outcome, fall back honestly when the attempt fails. The alternative — never try if the arithmetic is pessimistic — was tried in v37 and rejected because `SizeMin` is a hint, not a floor.
 
-- **The `DesiredStateId`-scoped retry policy.** A machine in OS-fallback with a matching state file stays in OS-fallback indefinitely, without re-attempting the destructive path. A state change (script version bump, manifest update, hardware change, Windows build update, CPU generation change, or VMD presence change) naturally re-arms the retry. This avoids re-shrinking the OS on every run of a machine that cannot shrink.
+- **The `DesiredStateId`-scoped retry policy.** A machine in OS-fallback with a matching state file stays in OS-fallback indefinitely, without re-attempting the destructive path. A state change (script version bump, manifest update, hardware change, Windows build update, CPU generation change, or VMD presence change) naturally re-arms the retry. This avoids re-shrinking the OS on every run of a machine that cannot shrink. The v45 patch 1 deferral marker extends the same policy to the pre-shrink deferral: a machine whose destructive sequence has deferred for a fixed reason does not re-attempt it every scheduled run.
 
-- **The BitLocker policy targets the volume reagentc will enable, not the OS volume.** The v43 patch 5 (further revision 5) policy replaces the earlier OS-volume gate. Under the new policy, the enable-only and dedicated-partition paths proceed regardless of C:'s BitLocker state, because reagentc does not care about C: — it cares about the volume it is being asked to enable WinRE on. `Set-RecoveryPartitionReadyForWinRE` prepares that volume: it decrypts it in place with `manage-bde -off` if needed and polls for completion. The only path that gates on C:'s state is the OS-fallback path, and it does so for a specific reason: there the target volume is C:. The gate never modifies C:'s state — the operator resolves the state by completing decryption of C: with `manage-bde -off C:` or waiting for an in-progress decryption to finish. As of v44 patch 6, the destructive partition path no longer consults C:'s state at all. The safety property is preserved by the OS-fallback gate alone in the two ordinary cases (the destructive attempt succeeds, or it fails before deletion); the narrow corner where it is not preserved — a destructive attempt that fails after deletion on an encrypted-C: machine — is documented in the Step 5 discussion above and in the `[v44 patch 7]` CHANGELOG entry.
+- **The BitLocker policy targets the volume reagentc will enable, not the OS volume.** The v43 patch 5 (further revision 5) policy replaces the earlier OS-volume gate. Under the new policy, the enable-only and dedicated-partition paths proceed regardless of C:'s BitLocker state, because reagentc does not care about C: — it cares about the volume it is being asked to enable WinRE on. `Set-RecoveryPartitionReadyForWinRE` prepares that volume: it decrypts it in place with `manage-bde -off` if needed and polls for completion. The only path that gates on C:'s state is the OS-fallback path, and it does so for a specific reason: there the target volume is C:. The gate never modifies C:'s state — the operator resolves the state by completing decryption of C: with `manage-bde -off C:` or waiting for an in-progress decryption to finish. As of v44 patch 6, the destructive partition path no longer consults C:'s state at all. The v45 patch 1 reorder closes the v44 residual for the shrink trigger; the remaining corner is the post-deletion create/format failure.
 
 - **The Audit Mode guard takes priority over everything except the program lock, including the BitLocker decision.** When `ImageState` is not `IMAGE_STATE_COMPLETE`, the script defers before it has fetched the manifest, resolved the OEM pack, computed the `DesiredStateId`, or read the state file. The reasoning is that a machine in Audit Mode is not a machine the script should be modifying at all, and the earlier the guard fires, the less work is wasted and the smaller the surface for accidental state change.
 
@@ -274,7 +99,7 @@ The eleven most consequential decisions in the whole script are:
 
 - **The type code is the recovery partition's identity; the volume label is only a hint.** The design choice was made during v44 patch 7. Before patch 7, the classifier and the fast-path count accepted either the type code or the volume label as evidence that a partition was a recovery partition. That was a wrong-question problem: the destructive path's delete authorization had always required the type code (because a label alone must never authorize deletion), but the count and the classifier used the label OR the type code. The downstream decision those two consumers actually needed was "is this a partition I am authorized to reuse and count as the authoritative recovery partition?" — and the answer to that question is "yes if and only if it carries the recovery type code." A Basic Data partition labelled "Recovery" is not a recovery partition; it is a data partition that happens to have a misleading label. Treating the label as sufficient authority created a non-convergence loop: the fast path counted the label-only partition (so the "exactly one recovery partition" condition could never be satisfied), the destructive path correctly refused to delete it, and the machine rebuilt on every run. The corrective pattern is the same one that appears in every other entry in this document: move the check from the convenient signal to the authoritative signal. The v44 patch 7 change applies that pattern to the classifier and the count, so all consumers of "is this a recovery partition?" now use the same rule.
 
-## A note on the v43 patch 5 field failures
+## A note on the field failures
 
 The v43 patch 5 change was driven by two field failures on the same day, both on Windows 11 build 26200 with Device Encryption mid-encryption:
 
@@ -310,6 +135,14 @@ The v44 patch 6 changes were driven by review rather than a single field failure
 
 The v44 patch 7 changes were also driven by review, not by a fresh field failure. The classifier non-convergence loop was identified from the code by ChatGPT; the pre-patch-7 code had the count and the classifier accepting label-OR-type while the destructive path accepted type-only, and the asymmetry was diagnosed as a genuine non-convergence defect rather than a hypothetical one. The three field runs that exercised the fix — Dell Vostro 16 5640, Lenovo V15 G5 IRL, and ASUS PRIME H510M-D — all converged on the second run. None of them happened to trigger the label-only case (the label-only partition would have to be created by something other than the script, on a machine whose other parameters made a rebuild otherwise unnecessary); the fix is validated by the classifier's behaviour on ordinary type-coded partitions and by the code inspection, not by a live reproduction of the loop.
 
+The v45 patch 1 changes were driven by the v44 patch 7 residual and by the user's field insight, not by an AI review. The field insight was shrink-first: the risky shrink operation should run in the reversible window, before any partition is destroyed. The v44 pipeline did the destructive operations in the wrong order; the v45 pipeline runs them in the right order. The four refinements (fail-closed C: volume-read check, delete-active-last ordering with route restoration, single-boundary geometry with whole-layout assertion, post-delete extension with safe fallback) were folded in during the v45 patch 1 cycle.
+
+The v45 patch 1 field run was on:
+
+- **ASUS PRIME H510M-D, 2026-10-01 23:48–23:51.** The first run took the reuse path — the existing 1000 MiB recovery partition was reused with 1082.2 MiB effective free against 1007 MiB required. Workspace selected a non-OS internal volume with 134.53 GiB free. WIM serviced, ResetBase ran (~28s), optimized WIM 756.72 MiB. `WIM_READY` checkpointed; `base.wim` removed after verified export. State file written with `UsedOSFallback = $false`; `Operating mode: DEDICATED`. Second run three minutes later took the fast path.
+
+The v45 patch 1 **field gap**: because the ASUS run took the reuse path, none of the v45-specific code paths were exercised on physical hardware. The unverified paths are: `Get-PartitionPlan` on a machine that requires a rebuild, the fail-closed C: pre-shrink check, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend` and its safe fallback, all four `Deferred` return paths, the deferral marker write/skip/clear lifecycle, `Restore-PreviousWinRERoute` and `Test-WinRELocationMatches`, `Assert-RecoveryPartitionLayout`, and MBR support. These are covered by parser and mocked-geometry tests but not by physical storage. The VM test plan in [testing.md](testing.md) exercises them.
+
 The BitLocker failure is instructive because it was invisible to each function in isolation. `Test-BitLockerProtected` was correctly implementing the tri-state contract for the state it observed (`ProtectionStatus=Off`). `Suspend-BitLockerForWinRE` was correctly taking the "already off, no suspension needed" branch. `New-Partition` was correctly creating a partition. `Set-RecoveryPartitionAttributes` was correctly applying the recovery type GUID. Each function did exactly what it was written to do. The bug was in the composition: the two BitLocker functions queried a subset of the protection state that was insufficient evidence for the decision the downstream code made with the answer.
 
 The same class of failure is what motivated the enable-failure counter: the state-write gate and the enable path were each correct in isolation, but the composition allowed a state file that said "complete" while the enable had failed, with no mechanism to break the resulting loop.
@@ -322,6 +155,8 @@ And in a fifth direction, the same class of failure explains the delete-and-recr
 
 And in a sixth direction, the same class of failure explains the v44 patch 7 classifier fix. The pre-patch-7 classifier and the fast-path count asked "does this partition look like a recovery partition?" — the answer was yes if the type code matched *or* the label matched. The destructive path asked a stricter version of the same question: "is this partition authorized to be deleted as a recovery partition?" — the answer was yes only if the type code matched. The two answers disagreed, and the disagreement was invisible because each consumer was correct in isolation. The downstream decision the classifier needed to answer was "is this the authoritative recovery partition?" — and the correct answer to that question, everywhere in the script, is "yes if and only if the type code matches." Patch 7 unifies the question across all consumers.
 
+And in a seventh direction, the same class of failure explains the v45 patch 1 fail-closed C: pre-shrink check. The pre-v45 check asked "did `Get-Volume -DriveLetter C` return a value?" — the answer was treated as evidence that C: was safe to shrink. When the read failed, the answer was "no", and the code proceeded anyway on the reasoning that the partition supported-size preflight was sufficient. But the question the downstream decision needed answered was "is C: safe to shrink?" — and "the volume query failed" is not evidence of safety, it is evidence of indeterminate state. The fail-closed check moves the answer to the question that matters: an indeterminate read defers, with a distinct reason and `RetrySuppressible = $false` because the read may clear on its own. The same corrective pattern — move the check from the convenient signal to the authoritative signal — appears again.
+
 **The shared shape.** All of those failures have one property in common: each function or check was individually correct, and each was answering a question that was not the question the downstream code needed answered.
 
 - `Test-BitLockerProtected` asked "is C: protected?" when reagentc was asking "is the target volume unencrypted?".
@@ -331,16 +166,19 @@ And in a sixth direction, the same class of failure explains the v44 patch 7 cla
 - The delete-and-recreate retry asked "how do I stop C: from blocking this operation?" when C: was never blocking anything in the first place.
 - The VMD presence check asked "did the enumeration return any devices?" when the downstream decision needed the answer to "does this machine have VMD hardware?".
 - The pre-v44-patch-7 classifier and fast-path count asked "does this partition look like a recovery partition?" when the downstream decision needed the answer to "is this partition authorized to be treated as the authoritative recovery partition?".
+- The pre-v45-patch-1 C: free-space check asked "did the volume query succeed?" when the downstream decision needed the answer to "is C: safe to shrink?".
 
 The corrective pattern is the same in every case: move the check from the state that is easy to query to the state that actually matters, and record enough about the deployment's inputs that a divergence from the last known good state will be detected rather than assumed absent. That pattern is what the invariants in this document exist to enforce, and it is why each invariant is stated in terms of the question the downstream code needs answered rather than the question that is convenient to ask.
 
-The v44 patch 3 destructive-path guard was an attempt to apply that pattern preemptively. It asked "is C: in a state where the OS-fallback route could complete?" before the destructive sequence began. That question was answerable and the answer was useful in some cases, but as v44 patch 6 review showed, it was over-broad: the dedicated-partition path's success or failure depends on the partition geometry, not on C:'s encryption state, and the OS-fallback gate already asks the same question at the point where the answer actually matters — after the destructive attempt has failed and the run is genuinely about to fall through to OS-fallback. The guard was not wrong to ask the question; it was wrong to ask it there. Patch 6 removes it, and the safety property is preserved by the gate that asks the right question at the right point, in the two ordinary cases. The narrow corner where the property is not preserved is the residual that the eventual post-failure check will close.
+The v44 patch 3 destructive-path guard was an attempt to apply that pattern preemptively. It asked "is C: in a state where the OS-fallback route could complete?" before the destructive sequence began. That question was answerable and the answer was useful in some cases, but as v44 patch 6 review showed, it was over-broad: the dedicated-partition path's success or failure depends on the partition geometry, not on C:'s encryption state, and the OS-fallback gate already asks the same question at the point where the answer actually matters — after the destructive attempt has failed and the run is genuinely about to fall through to OS-fallback. The guard was not wrong to ask the question; it was wrong to ask it there. Patch 6 removes it, and the safety property is preserved by the gate that asks the right question at the right point, in the ordinary cases. The narrower corner where the property is not preserved is the residual that the eventual post-failure check will close.
 
 The v44 patch 4 program lock is a different class of problem — a mutual-exclusion problem, not a wrong-question problem — and is included in the invariants because the pre-patch-4 code lacked any mechanism to enforce the exclusivity the WorkDir design assumed. The corrective pattern for that class is to move the coordination from an implicit assumption ("the scheduled task won't overlap") to an explicit, kernel-enforced primitive, and to accept that the primitive is defensive rather than authoritative (a broken lock logs and proceeds).
 
+The v45 patch 1 reorder is a sequencing problem, not a wrong-question problem. The pre-v45 code asked the right questions (is the shrink needed? is the plan valid? is the geometry correct?) but answered them in the wrong order: it ran the risky operation after the destructive operations instead of before. The corrective pattern for that class is to move the risky step into the window where failure is still reversible. This is a distinct corrective pattern from the wrong-question pattern, and it appears in this document as a separate class because the v45 reorder is the first instance of it in the project.
+
 ## Related documents
 
-- [state-and-idempotency.md](state-and-idempotency.md) — details on the state file, checkpoint file, and how they interact, plus the offline fallback's residual risk and the planned `LocalInputsId` field.
+- [state-and-idempotency.md](state-and-idempotency.md) — details on the state file, checkpoint file, deferral marker, and how they interact, plus the offline fallback's residual risk and the planned `LocalInputsId` field.
 - [recovery-partition.md](recovery-partition.md) — the partition lifecycle in depth.
 - [driver-injection.md](driver-injection.md) — injection and the success gate.
 - [exit-codes.md](exit-codes.md) — every exit path.

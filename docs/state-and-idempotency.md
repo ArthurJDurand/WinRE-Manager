@@ -1,6 +1,6 @@
 # State and idempotency
 
-WinRE Manager is idempotent via a single hash called `DesiredStateId`. Everything else — the state file, the checkpoint file, the fast path — exists to make that hash work.
+WinRE Manager is idempotent via a single hash called `DesiredStateId`. Everything else — the state file, the checkpoint file, the deferral marker, the fast path — exists to make that hash work.
 
 ## `DesiredStateId`
 
@@ -53,16 +53,17 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 ### When it does not change
 
 - Any cosmetic or logging fix shipped without bumping `ScriptVersion`.
-- Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, the further revisions to patch 5 (including further revision 5), and v44 patches 2, 3, 4, 5, 6, and 7 all ship under their respective `ScriptVersion`s without changing the DSI inputs, so the ID is unchanged and healthy machines do not rebuild.
+- Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, the further revisions to patch 5 (including further revision 5), and v44 patches 2 through 8 all ship under their respective `ScriptVersion`s without changing the DSI inputs, so the ID is unchanged and healthy machines do not rebuild.
 - A new WIM hash at the registered location. That is a separate check (see below), not part of the ID.
 - A Windows Update that changes the WIM inside the recovery partition without changing the OS build.
 - A change to the BitLocker policy or the target-preparation logic. The state file does not record BitLocker state; it records the deployment's identity and outcome.
 - A change to the recovery-partition classifier (the v44 patch 7 type-code-authority rule). The classifier affects the fast path's control-flow decision but not the identity of the deployment; a label-only partition on the OS disk changes whether the fast path fires, not what the state file records.
+- A change to the shrink-first ordering or the single-boundary geometry model (v45 patch 1). These change *how* the destructive path produces the target state, not *what* the target state is. The state file does not record partition-layout details.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, and the harness's moves to v14, v15, v16, v17, v18, v19, and v20 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
+`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, and the harness's moves to v14, v15, v16, v17, v18, v19, and v20 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
 
-The v44 patch 1 revision is the deliberate exception. It changes the DSI inputs and therefore bumps `ScriptVersion` to 44. Every managed machine performs one full-update pass on the next run and returns to the fast path. See the migration note in `CHANGELOG.md`.
+The v44 patch 1 and v45 patch 1 revisions are the deliberate exceptions. Each changes an input the `DesiredStateId` recipe depends on: v44 added `CPU` and `VMD` to the field list, and v45 changed the value of the `SCRIPT` field. Because the ID includes those inputs, the ID changes on every managed machine, and every managed machine performs one full-update pass on its next run before returning to the fast path. See the migration notes in `CHANGELOG.md`; v45 rollback by redeploying v44 likewise causes a one-time DSI mismatch and rebuild under the older behavior.
 
 ## The state file
 
@@ -101,7 +102,28 @@ Path: `C:\Recovery\OEM\winre_state.json`.
 
 Note: the stale file is left in place. If the next run also fails to reach a state-write point, the stale file stays. The next successful run overwrites it.
 
-`LastEnableResult` and `EnableFailureAttempts` are read with defaults of `"ok"` and `0`. A state file written by an earlier version of the script that does not contain those fields is accepted without triggering a rebuild; the fast path treats it as a healthy machine on the counters dimension.
+`LastEnableResult` and `EnableFailureAttempts` are read with defaults of `"ok"` and `0`. A state file written by an earlier version of the script that does not contain these fields is accepted without triggering a rebuild.
+
+### Partition deferral sidecar
+
+`C:\Recovery\OEM\winre_partition_deferred.json` records a pre-shrink deferral separately from the deployment state. It stores the `DesiredStateId` under which the deferral was written and a `Since` timestamp. The sidecar is not part of the deployment identity, and it is not what the fast path validates against — it is a temporary suppression record that prevents the script from re-attempting the same failing destructive sequence on every scheduled run while an operator resolves the underlying constraint.
+
+The marker is written by the main flow when `Ensure-AdequateRecoveryPartition` returns `Deferred` with `RetrySuppressible = $true`. Every pre-shrink deferral uses `RetrySuppressible = $true` except one: the fail-closed C: volume-read failure (`"C: volume could not be read for free-space check"`) uses `$false`, because an indeterminate read may clear on its own and the operator should not need to delete the marker to retry a transient condition. A `RetrySuppressible = $false` deferral exits `EXIT_WARNING` without writing the sidecar.
+
+On each subsequent run, the main flow reads the marker and evaluates two conditions:
+
+- **`Test-DeferredWinRERouteFunctional`** — WinRE is `Enabled`, the WIM registered at the active location is readable, and either the active partition is a type-coded recovery partition on the OS disk, or the OS-fallback route is on a `FullyDecrypted` C:.
+- **`$fastPathWillFire`** — the machine has converged on its own. No rebuild is required, WinRE is `Enabled`, and either (a) there is exactly one type-coded recovery partition on the OS disk and the active location is on the recovery partition or on OS-fallback, or (b) there is no recovery partition, `UsedOSFallback` is recorded in the state file, and the active location is on OS-fallback. These are the same conditions the fast path itself uses.
+
+The decision tree:
+
+- **The deferred route is functional and the fast path would not fire.** The marker is honored. The run exits `EXIT_WARNING` with a log message naming the marker file and, if a staged `WIM_READY` image is present in the recorded workspace, stating that it is available for immediate reuse. The staged workspace and checkpoint are preserved — the eventual successful run can resume from them. The marker alone suppresses identical retries.
+- **The fast path would fire.** The marker is obsolete: the machine has converged on its own, and there is nothing left to suppress. The marker is cleared and the run falls through to the fast path, exiting `EXIT_SUCCESS` rather than being pinned at `EXIT_WARNING`. This is the v45 patch 1 "Patch 9" behavior.
+- **The deferred route is not functional.** The marker is cleared and normal repair evaluation continues.
+
+A marker whose `DesiredStateId` does not match the current one is stale and is cleared on read.
+
+After freeing space or correcting the layout, delete both `winre_state.json` and `winre_partition_deferred.json` to force a retry without changing the deployment fingerprint. The state-file deletion clears the recorded deployment identity; the sidecar deletion clears the suppression record. Both are safe to delete: the next run treats the state as absent and re-runs the full-update path.
 
 ### Offline fallback trust (v44 patch 5)
 
@@ -178,11 +200,13 @@ Under `-DryRun` the loop-breaker logs `Would refuse to retry …` and continues,
 
 Path: `C:\ProgramData\OEM\Logs\winre_checkpoint.txt`.
 
-Format: `Step|DesiredStateId`, one line, e.g. `3|a1b2c3...`.
+Format: `Step|DesiredStateId|WorkDir|Flag`, one line, e.g. `4|a1b2c3...|D:\Temp\WinREWork|WIM_READY`. Existing two- and three-field checkpoints remain readable. A legacy step-4 checkpoint without `WIM_READY` is treated conservatively and reruns injection.
 
 ### Purpose
 
-The checkpoint file exists to make a partially-completed full-update run resumable. If a run completes step 2 and then the machine is rebooted or the task is killed, the next run can resume from step 3 instead of redoing step 2. This saves time on slow machines and on slow networks.
+The checkpoint file exists to make a partially-completed full-update run resumable. If a run completes step 2 and then the machine is rebooted or the task is killed, the next run can resume from step 3 instead of redoing step 2. This saves time on slow machines and on slow networks. The checkpoint records the selected workspace so a reboot does not send the next stage to a different volume. If that volume is absent or below the 3 GiB reserve, the script discards the incomplete workspace and restarts at step 1 on another eligible volume. A valid workspace with insufficient space and no alternative causes a deferral; it is not deleted.
+
+Workspace selection runs only after the healthy fast path, enable-only path, and offline deferral. It considers fixed NTFS volumes on allowlisted internal or virtual buses, excludes USB, SD/MMC, network, FireWire, Fibre Channel, unknown buses, recovery-typed and system partitions, and existing Temp/workspace reparse points, prefers a valid checkpoint workspace, and otherwise chooses the eligible non-OS volume with the most free space. With no valid checkpoint, it clears only canonical `X:\Temp\WinREWork` folders on eligible volumes before measuring space. On a fresh run, C: is used only when no eligible secondary fixed volume is available; a valid resume stays with its recorded volume while eligible. DISM, 7-Zip, and child-process temporary files are directed to the selected workspace. Servicing stages require a 3 GiB reserve. A verified `WIM_READY` resume requires 200 MiB because it no longer needs mount, download, injection, or export scratch. Both are admission thresholds, not hard upper bounds on workload size.
 
 ### Steps
 
@@ -192,7 +216,7 @@ The checkpoint file exists to make a partially-completed full-update run resumab
 | 1 | Step 1 (WorkDir wipe) complete. Resume at step 2. |
 | 2 | Step 2 (base WIM) complete. Resume at step 3. |
 | 3 | Step 3 (mount/inject) complete. Resume at step 4. |
-| 4 | Step 4 (optimize) complete. Resume at step 5. |
+| 4 | Step 4 (optimize) complete and `WIM_READY` recorded. Resume at step 5. |
 | 6 | Full-update path complete. The checkpoint is about to be deleted. |
 
 Step 5 is not checkpointed. It is the partition-and-deploy step, and resuming in the middle of it would leave the machine in an unrecoverable state.
@@ -202,11 +226,16 @@ Step 5 is not checkpointed. It is the partition-and-deploy step, and resuming in
 After `Get-Checkpoint`, the main flow applies two guards:
 
 ```powershell
-if ($step -ge 2 -and -not (Test-Path "$WorkDir\base.wim")) { $step = 1 }
-if ($step -ge 4 -and -not (Test-Path "$WorkDir\winre_optimized.wim")) { $step = 4 }
+if ($step -ge 4 -and -not (Test-Path "$WorkDir\winre_optimized.wim")) {
+    $step = if (Test-Path "$WorkDir\base.wim") { 3 } else { 1 }
+} elseif ($step -ge 2 -and $step -lt 4 -and -not (Test-Path "$WorkDir\base.wim")) {
+    $step = 1
+}
 ```
 
-If the checkpoint says step ≥ 2 but `base.wim` is missing (WorkDir was wiped manually, or the machine was rebooted into a clean state), reset to step 1. Same for `winre_optimized.wim` and step 4.
+If `base.wim` is missing before Step 4, reset to step 1. A Step 4 checkpoint with `WIM_READY` may omit `base.wim`, because it is deleted after a verified optimized export. If the optimized WIM is missing, resume from Step 3 when a base image remains, otherwise restart at Step 1.
+
+`WIM_READY` distinguishes a newly verified export from legacy step-4 checkpoints that may have been advanced by older failed-injection behavior. A valid `WIM_READY` checkpoint with an existing optimized WIM skips re-injection and re-export. The flag is crash-resume evidence, not part of the deployment identity.
 
 ### The v43 patch 4 migration guard
 
@@ -246,6 +275,7 @@ The checkpoint file is deleted:
 - After the enable-only path completes (any outcome).
 - After the pending-reboot path completes.
 - After the full-update path reaches step 6.
+- After a deferral marker is honored — the checkpoint is preserved alongside the staged workspace, because the deferred route is still functional and the staged image remains available for the eventual successful run.
 
 If a run is interrupted between `Set-Checkpoint -Step 6` and `Remove-ItemIfExist $CheckpointFile`, the checkpoint file persists. The migration guard handles this on the next run.
 
@@ -255,19 +285,21 @@ When the VMD hardware presence check is indeterminate, the run removes the check
 
 ## Crash consistency
 
-The two files have independent lifecycles, and their interaction is what the guards above are protecting.
+The three files — state, checkpoint, and deferral marker — have independent lifecycles, and their interaction is what the guards above are protecting.
 
-| State file | Checkpoint file | Meaning | Next run behaviour |
-|---|---|---|---|
-| Absent | Absent | Fresh machine, never run. | Full update from step 1. |
-| Absent | Present, step < 3 | Interrupted run before injection. | Full update from step 1 or 2. |
-| Absent | Present, step ≥ 4 | Interrupted failed-injection run, or `GeometryRestoreFailed` deleted the state file. | Migration guard resets `$step` to 2. Full update from step 2. |
-| Present, matching | Absent | Healthy, complete run. | Fast path. |
-| Present, matching | Present, step < 3 | Interrupted run that matched the state file. Unusual. | Full update from step 1 or 2. |
-| Present, matching | Present, step ≥ 4 | Interrupted failed-injection run with a stale-but-valid state file. | Migration guard resets `$step` to 2 (because `$needInject` will be true). Full update from step 2. |
-| Present, stale | Any | The machine's `DesiredStateId` has changed. | Full update from step 1. |
+| State file | Checkpoint file | Deferral marker | Meaning | Next run behaviour |
+|---|---|---|---|---|
+| Absent | Absent | Absent | Fresh machine, never run. | Full update from step 1. |
+| Absent | Present, step < 3 | Absent | Interrupted run before injection. | Full update from step 1 or 2. |
+| Absent | Present, step ≥ 4 | Absent | Interrupted failed-injection run, or `GeometryRestoreFailed` deleted the state file. | Migration guard resets `$step` to 2. Full update from step 2. |
+| Present, matching | Absent | Absent | Healthy, complete run. | Fast path. |
+| Present, matching | Absent | Present, matching | Pre-shrink deferral with the old route intact. | Marker honored if the route is functional; marker cleared if the route is broken. |
+| Present, matching | Present, step < 3 | Absent | Interrupted run that matched the state file. Unusual. | Full update from step 1 or 2. |
+| Present, matching | Present, step ≥ 4 | Absent | Interrupted failed-injection run with a stale-but-valid state file. | Migration guard resets `$step` to 2 (because `$needInject` will be true). Full update from step 2. |
+| Present, matching | Present, `WIM_READY` | Present, matching | Pre-shrink deferral with a staged optimized WIM available. | Marker honored if the route is functional; the staged WIM is reused on the eventual successful run. |
+| Present, stale | Any | Any | The machine's `DesiredStateId` has changed. | Full update from step 1. The deferral marker is cleared on read. |
 
-The two files are written atomically (`Write-FileAtomically` uses a temp file + `Move-Item` with retries), so neither can be partially written even on power loss.
+All three files are written atomically (`Write-FileAtomically` uses a temp file + `Move-Item` with retries), so none can be partially written even on power loss.
 
 ## Why not a database?
 
@@ -290,7 +322,7 @@ The v44 patch 4 program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock` is s
 - **The program lock** enforces single-instance exclusion. It has no content. It is a `FileShare.None` handle that the Windows kernel refuses to grant twice; the handle is released on process exit and the file is left in place. It carries no information between runs.
 - **The state file** records the deployment's identity and outcome. It persists across runs, it is read at startup, and it is what the fast path validates against.
 
-The lock does not replace the state file, and the state file does not replace the lock. A machine that runs the script twice in a row has the same state file and the same lock file throughout; the lock is acquired, the fast path runs, the lock is released. The lock's only job is to prevent two concurrent instances from racing on `C:\Temp\WinREWork`, on the log directory, and on the partition operations the script performs.
+The lock does not replace the state file, and the state file does not replace the lock. A machine that runs the script twice in a row has the same state file and the same lock file throughout; the lock is acquired, the fast path runs, the lock is released. The lock's only job is to prevent two concurrent instances from racing on the selected image workspace, the log directory, and the partition operations the script performs.
 
 **Deleting the lock file has no effect.** The lock is the open handle, not the file's existence. A second instance that opens the same path with `FileShare.None` will be refused by the kernel regardless of whether the file was present before. The file's presence on disk between runs is inert.
 
@@ -301,6 +333,6 @@ For the design reasoning behind the file lock (kernel enforcement, DACL avoidanc
 ## Related documents
 
 - [architecture.md](architecture.md) — the pipeline and how the state fits into it, plus the program lock's design reasoning.
-- [recovery-partition.md](recovery-partition.md) — what the `GeometryRestoreFailed` flag protects against.
+- [recovery-partition.md](recovery-partition.md) — what the `GeometryRestoreFailed` flag protects against and how the deferral marker participates in the shrink-first pipeline.
 - [exit-codes.md](exit-codes.md) — the exit code each state leads to.
 - [troubleshooting.md](troubleshooting.md) — the operator-facing playbook for each failure mode.

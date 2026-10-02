@@ -38,6 +38,8 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
+The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the machine's state and reports what production would do, but it does not simulate the destructive path or the plan. The shrink-first code paths are exercised on disposable VMs (see "v45 destructive-path regression" below), not through the harness.
+
 ### v20 changes
 
 Two changes.
@@ -408,8 +410,9 @@ The harness is deliberately narrow. It does not and cannot test:
 - **`reagentc /setreimage` or `reagentc /enable`.** No WinRE registration changes.
 - **The program lock.** The harness does not acquire `C:\ProgramData\OEM\Logs\WinREManager.lock`. It is read-only and safe to run concurrently with a live production run, with another harness run, or with any number of other processes. Production's lock is a mutual-exclusion primitive for `WinRE.ps1` only; the harness deliberately does not participate in it.
 - **The offline fallback.** The harness always performs a live manifest fetch. On an offline machine it will fail the manifest fetch and report the failure rather than exercising production's offline fast-path behavior. This is intentional: the harness is a download-and-extraction validator first, and the offline path is only reachable in production by design.
-- **State file or checkpoint file writes.** Those files are production-only artifacts. Option S reads the state file but does not modify it.
+- **State file, checkpoint file, or deferral-marker writes.** Those files are production-only artifacts. Option S reads the state file but does not modify it.
 - **The full-update pipeline.** The harness exercises the download and extraction steps in isolation, not the pipeline.
+- **The v45 shrink-first pipeline.** The plan, the pre-shrink, the extension path, and the whole-layout assertion are all production-only code paths. See the "v45 destructive-path regression" section below for how they are tested.
 
 Those paths are covered by field testing on representative hardware. See the "Field-tested hardware" table in the [README](../README.md).
 
@@ -426,49 +429,51 @@ Six known differences:
 - **VMD query-failure handling, Lenovo resolution, and Option S wording are aligned with production as of v18 and v19.** The harness's VMD presence check now treats a PnP enumeration error as indeterminate (matching production v44 patch 6), and the harness's `Get-LenovoWinPEPack` now sets `$Script:LenovoPackResolution` to the same five states as production. Before v18, an enumeration error in the harness produced a definitive answer, and a malformed Lenovo map entry looked identical to a legitimate no-pack case. Both were drift risks: the harness could disagree with production about what a live run would do. v19 corrected two further Option S wording issues (the state-file-absent-and-VMD-indeterminate case now records `SKIP`; the header and DSI MATCH verdict no longer overstate what DSI equality proves).
 - **The active-location classifier is aligned with production as of v20.** The harness's WinRE classifier now requires a type-coded recovery partition on the OS disk to reach the `DEDICATED` verdict, mirroring production v44 patch 3. Before v20, the classifier promoted a label-only match to `DEDICATED`, which could have reported `DEDICATED` for a machine whose registered location was a Basic Data partition labelled "Recovery" while production would have taken the full-update path. The harness's `LABEL-ONLY` verdict is informational and has no direct production equivalent; production's active-location classifier logs a WARN in the same situation without stopping.
 
-## The encrypted-C: failure-then-fallback test (planned; gating for future destructive-path changes)
+The harness has no mirror of the v45 shrink-first pipeline. Option 1 and Option S report the machine's current state and the DSI comparison, but they do not simulate the plan, the pre-shrink, the extension path, or the whole-layout assertion. That is by design: those paths are destructive and cannot be simulated read-only.
 
-Production v44 patch 6 removed the pre-destructive C: guard. That guard had deferred every destructive replacement on every encrypted-C: machine — including the machines where the destructive attempt would have succeeded — in exchange for protecting against one specific corner: a machine whose C: is encrypted and whose destructive attempt fails **after** the existing recovery partition has been deleted. In that corner the OS-fallback gate also refuses (reagentc will not enable WinRE on an encrypted OS volume), so the machine ends up with neither a dedicated recovery partition nor OS-fallback. See the `[v44 patch 7]` CHANGELOG entry and the [architecture.md Step 5 discussion](architecture.md) for the full statement of the residual.
+## v45 destructive-path regression (recommended)
 
-The residual has not been exercised in the field. No logged run has yet shown a destructive attempt that failed **after** deletion with C: encrypted. The correct fix, when one is warranted, is a **post-failure** check in the shrink-failure branch that handles the case **after** the destructive attempt fails — not a reinstatement of the pre-destructive guard, whose predicate ("is C: encrypted?") cannot distinguish a destructive attempt that will succeed from one that will fail. That fix should not ship until the residual has been measured.
+The v45 patch 1 changes to `Ensure-AdequateRecoveryPartition` are the largest rework of the destructive path since v43. The reorder moves the shrink into the reversible window; the geometry model changes from deficit-plus-slack to single-boundary; the plan gains several validity checks; the deletion loop reorders the active partition last; a post-delete extension path with a safe fallback replaces the pre-delete extend; and a whole-layout assertion verifies the created partition's geometry. None of these paths has been exercised against physical storage — the v45 patch 1 field verification took the reuse path, which does not enter the destructive sequence.
 
-**Gating requirement.** Until the deliberate shrink-failure test below is run and its result recorded, no further changes to the destructive path should ship. This applies to the C: guard's eventual replacement, to the planned 2 GiB sanity ceiling, and to any other change that alters the destructive sequence in `Ensure-AdequateRecoveryPartition`.
+The tests below are recommended for a disposable VM. They are not release gates: the shrink-first reorder closed the v44 residual for the shrink trigger, so the pre-shrink failure test is a regression test for behavior that is now expected to be safe, not a gate on shipping. The narrower residual — a `New-Partition` or `Format-Volume` failure after the existing recovery partition has already been deleted, on an encrypted C: — remains open. It is not exercised by any test below because the machine state it requires is expensive to reach.
 
-### What the test measures
+See the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries and [architecture.md](architecture.md).
 
-Four things, in order:
+### Paths that need coverage
 
-1. **The destructive attempt fails after deletion.** The test forces the shrink to fail on a machine with an existing type-coded recovery partition, so the partition is already deleted by the time the failure occurs.
-2. **C:'s state at the moment of failure.** The test machine's C: must be encrypted (`ProtectionStatus=On`, or `ProtectionStatus=Off` with a mid-operation `VolumeStatus`) so the OS-fallback gate will refuse.
-3. **The end state.** What the machine is left with after the run exits: no dedicated recovery partition, no OS-fallback, no working recovery route.
-4. **The operator experience.** What the log looks like, whether the exit code matches the documented behavior, and whether the log signature the docs promise (`Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`) actually appears.
+- **Pre-shrink failure.** All three shrink attempts fail; the script restores C: to its recorded original size, returns `Deferred` with `RetrySuppressible = $true`, preserves the existing route, and writes the deferral marker.
+- **Post-delete extension failure.** The plan calls for extension into the freed space; the extension fails after three tries; the safe fallback places the recovery partition at the current C: end, sets `$Script:nonFatalWarning`, and continues with WinRE deployable. If the fallback size is too small, C: is restored and the function returns `$null`.
+- **Whole-layout assertion.** `New-Partition` returns success but the actual geometry does not match the plan (wrong offset, wrong size, overlap, or a trailing extent that exceeds one alignment block); `Assert-RecoveryPartitionLayout` fires, `Remove-OrphanPartition` deletes the newly created partition, and the function returns `$null`.
+- **Deletion-failure route restoration.** A deletion fails mid-loop while WinRE is disabled; the script restores C: to its original size, calls `Restore-PreviousWinRERoute`, and either returns `Deferred` (route restored) or `$null` (route not restorable). `Test-WinRELocationMatches` handles the GLOBALROOT-vs-Volume-GUID form difference.
+- **Plan validation edge cases.** Each rejected layout (blocking non-recovery partition after C:, non-contiguous recovery partition, recovery-typed partition over 2 GiB, cross-disk inventory, insufficient aligned space) returns `Deferred` without touching WinRE or any partition.
+- **Deferral marker lifecycle.** The marker is written on a retry-suppressible deferral; a subsequent run honors it while the route is functional and does not repeat the pre-shrink retries; a run where the fast path would fire clears the marker and exits `EXIT_SUCCESS`; a `DesiredStateId` change clears the marker on read.
+- **MBR support.** The destructive path on an MBR disk uses `-MbrType 0x27` at creation and `set id=27` in `Set-RecoveryPartitionAttributes`. No MBR machine has been exercised in any v44 or v45 field data.
 
-### How to run the test
+### How to run these tests
 
-On a test machine whose C: is encrypted and whose only type-coded recovery partition is on the OS disk:
+Each test needs a different starting state. Use a snapshot-restorable VM; the destructive path is only safe in a disposable context.
 
-1. Confirm the machine's current state with `Test-WinRE.ps1` Option 1 and Option S. C: should report `ProtectionStatus=On` or a mid-operation `VolumeStatus`. The recovery partition should be type-coded and on the OS disk, and it should be the reagentc-registered location.
-2. Delete the state file at `C:\Recovery\OEM\winre_state.json` to force the full-update path.
-3. Force the shrink to fail. The most reliable way is to shrink C: externally to just above its `SizeMin` so the destructive attempt's shrink cannot fit the bucket. Alternatively, use a test machine whose C: is already close to its `SizeMin` after allowing the recovery-partition deletion and OS-extend steps to run.
-4. Run `WinRE.ps1` and capture the full log.
-5. Verify the log shows the sequence described in "What the test measures" above: deletion, shrink failure after three attempts, `Restore-OSPartitionSize`, OS-fallback gate deferral on encrypted C:, exit code 2.
-6. Record the actual end state of the machine: partition count, WinRE status, and whether any working recovery route exists.
+- **Pre-shrink failure.** Delete the state file to force the full-update path, then force the planned `Resize-Partition` to fail while keeping the geometry plan valid. Mocking `Resize-Partition` is the deterministic option; a storage-level resize failure is the realistic one.
+- **Post-delete extension failure.** Requires the plan to call for extension (the surplus case). Mock or force `Invoke-OSPartitionExtend`'s retries to fail and verify both branches: the fallback succeeds when the remaining extent is at least the bucket size, and returns `$null` when it is not.
+- **Whole-layout assertion.** Mock `New-Partition` to return a partition at the wrong offset or size, or use a VM whose storage layout causes the resize to land off-boundary.
+- **Deletion-failure route restoration.** Mock `Remove-Partition` to fail on a non-active partition while the active partition remains in the deletion list. Verify the active partition was deleted last and that `Restore-PreviousWinRERoute` was attempted.
+- **Plan validation edge cases.** Construct each rejected layout on a VM's virtual disk and verify the plan returns `Deferred` with no partition or WinRE change.
+- **Deferral marker lifecycle.** Run the pre-shrink failure test, re-run without fixing the constraint (the marker is honored), then mock the fast-path conditions to be met or fix the constraint so the machine converges (the marker is cleared and the run exits `EXIT_SUCCESS`).
+- **MBR.** Set up an MBR VM with a type-coded recovery partition; run the full-update path and verify the created partition carries MBR type `0x27`.
 
-The test is destructive: the machine's existing recovery partition will be deleted, and if the OS-fallback gate refuses on encrypted C:, the machine will end without a recovery route. Do not run this on a production machine. Use a test machine that can be re-imaged.
+### What to record when a test is run
 
-### What to record when the test is run
+For each test, record:
 
-Update this document and the `[v44 patch 7]` CHANGELOG entry's "Pending test" section with:
-
-- The machine tested (vendor, model, OS build).
-- C:'s exact encryption state at the time of the run.
-- Whether the destructive attempt failed at the shrink step or at a later step.
-- The end state: partition count, WinRE status, whether the machine has any working recovery route.
+- The test name and the path being exercised.
+- The machine setup (vendor, model, OS build, disk partition style, C:'s encryption state).
+- Whether the intended branch fired (identify the log line).
+- The end state: C: size, partition count, WinRE status, registered location.
 - The exit code.
-- Whether the documented log signature appeared.
-- Whether the operator experience matched what the docs promise.
+- Whether the deferral marker was written, honored, or cleared.
+- Any divergence from the expected behavior.
 
-If the test shows the corner is reachable in practice, the fix is the post-failure check described above, shipped as its own patch. If the test shows the corner is not reachable — for example, because `Restore-OSPartitionSize` reliably re-extends C: and the OS-fallback gate happens to accept the restored state — the corner is still a documented residual but with lower priority.
+If a divergence is found, report it as a bug with the test setup and the full log. The fix ships as its own patch, gated on the test that found it.
 
 ## Adding a test
 
@@ -489,4 +494,5 @@ Do not add tests that modify the machine's state. The harness's contract with th
 - [troubleshooting.md](troubleshooting.md) — how to use the diagnostic output to diagnose a failure, including the BitLocker hazard, VMD-query-indeterminate, and target-partition recovery procedures.
 - [driver-injection.md](driver-injection.md) — what the injection tests are actually testing.
 - [deployment.md](deployment.md) — the Audit Mode precondition for production deployment and the one-instance-per-machine program lock.
-- [state-and-idempotency.md](state-and-idempotency.md) — the `DesiredStateId` composition that Option S recomputes, and the offline fallback's residual risk.
+- [state-and-idempotency.md](state-and-idempotency.md) — the `DesiredStateId` composition that Option S recomputes, the deferral marker's relationship to the deployment identity, and the offline fallback's residual risk.
+- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle that the v45 destructive-path regression tests exercise.

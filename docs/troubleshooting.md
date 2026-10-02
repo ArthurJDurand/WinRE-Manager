@@ -33,6 +33,8 @@ One further check that runs early and can defer the run is the VMD hardware pres
 
 One classifier message that fires early, without stopping the run, is the label-only classifier WARN (v44 patch 3). When the active WinRE location resolves to a partition whose GPT type is not the recovery GUID and whose MBR type is not `0x27`, but whose volume label is `Recovery` or `WINRE`, the classifier logs a WARN and does **not** treat the partition as a recovery partition. See "The machine keeps rebuilding and never takes the fast path (label-only recovery partition)" below.
 
+One further class of deferrals was introduced in v45 patch 1: the pre-shrink deferrals from `Ensure-AdequateRecoveryPartition`. The function returns a `Deferred` result with a specific `Reason`, and when `RetrySuppressible = $true` the main flow writes the deferral sidecar at `C:\Recovery\OEM\winre_partition_deferred.json`. See "The destructive replacement was deferred before partition deletion" below for the full list of reasons and their resolutions.
+
 ## The machine has no recovery partition and WinRE is disabled
 
 **This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 or later, this failure mode no longer occurs on the dedicated-partition route.** The pre-patch-5 code deleted the recovery partition on a machine mid-Device-Encryption and could not recreate it. The current code prevents that by applying the recovery type GUID at partition creation and by decrypting in place if the Device Encryption service claims the partition anyway.
@@ -69,7 +71,7 @@ Two field failures, both on Windows 11 build 26200:
 - **Dell Latitude 3550** (Intel Core Ultra 5 125U) — 2026-09-28, `VolumeStatus=EncryptionInProgress` at 73.6%.
 - **HP ProBook 450 15.6 inch G10** (Intel Core i7-1355U) — 2026-09-28, same state.
 
-**A related but distinct failure mode (v44 patch 6).** The failure-then-fallback corner described under ["The OS-fallback route deferred because C: is encrypted"](#the-os-fallback-route-deferred-because-c-is-encrypted) also produces a machine with no dedicated recovery partition and no working WinRE registration. It is a different root cause — a destructive-shrink failure on an encrypted-C: machine, not the pre-patch-5 Device Encryption race — but the end state looks similar. If the machine's log shows `Pre-deletion inventory:` followed later in the same run by `OS-fallback deferred:`, see that section instead of this one. If the machine's log shows `Newly created recovery partition is BitLocker-encrypted - attempting delete and recreate after suspend`, this section applies.
+**A related but distinct failure mode.** The post-deletion create/format corner described under ["The OS-fallback route deferred because C: is encrypted"](#the-os-fallback-route-deferred-because-c-is-encrypted) also produces a machine with no dedicated recovery partition and no working WinRE registration. It is a different root cause — a `New-Partition` or `Format-Volume` failure after deletion on an encrypted-C: machine, not the pre-patch-5 Device Encryption race — but the end state looks similar. If the machine's log shows `Pre-deletion inventory:` followed later in the same run by `OS-fallback deferred:`, see that section instead of this one. If the machine's log shows `Newly created recovery partition is BitLocker-encrypted - attempting delete and recreate after suspend`, this section applies.
 
 **Recovery procedure.** Wait for the encryption to finish or abort it, then re-run with patch 5 or later.
 
@@ -92,7 +94,7 @@ Read the `Conversion Status:` line.
 
   This starts decryption. On a machine mid-encryption, decryption is usually faster than encryption. Wait until `Conversion Status:` reads `Fully Decrypted` before continuing.
 
-**Step 2 — update `WinRE.ps1` to v44 patch 1 or later.** Check the `.NOTES` block at the top of the file for a `Version : 44` line. If the file is still v43, apply the v44 update before proceeding.
+**Step 2 — update `WinRE.ps1` to v45 patch 1 or later.** Check the `.NOTES` block at the top of the file for a `Version : 45` line. If the file is older, deploy the v45 release before proceeding.
 
 **Step 3 — re-run `WinRE.ps1`.** With the current policy, the script will:
 
@@ -119,7 +121,7 @@ This gives you OS-fallback WinRE — functional but not the design goal. The ded
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v44 patch 7) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v45 patch 1) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -198,6 +200,64 @@ Common causes of the enumeration error:
 
 **Do not disable the fail-closed check.** The check exists because guessing wrong on VMD presence produces a recovery image that cannot see the OS disk. The cost of a deferral is one pipeline run; the cost of bypassing the check is a machine with a non-functional recovery environment. If the check is firing repeatedly, the underlying PnP service issue is the problem to solve.
 
+## The destructive replacement was deferred before partition deletion (v45 patch 1)
+
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: the old recovery partition is still present, WinRE is still `Enabled` and registered to it, no partition was deleted, and the run did not attempt OS-fallback. The deferral is protective: the destructive sequence was about to run, the read-only plan or the pre-shrink check determined that it could not safely complete, and the script stepped back before destroying anything.
+
+**Log signature.** The last lines of the run before exit are:
+
+```
+[WARN] Dedicated replacement deferred before partition deletion (<Reason>). The existing WinRE route was preserved; not attempting OS-fallback.
+[WARN] Recorded retry-suppressing deferral for DesiredStateId <id>; next run will verify the existing route before skipping identical retries. Delete C:\Recovery\OEM\winre_state.json and C:\Recovery\OEM\winre_partition_deferred.json to force a retry.
+```
+
+The `<Reason>` is one of the following. Each has a distinct resolution.
+
+- **`Dedicated recovery partition plan rejected: <specific reason>. No partition or WinRE changes were made.`** — The read-only geometry plan rejected the layout. The `RetrySuppressible` flag is not set; the marker is not written. The nested `<specific reason>` is one of: cross-disk inventory, OS-partition overlap, recovery-typed partition over 2 GiB, recovery-typed partition preceding C:, non-contiguous recovery partition, `SizeMin` unavailable, bucket size invalid, or insufficient contiguous space after the planned resize.
+- **`Pre-shrink free-space check could not read the C: volume (Get-Volume -DriveLetter C returned nothing). Refusing to shrink C: without verifying the 3 GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed.`** — Fail-closed C: volume-read check. `RetrySuppressible = $false`; the marker is not written; the next run retries naturally.
+- **`Pre-shrink free-space check failed: shrinking C: by <n> MiB would leave only <m> GiB free, below the 3 GiB minimum. …`** — The measured projected free space on C: after the planned shrink would fall below 3 GiB. `RetrySuppressible = $true`; the marker is written.
+- **`Pre-destructive shrink failed after all retries. Existing WinRE registration and recovery partitions remain intact; deferring without OS-fallback.`** — All three shrink attempts (immediate, sleep-10s, defrag) failed. `RetrySuppressible = $true`; the marker is written.
+- **`OS partition did not land at the planned size; preserving the old recovery route and deferring`** — The shrink returned success but the post-resize verification failed. `RetrySuppressible = $true`; the marker is written.
+- **`Resize rounding leaves only <n> MiB for a <m> MiB bucket; preserving the old route and deferring`** — The actual post-resize geometry leaves less space than the plan's bucket needs. `RetrySuppressible = $true`; the marker is written.
+
+**Cause.** The v45 patch 1 pipeline runs the risky operation — the shrink — in the reversible window, before `reagentc /disable` and before any partition deletion. The read-only geometry plan checks the layout before any change. Any of the conditions above stops the run before the destructive sequence begins. The old recovery route is left intact.
+
+The most common causes:
+
+- **Insufficient free space on C:.** The shrink would take C: below the 3 GiB reserve. Free space on C: and re-run.
+- **Transient volume-read failure.** `Get-Volume -DriveLetter C` returned nothing. This is rare and usually transient; re-run.
+- **Blocking layout.** A non-recovery partition after C:, a non-contiguous recovery partition, or a recovery-typed partition preceding C:. The disk layout requires manual review.
+- **Oversized recovery partition.** A recovery-typed partition over 2 GiB is present, and the plan refuses to reuse or delete it. Preserve it or use the harness Option 1 to inspect it.
+- **Shrink failure.** C: cannot be shrunk by the required amount even after the sleep-and-defrag retries. Free space on C:, defragment the drive, or reduce the required bucket (which depends on the WIM size).
+
+**The retry-suppressing marker.** When the deferral is retry-suppressible, the main flow writes a sidecar at `C:\Recovery\OEM\winre_partition_deferred.json` containing the current `DesiredStateId` and a `Since` timestamp. On subsequent runs, the marker is honored only if:
+
+- The old route is still verified functional (WinRE `Enabled`, registered WIM readable, and the active location is either a type-coded recovery partition on the OS disk or OS-fallback on a `FullyDecrypted` C:).
+- The fast path would not fire — that is, the machine has not converged on its own.
+
+If both hold, the run exits `EXIT_WARNING` without repeating the same pre-shrink retries. If the fast path would fire (the machine has converged, no rebuild required), the marker is cleared and the run falls through to the fast path, exiting `EXIT_SUCCESS`. If the old route is not functional, the marker is cleared and normal repair evaluation continues. A `DesiredStateId` mismatch also clears the marker on read.
+
+**Resolution.**
+
+1. **Read the `<Reason>` in the log.** Each reason maps to a distinct resolution.
+2. **For insufficient free space:** free at least the deficit on C: (the log line records the current free, the planned shrink, and the projected post-shrink free). Delete unnecessary files, empty the Recycle Bin, or move data to another drive. The bucket size depends on the WIM size + 280 MiB, rounded up to the next 100 MiB boundary, minimum 1000 MiB.
+3. **For blocking layout:** run `scripts\Test-WinRE.ps1` Option 1 to inspect the disk layout. A non-recovery partition between C: and the disk end, or a non-contiguous recovery partition, requires manual review before the script can proceed.
+4. **For an oversized recovery-typed partition:** the partition is being preserved for operator review because it may be an OEM factory recovery volume. Run the harness Option 1 to identify it, and either move it, label it away from `Recovery`/`WINRE`, or leave it as clutter — the script will not delete a recovery-typed partition over 2 GiB.
+5. **For a transient volume-read failure:** re-run. The deferral is not retry-suppressed, so the next run attempts the pre-shrink again.
+6. **For a genuine shrink failure:** free space on C:, run `defrag C: /x` manually from an elevated shell, and re-run.
+7. **After resolving the underlying cause, delete both files to force a retry:**
+
+   ```powershell
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force
+   ```
+
+   The marker deletion clears the suppression record; the state-file deletion clears the recorded deployment identity. Both are safe: the next run treats the state as absent and re-runs the full-update path. Deleting only the state file is not sufficient to clear the marker cleanly — the marker is keyed by `DesiredStateId` and the next run would compute the same DSI, so the marker would still suppress the retry unless the state file's absence forces a rebuild that ultimately converges.
+
+   If you want to force a retry *without* losing the recorded state, delete only the marker file. The next run will re-attempt the pre-shrink; if it succeeds, the run proceeds; if it fails again, the marker is re-written with a fresh `Since` timestamp.
+
+8. **If the marker is present on a later run and you want to know whether it will be honored,** check the log for the line `Dedicated recovery creation was deferred for this DesiredStateId on <Since>. Existing WinRE route is Enabled and its registered WIM is readable; not repeating the same pre-shrink retries (<staged note>).` — that line confirms the marker was honored.
+
 ## The script exited with a rename error (concurrent instance)
 
 **This failure mode was substantially reduced by v44 patch 4.** Before patch 4, the script had no startup lock: two concurrent `WinRE.ps1` processes could collide at Step 2 and the second one would exit with `EXIT_FATAL` (code 3) on a rename error. Patch 4 adds an exclusive file lock at `C:\ProgramData\OEM\Logs\WinREManager.lock`. As of patch 4, the primary concurrent-instance failure shape is a fast exit with `EXIT_WARNING` (code 2), not a fatal rename error. The rename error is now reachable only in the narrow non-contention lock-failure case described below.
@@ -244,7 +304,7 @@ The most common trigger is a **manual invocation** of `WinRE.ps1` (from an inter
 followed later in the same run by:
 
 ```
-[ERROR] FATAL ERROR: Cannot rename because item at 'C:\Temp\WinREWork\winre.wim' does not exist.
+[ERROR] FATAL ERROR: Cannot rename because item at '<workspace>\winre.wim' does not exist.
 [ERROR] Stack: at <ScriptBlock>, ...
 ```
 
@@ -423,7 +483,7 @@ As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` in
 [WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=<state>). reagentc will refuse to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state.
 ```
 
-**The compound signature — destructive-failure-then-deferral (v44 patch 6/7).** When the OS-fallback deferral is reached via a destructive-partition failure — the existing type-coded recovery partition was deleted, and the OS-shrink then failed after all three attempts — the log shows the deletion first, then the shrink failure, then the OS-fallback deferral in the same run. The full sequence is:
+**The compound signature — post-deletion create/format failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The two remaining triggers under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure, both of which occur after deletion. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section above.) The full sequence for the post-deletion case is:
 
 ```
 [INFO] Pre-deletion inventory:
@@ -431,19 +491,30 @@ As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` in
 …
 [INFO] Confirmed deletion of partition 4 on disk 0
 …
-[WARN] Shrink attempt 3 (post-defrag) failed: …
-[ERROR] OS partition shrink failed after all three attempts. Recovery partitions have already been deleted.
-[WARN] Restoring OS partition size before falling back to OS-fallback.
+[WARN] New-Partition attempt 1 failed: …
+[WARN] New-Partition attempt 2 failed: …
+[WARN] New-Partition attempt 3 failed: …
+[ERROR] New-Partition failed after 3 attempts
+…
 [ERROR] Returning null - main flow will attempt OS-partition fallback (C:\Recovery\WindowsRE).
 …
 [WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=True). …
 ```
 
-This compound signature means the machine is now in the **failure-then-fallback corner**: the existing type-coded recovery partition has been deleted, and the OS-fallback route has refused because C: is encrypted. The machine ends this run with neither a dedicated recovery partition nor a working OS-fallback registration — the residual failure mode that the `[v44 patch 7]` CHANGELOG entry documents.
+or the analogous sequence for `Format-Volume`:
 
-**This corner has not been exercised in the field.** No logged run has yet shown a destructive attempt that failed *after* deletion with C: encrypted. [testing.md](testing.md) documents the deliberate shrink-failure test that will gate any future change to the destructive path. **If you see this signature on a machine, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — it is a case the project wants field data on.** Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run.
+```
+[ERROR] Format-Volume failed: …
+[INFO] Removing orphan partition …
+```
 
-**Why the script does not reinstate the pre-destructive C: guard.** The v44 patch 3 guard deferred every destructive replacement on every encrypted-C: machine, including the machines where the destructive attempt would have succeeded. The correct fix is a **post-failure** check in the shrink-failure branch that handles the corner *after* the destructive attempt fails, not a pre-destructive veto. The guard's predicate — "is C: encrypted?" — cannot distinguish a destructive attempt that will succeed from one that will fail. See the `[v44 patch 7]` CHANGELOG entry for the full reasoning and the field evidence.
+followed by the OS-fallback deferral.
+
+This compound signature means the machine is now in the **post-deletion residual corner**: the existing type-coded recovery partition has been deleted, and the OS-fallback route has refused because C: is encrypted. The machine ends this run with neither a dedicated recovery partition nor a working OS-fallback registration — the residual failure mode that the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries document. The v45 reorder narrowed the corner: only post-deletion `New-Partition` or `Format-Volume` failures now reach it, whereas v44 also reached it via shrink failures after deletion.
+
+**This corner has not been exercised in the field.** No logged run has yet shown a destructive attempt that failed *after* deletion with C: encrypted. [testing.md](testing.md) documents the deliberate post-deletion failure test that will gate any future change to the destructive path. **If you see this signature on a machine, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — it is a case the project wants field data on.** Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run.
+
+**Why the script does not reinstate the pre-destructive C: guard.** The v44 patch 3 guard deferred every destructive replacement on every encrypted-C: machine, including the machines where the destructive attempt would have succeeded. The correct fix is a **post-failure** check in the post-deletion failure branches that handles the corner *after* the destructive attempt fails, not a pre-destructive veto. The guard's predicate — "is C: encrypted?" — cannot distinguish a destructive attempt that will succeed from one that will fail. See the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries for the full reasoning and the field evidence.
 
 **Cause.** On the OS-fallback route the target volume *is* the OS volume. reagentc refuses to enable WinRE on an encrypted OS volume, always — this is a hard OS check, not something the script can work around. The gate exists to prevent the script from deploying a WIM it cannot register.
 
@@ -469,7 +540,7 @@ Read the `Conversion Status:` line and act accordingly:
 
   Note that **adding a key protector or arming protection does not resolve this state** — those actions make C: *more* protected, not less. The OS-fallback route requires `FullyDecrypted`.
 
-  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed at the shrink step (which is why it fell back to OS-fallback), so the way to use the dedicated-partition route is to free up space on C: so the shrink can succeed. See the ["OS-fallback, retrying the dedicated path"](#os-fallback-retrying-the-dedicated-path) note below.
+  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed, which is why it fell back to OS-fallback. The way to use the dedicated-partition route is to resolve whatever caused the destructive failure (insufficient space on C:, a layout problem, etc.) and free the constraint so a retry can succeed. See the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section above for the constraint-specific resolutions.
 
 - **`Fully Encrypted` with `Protection Off`** — the machine is in a suspended or Waiting-for-Activation state. To use the OS-fallback route you must still decrypt C: (`manage-bde -off C:`), because reagentc refuses on a `FullyEncrypted` volume regardless of protection state.
 
@@ -737,10 +808,10 @@ dism /Export-Image reported success but <path> does not exist
 
 **Resolution.** Manual. The script exits with `EXIT_FATAL`.
 
-1. Check `C:\Temp\WinREWork\base.wim` for size and integrity.
-2. Check free space on `C:\Temp` and on the volume where `winre_optimized.wim` is being written.
-3. Check `Get-WindowsImage -Mounted` for stale mounts. If any mount's path is under `C:\Temp\WinREWork`, dismount it with `-Discard`.
-4. Delete `C:\Temp\WinREWork` and let the next run start fresh.
+1. Find the `Workspace selected:` line in the log and inspect that `<drive>:\Temp\WinREWork` for WIM size and integrity.
+2. Check free space on the selected workspace volume. The script requires 3 GiB at admission, but a larger-than-expected source, OEM pack, or scratch peak can still exhaust it during servicing.
+3. Check `Get-WindowsImage -Mounted` for stale mounts. If any mount's path is under the selected workspace, dismount it with `-Discard`.
+4. Delete the selected workspace and its checkpoint file, then let the next run select a volume and start fresh.
 
 ## Base WIM download fails
 
@@ -768,7 +839,7 @@ followed by a download error or a `FATAL` exit.
 
 ## `New-Partition` fails after 3 attempts
 
-**Symptom.** The OS partition has been shrunk, the recovery partitions have been deleted, and the script cannot create the new partition.
+**Symptom.** The OS partition has been shrunk and the eligible recovery partitions have been deleted, but the script cannot create the new partition.
 
 **Log lines.**
 
@@ -779,11 +850,43 @@ New-Partition attempt 3 failed: ...
 New-Partition failed after 3 attempts
 ```
 
-**Cause.** The disk geometry changed between the shrink and the create (uncommon), or there is genuinely not enough unallocated space at the target offset.
+**Cause.** The disk geometry changed between the read-only plan and creation, or a disk error prevented creation at the planned extent.
 
-**Resolution.** Automatic. The script calls `Restore-OSPartitionSize` to re-extend C: and returns `$null` from `Ensure-AdequateRecoveryPartition`. The main flow falls through to OS-fallback. The run exits with `EXIT_WARNING`.
+**Resolution.** Automatic. The script calls `Restore-OSPartitionSize` to restore C: to its recorded original size and returns a creation failure. The main flow may use OS-fallback if C: is confirmed fully decrypted. The run exits with `EXIT_WARNING` when fallback succeeds.
 
 If `Restore-OSPartitionSize` also fails, `$Script:GeometryRestoreFailed` is set and the state file is deleted. The next run will re-attempt the destructive path from scratch.
+
+## The post-delete extension failed (v45 patch 1)
+
+**Symptom.** The plan called for C: to grow into the space the old recovery partitions occupied (the surplus case). The extension ran after the deletions and failed after all retries. The script used its safe fallback and continued with a slightly different recovery partition layout than the plan intended — the recovery partition starts at the current (un-extended) C: end instead of the planned offset.
+
+**Log signature.** The run continues past the extension failure:
+
+```
+[WARN] Post-delete extend attempt 1 failed: ...
+[WARN] Post-delete extend attempt 2 failed: ...
+[WARN] Post-delete extend attempt 3 failed: ...
+[WARN] Post-delete C: extension failed after all retries; attempting the safe fallback (recovery partition at the current C: end) so WinRE remains deployable.
+[INFO] Extension-failure fallback: creating recovery partition at <offset> MiB with size <size> MiB (no trailing gap; the C: extension was not performed)
+```
+
+The run then proceeds to create, format, and deploy into the fallback partition. The exit code is 2 (`EXIT_WARNING`) because `$Script:nonFatalWarning` is set.
+
+If the fallback also fails — the remaining extent after the current C: end is smaller than the plan's bucket size — the script restores C: to its original size and returns `$null`; the main flow falls through to the OS-fallback decision, and the log shows:
+
+```
+[ERROR] Extension-failure fallback unavailable: only <n> MiB free after the current C: end, less than the <m> MiB bucket. Falling through to the caller's OS-fallback decision.
+```
+
+**Cause.** `Invoke-OSPartitionExtend` runs three times with 5-second spacing between attempts. It fails when the storage stack refuses to grow C: into the freed space — typically because a file on the volume is unmovable, because a temporary lock is held by a system service, or because the disk has a physical constraint. The extension is a real operation on physical storage, and its failure is a storage-stack condition, not a script bug.
+
+**Why the safe fallback exists.** Exact geometry — C: ending exactly at the planned boundary, recovery partition of exactly the planned size — is a goal, not a reason to leave WinRE disabled. When the extension fails, the script computes the largest recovery partition that fits between the current C: end and `AlignedManagedExtentEnd`. If that is at least the plan's bucket size, it creates the partition there. The trade is a small residual unallocated gap after the recovery partition; the benefit is that WinRE is deployable and functional. The alternative — restore C:, return `$null`, fall through to OS-fallback on an encrypted C: — leaves the machine degraded when a working dedicated recovery partition was one step away.
+
+**Resolution.**
+
+1. **If the run continued past the extension failure** (the log shows `Extension-failure fallback: creating recovery partition`), nothing needs to be done. The machine is in a functional dedicated-recovery state; the trailing gap is cosmetic. The next full-update pass — triggered by a DSI change — will re-plan the layout from the plan's perspective.
+2. **If the run did not continue** (the log shows `Extension-failure fallback unavailable`), the machine is on the OS-fallback route or has no working recovery route. Check the machine's end state with the harness Option 1. If a recovery route exists, no action needed. If neither route exists, follow the ["The machine has no recovery partition and WinRE is disabled"](#the-machine-has-no-recovery-partition-and-winre-is-disabled) section.
+3. **If extension failures are recurring** on the same machine, the freed space after the old recovery partitions may be partially occupied by unmovable files or by a stale temporary allocation. Run `defrag C: /x` from an elevated shell and re-run.
 
 ## Drive letters exhausted
 
@@ -862,15 +965,15 @@ Parser: reagentc location  [FAIL] ...did not match any line
 
 **Resolution.** Automatic. The script falls through to the full-update path. A rebuild on a healthy machine is a no-op for the partition layout; it copies the current WIM, verifies it, and rewrites the state file.
 
-**Expected during the v44 patch 1 rollout.** The v44 patch 1 revision added CPU vendor/generation and VMD presence to the `DesiredStateId`. Every managed machine's stored state file, written under v43, no longer matches the ID computed under v44. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after the update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
+**Expected during the v44 patch 1 and v45 patch 1 rollouts.** Both revisions changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45 changed the `SCRIPT` component. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
 
-If the state file is repeatedly disappearing on a machine that has already taken one full-update pass under v44, check:
+If the state file is repeatedly disappearing on a machine that has already taken one full-update pass under the current version, check:
 
 1. Whether `Restore-OSPartitionSize` is failing. If it is, `$Script:GeometryRestoreFailed` is set and `Write-WinREState` deletes the state file on purpose. The log will show `Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file`. Investigate why the geometry restore is failing.
 2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
 3. Whether the loop-breaker is firing because the enable-failure counter reached 3. The state file is deliberately left in place in that case (the operator deletes it manually to reset the counter), but if a cleanup tool is configured to remove anything in `C:\Recovery\OEM\` on a schedule, it will also remove the state file for this reason.
 
-**Not to be confused with the Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The four are distinguishable: the deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation.
+**Not to be confused with the Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink deferral, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation. The pre-shrink deferral additionally writes the sidecar marker at `C:\Recovery\OEM\winre_partition_deferred.json` — see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1) section.
 
 **Not to be confused with the enable-only failure path either.** The enable-only failure path **writes** the state file with a non-`"ok"` `LastEnableResult` and an incremented counter. The state file's `LastUpdated` timestamp will be newer than the run start, and its `EnableFailureAttempts` will be non-zero. If you were expecting the state file to be absent, this is what happened.
 
@@ -892,22 +995,23 @@ Do not edit the state file's `UsedOSFallback` field and leave the rest in place;
 
 **Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
 
-**Not to be confused with a deferral.** A machine on which an Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, injection-failure, or offline-fallback deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
+**Not to be confused with a deferral.** A machine on which an Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink, injection-failure, or offline-fallback deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
 
 ### OS-fallback, retrying the dedicated path
 
 If the machine is stuck in OS-fallback because the OS partition could not be shrunk enough to create a dedicated recovery partition, the fix is to free up space on C: so that the shrink can succeed on the next full-update attempt.
 
 1. Free up space on C:. The script attempts to shrink by the required bucket size (`WIM size + 250 MiB + 30 MiB`, rounded up to the next 100 MiB boundary, minimum 1000 MiB). Free at least that much plus a margin.
-2. Delete the state file to force the next run to re-attempt:
+2. Delete both the state file and the deferral marker (if present) to force the next run to re-attempt:
 
    ```powershell
-   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force -ErrorAction SilentlyContinue
    ```
 
 3. Re-run `WinRE.ps1`. It will re-attempt the destructive path with the newly freed space. If the shrink succeeds, the machine ends in a `DEDICATED` end state.
 
-If the shrink still fails, the machine falls back to OS-fallback again with the same state. The C: volume's free space is the constraint.
+If the shrink still fails, the v45 pre-shrink deferral writes the marker again and preserves the old route. Free space on C: or address the blocking layout, then delete the marker file to retry.
 
 ## The machine keeps rebuilding and never takes the fast path (label-only recovery partition)
 
@@ -939,7 +1043,7 @@ or, if the OS-shrink could not fit:
 - Not reused by `Find-SuitableRecoveryPartition`.
 - Not deleted by any code path — a label alone is never sufficient authority for deletion, on any disk.
 
-The consequence is that the machine's fast-path condition "exactly one type-coded recovery partition on the OS disk" cannot be satisfied by the label-only partition. Every run takes the full-update path. If the OS-shrink succeeds, the run creates a proper type-coded partition and the next run's fast path fires — convergence, one run later. If the OS-shrink fails, the run falls through to OS-fallback and the next run resumes OS-fallback behavior (which also exits 2 without re-attempting the destructive path — see the previous section).
+The consequence is that the machine's fast-path condition "exactly one type-coded recovery partition on the OS disk" cannot be satisfied by the label-only partition. Every run takes the full-update path. If the OS-shrink succeeds, the run creates a proper type-coded partition and the next run's fast path fires — convergence, one run later. If the OS-shrink fails, the v45 pre-shrink deferral preserves the old route and the machine retries when the constraint is resolved.
 
 Before v44 patch 7, this was a permanent non-convergence loop. The fast-path count and the classifier accepted the label-only match as a recovery partition, so the "exactly one recovery partition" condition could never be satisfied (the label-only match counted as one) while the destructive path correctly refused to delete it. The machine rebuilt on every run without ever reaching the fast path. Patch 7 fixed that by treating the label-only match as not-a-recovery-partition everywhere.
 
@@ -1018,15 +1122,16 @@ Use it to:
 - Verify that the resolved OEM pack and VMD drivers are what you expect.
 - Verify that the classifier verdict matches what you believe the machine's state to be.
 - Verify that the Audit Mode guard would not defer a live run.
+- Verify that the v45 pre-shrink deferral would not fire on the next live run, by checking whether `Ensure-AdequateRecoveryPartition`'s dry-run plan line appears and what plan it reports.
 
-The dry run does not write to the state file or the checkpoint file. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step:
+The dry run does not write to the state file, the checkpoint file, or the deferral marker. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step:
 
 - **The program lock is skipped.** The lock is a state-modifying action (it opens the lock file with an exclusive handle), and DryRun's contract is to modify nothing. A dry run is safe to run concurrently with a live deployment, and the harness (`scripts\Test-WinRE.ps1`) is safe to run concurrently with either.
 - The Audit Mode guard is read-only and logs `Would defer …` when the live run would defer.
 - The drive-letter assignment is skipped under DryRun; the caller works with the original `\\?\GLOBALROOT` path.
 - The **full-update pipeline** terminates at a single choke point at the top of the full-update path. It logs a plan for Steps 1 through 7 and exits cleanly without running `dism`, 7-Zip, or any file I/O in WorkDir.
-- The **destructive partition path** in `Ensure-AdequateRecoveryPartition` terminates at a single choke point immediately after the read-only pre-checks and pre-deletion inventory. It logs a plan for the delete, extend, shrink, create, format, and attribute steps.
-- Every state-modifying helper handles DryRun internally: `Set-RecoveryPartitionReadyForWinRE`, `Invoke-ReagentcEnable`, `Write-WinREState`, `Remove-StrayRecoveryPartitions`, `Remove-ItemIfExist`, `Restore-OSPartitionSize`, `Remove-OrphanPartition`, `Set-RecoveryPartitionAttributes`, `Invoke-DriveLetterAssignment`, `Invoke-DriveLetterRemoval`, `Invoke-VendorExtraction`, `Invoke-CabExtraction`, `Invoke-OemPackDownload`, `Invoke-DismMount`, `Set-Checkpoint`, `New-DirectoryIfNotExists`.
+- The **destructive partition path** in `Ensure-AdequateRecoveryPartition` terminates at a single choke point immediately after the read-only pre-checks and pre-deletion inventory. It logs a plan for the delete, extend, shrink, create, format, and attribute steps. Under v45 patch 1 the plan summary is preceded by a `[DRY RUN] Plan is valid:` line that names the shrink, extend, and no-resize decision and the planned partition offset.
+- Every state-modifying helper handles DryRun internally: `Set-RecoveryPartitionReadyForWinRE`, `Invoke-ReagentcEnable`, `Write-WinREState`, `Write-PartitionDeferral`, `Clear-PartitionDeferral`, `Remove-StrayRecoveryPartitions`, `Remove-ItemIfExist`, `Restore-OSPartitionSize`, `Remove-OrphanPartition`, `Set-RecoveryPartitionAttributes`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, `Invoke-DriveLetterAssignment`, `Invoke-DriveLetterRemoval`, `Invoke-VendorExtraction`, `Invoke-CabExtraction`, `Invoke-OemPackDownload`, `Invoke-DismMount`, `Set-Checkpoint`, `New-DirectoryIfNotExists`.
 
 Two checks run under `-DryRun` in read-only form and log a `Would defer …` or `Would refuse …` line when the live run would not proceed:
 
@@ -1038,6 +1143,8 @@ A dry run that reports either of these is telling you the machine would be defer
 The DryRun contract for the OS-fallback BitLocker gate is that the gate is logged but does not short-circuit. If the OS-fallback route is reached under DryRun, the gate logs `OS-fallback deferred: C: could not be confirmed fully decrypted` and continues — but the deployed WIM plan downstream is not evaluated against C:'s state, because no WIM is deployed under DryRun.
 
 The DryRun contract for the VMD-query-indeterminate deferral (v44 patch 6) is the same: the enumeration error is logged, and the run continues rather than exiting.
+
+The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the specific deferral reason is not surfaced in dry-run mode the way it is in a live run, because DryRun's choke point sits above the reason-returning code. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN]   - Disk …` lines.
 
 Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable …` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
 
@@ -1052,12 +1159,16 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - BitLocker state — **both** `Protection Status:` and `Conversion Status:` from `manage-bde -status C:`. The `Conversion Status` value matters: on the OS-fallback route, `Fully Encrypted` with `Protection Off` is one of the states that the script defers on, and on the dedicated-partition route, the target partition's conversion status is what determines whether `Set-RecoveryPartitionReadyForWinRE` will need to run `manage-bde -off`. Omitting the conversion status makes the report impossible to diagnose.
 - The target recovery partition's BitLocker state — the `manage-bde -status` output for the partition reagentc is registered to. The harness's `Test-WinRE.ps1` Option 1 reports this automatically.
 - `ImageState` from `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` if the machine may be in Audit Mode or OOBE.
+- Free space on C: and the total size of C: if the run exited with a pre-shrink deferral. The v45 patch 1 free-space check refuses to shrink C: below a 3 GiB reserve, and the deferral reason names the projected post-shrink free space.
+- Whether a deferral marker file exists at `C:\Recovery\OEM\winre_partition_deferred.json`. If it does, its contents (the `DesiredStateId` and `Since` fields) tell you the exact DSI under which the destructive sequence deferred.
 - Exit code.
 - If the run exited with code 2 and the log shows `Another WinRE Manager instance is already running (program lock file is exclusively held)`, note whether any other `WinRE.ps1` process (scheduled task, manual invocation, RMM tool, Intune remediation) was running at the same time. As of v44 patch 4, this is not a failure — the other instance is doing the work — but the reporter should confirm they are not looking at a machine with a scheduled task stuck in a running state. Check the scheduled task's "Last Run Result" via `Get-ScheduledTaskInfo`.
 - If the run exited with code 2 and the log shows `VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined`, include the raw PnP enumeration error from the line above it (`VMD hardware detection reported N error(s) during PnP enumeration: …`). The specific error text is what distinguishes a service issue from an antivirus/EDR block from a device in an error state.
 - If the run exited with code 2 and the log shows `Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable` or `Offline fallback: using state file's stored DesiredStateId`, note whether the machine was actually offline (no network, DNS failure, proxy) and what the state file's `LastUpdated` timestamp is. This discriminates the offline-fallback deferral (machine unchanged, next scheduled run with network completes the work) from the fast-path-under-offline case (degraded-success, exit 2).
-- If the run exited with code 2 and the log shows the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`, this is the failure-then-fallback corner the `[v44 patch 7]` CHANGELOG entry documents. Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run. The project wants field data on this corner — see the "The OS-fallback route deferred because C: is encrypted" section above.
-- If the run exited with code 3 and the log ends with `Cannot rename because item at 'C:\Temp\WinREWork\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
+- If the run exited with code 2 and the log shows `Dedicated replacement deferred before partition deletion`, this is a v45 pre-shrink deferral. Include the `<Reason>` string from that log line, the current free space on C:, and the total size of C:. See "The destructive replacement was deferred before partition deletion" above for the full list of reasons and their resolutions.
+- If the run exited with code 2 and the log shows `Extension-failure fallback: creating recovery partition` or `Extension-failure fallback unavailable`, this is a v45 post-delete extension failure. Include the machine's disk layout from `Test-WinRE.ps1` Option 1, the plan's bucket size, and the current C: end and disk end.
+- If the run exited with code 2 and the log shows the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`, this is the post-deletion create/format residual that the `[v45 patch 1]` CHANGELOG entry documents. Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run. The project wants field data on this corner — see the "The OS-fallback route deferred because C: is encrypted" section above.
+- If the run exited with code 3 and the log ends with `Cannot rename because item at '<workspace>\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
 - The relevant slice of the log — not the whole file unless asked.
 - The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes the BitLocker, Windows Setup state, target-partition state, and classifier verdicts. If the report is about the fast path or the state file, also include the output of Option S.
 
@@ -1065,5 +1176,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 
 - [exit-codes.md](exit-codes.md) — what each exit code means.
 - [architecture.md](architecture.md) — where each failure mode fits in the pipeline.
-- [testing.md](testing.md) — how to use the harness to diagnose.
+- [testing.md](testing.md) — how to use the harness to diagnose, including the v45 destructive-path regression test plan.
 - [deployment.md](deployment.md) — the "One instance per machine" precondition for manual invocations and the offline behavior of the scheduled task.
+- [state-and-idempotency.md](state-and-idempotency.md) — the deferral marker's relationship to the deployment identity and the operator reset procedure.
+- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 pre-shrink deferral reasons.

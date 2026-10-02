@@ -30,6 +30,7 @@
 - [ ] Field-tested on a GPT machine
 - [ ] Field-tested on an MBR machine
 - [ ] If the shrink path is touched: tested on hardware with OS partition at `SizeMin`
+- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test documented in `docs/testing.md` has been run and its result is recorded. Changes to this segment are gated on that test — see CONTRIBUTING.md for the scope.
 - [ ] If the BitLocker handling is touched: verified that the harness's Option 1 "Target recovery partition state" block reflects the state production would prepare, and that the code path for both an unencrypted target and an encrypted target is reachable
 - [ ] If the `DesiredStateId` inputs are touched: verified that the harness's Option S "State file parity check" recomputes the same ID production computes on this machine, and that a machine whose previous state file is stale is correctly predicted to rebuild
 

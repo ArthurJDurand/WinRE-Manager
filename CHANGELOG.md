@@ -6,6 +6,80 @@ This file is the authoritative user-facing record of what changed and when. The 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to a `ScriptVersion` + patch-generation scheme rather than strict SemVer — see [docs/state-and-idempotency.md](docs/state-and-idempotency.md) for why.
 
+## [v45 patch 1] — 2026-10-01
+
+Shrink-first redesign of `Ensure-AdequateRecoveryPartition` with a read-only geometry plan, single-boundary exact partition placement, capacity-aware internal workspace selection, a deferral sidecar that suppresses identical retries only while the previous route is verified functional, and a post-creation whole-layout assertion. `ScriptVersion` moves from 44 to 45; every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path.
+
+The change was driven by the v44 patch 7 residual: a shrink failure after the old recovery partition had already been deleted, on an encrypted-C: machine, left the machine with neither a dedicated recovery partition nor OS-fallback. The v44 pipeline did the destructive part (delete → extend → shrink → create) in the wrong order; a failed shrink left the old recovery partition already gone, and OS-fallback is unavailable on encrypted C:. The v45 pipeline runs the risky step (the shrink) in the reversible window, before any partition is destroyed. A failed pre-shrink leaves the machine untouched; the old route remains registered and functional, and a sidecar marker suppresses identical retries until the underlying constraint is resolved.
+
+### Changed
+
+- **Shrink-first replacement (the headline).** The pre-shrink now runs in the reversible window, before `reagentc /disable` and before any partition deletion. A failed pre-shrink returns `Deferred` with the old route intact. This closes the v44 residual for the shrink case.
+
+- **Single-boundary exact geometry.** `Get-PartitionPlan` computes a target boundary rather than a shrink amount. The aligned managed extent end is `floor(tailEnd / 1 MiB) × 1 MiB`; the recovery partition occupies the last `bucketSize` bytes up to that boundary; C: is resized so it ends exactly where the recovery partition begins. The trailing gap left by the previous deficit-plus-slack model is eliminated. Bytes between the raw extent end and the aligned end are logged explicitly as an alignment reserve, not treated as a defect.
+
+- **Post-delete extension when the plan calls for it.** When the plan requires C: to grow into space the old recovery partitions occupied, `Invoke-OSPartitionExtend` runs **after** the deletions, with 3 retries at 5-second intervals. On failure, the safe fallback places the recovery partition at the current (un-extended) C: end, filling to `AlignedManagedExtentEnd`; a non-fatal warning is set and the run continues with WinRE deployable. Exact geometry is a goal, not a reason to leave WinRE disabled.
+
+- **Post-creation whole-layout assertion.** `Assert-RecoveryPartitionLayout` re-queries the newly created partition immediately after `New-Partition` and confirms identity, exact offset, size within one alignment block of the plan, no overlap with the OS partition, the C:-to-recovery gap within one alignment block, and the partition end at `AlignedManagedExtentEnd`. On failure the script calls `Remove-OrphanPartition` and returns `$null`, matching the existing `Format-Volume`-failure recovery shape.
+
+- **Fail-closed pre-shrink C: free-space check.** The pre-shrink free-space verification refuses to shrink C: when `Get-Volume -DriveLetter C` returns nothing, deferring with a distinct reason (`"C: volume could not be read for free-space check"`) and `RetrySuppressible = $false`. The measured "post-shrink free space below minimum" case remains `RetrySuppressible = $true`; only the volume-read-failure case is not retry-suppressed, because an indeterminate read may clear on its own.
+
+- **Route restoration on deletion failure.** When a recovery-partition deletion fails after WinRE has already been disabled, the script attempts `Restore-PreviousWinRERoute` before returning. If the previous route is restored, the run returns a `Deferred` result; if not, `$null` as before.
+
+- **Delete-active-last ordering.** The currently active recovery partition (resolved from `$stateBefore.Location`) is deleted last, so a mid-loop failure leaves the previous route's target available for restoration.
+
+- **Route-identity check in `Restore-PreviousWinRERoute`.** The function now confirms the now-Enabled WinRE `Location` matches the previous route before reporting success, using a string comparison with a disk/partition identity fallback for the GLOBALROOT-vs-Volume-GUID form reagentc may report after a disable/enable cycle. A machine whose WinRE is Enabled but registered to a different location is not treated as "restored".
+
+- **Plan-before-change contract.** The destructive pipeline is gated behind a read-only plan that validates: no cross-disk entries, no OS-partition overlap, no recovery-typed partitions exceeding the 2 GiB ceiling, no recovery-typed partitions preceding C:, non-contiguous recovery partitions, and insufficient contiguous space after the planned resize. An invalid plan returns `Deferred` with no partition or WinRE change.
+
+- **Capacity-aware internal workspace.** `Get-WorkDirCandidates` restricts to fixed NTFS volumes on an allowlisted set of internal/virtual buses (ATA, SATA, NVMe, RAID, SAS, Spaces, Virtual, File Backed Virtual, SCM). USB, SD/MMC, network, FireWire, Fibre Channel, unknown buses, and reparse-point workspace paths are excluded. Fresh runs prefer the non-OS volume with the most space. Admission is `$MinFreeSpaceGB` (3 GiB) for a fresh service, or `$WorkDirResumeMinFreeMB` (200 MiB) when a verified `WIM_READY` checkpoint exists in the recorded workspace.
+
+- **Checkpoint format extension with `WIM_READY`.** The checkpoint format is `Step|DesiredStateId|WorkDir|WIM_READY`. The flag is set at Step 4 after a verified `dism /Export-Image`. `base.wim` is deleted at that point to reclaim workspace capacity before partition planning. Legacy two- and three-field checkpoints remain readable; a Step 4 checkpoint without the ready flag conservatively reruns injection.
+
+- **Workspace and checkpoint preservation on the retry-suppressed skip path.** The sidecar deferral does not clean up the staged workspace or checkpoint. If the machine's inputs have not changed and the previous route is still functional, the staged optimized WIM remains available for the eventual successful run. The marker alone suppresses identical retries.
+
+- **Marker obsolescence on fast-path convergence.** The deferral-skip path computes `$fastPathWillFire` before deciding whether to honor the marker. If the machine has converged on its own — one type-coded recovery partition on the OS disk, no rebuild required, WinRE Enabled — the marker is cleared and the run falls through to the fast path, exiting `EXIT_SUCCESS` rather than being pinned at `EXIT_WARNING`.
+
+- **2 GiB recovery-partition ceiling implemented.** `$MaxManagedRecoveryPartitionMiB = 2048` is now enforced in `Find-SuitableRecoveryPartition`, `Remove-StrayRecoveryPartitions`, and `Get-PartitionPlan`. This closes the v44 "Known gaps" entry that named all three functions.
+
+- **`Restore-OSPartitionSize` accepts `-TargetSizeBytes`.** The old "extend to `SizeMax`" behavior is gone for recovery calls; the exact pre-attempt C: size is restored on failure. The parameterless call falls back to `SizeMax` only for legacy call sites.
+
+### Migration Note
+
+`ScriptVersion` moves from 44 to 45, so the `SCRIPT` component of `DesiredStateId` changes. Every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. No driver-manifest, OEM-map, or driver-selection inputs changed. The DSI bump is intentional: it is the version boundary that ensures the new shrink-first code path is exercised on every machine. Rollback by redeploying v44 causes another DSI mismatch and one full update under the older behavior; do not manually edit the stored `DesiredStateId`.
+
+A machine with a deferral marker written by a v45 run is unaffected by the DSI change: the marker is keyed to the same `DesiredStateId` the current run computes, so it is honored on subsequent v45 runs and cleared automatically if the machine has converged. A machine with a marker written by a v44 run under the same `DesiredStateId` (which cannot happen because the DSI includes `SCRIPT`) would be cleared on first read.
+
+### Field verification
+
+- **ASUS PRIME H510M-D (i5-11400, Win 11), 2026-10-01 23:48–23:51.** Clean v45 patch 1 run on the full-update path, followed by a fast-path run three minutes later. Workspace selection chose a non-OS internal volume with 134.53 GiB free. The existing 1000 MiB recovery partition was reused (`effective free 1082.2 MiB vs 1007 MiB required`); no destructive work. WIM serviced (Steps 2–3), ResetBase ran (~28s), optimized WIM 756.72 MiB. `WIM_READY` checkpointed; `base.wim` removed after verified export. State file written with `UsedOSFallback = $false`; `Operating mode: DEDICATED`. Second run took the fast path.
+
+### Field gap (v45 patch 1, not yet exercised on hardware)
+
+Because the ASUS run took the reuse path, the following code paths ran zero times in that run and remain unverified on physical hardware:
+
+- `Get-PartitionPlan` and its validity checks on a machine that requires a rebuild.
+- The pre-shrink free-space check (the 3 GiB reserve) and the fail-closed volume-read branch.
+- `Invoke-OSPartitionShrink` and its immediate/sleep/defrag retries.
+- `Invoke-OSPartitionExtend` and its safe fallback.
+- The `Deferred` return paths from `Ensure-AdequateRecoveryPartition`.
+- Partition deferral marker write / skip / clear.
+- `Restore-PreviousWinRERoute`, `Test-WinRELocationMatches`, and the delete-active-last ordering.
+- `Assert-RecoveryPartitionLayout`.
+- MBR anything.
+
+These are covered by parser and mocked-geometry tests but have not been exercised against physical storage. The VM test plan in [docs/testing.md](docs/testing.md) covers them.
+
+### Known limitation (narrower than v44 patch 7)
+
+The v44 residual — a shrink failure after deletion on an encrypted-C: machine — is closed by the shrink-first reorder. The remaining corner is narrower: a failure of `New-Partition` or `Format-Volume` **after** the old recovery partition has been deleted, on encrypted C:, with no successful retry. The `[v44 patch 7]` CHANGELOG entry documents the original scope; this entry narrows it to post-deletion create/format failures only.
+
+## [v44 patch 8] — 2026-10-01
+
+### Changed
+
+- **Workspace initialization follows route classification.** Healthy fast-path runs, enable-only repairs, and offline deferrals no longer validate checkpoints, wipe stale image scratch files, or create `WorkDir`. Full-update checkpoint and resume behavior was otherwise unchanged in this patch. `ScriptVersion` and `DesiredStateId` remained unchanged.
+
 ## [v44 patch 7] — 2026-10-01
 
 Six patches closing a non-convergence loop in the recovery-partition classifier, a VMD extraction-directory cleanup, and a diagnostic-only logging change on the destructive path. `ScriptVersion` remains 44; `DesiredStateId` is unchanged; no fleet-wide rebuild is forced.
