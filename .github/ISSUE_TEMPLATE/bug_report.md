@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v46 patch 2, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v46 patch 2) ==========`) -->
+- **WinRE.ps1 version:** <!-- e.g. v47 patch 1, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v47 patch 1) ==========`) -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
@@ -25,7 +25,7 @@ labels: ['bug', 'needs-triage']
 - **Target recovery partition state:** <!-- run: .\scripts\Test-WinRE.ps1 and choose Option 1. Copy the "Target recovery partition state" block. -->
   <!-- This is the partition reagentc is registered to. It is what production prepares via Set-RecoveryPartitionReadyForWinRE. If the block says "BitLocker-managed", production will run manage-bde -off against it before calling reagentc /enable. -->
 - **VMD hardware present:** <!-- output of the harness Option 1 "VMD hardware presence" block, or "yes/no" from BIOS if the harness cannot be run. VMD presence is one of the DesiredStateId inputs. -->
-  <!-- If the harness reports "INDETERMINATE", copy the enumeration error line above it (VMD hardware detection reported N error(s) during PnP enumeration: …). The specific error text distinguishes a service issue from an antivirus/EDR block from a device in an error state. -->
+  <!-- If the harness reports "INDETERMINATE", copy the enumeration error line printed under it (the harness emits `PnP enumeration error: …` in the line below the INDETERMINATE verdict). The specific error text distinguishes a service issue from an antivirus/EDR block from a device in an error state. -->
 - **State file fields:** <!-- if C:\Recovery\OEM\winre_state.json exists, paste: DesiredStateId, LastUpdated, LastEnableResult, and EnableFailureAttempts -->
   <!-- LastEnableResult and EnableFailureAttempts are optional in the JSON and default to "ok" / 0 if absent. LastUpdated distinguishes a run that reached the state-write point (timestamp newer than run start) from a deferral (timestamp unchanged). DesiredStateId is required for the maintainer to check whether the state file would be accepted on this machine. -->
   <!-- If you can run the harness, Option S "State file parity check" reports whether the on-disk state file matches the ID production would compute right now. -->
@@ -70,6 +70,9 @@ labels: ['bug', 'needs-triage']
 - `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted` — the post-deletion residual corner. **Capture the full log and the machine's end state.** The project wants field data on this corner.
 - `Refusing to retry reagentc /enable` — enable-failure loop-breaker. The state file still records the counter; the operator resolves the cause, deletes the state file, re-runs.
 - `Planned recovery extent is no longer free after deletion (offset=... size=... overlapCount=0)` with an `alignment reserve` value in the plan summary — the v45 plan-rejection corner fixed by v46 patch 1. Include the top-of-log version banner and the `alignment reserve` value.
+- `Strip stage failed - candidate rejected` — the v47 strip stage rejected the candidate. Include the specific strip failure reason from the preceding line (enumeration, removal, missing INF field, or budget exhaustion) and the pre-strip inventory lines.
+- `Registered-source recheck at <site> : CHANGED` followed by `Registered WinRE source changed during candidate preparation` — the v47 race detector fired. Include the captured fingerprint line, the recheck line, the change triple (`location=<bool> version=<bool> hash=<bool>`), and whether a Windows Update was in flight.
+- `State has no DeployedWinREMetadata anchor`, `Registered WinRE metadata changed from … to …`, or `Registered WinRE metadata could not be read` — the v47 metadata-based rebuild trigger fired. Include the state file's `DeployedWinREMetadata` value and the currently-registered WinRE's `Version` / `SPBuild`.
 - `CmdletizationQuery_NotFound_DiskNumber` or `No MSFT_Partition objects found with property 'DiskNumber'` — the SD/MMC read. Note the disk number and whether the machine has a card reader or an empty USB enclosure attached.
 
 <details>
@@ -96,4 +99,4 @@ paste here
 
 ---
 
-**Why we ask for all this.** The script's design is organized around four invariants — *never break Windows RE*, *never leave a machine without a working recovery route*, *minimize the `reagentc /disable` → `reagentc /enable` window*, and *do no work unless needed; prepare everything before touching anything*. See [`docs/architecture.md`](../docs/architecture.md) for the full hierarchy. The fields above are the ones that let the maintainer determine which invariant was involved in your failure and reproduce it. `docs/deployment.md` translates the invariants into deployment-time guidance, `docs/troubleshooting.md` maps log signatures to symptoms, and `CONTRIBUTING.md` documents the report requirements.
+**Why we ask for all this.** The script's design is organized around four invariants — *never break Windows RE*, *never leave a machine without a working recovery route*, *minimize the `reagentc /disable` → `reagentc /enable` window*, and *do no work unless needed; prepare everything before touching anything*. See [`docs/architecture.md`](docs/architecture.md) for the full hierarchy. The fields above are the ones that let the maintainer determine which invariant was involved in your failure and reproduce it. [`docs/deployment.md`](docs/deployment.md) translates the invariants into deployment-time guidance, [`docs/troubleshooting.md`](docs/troubleshooting.md) maps log signatures to symptoms, and [`CONTRIBUTING.md`](CONTRIBUTING.md) documents the report requirements.

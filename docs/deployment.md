@@ -105,7 +105,7 @@ Before the first run on any machine, confirm:
 
 There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (further revision 5) policy is target-volume-based: the enable-only and dedicated-partition paths do not depend on C:'s BitLocker state at all. If the target recovery partition is encrypted, the script decrypts it in place via `Set-RecoveryPartitionReadyForWinRE` before calling reagentc. The only route that depends on C:'s BitLocker state is the OS-fallback route, because on that route the target volume *is* C:. The destructive partition path does not depend on C:'s state either — as of v44 patch 6 it does not consult C: at all. Neither the OS-fallback gate nor the destructive path modifies C:'s BitLocker state. See the "Device Encryption" section below.
 
-The harness's System Diagnostic (`scripts\Test-WinRE.ps1` Option 1) reports `ImageState`, C:'s BitLocker state, the target recovery partition's BitLocker state, and the workspace-selection eligibility. Run it on a representative machine before pushing the task to a fleet.
+The harness's System diagnostic (`scripts\Test-WinRE.ps1` Option 1) reports `ImageState`, C:'s BitLocker state, the target recovery partition's BitLocker state, and the workspace-selection eligibility. Run it on a representative machine before pushing the task to a fleet.
 
 ## Scheduled task
 
@@ -438,7 +438,7 @@ Concretely, on the first run after the update, every machine will:
 4. Rebuild the WIM, deploy it, and write a state file under the new ID.
 5. Return to the fast path on the second run.
 
-On a healthy NVMe laptop this is roughly 3–5 minutes of I/O and CPU. Machines with a suitable existing recovery partition re-use it; no partition work occurs on healthy machines. This is the intended behaviour and the reason the `Migration note` in `CHANGELOG.md` is present.
+On a healthy NVMe laptop this is roughly 3–5 minutes of I/O and CPU. Machines with a suitable existing recovery partition re-use it; no partition work occurs on healthy machines. This is the intended behaviour and the reason the `Migration Note` in `CHANGELOG.md` is present.
 
 Two cases that are handled cleanly without operator attention:
 
@@ -572,12 +572,12 @@ For MDM / orchestration:
 |---|---|
 | 0 | None. Record success. |
 | 1 | Reboot the machine at the next convenient window. The script will finish on the next boot. |
-| 2 | Investigate. WinRE is functional but degraded, or the script deferred work, or the enable step failed and the counter incremented. Collect the log and check the state file's `LastUpdated` timestamp, its `LastEnableResult` field, and whether a deferral marker exists at `C:\Recovery\OEM\winre_partition_deferred.json`. **Eleven** distinct cases are documented in [exit-codes.md](exit-codes.md): OS-fallback, Step 3 → Step 4 pipeline gate, Audit Mode deferral, VMD-query-indeterminate deferral, OS-fallback BitLocker deferral, **v45 pre-shrink deferral**, enable-only failure, concurrent-instance deferral (v44 patch 4), offline-fallback deferral (v44 patch 5), and **v47 race-detector abort** at the two `/disable` sites. The concurrent-instance case is **not a failure** — the other instance is doing the work. The offline-fallback fast-path case is a **degraded-success** — the machine is healthy and unchanged. The VMD-query-indeterminate, v45 pre-shrink, and v47 race-detector cases are **protective deferrals** — no state was committed. |
+| 2 | Investigate. WinRE is functional but degraded, or the script deferred work, or the enable step failed and the counter incremented. Collect the log and check the state file's `LastUpdated` timestamp, its `LastEnableResult` field, and whether a deferral marker exists at `C:\Recovery\OEM\winre_partition_deferred.json`. **Eleven** distinct cases are documented in [exit-codes.md](exit-codes.md): OS-fallback, **v47 strip-failure abort**, Step 3 → Step 4 pipeline gate, Audit Mode deferral, VMD-query-indeterminate deferral, OS-fallback BitLocker deferral, **v45 pre-shrink deferral**, enable-only failure, concurrent-instance deferral (v44 patch 4), offline-fallback deferral (v44 patch 5), and **v47 race-detector abort** at the two `/disable` sites. The concurrent-instance case is **not a failure** — the other instance is doing the work. The offline-fallback fast-path case is a **degraded-success** — the machine is healthy and unchanged. The VMD-query-indeterminate, v45 pre-shrink, and v47 race-detector cases are **protective deferrals** — no state was committed. |
 | 3 | Investigate. The run failed and did not write state, or the enable-failure loop-breaker fired. Collect the log. Do not retry automatically. |
 
 Do **not** treat exit code 2 as success. A machine in OS-fallback is intentionally reported as a warning; it will be treated as a healthy machine by the fast path only if the state file records `UsedOSFallback = true` for the current `DesiredStateId`. A machine on which the Audit Mode guard or a v45 pre-shrink deferral fired will have an unchanged (or absent) state file and a single deferral line in the log. See [exit-codes.md](exit-codes.md) for how to distinguish the eleven cases.
 
-Do **not** configure retry loops that ignore the exit code and re-run unconditionally. Deferrals are not improved by retrying — the same gate will fire on the next run (Rule 4). Enable failures are handled by the counter; after three consecutive failures the loop-breaker fires and requires manual intervention. The concurrent-instance deferral is not a failure at all; retrying while the other instance is still running will simply produce another `EXIT_WARNING`. The VMD-query-indeterminate deferral is not improved by retrying — the underlying PnP service issue must be resolved. The v45 pre-shrink deferral is not improved by retrying until the constraint is resolved (free space on C:, disk layout, oversized recovery partition, transient volume read, or shrink failure). The v47 race-detector abort is not improved by retrying immediately — the underlying Windows Update servicing of the registered WinRE is a transient condition, and the next scheduled run (or a manual re-run after the WU settles) is the correct response. Resolve the underlying condition, then re-run.
+Do **not** configure retry loops that ignore the exit code and re-run unconditionally. Deferrals are not improved by retrying — the same gate will fire on the next run (Rule 4). Enable failures are handled by the counter; after three consecutive failures the loop-breaker fires and requires manual intervention. The concurrent-instance deferral is not a failure at all; retrying while the other instance is still running will simply produce another `EXIT_WARNING`. The VMD-query-indeterminate deferral is not improved by retrying — the underlying PnP service issue must be resolved. The v45 pre-shrink deferral is not improved by retrying until the constraint is resolved (free space on C:, disk layout, oversized recovery partition, transient volume read, or shrink failure). The v47 race-detector abort is not improved by retrying immediately — the underlying Windows Update servicing of the registered WinRE is a transient condition, and the next scheduled run (or a manual re-run after the WU settles) is the correct response. The v47 strip-failure abort is not improved by retrying until the specific strip failure has been diagnosed — see [troubleshooting.md](troubleshooting.md) for the specific failure modes. Resolve the underlying condition, then re-run.
 
 ## MDM / Intune
 
@@ -619,7 +619,7 @@ The script is destructive on the recovery partition and non-destructive on the O
 
 ### v44 patch 1 specifically
 
-Add a step 0 before the canary ring: run the current script on one machine and confirm the full-update pass completes and the state file is rewritten under the new `DesiredStateId`. Then roll out normally. The `Migration note` in `CHANGELOG.md` and the "v44 patch 1 migration" section above describe the expected behaviour.
+Add a step 0 before the canary ring: run the current script on one machine and confirm the full-update pass completes and the state file is rewritten under the new `DesiredStateId`. Then roll out normally. The `Migration Note` in `CHANGELOG.md` and the "v44 patch 1 migration" section above describe the expected behaviour.
 
 ### v44 patch 3 specifically
 

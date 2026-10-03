@@ -246,7 +246,7 @@ Rule 1 is about not damaging what is there. Rule 2 is about what happens after a
 |---|---|
 | A pre-shrink failure leaves the old recovery route `Enabled` and untouched. | Shrink-first ordering (v45 patch 1); `Restore-OSPartitionSize` restores the pre-attempt C: size. |
 | A deletion failure attempts to restore the previous route. | `Restore-PreviousWinRERoute` — restores C:, re-registers the previous partition, verifies the location matches. |
-| A deferral marker suppresses identical retries only while the old route is verified functional. | `Test-DeferredWinRERouteFunction` gate on the marker. |
+| A deferral marker suppresses identical retries only while the old route is verified functional. | `Test-DeferredWinRERouteFunctional` gate on the marker. |
 | When the dedicated-partition route cannot complete, the OS-fallback route is attempted as a last resort. | Main-flow OS-fallback fall-through, guarded by the OS-fallback gate for encrypted C:. |
 | The fallback WIM at `C:\Recovery\WindowsRE\winre.wim` is refreshed on every successful deploy. | Deployment-tail copy, guarded against self-reference. |
 | The state file is invalidated when C: geometry cannot be verified, forcing a clean retry from scratch. | `$Script:GeometryRestoreFailed` → state-file deletion in `Write-WinREState`. |
@@ -431,7 +431,7 @@ Four residuals are carried forward under v47:
 
 ## Control-flow invariants
 
-These are the invariants the script maintains, in the order they are enforced. Each one has a real field failure behind it, except where explicitly noted; the `.NOTES` block in `scripts/WinRE.ps1` names them as "CRITICAL LESSONS LEARNED." They are the detailed enforcement of Rules 1–4 above.
+These are the invariants the script maintains, in the order they are enforced. Each one has a real field failure behind it, except where explicitly noted; the `.NOTES` block in `scripts/WinRE.ps1` carries the "Critical lessons (do not regress)" list. They are the detailed enforcement of Rules 1–4 above.
 
 1. **Exactly one type-coded recovery partition exists, on the OS disk.** Enforced on the fast path, the enable-only path, both pending-reboot exits, and Step 7 of the full-update path. A type-coded recovery partition on any non-OS disk is deleted unconditionally. A partition detected only by a Recovery/WINRE volume label is not counted, not reused, and not deleted — a label alone is never sufficient authority for any of those decisions. The invariant is absolute; the type code, not the label, is what identifies a recovery partition for every decision the script makes.
 
@@ -549,7 +549,7 @@ Both machines lost their dedicated recovery partition and had WinRE disabled. Th
 After the further revision landed, two more Dell machines ran against a mid-encryption state:
 
 - **Dell Pro Slim QCS1250** (Intel Core Ultra 5 235) — startup gate fired, machine unchanged, exit code 2.
-- **Dell Vostro 16 5640** (Intel Core i7-150U) — same.
+- **Dell Vostro 16 5640** (Intel Core 7 150U) — same.
 
 The further revision 5 change to target-volume-based preparation was driven by a different field observation, made on the same day:
 

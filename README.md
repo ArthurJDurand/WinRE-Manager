@@ -187,7 +187,7 @@ A recovery environment that boots but cannot be navigated is barely a recovery e
 
 A machine that has ever run WinRE Manager carries *our* previously injected OEM and VMD drivers inside its registered WinRE image. v47 normalizes that away before injecting the current recipe: the mounted image is stripped to **zero third-party drivers**, proven by re-enumeration, and only then is the current driver set injected.
 
-This is what makes the deployment identity — `DesiredStateId` — a reliable fingerprint of the image contents, not just of the inputs that produced them. It also means the WIM cannot silently accumulate drivers across rebuilds. The strip stage is hard-gated: if enumeration, removal, or the final zero-driver verification fails at any point, the candidate is discarded before any partition work, `reagentc` call, or WIM deployment begins.
+This is what makes the deployed image a deterministic function of the current recipe: the same inputs always produce the same image, rather than one whose driver set depends on what prior rebuilds happened to leave behind. It also means the WIM cannot silently accumulate drivers across rebuilds. The strip stage is hard-gated: if enumeration, removal, or the final zero-driver verification fails at any point, the candidate is discarded before any partition work, `reagentc` call, or WIM deployment begins.
 
 ### Recovery partition geometry — the right size, in the right place, on the right disk
 
@@ -286,14 +286,16 @@ That machine is in a healthy `DEDICATED` end state. Production takes the fast pa
 
 ## How a full update runs
 
-1. Classify WinRE state and deployment inputs. Healthy routes exit before workspace setup.
-2. Resolve and verify every preparation — OEM pack, VMD package, base WIM — **before** the pipeline begins.
-3. Select an internal workspace with enough free space; preserve its location in the checkpoint.
-4. Obtain the base WIM, **strip every third-party driver and prove the image is clean**, inject the current recipe, run component cleanup, export the optimized WIM.
-5. Record `WIM_READY` (bound to the source image's content hash), then remove `base.wim` to reclaim space before partition work.
-6. Reuse a suitable type-coded recovery partition, or make a read-only single-boundary plan for a replacement.
-7. Pre-shrink C: inside the reversible window — **before** WinRE is disabled and **before** any partition is deleted. Verify geometry. Then disable WinRE and delete eligible recovery partitions (the currently-active one last).
-8. Extend C: into the reclaimed space, create the new recovery partition on the planned boundary, deploy and hash-verify the WIM, prepare the target volume, register and enable WinRE, write deployment state.
+The full-update pipeline is a narrative of preparation-then-action. This section is a user-facing summary; the canonical step numbering the script uses internally is documented in [`docs/architecture.md`](docs/architecture.md#the-eight-steps) under "The eight steps" — that section carries the step numbers as the script labels them.
+
+- Classify WinRE state and deployment inputs. Healthy routes exit before workspace setup.
+- Resolve and verify every preparation — OEM pack, VMD package, base WIM — **before** the pipeline begins.
+- Select an internal workspace with enough free space; preserve its location in the checkpoint.
+- Obtain the base WIM, **strip every third-party driver and prove the image is clean**, inject the current recipe, run component cleanup, export the optimized WIM.
+- Record `WIM_READY` (bound to the source image's content hash), then remove `base.wim` to reclaim space before partition work.
+- Reuse a suitable type-coded recovery partition, or make a read-only single-boundary plan for a replacement.
+- Pre-shrink C: inside the reversible window — **before** WinRE is disabled and **before** any partition is deleted. Verify geometry. Then disable WinRE and delete eligible recovery partitions (the currently-active one last).
+- Extend C: into the reclaimed space, create the new recovery partition on the planned boundary, deploy and hash-verify the WIM, prepare the target volume, register and enable WinRE, write deployment state.
 
 ## Disk-space and partition safety
 

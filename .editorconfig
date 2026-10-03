@@ -23,6 +23,9 @@ charset = utf-8-bom
 end_of_line = crlf
 indent_size = 4
 
+[*.{cmd,bat}]
+end_of_line = crlf
+
 [*.md]
 trim_trailing_whitespace = false
 

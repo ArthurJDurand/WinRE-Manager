@@ -8,15 +8,11 @@ $RECYCLE.BIN/
 # PowerShell
 *.ps1xml
 *.pssc
-*.psd1.bak
-*.psm1.bak
 *.clixml
 
 # Test artifacts (in case the harness working directory is ever inside the repo)
 WinRETest/
 TestResults/
-Pester*.xml
-*.trx
 
 # Local build outputs of the map builders
 DellWinPEMap.json
@@ -40,4 +36,5 @@ LenovoWinPEMap.json
 # Secrets / environment
 .env
 .env.*
+!.env.example
 secrets.local.*

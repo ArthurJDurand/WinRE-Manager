@@ -151,7 +151,7 @@ The bug was first seen on physical hardware: a Lenovo IdeaPad 3 15IAU7 (MT 82RK)
 
 The v46 patch 1 fix clamps `tailEnd` to `diskSize − 1 MiB` before aligning, on both branches of the plan (blocking partition and no blocking partition). The same layout that v45 rejected now produces a valid plan; the post-delete geometry check passes with the partition end exactly 1 MiB inside the disk end. This is a `ScriptVersion` bump (45 → 46), so every managed machine performs one full update on its next scheduled run.
 
-The clamp is stated in [architecture.md](architecture.md) invariant 18 and its reasoning is documented as the "eighth direction" of the wrong-question pattern in the same document.
+The clamp is stated in [architecture.md](architecture.md) invariant 18 and its reasoning is documented as the "ninth direction" of the wrong-question pattern in the same document.
 
 ## The OS partition resize sequence (v45 patch 1)
 

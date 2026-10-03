@@ -24,6 +24,7 @@
 *.7z binary
 *.cab binary
 *.exe binary
+*.lnk binary
 
 # Diff drivers
 *.ps1  diff=powershell

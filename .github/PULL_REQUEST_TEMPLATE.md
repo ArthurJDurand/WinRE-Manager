@@ -12,14 +12,14 @@
 - [ ] `ScriptVersion` bumped because the deployed WIM or partition layout changed
 - [ ] `ScriptVersion` bumped because a `DesiredStateId` input changed (a new hardware property or a new deployment input is now part of the ID)
 - [ ] If bumped, `DesiredStateId` will change and healthy machines rebuild once
-- [ ] If bumped because a `DesiredStateId` input changed, the new `CHANGELOG.md` entry includes a `Migration note` section describing the expected fleet behaviour and the rollback procedure
+- [ ] If bumped because a `DesiredStateId` input changed, the new `CHANGELOG.md` entry includes a `Migration Note` section describing the expected fleet behaviour and the rollback procedure
 
 ## Changelog
 
 - [ ] Added an entry to `CHANGELOG.md` describing the change in user-facing terms, with the real field case or review finding that motivated it
 - [ ] If the change modifies a design invariant or adds a new lesson, updated the relevant section of the `.NOTES` block in `scripts/WinRE.ps1`
 
-`CHANGELOG.md` is the historical record of what changed and when. The `.NOTES` block records the current design invariants and the CRITICAL LESSONS LEARNED list. The two files serve different readers and both are part of the complete record.
+`CHANGELOG.md` is the historical record of what changed and when. The `.NOTES` block records the current design invariants and the Critical lessons list. The two files serve different readers and both are part of the complete record.
 
 ## Testing
 
@@ -54,7 +54,7 @@ WinRE Manager's design is organized around four rules, in this order. See [`docs
 
 Rules 1–3 are invariants: no PR may weaken them. Rule 4 is the working rule by which 1–3 are enforced on the fast path, the enable-only path, and the destructive path.
 
-- [ ] I have read the four design invariants in [`docs/architecture.md`](docs/architecture.md) and the "CRITICAL LESSONS LEARNED" section in `scripts/WinRE.ps1`
+- [ ] I have read the four design invariants in [`docs/architecture.md`](docs/architecture.md) and the "Critical lessons (do not regress)" section in `scripts/WinRE.ps1`
 - [ ] This change does not weaken any invariant without a new field case
 - [ ] Any destructive operation either verifies preconditions and restores geometry on failure, or sets `$Script:GeometryRestoreFailed`
 - [ ] Any `try/catch` either logs, sets a state flag, or both

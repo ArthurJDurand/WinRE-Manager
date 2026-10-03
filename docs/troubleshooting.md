@@ -23,7 +23,7 @@ Three common entry points, if you already know which one you are:
 
 Every line is `yyyy-MM-dd HH:mm:ss [LEVEL] message`. Levels are `INFO`, `WARN`, `ERROR`, `FATAL`. In `-DryRun` mode, every line is prefixed with `[DRYRUN-<LEVEL>]` instead so a dry-run audit can be distinguished from a live run.
 
-The first line is `========== WinRE Manager Started (v<version> patch <level>) ==========`. The last line names the outcome and, if applicable, the exit code.
+The first line is `========== WinRE Manager Started (v<version> patch <level>) ==========`. Most runs end with a `Released program lock` line; the reboot-required path additionally logs `========== WinRE Manager completed - reboot still required ==========` before exiting. The exit code, not a final log line, is the authoritative outcome signal.
 
 As of v46 patch 2, every run logs three build numbers: the registered WinRE version (`WinRE status: ..., Location: ..., Version: <x>`), the source WIM build (`Source WIM build: <build> (path: <path>)` during force-upgrade detection), and the post-deploy WIM build (`Post-deploy WIM build: <build> (source: <path>)` immediately before the state write). None of the three affects control flow; they are logged for evidence. A run whose `Source WIM build` or `Post-deploy WIM build` is older than the registered `Version` is a candidate signal for base-image drift, not a fault.
 
@@ -108,7 +108,7 @@ Read the `Conversion Status:` line.
 
   This starts decryption. On a machine mid-encryption, decryption is usually faster than encryption. Wait until `Conversion Status:` reads `Fully Decrypted` before continuing.
 
-**Step 2 — update `WinRE.ps1` to v45 patch 1 or later.** Check the `.NOTES` block at the top of the file for a `Version : 45` line. If the file is older, deploy the v45 release before proceeding.
+**Step 2 — update `WinRE.ps1` to v45 patch 1 or later.** Check the `.NOTES` block at the top of the file for its `Version` line. If the version is below 45, deploy the v45 release (or the current release) before proceeding.
 
 **Step 3 — re-run `WinRE.ps1`.** With the current policy, the script will:
 
@@ -135,7 +135,7 @@ This gives you OS-fallback WinRE — functional but not the design goal. The ded
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v45 patch 1) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v47 patch 1) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -788,7 +788,12 @@ As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` in
 [WARN] New-Partition attempt 3 failed: …
 [ERROR] New-Partition failed after 3 attempts
 …
-[ERROR] Returning null - main flow will attempt OS-partition fallback (C:\Recovery\WindowsRE).
+[WARN] ================================================================================
+[WARN] Dedicated recovery partition creation failed after all attempts.
+[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
+[WARN] This is NOT equivalent to a dedicated recovery partition.
+[WARN] WinRE will function but with reduced resilience. Exit code will be 2.
+[WARN] ================================================================================
 …
 [WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=True). …
 ```
@@ -797,7 +802,14 @@ or the analogous sequence for `Format-Volume`:
 
 ```
 [ERROR] Format-Volume failed: …
-[INFO] Removing orphan partition …
+[INFO] Removing orphan partition <disk>/<part> after Format-Volume failure (main path)
+…
+[WARN] ================================================================================
+[WARN] Dedicated recovery partition creation failed after all attempts.
+[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
+[WARN] This is NOT equivalent to a dedicated recovery partition.
+[WARN] WinRE will function but with reduced resilience. Exit code will be 2.
+[WARN] ================================================================================
 ```
 
 followed by the OS-fallback deferral.
