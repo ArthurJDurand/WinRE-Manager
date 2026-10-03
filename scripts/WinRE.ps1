@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 46 (v46 patch 2)
+    Version : 47 (v47 patch 1)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -45,8 +45,24 @@
             - Indeterminate VMD detection defers. Network requests use the timeout.
             - Build-drift observability: every run logs the registered WinRE
                 version (pre-touch, from reagentc), the source WIM build, and
-                the post-deploy WIM build. Logged for evidence only; no gate
-                reads these values and none enters DesiredStateId.
+                the post-deploy WIM build. v47 additionally logs the
+                currently-registered WinRE's SHA256, the last successfully
+                deployed WIM's SHA256, and whether the two differ (byte-drift
+                evidence for a metadata-neutral source change), plus the
+                final deployed WIM's SHA256. Logged for evidence only; no
+                gate reads any of these values and none enters
+                DesiredStateId.
+
+            - LKG migration bridge: on the first v47 run on a machine whose
+                state file was written by v46 or earlier, the DSI mismatch
+                correctly causes the state reader to return empty, which
+                would make the manager's own last-known-good copy at
+                C:\Recovery\WindowsRE\winre.wim unrecognizable as LKG. A
+                separate narrow read of the stale state file's
+                CurrentImageHash restores LKG validation for exactly this
+                migration window. It does NOT make the stale state
+                operationally authoritative and is used only at
+                LKG-validation call sites.
 
         Known gap:
             - Offline fallback trusts stored DesiredStateId; LocalInputsId would
@@ -94,8 +110,8 @@ $EXIT_REBOOT_REQUIRED  = 1
 $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
-$ScriptVersion    = 46
-$ScriptPatchLevel = "2"
+$ScriptVersion    = 47
+$ScriptPatchLevel = "1"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -145,6 +161,9 @@ $Script:offlineFallback        = $false
 $Script:OriginalTempPath       = $null
 $Script:OriginalTmpPath        = $null
 $Script:TempEnvironmentChanged = $false
+$Script:RegisteredSourceFingerprint = $null
+$Script:DeployedWinREMetadata = $null
+$Script:StagedWimSourceHash = $null
 
 # =========================== LOGGING ===========================
 function Write-Log {
@@ -210,22 +229,27 @@ function Get-Checkpoint {
         [Parameter(Mandatory)][AllowEmptyString()][string]$CurrentDesiredStateId
     )
     if (-not (Test-Path $CheckpointFile)) {
-        return @{ Step = 0; DesiredStateId = $null; WorkDir = $null; WimReady = $false; Valid = $true }
+        return @{ Step = 0; DesiredStateId = $null; WorkDir = $null; WimReady = $false; SourceHash = $null; Valid = $true }
     }
     try {
         $raw   = (Get-Content $CheckpointFile -Raw).Trim()
-        $parts = $raw -split '\|', 4
+        # v47: 5th field is the optional source-content hash that identifies
+        # the WIM from which the WIM_READY candidate was prepared. Legacy
+        # 4-field checkpoints have no source identity and are invalidated
+        # by the resume-time validator.
+        $parts = $raw -split '\|', 5
         $step  = [int]$parts[0]
         $storedId = if ($parts.Count -gt 1) { $parts[1] } else { $null }
         $storedWorkDir = if ($parts.Count -gt 2) { $parts[2] } else { $null }
         $storedWimReady = ($parts.Count -gt 3 -and $parts[3] -eq 'WIM_READY')
-        if (-not $storedId) { return @{ Step = 0; DesiredStateId = $null; WorkDir = $storedWorkDir; WimReady = $storedWimReady; Valid = $false } }
+        $storedSourceHash = if ($parts.Count -gt 4 -and $parts[4]) { [string]$parts[4] } else { $null }
+        if (-not $storedId) { return @{ Step = 0; DesiredStateId = $null; WorkDir = $storedWorkDir; WimReady = $storedWimReady; SourceHash = $storedSourceHash; Valid = $false } }
         if ($storedId -ne $CurrentDesiredStateId) {
-            return @{ Step = 0; DesiredStateId = $storedId; WorkDir = $storedWorkDir; WimReady = $storedWimReady; Valid = $false }
+            return @{ Step = 0; DesiredStateId = $storedId; WorkDir = $storedWorkDir; WimReady = $storedWimReady; SourceHash = $storedSourceHash; Valid = $false }
         }
-        return @{ Step = $step; DesiredStateId = $storedId; WorkDir = $storedWorkDir; WimReady = $storedWimReady; Valid = $true }
+        return @{ Step = $step; DesiredStateId = $storedId; WorkDir = $storedWorkDir; WimReady = $storedWimReady; SourceHash = $storedSourceHash; Valid = $true }
     } catch {
-        return @{ Step = 0; DesiredStateId = $null; WorkDir = $null; WimReady = $false; Valid = $false }
+        return @{ Step = 0; DesiredStateId = $null; WorkDir = $null; WimReady = $false; SourceHash = $null; Valid = $false }
     }
 }
 
@@ -234,11 +258,14 @@ function Set-Checkpoint {
         [Parameter(Mandatory)][string]$CheckpointFile,
         [Parameter(Mandatory)][int]$Step,
         [Parameter(Mandatory)][AllowEmptyString()][string]$DesiredStateId,
-        [switch]$WimReady
+        [switch]$WimReady,
+        [AllowNull()][string]$SourceHash = $null
     )
     if ($Script:DryRun) { Write-Log "[DRY RUN] Would set checkpoint $Step"; return }
     $checkpointFlag = if ($WimReady) { 'WIM_READY' } else { '-' }
-    Write-FileAtomically -Path $CheckpointFile -Content "$Step|$DesiredStateId|$WorkDir|$checkpointFlag"
+    $content = "$Step|$DesiredStateId|$WorkDir|$checkpointFlag"
+    if ($SourceHash) { $content = "$content|$SourceHash" }
+    Write-FileAtomically -Path $CheckpointFile -Content $content
 }
 
 # =========================== WINRE STATE ===========================
@@ -1418,6 +1445,28 @@ function Ensure-AdequateRecoveryPartition {
         if ($Script:DryRun) {
             Write-Log "[DRY RUN] Would disable WinRE before partition recreation"
         } else {
+            # v47: race-detector recheck immediately before the first
+            # possible /disable of this execution. This site runs after
+            # the pre-destructive C: shrink, so an abort must restore
+            # C: to its captured size before returning Deferred. No
+            # partitions have been deleted yet at this point; the old
+            # WinRE route is still intact and no route restoration is
+            # needed.
+            if (-not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'Ensure-AdequateRecoveryPartition')) {
+                Write-Log "Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring C: to its captured size; no partitions have been deleted." -Level WARN
+                $restoreOk = Restore-OSPartitionSize -Reason "registered source drifted before /disable" -TargetSizeBytes $initialOSSize
+                if (-not $restoreOk) {
+                    Write-Log "C: could not be verified at its original size after drift abort; deleting state file so the next run retries from a clean slate" -Level ERROR
+                    $statePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+                    Remove-ItemIfExist $statePath
+                }
+                # Invalidate staged work: the checkpoint and its WIM are tied
+                # to a source that is now known to have drifted.
+                Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+                Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+                Remove-ItemIfExist "$WorkDir\base.wim"
+                return @{ Status = "Deferred"; Reason = "registered source changed before disable" }
+            }
             Write-Log "Disabling WinRE before partition recreation"
             $disableOutput = cmd /c "reagentc /disable 2>&1"
             $disableExit = $LASTEXITCODE
@@ -2166,6 +2215,274 @@ function Get-FileSizeMB {
     catch { Write-Log "Get-FileSizeMB: could not stat $Path - $_" -Level WARN; return -1 }
 }
 
+# v47: read DISM servicing metadata from a WIM for source-selection
+# comparison. Returns $null if the image cannot be read.
+function Get-WimServicingMetadata {
+    param([string]$WimPath)
+    if (-not $WimPath) { return $null }
+    try {
+        $info = Get-WindowsImage -ImagePath $WimPath -Index 1 -ErrorAction Stop
+        return @{
+            Version      = [string]$info.Version
+            SPBuild      = [string]$info.SPBuild
+            SPLevel      = [string]$info.SPLevel
+            Architecture = [string]$info.Architecture
+        }
+    } catch {
+        Write-Log "Get-WimServicingMetadata: could not read $WimPath - $_" -Level WARN
+        return $null
+    }
+}
+
+# v47: compare two DISM servicing-metadata sets.
+#   'A-newer-or-equal' when A is at least as new as B
+#   'A-older'          when A is older than B
+#   $null              when the comparison cannot be made
+# Ordering keys: Version (strict parse on both sides), then SPBuild
+# (strict parse on both sides), then SPLevel (permissive - used only
+# when both sides parse). Architecture must match. Microsoft documents
+# that an LCU bumps ServicePackBuild while the base Version can remain
+# unchanged, so Version alone is not sufficient. A Dynamic Update may
+# not change either field, so equal metadata does not prove
+# byte-for-byte equality; that tradeoff is accepted here and is handled
+# at the checkpoint layer by source-content-hash binding.
+function Compare-WimServicingMetadata {
+    param($MetaA, $MetaB)
+    if (-not $MetaA -or -not $MetaB) { return $null }
+    if ($MetaA.Architecture -and $MetaB.Architecture -and
+        $MetaA.Architecture -ne $MetaB.Architecture) { return $null }
+
+    # Primary key: Version (Major.Minor.Build.Revision).
+    # Version must parse on both sides to order at all; if it does not,
+    # the comparison is indeterminate and the caller falls back to LKG.
+    $vA = $null; $vB = $null
+    try { $vA = [System.Version]([string]$MetaA.Version) } catch { }
+    try { $vB = [System.Version]([string]$MetaB.Version) } catch { }
+    if (-not $vA -or -not $vB) { return $null }
+    if ($vA -gt $vB) { return 'A-newer-or-equal' }
+    if ($vA -lt $vB) { return 'A-older' }
+
+    # Version tied. Microsoft's WinRE documentation states that an LCU
+    # bumps the servicing build while the base Version can remain
+    # unchanged; SPBuild is the numeric UBR and is the correct
+    # discriminator in that case. If Version is tied but either SPBuild
+    # cannot be parsed, the comparison is indeterminate; return $null
+    # rather than treating it as equality.
+    $sA = 0; $sB = 0
+    if (-not [int]::TryParse([string]$MetaA.SPBuild, [ref]$sA)) { return $null }
+    if (-not [int]::TryParse([string]$MetaB.SPBuild, [ref]$sB)) { return $null }
+    if ($sA -gt $sB) { return 'A-newer-or-equal' }
+    if ($sA -lt $sB) { return 'A-older' }
+
+    # SPBuild tied. SPLevel is a secondary tiebreak; use it only when
+    # both sides parse. If either side is unparseable, the tie stands
+    # on the two primary keys alone.
+    $lA = 0; $lB = 0
+    if ([int]::TryParse([string]$MetaA.SPLevel, [ref]$lA) -and
+        [int]::TryParse([string]$MetaB.SPLevel, [ref]$lB)) {
+        if ($lA -gt $lB) { return 'A-newer-or-equal' }
+        if ($lA -lt $lB) { return 'A-older' }
+    }
+
+    # Version and SPBuild both tied; SPLevel either tied or not
+    # comparable on both sides. Equal on all comparable keys means the
+    # registered WIM is eligible.
+    return 'A-newer-or-equal'
+}
+
+# v47: validate the manager's last-known-good copy. The LKG is
+# C:\Recovery\WindowsRE\winre.wim and is only trusted when its SHA256
+# matches state.CurrentImageHash. A failed fallback copy in a prior run
+# breaks the equality, so a partial or stale file cannot be silently
+# promoted. No new persistence field is needed.
+#
+# Returns a hashtable @{ Path = <string>; Hash = <string> } when the
+# LKG is valid, $null otherwise. Callers that need only the path read
+# .Path; callers that need the content hash for source-binding or
+# checkpoint validation read .Hash.
+function Get-LKGWinREImagePath {
+    param([string]$StoredHash)
+    if (-not $StoredHash) { return $null }
+    $candidate = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { return $null }
+    $hash = Get-LiveWimHash -WimPath $candidate
+    if (-not $hash) {
+        Write-Log "Get-LKGWinREImagePath: LKG candidate exists but is unreadable: $candidate" -Level WARN
+        return $null
+    }
+    if ($hash -ne $StoredHash) {
+        Write-Log "Get-LKGWinREImagePath: LKG candidate hash $hash does not match state.CurrentImageHash $StoredHash - not treated as LKG"
+        return $null
+    }
+    return @{ Path = $candidate; Hash = $hash }
+}
+
+# =========================== REGISTERED-SOURCE FINGERPRINT ===========================
+# v47: race detector for the interval between source selection and the
+# first reagentc /disable of an execution. WU may service or replace
+# the registered WinRE while the script is preparing its candidate.
+# The detector catches that drift and aborts before disabling.
+#
+# This is NOT a lock. Microsoft does not document reagentc /disable as
+# atomic with respect to Windows Update, so the microseconds between
+# the recheck and /disable returning cannot be eliminated without
+# moving work into the disable->enable window and violating invariant
+# 3. The detector narrows the window from minutes to that residual.
+#
+# Get-RegisteredWinREFingerprint returns a hashtable with a Status
+# field:
+#   'none'      - WinRE was not Enabled or had no registered location
+#                 at capture time. The recheck verifies no registered
+#                 source has appeared since.
+#   'unreadable' - WinRE was Enabled with a registered location but no
+#                 readable WIM was found there. The recheck verifies
+#                 Location and Version remain unchanged and the WIM is
+#                 still unreadable before allowing the verified-source
+#                 repair path to proceed.
+#   'captured'   - fingerprint fully captured (Location, Version, Hash).
+#                 The recheck re-reads all three and returns $true only
+#                 when nothing changed.
+
+function Get-RegisteredWinREFingerprint {
+    param(
+        [Parameter(Mandatory)][hashtable]$WinREState,
+        [AllowEmptyString()][string]$RegisteredWimPath,
+        [AllowNull()][string]$RegisteredWimHash
+    )
+    if (-not $WinREState -or $WinREState.Status -ne 'Enabled') {
+        return @{ Status = 'none' }
+    }
+    if (-not $WinREState.Location) {
+        return @{ Status = 'none' }
+    }
+    if ($RegisteredWimPath -and $RegisteredWimHash) {
+        return @{
+            Status   = 'captured'
+            Location = $WinREState.Location
+            Version  = $WinREState.Version
+            Hash     = $RegisteredWimHash
+        }
+    }
+    # WinRE is Enabled with a registered location, but no readable WIM was
+    # found there. The source cannot be fingerprinted. The recheck helper
+    # defers on this state rather than treating it as "no source."
+    return @{
+        Status   = 'unreadable'
+        Location = $WinREState.Location
+        Version  = $WinREState.Version
+    }
+}
+
+function Assert-RegisteredWinREUnchanged {
+    param(
+        [AllowNull()][object]$Captured,
+        [Parameter(Mandatory)][string]$CalledFrom
+    )
+
+    # Helper: read the current registered WIM hash if the registered
+    # location yields a readable WIM. Returns $null when not readable.
+    $readNowRegisteredHash = {
+        param($state)
+        if (-not $state -or $state.Status -ne 'Enabled' -or -not $state.Location) { return $null }
+        try {
+            $tempLoc = @(Ensure-RecoveryPartitionAccess -TargetDir $state.Location)[0]
+            if (-not $tempLoc) { return $null }
+            # Probe both forms: the resolver returns a drive root when the
+            # registered location was a raw partition path, and returns the
+            # subpath directly when the registered location already
+            # included Recovery\WindowsRE. Only one candidate resolves to a
+            # real file on a given machine.
+            foreach ($cand in @(Join-Path $tempLoc "Recovery\WindowsRE\winre.wim"; Join-Path $tempLoc "winre.wim")) {
+                if (Test-Path -Path $cand -PathType Leaf -ErrorAction SilentlyContinue) {
+                    $h = Get-LiveWimHash -WimPath $cand
+                    if ($h) { return $h }
+                }
+            }
+        } catch { }
+        return $null
+    }
+
+    # No registered source existed at capture time. If one has appeared
+    # since (WU may have registered WinRE), defer to re-evaluate source
+    # selection; otherwise there is nothing to protect.
+    if (-not $Captured -or $Captured.Status -eq 'none') {
+        $nowForNone = Get-WinREState
+        if ($nowForNone.Status -eq 'Enabled') {
+            Write-Log "Registered-source recheck at $CalledFrom : no registered source at capture time, but WinRE is now Enabled at $($nowForNone.Location) - deferring to re-evaluate source selection" -Level WARN
+            return $false
+        }
+        Write-Log "Registered-source recheck at $CalledFrom : no registered source present at capture or now; nothing to protect"
+        return $true
+    }
+
+    # Registered source existed but its WIM was not readable at capture
+    # time. Distinguish two cases:
+    #   - still unreadable: the situation is unchanged and the repair
+    #     path must be allowed to proceed (otherwise a persistently
+    #     corrupt registered WIM would block every run)
+    #   - now readable: WU may have delivered a new one; defer to
+    #     re-evaluate source selection
+    if ($Captured.Status -eq 'unreadable') {
+        $nowForUnreadable = Get-WinREState
+        if ($nowForUnreadable.Status -ne 'Enabled') {
+            Write-Log "Registered-source recheck at $CalledFrom : registered WIM was unreadable at capture time; WinRE status is now $($nowForUnreadable.Status) - deferring to re-evaluate" -Level WARN
+            return $false
+        }
+        # Compare Location and Version against the captured values. A
+        # redirect to a different location (even one whose WIM is also
+        # unreadable) or a servicing bump means the registered source is
+        # not the one we captured; defer to re-evaluate.
+        $capturedLocU = if ($Captured.Location) { $Captured.Location.TrimEnd('\') } else { '' }
+        $nowLocU      = if ($nowForUnreadable.Location) { $nowForUnreadable.Location.TrimEnd('\') } else { '' }
+        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($capturedLocU, $nowLocU)) {
+            Write-Log "Registered-source recheck at $CalledFrom : registered WIM was unreadable at capture time; registered location changed from $($Captured.Location) to $($nowForUnreadable.Location) - deferring to re-evaluate source selection" -Level WARN
+            return $false
+        }
+        if ($nowForUnreadable.Version -ne $Captured.Version) {
+            Write-Log "Registered-source recheck at $CalledFrom : registered WIM was unreadable at capture time; registered version changed from $($Captured.Version) to $($nowForUnreadable.Version) - deferring to re-evaluate source selection" -Level WARN
+            return $false
+        }
+        $nowHashUnreadable = & $readNowRegisteredHash $nowForUnreadable
+        if ($nowHashUnreadable) {
+            Write-Log "Registered-source recheck at $CalledFrom : registered WIM was unreadable at capture time but is now readable - deferring to re-evaluate source selection" -Level WARN
+            return $false
+        }
+        Write-Log "Registered-source recheck at $CalledFrom : registered WIM remains unreadable at the same location and version; allowing repair path to proceed against the separately verified source"
+        return $true
+    }
+
+    # Captured is 'captured'.
+    $now = Get-WinREState
+    if ($now.Status -ne 'Enabled') {
+        Write-Log "Registered-source recheck at $CalledFrom : WinRE status changed from Enabled to $($now.Status) since capture; cannot verify source unchanged - deferring" -Level WARN
+        return $false
+    }
+
+    $capturedLoc = if ($Captured.Location) { $Captured.Location.TrimEnd('\') } else { '' }
+    $nowLoc      = if ($now.Location)      { $now.Location.TrimEnd('\')      } else { '' }
+    $locChanged  = -not [System.StringComparer]::OrdinalIgnoreCase.Equals($capturedLoc, $nowLoc)
+    $verChanged  = ($now.Version -ne $Captured.Version)
+
+    $hashChanged = $false
+    if ($Captured.Hash) {
+        $nowHash = & $readNowRegisteredHash $now
+        if (-not $nowHash) {
+            Write-Log "Registered-source recheck at $CalledFrom : registered WIM hash could not be re-read; treating as changed (safe side)" -Level WARN
+            $hashChanged = $true
+        } elseif ($nowHash -ne $Captured.Hash) {
+            $hashChanged = $true
+        }
+    }
+
+    if ($locChanged -or $verChanged -or $hashChanged) {
+        Write-Log "Registered-source recheck at $CalledFrom : CHANGED (location=$locChanged version=$verChanged hash=$hashChanged); captured loc=$($Captured.Location) ver=$($Captured.Version); now loc=$($now.Location) ver=$($now.Version)" -Level WARN
+        return $false
+    }
+
+    Write-Log "Registered-source recheck at $CalledFrom : unchanged (location=$($now.Location), version=$($now.Version))"
+    return $true
+}
+
 # =========================== OEM PROVIDERS ===========================
 function Get-DellWinPEPack {
     param($Hardware)
@@ -2324,6 +2641,38 @@ function Get-DesiredStateId {
 }
 
 # =========================== STATE FILE ===========================
+# v47: narrow read of a stale state file's CurrentImageHash, used only
+# for LKG validation during the v46 -> v47 migration.
+#
+# Read-WinREState correctly refuses to accept a state file whose
+# DesiredStateId does not match the current one. On the first v47 run on
+# a machine whose state file was written by v46 or earlier, that refusal
+# turns $storedHash into $null, which makes Get-LKGWinREImagePath refuse
+# to promote C:\Recovery\WindowsRE\winre.wim to LKG status even though the
+# file is the manager's own last-known-good copy from the prior
+# deployment.
+#
+# The CurrentImageHash field records a fact about the machine that
+# survives a version boundary: the hash of the last successfully deployed
+# WIM. Reading it in isolation lets the LKG validation work across the
+# boundary without weakening the DSI gate on operational state.
+#
+# The value returned here is advisory only. It does NOT make the stale
+# state file authoritative and it does NOT enter any gate other than LKG
+# validation. Callers must not use it as operational state.
+function Get-StaleWinREStateImageHash {
+    $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        $stale = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($stale.CurrentImageHash) { return [string]$stale.CurrentImageHash }
+        return $null
+    } catch {
+        Write-Log "Get-StaleWinREStateImageHash: could not read $path - $_" -Level WARN
+        return $null
+    }
+}
+
 function Read-WinREState {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$CurrentDesiredStateId)
     $empty = @{
@@ -2337,6 +2686,7 @@ function Read-WinREState {
         RepairAttempts           = 0
         LastEnableResult         = "ok"
         EnableFailureAttempts    = 0
+        DeployedWinREMetadata    = $null
     }
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
     if (-not (Test-Path $path)) { return $empty }
@@ -2355,6 +2705,7 @@ function Read-WinREState {
                 RepairAttempts           = if ($state.RepairAttempts) { [int]$state.RepairAttempts } else { 0 }
                 LastEnableResult         = if ($state.LastEnableResult) { [string]$state.LastEnableResult } else { "ok" }
                 EnableFailureAttempts    = if ($state.EnableFailureAttempts) { [int]$state.EnableFailureAttempts } else { 0 }
+                DeployedWinREMetadata    = if ($state.DeployedWinREMetadata) { [string]$state.DeployedWinREMetadata } else { $null }
             }
         }
         Write-Log "State file DesiredStateId mismatch - stale" -Level WARN
@@ -2376,8 +2727,14 @@ function Write-WinREState {
         [bool]$UsedOSFallback = $false,
         [int]$RepairAttempts = 0,
         [string]$LastEnableResult = "ok",
-        [int]$EnableFailureAttempts = 0
+        [int]$EnableFailureAttempts = 0,
+        [string]$DeployedWinREMetadata = $null
     )
+    # v47: DeployedWinREMetadata defaults to the script-scoped carry-forward
+    # value. Only the full-update deployment path overrides it explicitly.
+    if (-not $PSBoundParameters.ContainsKey('DeployedWinREMetadata')) {
+        $DeployedWinREMetadata = $Script:DeployedWinREMetadata
+    }
     $state = @{
         DesiredStateId           = $DesiredStateId
         CurrentImageHash         = $Hash
@@ -2391,6 +2748,7 @@ function Write-WinREState {
     }
     if ($null -ne $DeployedDiskNumber -and [int]$DeployedDiskNumber -ge 0) { $state.DeployedDiskNumber = [int]$DeployedDiskNumber }
     if ($null -ne $DeployedPartitionNumber -and [int]$DeployedPartitionNumber -ge 0) { $state.DeployedPartitionNumber = [int]$DeployedPartitionNumber }
+    if ($DeployedWinREMetadata) { $state.DeployedWinREMetadata = [string]$DeployedWinREMetadata }
     $stateJson = $state | ConvertTo-Json -Depth 3
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
 
@@ -2500,6 +2858,82 @@ function Invoke-DismMount {
         }
     }
     throw "DISM mount failed after 3 attempts"
+}
+
+# =========================== THIRD-PARTY DRIVER STRIP ===========================
+# v47: Remove every third-party driver from a mounted image. Hard-gated:
+# any failure to enumerate, remove, or re-verify returns $false, and the
+# caller MUST reject the candidate. Enumeration failure is NEVER
+# interpreted as zero drivers.
+#
+# Uses Get-WindowsDriver -Path $MountDir WITHOUT -All and WITHOUT a
+# provider filter. Microsoft documents this form as the third-party
+# inventory of a mounted image. Do not add -All or a provider filter.
+#
+# Re-enumerates after each removal because published OEM#.inf numbering
+# can change as packages are removed. The loop terminates only when a
+# fresh enumeration returns zero entries. The budget is generous headroom
+# over the initial count and is not expected to be hit in practice.
+function Remove-AllThirdPartyDrivers {
+    param([Parameter(Mandatory)][string]$MountDir)
+
+    $initialDrivers = $null
+    try {
+        $initialDrivers = @(Get-WindowsDriver -Path $MountDir -ErrorAction Stop)
+    } catch {
+        Write-Log "Strip: initial Get-WindowsDriver enumeration failed: $_ - candidate rejected" -Level ERROR
+        return $false
+    }
+
+    Write-Log "Strip: pre-strip third-party inventory: $($initialDrivers.Count) package(s)"
+    foreach ($d in $initialDrivers) {
+        $inf      = if ($d.Driver)           { $d.Driver }           else { '(unknown)' }
+        $provider = if ($d.ProviderName)     { $d.ProviderName }     else { '(unknown)' }
+        $version  = if ($d.Version)          { $d.Version }          else { '(unknown)' }
+        $orig     = if ($d.OriginalFileName) { $d.OriginalFileName } else { '(unknown)' }
+        Write-Log "Strip:   $inf | $provider | $version | $orig"
+    }
+
+    if ($initialDrivers.Count -eq 0) {
+        Write-Log "Strip: image already has zero third-party drivers"
+        return $true
+    }
+
+    $removed = 0
+    $budget  = [int](($initialDrivers.Count * 4) + 16)
+    for ($i = 0; $i -lt $budget; $i++) {
+        $currentDrivers = $null
+        try {
+            $currentDrivers = @(Get-WindowsDriver -Path $MountDir -ErrorAction Stop)
+        } catch {
+            Write-Log "Strip: re-enumeration failed at iteration $i : $_ - candidate rejected" -Level ERROR
+            return $false
+        }
+
+        if ($currentDrivers.Count -eq 0) {
+            Write-Log "Strip: verified zero third-party drivers remaining after removing $removed package(s)"
+            return $true
+        }
+
+        $target    = $currentDrivers[0]
+        $targetInf = if ($target.Driver) { $target.Driver } else { $null }
+        if (-not $targetInf) {
+            Write-Log "Strip: enumeration entry has no Driver field (published INF name) - candidate rejected" -Level ERROR
+            return $false
+        }
+
+        try {
+            Remove-WindowsDriver -Path $MountDir -Driver $targetInf -ErrorAction Stop | Out-Null
+            Write-Log "Strip: removed $targetInf"
+        } catch {
+            Write-Log "Strip: Remove-WindowsDriver failed for $targetInf : $_ - candidate rejected" -Level ERROR
+            return $false
+        }
+        $removed++
+    }
+
+    Write-Log "Strip: exhausted iteration budget ($budget) without reaching zero - candidate rejected" -Level ERROR
+    return $false
 }
 
 # =========================== OEM EXTRACTION HELPERS ===========================
@@ -2724,6 +3158,48 @@ function Invoke-OemPackDownload {
     return $false
 }
 
+# =========================== GITHUB BASE WIM ===========================
+# v47: extracted from the Step 2 cold-start path so source selection can
+# invoke it from either branch. Returns $true on success, $false on
+# unrecoverable failure; the caller maps failure to EXIT_FATAL.
+function Get-GitHubBaseWinRE {
+    param(
+        [Parameter(Mandatory)][string]$WorkDir,
+        [Parameter(Mandatory)]$Hardware
+    )
+    if (-not (Ensure-7Zip)) {
+        Write-Log "7-Zip required" -Level FATAL
+        return $false
+    }
+    $folder = if ($Hardware.IsWin10) { "Win10" } else { "Win11" }
+    $apiUrl = "$BaseWinRERepoApi/$folder"
+    $files = Invoke-RestMethod -Uri $apiUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
+    $parts = $files | Where-Object { $_.name -match '^[Ww]inre\.7z\.\d+$' } | Sort-Object name
+    foreach ($part in $parts) {
+        Invoke-WebRequest -Uri $part.download_url -OutFile (Join-Path $WorkDir $part.name) -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
+    }
+    # v44 patch 6: remove any stale winre.wim from an interrupted
+    # previous extraction, verify extraction produced it, then remove
+    # any stale destination base.wim before the rename.
+    $extractedWim = Join-Path $WorkDir "winre.wim"
+    if (Test-Path -LiteralPath $extractedWim) {
+        Write-Log "Removing stale extracted WIM before extraction: $extractedWim" -Level WARN
+        Remove-Item -LiteralPath $extractedWim -Force -ErrorAction SilentlyContinue
+    }
+    & $7Zip x (Join-Path $WorkDir $parts[0].name) -o"$WorkDir" -w"$WorkDir\scratch" -y | Out-Null
+    if (-not (Test-Path -LiteralPath $extractedWim -PathType Leaf)) {
+        throw "GitHub base WIM extraction did not produce winre.wim"
+    }
+    $staleBase = Join-Path $WorkDir "base.wim"
+    if (Test-Path -LiteralPath $staleBase) {
+        Write-Log "Removing stale base.wim before rename: $staleBase" -Level WARN
+        Remove-Item -LiteralPath $staleBase -Force -ErrorAction SilentlyContinue
+    }
+    Rename-Item -LiteralPath $extractedWim -NewName "base.wim" -ErrorAction Stop
+    Write-Log "Downloaded base WIM from GitHub"
+    return $true
+}
+
 # =========================== MAIN ===========================
 try {
     New-DirectoryIfNotExists $LogDir
@@ -2946,6 +3422,25 @@ try {
     $state = Read-WinREState -CurrentDesiredStateId $DesiredStateId
     $storedHash = $state.CurrentImageHash
     $storedDriverVersion = $state.InjectedDriverSetVersion
+    # v47: carry the last-deployed WinRE metadata in script scope so every
+    # Write-WinREState call preserves it by default. Only the full-update
+    # deployment path overrides this with the metadata of the WIM it just
+    # deployed.
+    $Script:DeployedWinREMetadata = $state.DeployedWinREMetadata
+    # v47: LKG-validation hash. The operational read above refuses to
+    # accept a stale state file, which correctly nulls $storedHash on the
+    # first v47 run on a v46 machine. The file's CurrentImageHash is still
+    # the hash of the last successfully deployed WIM, so read it in
+    # isolation to restore LKG validation across the version boundary. The
+    # fallback is used only at LKG-validation call sites and does not make
+    # the stale state operationally authoritative.
+    $lkgStoredHash = $storedHash
+    if (-not $lkgStoredHash) {
+        $lkgStoredHash = Get-StaleWinREStateImageHash
+        if ($lkgStoredHash) {
+            Write-Log "LKG validation: using historical CurrentImageHash from stale state file ($lkgStoredHash) for the v46 -> v47 migration"
+        }
+    }
 
     # ---- Pending-reboot repair ----
     if ($state.PendingReboot -eq $true -and $state.DesiredStateId -eq $DesiredStateId) {
@@ -3070,6 +3565,11 @@ try {
     if ($WinREState.Location) {
         $tempLocation = @(Ensure-RecoveryPartitionAccess -TargetDir $WinREState.Location)[0]
         if ($tempLocation) {
+            # Probe both forms: the resolver returns a drive root when the
+            # registered location was a raw partition path, and returns the
+            # subpath directly when the registered location already
+            # included Recovery\WindowsRE. Only one candidate resolves to a
+            # real file on a given machine.
             foreach ($cand in @(Join-Path $tempLocation "Recovery\WindowsRE\winre.wim"; Join-Path $tempLocation "winre.wim")) {
                 if (Test-Path -Path $cand -PathType Leaf -ErrorAction SilentlyContinue) {
                     $candidateHash = Get-LiveWimHash -WimPath $cand
@@ -3134,10 +3634,61 @@ try {
     }
 
     # ---- needInject determination ----
+    # v47: drift detection is metadata-based, not WIM-hash-based. A WIM
+    # recompression by an external tool changes bytes without changing the
+    # semantic desired state, so the WIM hash is not a rebuild trigger.
+    # Metadata (DISM Version and SPBuild) is a cheap and useful signal:
+    # Microsoft documents that an LCU bumps SPBuild while the base Version
+    # may remain unchanged, so both are compared. The tradeoff is that a
+    # Dynamic Update package may not change either field, so equal metadata
+    # does not prove byte-for-byte equality; that is accepted here. The
+    # WIM hash remains in use for copy verification, deployment
+    # verification, and the pre-/disable race detector, not as a rebuild
+    # trigger.
     $needInject = $false
-    $activeWimChanged = ($storedHash -and $ActiveLocationHash -and $ActiveLocationHash -ne $storedHash)
+    $registeredSourceChanged = $false
+    $registeredMetaString = $null
+    $registeredMetadataUnreadable = $false
+    if ($ActiveLocationWimPresent -and $ActiveLocationImage) {
+        $regMetaNow = Get-WimServicingMetadata -WimPath $ActiveLocationImage
+        if ($regMetaNow) {
+            $registeredMetaString = "$($regMetaNow.Version)|$($regMetaNow.SPBuild)"
+        } else {
+            # v47: registered WIM present but metadata unreadable. This is
+            # the same condition Patch 2C treats as "registered not
+            # usable" for source selection. Force a rebuild so the repair
+            # path replaces it. Without this, a valid-looking state could
+            # let the script take the fast path over an unreadable
+            # registered image.
+            $registeredMetadataUnreadable = $true
+        }
+    }
+    if ($registeredMetaString -and $state.DeployedWinREMetadata) {
+        $registeredSourceChanged = ($registeredMetaString -ne $state.DeployedWinREMetadata)
+    }
+    if ($registeredMetaString) {
+        Write-Log "Registered WinRE metadata: $registeredMetaString; last deployed: $(if ($state.DeployedWinREMetadata) { $state.DeployedWinREMetadata } else { '(none)' })"
+    }
+    # v47: byte-drift evidence. The metadata comparison above is the drift
+    # *gate*; this is its observability counterpart. A hash difference
+    # between the currently-registered image and the last successfully
+    # deployed WIM is field evidence of a source change that the metadata
+    # comparison may not have caught -- Microsoft documents that a
+    # Dynamic Update may change a serviced WinRE's contents without
+    # bumping Version or SPBuild. Logged for evidence only; the
+    # byte-drift signal does not enter any gate and does not become a
+    # rebuild trigger.
+    if ($ActiveLocationWimPresent -and $ActiveLocationHash -and $lkgStoredHash) {
+        $byteDrift = ($ActiveLocationHash -ne $lkgStoredHash)
+        Write-Log "Registered WinRE SHA256: $ActiveLocationHash"
+        Write-Log "Last deployed WinRE SHA256: $lkgStoredHash"
+        Write-Log "Byte drift from last deployment: $(if ($byteDrift) { 'YES' } else { 'NO' })"
+    }
+
     if ($forceUpgrade) { $needInject = $true; Write-Log "OS upgrade detected - forcing WIM rebuild" }
-    elseif ($activeWimChanged) { $needInject = $true; Write-Log "Active WIM hash differs from stored - rebuilding" }
+    elseif ($registeredMetadataUnreadable) { $needInject = $true; Write-Log "Registered WinRE metadata could not be read - forcing rebuild so the repair path can replace the image" }
+    elseif ($registeredSourceChanged) { $needInject = $true; Write-Log "Registered WinRE metadata changed from $($state.DeployedWinREMetadata) to $registeredMetaString - rebuilding" }
+    elseif ($storedHash -and $storedDriverVersion -and -not $state.DeployedWinREMetadata) { $needInject = $true; Write-Log "State has no DeployedWinREMetadata anchor (previous deployment could not record it) - rebuilding" }
     elseif ($storedDriverVersion -and $storedDriverVersion -ne $ExpectedDriverSetVersion) { $needInject = $true; Write-Log "Driver version changed - rebuilding" }
     elseif (-not $storedHash -or -not $storedDriverVersion) { $needInject = $true; Write-Log "No valid state (missing or stale) - rebuilding" }
 
@@ -3146,8 +3697,8 @@ try {
         $needInject = $true
     }
 
-    if ($activeWimChanged) {
-        Write-Log "Invalidating any staged WIM checkpoint because the currently registered source image changed" -Level WARN
+    if ($registeredSourceChanged) {
+        Write-Log "Invalidating any staged WIM checkpoint because the currently registered source image metadata changed" -Level WARN
         Remove-ItemIfExist $CheckpointFile
     }
 
@@ -3210,6 +3761,19 @@ try {
             $needInject = $true
         }
     }
+    # v47: mirror of the guard above for the OS-fallback route. The
+    # registered location there is C:\Recovery\WindowsRE, and the fast
+    # path's OS-fallback branch accepts the machine on the classifier
+    # verdict alone; it does not re-check that the WIM at that location
+    # is readable. Without this guard, a machine whose registered
+    # OS-fallback winre.wim has gone missing could take the fast path on
+    # the strength of a WIM discovered by the loose fallback path
+    # ($FallbackImage), which is not the registered source. Force a
+    # rebuild so the repair path replaces the registered image.
+    elseif ($activeOnOSFallback -and -not $ActiveLocationWimPresent -and $WinREState.Status -eq "Enabled") {
+        Write-Log "WinRE is registered via OS-fallback (location: $($WinREState.Location)) but its winre.wim could not be read at that location - forcing rebuild" -Level WARN
+        $needInject = $true
+    }
 
     $partitionDeferral = Read-PartitionDeferral -CurrentDesiredStateId $DesiredStateId
     if ($partitionDeferral) {
@@ -3218,7 +3782,7 @@ try {
                                      -ActiveOnRecovery $activeOnRecovery -ActiveOnOSFallback $activeOnOSFallback
         $stagedCheckpoint = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
         $stagedWimReady = $false
-        if (-not $activeWimChanged -and $stagedCheckpoint.Valid -and $stagedCheckpoint.WimReady -and $stagedCheckpoint.WorkDir) {
+        if (-not $registeredSourceChanged -and $stagedCheckpoint.Valid -and $stagedCheckpoint.WimReady -and $stagedCheckpoint.WorkDir) {
             $stagedWorkspace = @(Get-WorkDirCandidates | Where-Object {
                 [System.StringComparer]::OrdinalIgnoreCase.Equals($_.Path.TrimEnd('\'), ([string]$stagedCheckpoint.WorkDir).TrimEnd('\'))
             } | Select-Object -First 1)
@@ -3484,6 +4048,35 @@ try {
 
     # Initialize scratch only after all no-op and enable-only paths exit.
     $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
+
+    # v47: a WIM_READY checkpoint is bound to the source-content hash that
+    # produced the staged WIM. The metadata comparison in the drift
+    # detector cannot detect a metadata-neutral source change (Microsoft
+    # documents that a Dynamic Update may not bump Version or SPBuild).
+    # The staged WIM must be invalidated if the source it was prepared
+    # from is no longer present with the same bytes. Legacy checkpoints
+    # without a source hash are also invalidated.
+    if ($cp.Valid -and $cp.Step -ge 4 -and $cp.WimReady) {
+        $storedSourceHash = $cp.SourceHash
+        if (-not $storedSourceHash) {
+            Write-Log "Checkpoint WIM_READY has no recorded source identity (legacy or GitHub-sourced checkpoint); invalidating to rebuild from a known source" -Level WARN
+            Remove-ItemIfExist $CheckpointFile
+            $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
+        } else {
+            $candidateHashes = @()
+            if ($ActiveLocationHash) { $candidateHashes += $ActiveLocationHash }
+            $lkgForCheck = Get-LKGWinREImagePath -StoredHash $lkgStoredHash
+            if ($lkgForCheck) { $candidateHashes += $lkgForCheck.Hash }
+            if ($candidateHashes -notcontains $storedSourceHash) {
+                Write-Log "Checkpoint WIM_READY source identity $storedSourceHash no longer matches any available source (registered=$(if ($ActiveLocationHash) { $ActiveLocationHash } else { 'none' }), lkg=$(if ($lkgForCheck) { $lkgForCheck.Hash } else { 'none' })); invalidating to rebuild from the current source" -Level WARN
+                Remove-ItemIfExist $CheckpointFile
+                $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
+            } else {
+                Write-Log "Checkpoint WIM_READY source identity $storedSourceHash matches an available source"
+            }
+        }
+    }
+
     $step = $cp.Step
     $workDirCandidates = @(Get-WorkDirCandidates)
     $checkpointPath = if ($cp.WorkDir) { [string]$cp.WorkDir } else { $DefaultWorkDir }
@@ -3572,6 +4165,38 @@ try {
     # ============ FULL UPDATE PATH ============
     Write-Log "Starting full update"
 
+    # v47: capture the registered-source fingerprint immediately before
+    # source acquisition. The recheck helper compares this against a
+    # fresh reading immediately before whichever /disable site this
+    # execution reaches first. DryRun does not capture (no /disable
+    # site is reached and the SHA256 cost is not justified).
+    $Script:RegisteredSourceFingerprint = $null
+    if (-not $Script:DryRun) {
+        # Only pass the registered WIM path/hash when the registered
+        # location actually produced a readable WIM. $ActiveLocationImage
+        # can be populated by fallback discovery while
+        # $ActiveLocationWimPresent is $false; passing it in that case
+        # would fingerprint the fallback as if it were the registered
+        # source.
+        $regWimPathForFingerprint = if ($ActiveLocationWimPresent) { $ActiveLocationImage } else { $null }
+        $regWimHashForFingerprint = if ($ActiveLocationWimPresent) { $ActiveLocationHash } else { $null }
+        $Script:RegisteredSourceFingerprint = Get-RegisteredWinREFingerprint `
+            -WinREState $WinREState `
+            -RegisteredWimPath $regWimPathForFingerprint `
+            -RegisteredWimHash $regWimHashForFingerprint
+        switch ($Script:RegisteredSourceFingerprint.Status) {
+            'captured' {
+                Write-Log "Captured registered-source fingerprint: location=$($Script:RegisteredSourceFingerprint.Location), version=$($Script:RegisteredSourceFingerprint.Version), hash=$($Script:RegisteredSourceFingerprint.Hash)"
+            }
+            'unreadable' {
+                Write-Log "Registered-source fingerprint unavailable: WinRE is Enabled at $($Script:RegisteredSourceFingerprint.Location) but its WIM could not be read. The pre-/disable race-detector recheck will defer." -Level WARN
+            }
+            default {
+                Write-Log "No registered source to fingerprint (WinRE status=$($WinREState.Status))"
+            }
+        }
+    }
+
     if ($Script:DryRun) {
         Write-Log "[DRY RUN] Full update plan (checkpoint step $step):"
 
@@ -3579,10 +4204,10 @@ try {
             Write-Log "[DRY RUN]   Step 1: Clean WorkDir\mount and WorkDir\base.wim"
         }
         if ($step -le 2 -and $needInject) {
-            if ($ActiveLocationImage) {
-                Write-Log "[DRY RUN]   Step 2: Copy base WIM from $ActiveLocationImage to WorkDir\base.wim"
-            } elseif ($FallbackImage) {
-                Write-Log "[DRY RUN]   Step 2: Copy base WIM from $FallbackImage to WorkDir\base.wim"
+            if ($ActiveLocationImage -or $FallbackImage) {
+                Write-Log "[DRY RUN]   Step 2: Select base WIM source (registered vs hash-validated LKG by Version/SPBuild/SPLevel; GitHub cold-start if neither usable) and copy to WorkDir\base.wim"
+                Write-Log "[DRY RUN]     Registered candidate: $(if ($ActiveLocationImage) { $ActiveLocationImage } else { '(unavailable)' })"
+                Write-Log "[DRY RUN]     LKG candidate: $env:SystemDrive\Recovery\WindowsRE\winre.wim (used only when SHA256 matches state.CurrentImageHash)"
             } else {
                 Write-Log "[DRY RUN]   Step 2: Download base WIM from GitHub and extract to WorkDir\base.wim"
             }
@@ -3624,40 +4249,89 @@ try {
         Write-Log "Step 2: Obtaining base WIM"
         if ($needInject) {
             if (-not $ActiveLocationImage -and -not $FallbackImage) {
-                if (-not (Ensure-7Zip)) { Write-Log "7-Zip required" -Level FATAL; exit $EXIT_FATAL }
-                $folder = if ($Hardware.IsWin10) { "Win10" } else { "Win11" }
-                $apiUrl = "$BaseWinRERepoApi/$folder"
-                $files = Invoke-RestMethod -Uri $apiUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
-                $parts = $files | Where-Object { $_.name -match '^[Ww]inre\.7z\.\d+$' } | Sort-Object name
-                foreach ($part in $parts) {
-                    Invoke-WebRequest -Uri $part.download_url -OutFile (Join-Path $WorkDir $part.name) -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
+                if (-not (Get-GitHubBaseWinRE -WorkDir $WorkDir -Hardware $Hardware)) {
+                    Write-Log "GitHub base WIM retrieval failed" -Level FATAL
+                    exit $EXIT_FATAL
                 }
-                # v44 patch 6: remove any stale winre.wim from an
-                # interrupted previous extraction, verify extraction
-                # produced it, then remove any stale destination
-                # base.wim before the rename. Closes the step-2 wedge
-                # where an abrupt interruption left base.wim in place
-                # and blocked the rename on the next run.
-                $extractedWim = Join-Path $WorkDir "winre.wim"
-                if (Test-Path -LiteralPath $extractedWim) {
-                    Write-Log "Removing stale extracted WIM before extraction: $extractedWim" -Level WARN
-                    Remove-Item -LiteralPath $extractedWim -Force -ErrorAction SilentlyContinue
-                }
-                & $7Zip x (Join-Path $WorkDir $parts[0].name) -o"$WorkDir" -w"$WorkDir\scratch" -y | Out-Null
-                if (-not (Test-Path -LiteralPath $extractedWim -PathType Leaf)) {
-                    throw "GitHub base WIM extraction did not produce winre.wim"
-                }
-                $staleBase = Join-Path $WorkDir "base.wim"
-                if (Test-Path -LiteralPath $staleBase) {
-                    Write-Log "Removing stale base.wim before rename: $staleBase" -Level WARN
-                    Remove-Item -LiteralPath $staleBase -Force -ErrorAction SilentlyContinue
-                }
-                Rename-Item -LiteralPath $extractedWim -NewName "base.wim" -ErrorAction Stop
-                Write-Log "Downloaded base WIM from GitHub"
             } else {
-                $src = if ($ActiveLocationImage) { $ActiveLocationImage } else { $FallbackImage }
-                Copy-Item $src "$WorkDir\base.wim" -Force
-                Write-Log "Copied base WIM from $src"
+                # v47: source selection. The registered image is usable
+                # only when its servicing metadata can be read. The LKG
+                # is usable only when its SHA256 matches
+                # state.CurrentImageHash. If neither is usable, fall
+                # through to the GitHub cold-start baseline; the loose
+                # $FallbackImage discovery is not a designed source and
+                # is not used here.
+                $lkgResult = Get-LKGWinREImagePath -StoredHash $lkgStoredHash
+                $lkgPath   = if ($lkgResult) { $lkgResult.Path } else { $null }
+                # v47: only treat the candidate as "registered" when discovery
+                # found a readable WIM at the registered location.
+                # $ActiveLocationImage can be populated by fallback discovery
+                # when the registered location did not produce a WIM; in that
+                # case $ActiveLocationWimPresent is $false and the fallback is
+                # not a designed source. Source-selection chain is
+                # registered -> LKG -> GitHub. Gate accordingly.
+                $regMeta   = if ($ActiveLocationWimPresent -and $ActiveLocationImage) { Get-WimServicingMetadata -WimPath $ActiveLocationImage } else { $null }
+                $regUsable = [bool]($ActiveLocationWimPresent -and $ActiveLocationImage -and $regMeta)
+                $lkgUsable = [bool]$lkgResult
+
+                if (-not $regUsable -and $ActiveLocationWimPresent -and $ActiveLocationImage) {
+                    Write-Log "Registered WinRE candidate is present at $ActiveLocationImage but its servicing metadata could not be read; treating as not usable" -Level WARN
+                }
+                if (-not $ActiveLocationWimPresent -and $ActiveLocationImage) {
+                    Write-Log "A WIM was discovered at $ActiveLocationImage but not at the registered location; not treating it as a registered source" -Level WARN
+                }
+
+                $selectedSource = $null
+                $selectedSourceHash = $null
+                $selectedReason = $null
+                if ($regUsable -and $lkgUsable) {
+                    $lkgMeta = Get-WimServicingMetadata -WimPath $lkgPath
+                    $cmp = Compare-WimServicingMetadata -MetaA $regMeta -MetaB $lkgMeta
+                    if ($cmp -eq 'A-older') {
+                        $selectedSource = $lkgPath
+                        $selectedSourceHash = $lkgResult.Hash
+                        $selectedReason = "registered older than LKG (reg=$($regMeta.Version)/$($regMeta.SPBuild), lkg=$($lkgMeta.Version)/$($lkgMeta.SPBuild))"
+                    } elseif ($cmp -eq 'A-newer-or-equal') {
+                        $selectedSource = $ActiveLocationImage
+                        $selectedSourceHash = $ActiveLocationHash
+                        $selectedReason = "registered at least as new as LKG (reg=$($regMeta.Version)/$($regMeta.SPBuild), lkg=$($lkgMeta.Version)/$($lkgMeta.SPBuild))"
+                    } else {
+                        # Indeterminate comparison (metadata shape mismatch
+                        # or unparseable fields). The registered image is
+                        # not proven at least as new as the LKG, so the
+                        # hash-validated LKG wins.
+                        $selectedSource = $lkgPath
+                        $selectedSourceHash = $lkgResult.Hash
+                        $selectedReason = "metadata comparison indeterminate; using hash-validated LKG"
+                    }
+                } elseif ($regUsable) {
+                    $selectedSource = $ActiveLocationImage
+                    $selectedSourceHash = $ActiveLocationHash
+                    $selectedReason = "no hash-validated LKG present; using registered"
+                } elseif ($lkgUsable) {
+                    $selectedSource = $lkgPath
+                    $selectedSourceHash = $lkgResult.Hash
+                    $selectedReason = "registered not usable; using hash-validated LKG"
+                } else {
+                    $selectedReason = "neither registered nor hash-validated LKG usable; GitHub cold-start"
+                }
+
+                if ($selectedSource) {
+                    Write-Log "Base WIM source selection: $selectedReason -> $selectedSource"
+                    Copy-Item $selectedSource "$WorkDir\base.wim" -Force
+                    Write-Log "Copied base WIM from $selectedSource"
+                    $Script:StagedWimSourceHash = $selectedSourceHash
+                } else {
+                    Write-Log "Base WIM source selection: $selectedReason"
+                    # GitHub cold-start: no on-disk source to fingerprint.
+                    # A WIM_READY checkpoint prepared from a GitHub source
+                    # will be treated as stale on resume, which is safe.
+                    $Script:StagedWimSourceHash = $null
+                    if (-not (Get-GitHubBaseWinRE -WorkDir $WorkDir -Hardware $Hardware)) {
+                        Write-Log "GitHub base WIM retrieval failed" -Level FATAL
+                        exit $EXIT_FATAL
+                    }
+                }
             }
         }
         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
@@ -3692,6 +4366,22 @@ try {
         $MountDir = "$WorkDir\mount"
         Invoke-DismMount -ImageFile "$WorkDir\base.wim" -MountDir $MountDir -Index 1
 
+        # v47: normalize the mounted image to zero third-party drivers
+        # before injecting the current recipe. Hard gate: any failure to
+        # enumerate, remove, or prove zero rejects the candidate. On
+        # rejection, dismount with -Discard, clean up, roll the checkpoint
+        # back to step 2, and defer. No injection, no export, no partition
+        # work, no WinRE disable.
+        if (-not (Remove-AllThirdPartyDrivers -MountDir $MountDir)) {
+            Write-Log "Strip stage failed - candidate rejected. Dismounting with -Discard and deferring before injection, export, partition work, or WinRE disable." -Level ERROR
+            try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
+            Remove-ItemIfExist $MountDir
+            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+            Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+            Remove-ItemIfExist "$WorkDir\base.wim"
+            exit $EXIT_WARNING
+        }
+
         $extractDir = "$WorkDir\oem_extract"
 
         # Add-WindowsDriver's return-shape filter ($_.Operation -in
@@ -3706,6 +4396,20 @@ try {
             ).Count
         } catch { }
         Write-Log "Pre-injection third-party driver count: $preInjectThirdParty"
+        # v47: the strip stage above proved zero third-party drivers using
+        # the filterless form Microsoft documents as the third-party
+        # inventory. This pre-injection count uses the legacy filtered
+        # form retained for injection-delta accounting. If the two views
+        # disagree, log the discrepancy and flag a non-fatal warning. The
+        # filterless form remains authoritative for the zero-driver
+        # guarantee, so this does not abort the run; the existing
+        # injection success gate (delta == 0 AND matchedInfCount == 0)
+        # already fails conservatively in the case where a real
+        # discrepancy would matter.
+        if ($preInjectThirdParty -gt 0) {
+            Write-Log "Strip claimed zero third-party drivers but the filtered pre-injection count is $preInjectThirdParty - the filterless and filtered DISM queries disagree on this image. Filterless is authoritative; injection delta accounting may underreport." -Level WARN
+            $Script:nonFatalWarning = $true
+        }
 
         if ($OEMPackage) {
             Write-Log "Processing OEM pack: $($OEMPackage.Name)"
@@ -3902,7 +4606,6 @@ try {
         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
         Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
         Remove-ItemIfExist "$WorkDir\base.wim"
-        $Script:nonFatalWarning = $true
         exit $EXIT_WARNING
     }
 
@@ -3919,7 +4622,35 @@ try {
             exit $EXIT_FATAL
         }
         if ($Script:ImageInjectionComplete) {
-            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 4 -DesiredStateId $DesiredStateId -WimReady
+            # v47: if this execution resumed at Step 3, Step 2 was skipped
+            # and $Script:StagedWimSourceHash is still $null. Recover it
+            # from base.wim by matching against the registered WIM hash
+            # and the hash-validated LKG. If base.wim matches neither, it
+            # is a GitHub cold-start (or an unknown on-disk source) and
+            # the source identity is intentionally left $null, which
+            # causes the next resume to invalidate the checkpoint
+            # conservatively. base.wim is still present at this point;
+            # it is removed immediately after the checkpoint write.
+            if (-not $Script:StagedWimSourceHash -and (Test-Path "$WorkDir\base.wim")) {
+                $recoveredHash = Get-LiveWimHash -WimPath "$WorkDir\base.wim"
+                if ($recoveredHash) {
+                    if ($ActiveLocationHash -and $recoveredHash -eq $ActiveLocationHash) {
+                        $Script:StagedWimSourceHash = $recoveredHash
+                        Write-Log "Recovered staged WIM source identity from base.wim: registered ($recoveredHash)"
+                    } else {
+                        $lkgForRecovery = Get-LKGWinREImagePath -StoredHash $lkgStoredHash
+                        if ($lkgForRecovery -and $recoveredHash -eq $lkgForRecovery.Hash) {
+                            $Script:StagedWimSourceHash = $recoveredHash
+                            Write-Log "Recovered staged WIM source identity from base.wim: LKG ($recoveredHash)"
+                        } else {
+                            Write-Log "base.wim hash $recoveredHash does not match registered or LKG; treating as GitHub cold-start (no source identity)"
+                        }
+                    }
+                } else {
+                    Write-Log "Could not hash base.wim at Step 4 to recover source identity; checkpoint will have no source binding" -Level WARN
+                }
+            }
+            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 4 -DesiredStateId $DesiredStateId -WimReady -SourceHash $Script:StagedWimSourceHash
             Remove-ItemIfExist "$WorkDir\base.wim"
             Write-Log "Removed base.wim after verified export to free workspace capacity before partition planning"
         } else {
@@ -4003,6 +4734,22 @@ try {
 
     $CurrentWinREState = Get-WinREState
     if ($CurrentWinREState.Status -eq "Enabled") {
+        # v47: race-detector recheck immediately before the first
+        # possible /disable of this execution. This site is reached
+        # with the old WinRE route intact and no partition changes
+        # made by Ensure-AdequateRecoveryPartition (if that function
+        # ran and disabled WinRE, this branch does not execute). A
+        # drift-abort here is a clean defer without rollback.
+        if (-not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'Step 5 deployment')) {
+            Write-Log "Registered WinRE source changed during candidate preparation - aborting before /disable. The old WinRE route remains intact; no partition changes have been made at this site." -Level WARN
+            # Invalidate staged work: the checkpoint and its WIM are tied to
+            # a source that is now known to have drifted.
+            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+            Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+            Remove-ItemIfExist "$WorkDir\base.wim"
+            $Script:nonFatalWarning = $true
+            exit $EXIT_WARNING
+        }
         Write-Log "Disabling WinRE before deployment"
         $disOut = cmd /c "reagentc /disable 2>&1"
         $disExit = $LASTEXITCODE
@@ -4096,9 +4843,14 @@ try {
         }
     }
 
-    # Update the OS-fallback WIM. Skip when the deployment source is
-    # already the fallback file itself: the block would delete the source
-    # and then copy it to itself, destroying the only copy.
+    # Update the OS-fallback WIM at C:\Recovery\WindowsRE\winre.wim.
+    # In v47 this file serves two roles: the OS-fallback deployment target
+    # when WinRE runs from the OS partition, and the last-known-good (LKG)
+    # source that Get-LKGWinREImagePath validates against
+    # state.CurrentImageHash. Both roles require it to hold the current
+    # image. Skip when the deployment source is already this file: the
+    # block would delete the source and then copy it to itself, destroying
+    # the only copy.
     $fallbackTarget = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
     $srcFullFb = $null; try { $srcFullFb = [System.IO.Path]::GetFullPath($SourceWim) } catch { }
     $dstFullFb = $null; try { $dstFullFb = [System.IO.Path]::GetFullPath($fallbackTarget) } catch { }
@@ -4146,6 +4898,25 @@ try {
     # older one. Informational only.
     $deployedWimBuild = Get-WimBuild -WimPath $SourceWim
     Write-Log "Post-deploy WIM build: $(if ($deployedWimBuild) { $deployedWimBuild } else { 'unknown' }) (source: $SourceWim)"
+    # v47: log the final deployed WIM's SHA256. This is the value that
+    # will be written to the state file as CurrentImageHash and will be
+    # compared against the next run's registered hash for byte-drift
+    # evidence. Logged for evidence only; no gate reads it.
+    if ($finalHash) {
+        Write-Log "Final deployed WinRE SHA256: $finalHash"
+    }
+    # v47: capture the metadata of the WIM just deployed so the next run's
+    # drift detection has an anchor. If the metadata cannot be read, store
+    # $null; the next run will then treat the state as missing metadata
+    # and force a rebuild.
+    $deployedMetaNow = Get-WimServicingMetadata -WimPath $SourceWim
+    if ($deployedMetaNow) {
+        $Script:DeployedWinREMetadata = "$($deployedMetaNow.Version)|$($deployedMetaNow.SPBuild)"
+        Write-Log "Deployed WinRE metadata: $($Script:DeployedWinREMetadata)"
+    } else {
+        $Script:DeployedWinREMetadata = $null
+        Write-Log "Deployed WinRE metadata could not be read from $SourceWim; next run will treat this as missing metadata and rebuild" -Level WARN
+    }
     if ($Script:ImageInjectionComplete -and $finalHash) {
         $deployedDisk = if ($recoveryPartition) { $recoveryPartition.DiskNumber } else { -1 }
         $deployedPart = if ($recoveryPartition) { $recoveryPartition.PartitionNumber } else { -1 }

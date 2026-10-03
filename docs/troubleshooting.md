@@ -27,6 +27,16 @@ The first line is `========== WinRE Manager Started (v<version> patch <level>) =
 
 As of v46 patch 2, every run logs three build numbers: the registered WinRE version (`WinRE status: ..., Location: ..., Version: <x>`), the source WIM build (`Source WIM build: <build> (path: <path>)` during force-upgrade detection), and the post-deploy WIM build (`Post-deploy WIM build: <build> (source: <path>)` immediately before the state write). None of the three affects control flow; they are logged for evidence. A run whose `Source WIM build` or `Post-deploy WIM build` is older than the registered `Version` is a candidate signal for base-image drift, not a fault.
 
+As of v47 patch 1, a full-update run additionally logs:
+
+- **The registered-source fingerprint captured before source acquisition**: `Captured registered-source fingerprint: location=..., version=..., hash=...`. This is the value the pre-`/disable` race detector compares against later.
+- **The base WIM source-selection decision**: `Base WIM source selection: <reason> -> <path>`. The reason names the branch — `no hash-validated LKG present; using registered`, `registered at least as new as LKG`, `registered older than LKG`, `metadata comparison indeterminate; using hash-validated LKG`, `registered not usable; using hash-validated LKG`, or `neither registered nor hash-validated LKG usable; GitHub cold-start`.
+- **The strip stage's inventory and progress**: `Strip: pre-strip third-party inventory: N package(s)`, followed by one line per package (`Strip:   <OEM#.inf> | <provider> | <version> | <original filename>`), then `Strip: removed <OEM#.inf>` per removal and a terminator (`Strip: verified zero third-party drivers remaining after removing N package(s)` or `Strip: image already has zero third-party drivers`).
+- **The pre-injection third-party driver count**: `Pre-injection third-party driver count: N`. Under v47 this should be 0 unless the filterless and filtered DISM queries disagree (see the note in the strip-failure section below).
+- **The race-detector recheck at whichever `/disable` site the execution reached**: `Registered-source recheck at <site> : unchanged (...)`, where `<site>` is `Ensure-AdequateRecoveryPartition` or `Step 5 deployment`. On drift, the same line reads `CHANGED (location=<bool> version=<bool> hash=<bool>)`.
+- **The registered-versus-deployed metadata comparison** at the drift detector: `Registered WinRE metadata: <ver>|<sp>; last deployed: <ver>|<sp>` (or `(none)` on the first v47 run).
+- **The deployed metadata anchor written at state-write time**: `Deployed WinRE metadata: <ver>|<sp>`.
+
 The program lock is acquired first, immediately after the banner. The log records `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on success, `Another WinRE Manager instance is already running (program lock file is exclusively held). …` if a second instance is running, and `Could not set up program lock at <path> : <error> - proceeding without single-instance protection; concurrent runs may collide` if the lock could not be acquired for a non-contention reason. Under `-DryRun` the lock is skipped and the log records `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances`. See "The script exited with a rename error (concurrent instance)" below for the full discussion.
 
 One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. As of v44 patch 6, the destructive path no longer consults C:'s BitLocker state at all — only the OS-fallback route does, because on that route the target volume *is* C:.
@@ -35,7 +45,9 @@ One further check that runs early and can defer the run is the VMD hardware pres
 
 One classifier message that fires early, without stopping the run, is the label-only classifier WARN (v44 patch 7). When the active WinRE location resolves to a partition whose GPT type is not the recovery GUID and whose MBR type is not `0x27`, but whose volume label is `Recovery` or `WINRE`, the classifier logs a WARN and does **not** treat the partition as a recovery partition. See "The machine keeps rebuilding and never takes the fast path (label-only recovery partition)" below.
 
-One further class of deferrals was introduced in v45 patch 1: the pre-shrink deferrals from `Ensure-AdequateRecoveryPartition`. The function returns a `Deferred` result with a specific `Reason`, and when `RetrySuppressible = $true` the main flow writes the deferral sidecar at `C:\Recovery\OEM\winre_partition_deferred.json`. v46 patch 2 added two further reasons to this set. See "The destructive replacement was deferred before partition deletion" below for the full list of reasons and their resolutions.
+One further class of deferrals was introduced in v45 patch 1: the pre-shrink deferrals from `Ensure-AdequateRecoveryPartition`. The function returns a `Deferred` result with a specific `Reason`, and when `RetrySuppressible = $true` the main flow writes the deferral sidecar at `C:\Recovery\OEM\winre_partition_deferred.json`. v46 patch 2 and v47 patch 1 added further reasons to this set. See "The destructive replacement was deferred before partition deletion" below for the full list of reasons and their resolutions.
+
+Three v47 patch 1-specific failures have their own sections: the strip stage failing (see "The strip stage failed"), the pre-`/disable` race detector firing (see "The pre-`/disable` race detector fired"), and a metadata-triggered rebuild (see "The rebuild ran because the registered WinRE metadata changed"). These are the newest addition to the playbook and have not been exercised in the field; a machine that reaches them warrants a bug report.
 
 ## The machine has no recovery partition and WinRE is disabled
 
@@ -223,9 +235,188 @@ Field case: **HP EliteBook 8 G1i 16 inch Notebook AI PC** with an SD/MMC card re
 
 **Is this a problem on a pre-v46-patch-2 build?** No. The error is cosmetic — the diagnostic continues after each occurrence, the machine state is not affected, and no decision the script makes depends on the missing partitions. The correct response, if you see it, is to note the disk number the error names (it is a disk with no partitions) and confirm the rest of the diagnostic is complete.
 
-## The destructive replacement was deferred before partition deletion (v45 patch 1; v46 patch 2 added reasons)
+## The strip stage failed (v47 patch 1)
 
-**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: the old recovery partition is still present, no partition was deleted, and the run did not attempt OS-fallback. The deferral is protective: the destructive sequence was about to run, the read-only plan or the pre-shrink check determined that it could not safely complete, and the script stepped back before destroying anything. In one v46 patch 2 sub-case — the pre-deletion resolver guard — WinRE is left `Disabled` because `reagentc /disable` has already run; see "The active WinRE route could not be resolved to a partition" below. In every other reason, WinRE stays `Enabled` and registered to the old recovery partition.
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no WIM was deployed, no partition was deleted, WinRE was not disabled, and no `reagentc` call was made. The state file is unchanged (or absent). The run got as far as mounting the base WIM, and the strip stage could not prove the mounted image was free of third-party drivers.
+
+**Log signature.** One of the following before the abort line:
+
+```
+[ERROR] Strip: initial Get-WindowsDriver enumeration failed: <error> - candidate rejected
+```
+
+or
+
+```
+[ERROR] Strip: re-enumeration failed at iteration <n> : <error> - candidate rejected
+```
+
+or
+
+```
+[ERROR] Strip: enumeration entry has no Driver field (published INF name) - candidate rejected
+```
+
+or
+
+```
+[ERROR] Strip: Remove-WindowsDriver failed for <OEM#.inf> : <error> - candidate rejected
+```
+
+or
+
+```
+[ERROR] Strip: exhausted iteration budget (<n>) without reaching zero - candidate rejected
+```
+
+Followed by:
+
+```
+[ERROR] Strip stage failed - candidate rejected. Dismounting with -Discard and deferring before injection, export, partition work, or WinRE disable.
+```
+
+Followed by the dismount, checkpoint rollback to Step 2, and removal of `base.wim` and any stale `winre_optimized.wim`, then exit code 2.
+
+**Cause.** The v47 strip stage is a hard gate. It uses `Get-WindowsDriver -Path $MountDir` **without `-All` and without a provider filter** to enumerate the third-party inventory of the mounted image, removes each published `OEM#.inf` one at a time, and re-enumerates after each removal. It succeeds only when a fresh enumeration returns zero entries. Every failure mode is treated as a candidate rejection:
+
+- **Initial enumeration failed.** `Get-WindowsDriver` itself threw on the mounted image. Common causes: the image is corrupt or partially written, DISM cannot read the image's driver store, or a DISM servicing stack issue is preventing the query.
+- **Re-enumeration failed at iteration N.** The initial enumeration succeeded but a subsequent one threw. This is unusual and often indicates a DISM state that degraded during the removals.
+- **Enumeration entry has no `Driver` field.** A returned driver entry is missing the published INF name the removal call needs. This is a DISM return-shape anomaly.
+- **`Remove-WindowsDriver` failed.** The removal call for a specific published INF returned an error. Common causes: the driver package is marked non-removable in the image, the image is locked, or a DISM servicing stack error.
+- **Iteration budget exhausted.** The loop ran more iterations than the budget allowed without reaching zero. This usually means removals are succeeding but new third-party entries keep appearing — an unusual state that the hard gate refuses to interpret.
+
+**Why the run stops.** Microsoft documents `Get-WindowsDriver` / `Remove-WindowsDriver` and offline WinRE servicing with DISM, but the "strip-everything-then-inject-the-recipe" pattern is the project's own engineering choice. Its safety property is that the deployed image is a deterministic function of Microsoft's WinRE base plus the current recipe — with no memory of prior rebuilds. That property only holds if the strip is provably complete. If the strip cannot prove zero third-party drivers remain, the candidate WIM's provenance is not deterministic, and deploying it would reintroduce the driver-accumulation problem the v47 design exists to eliminate. The abort is a protective failure, not a degraded-success: the run stops before anything is committed.
+
+**Enumeration failure is never interpreted as zero.** A DISM query that throws is not evidence that the image has zero third-party drivers — it is evidence that the query could not be answered. The gate is deliberately fail-closed on this point.
+
+**Resolution.**
+
+1. **Re-run the harness Option 1 diagnostic** to confirm the underlying Windows tooling is healthy. In particular, confirm the DISM cmdlet check (Check 11) passes — `Mount-WindowsImage`, `Dismount-WindowsImage`, `Get-WindowsImage`, `Add-WindowsDriver`, and `Get-WindowsDriver` must all be present.
+
+2. **Check the log line above the failure** for the specific error. The candidate rejection reason names the exact failure: an enumeration error, a removal error, a missing `Driver` field, or a budget exhaustion.
+
+3. **If the failure is on the initial enumeration**, the mounted image may be corrupt or partially written. Check the workspace's `base.wim` size against the source from which it was copied; a partially-written base image can cause a DISM read failure. The next run re-acquires the base WIM from source and retries.
+
+4. **If the failure is `Remove-WindowsDriver failed` for a specific INF**, the driver package may be marked non-removable in the image. This is uncommon for the OEM WinPE driver packs that the recipe typically adds, and it usually indicates an image whose driver store has been modified outside the project's own pipeline. On a machine whose registered WinRE is the source, this may be a Windows Update-delivered image with a package the removal API cannot touch. Investigate the driver store state on the mounted image if you have a way to reproduce the mount outside the script.
+
+5. **If the failure is `exhausted iteration budget`**, the removals are not converging. This is unusual and warrants a bug report; include the full log (the per-iteration removal lines are logged).
+
+6. **After identifying the cause, resolve it and re-run `WinRE.ps1`.** The checkpoint is at Step 2 and the workspace was cleaned by the gate; the next run re-acquires the base WIM and re-runs the strip.
+
+**Not to be confused with the OEM or VMD injection failure.** Both are protective stops in Step 3, but they fire at different points: the strip failure fires between mount and injection; the injection failure fires after the strip succeeded, during the recipe-injection step. The log signatures are distinct — the strip failure's abort line reads `Strip stage failed - candidate rejected`; the injection failure's abort line reads `Image injection did not complete. Stopping before Step 4 and before any deployment.`
+
+**Field status.** The strip stage with a non-zero third-party driver set has not been exercised in a v47 production run. The ASUS PRIME H510M-D v47 field run took the strip as a no-op (the registered image was already clean). If you see this section's log signature on a machine — especially the initial-enumeration or removal-failure variants — please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section.
+
+## The pre-`/disable` race detector fired (v47 patch 1)
+
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: no partition was deleted, no WIM was deployed. The abort happened before a `reagentc /disable` call. If the abort fired at the `Ensure-AdequateRecoveryPartition` site, C: is restored to its captured size — the pre-shrink ran before the abort, so a size restoration is required. If the abort fired at the Step 5 deployment site, no rollback is needed because no partition changes were made.
+
+**Log signature.** The captured fingerprint appears near the start of the full-update path:
+
+```
+[INFO] Captured registered-source fingerprint: location=<location>, version=<version>, hash=<hash>
+```
+
+The abort appears at whichever `/disable` site the execution reached:
+
+```
+[WARN] Registered-source recheck at Step 5 deployment : CHANGED (location=<bool> version=<bool> hash=<bool>); captured loc=<captured> ver=<captured>; now loc=<now> ver=<now>
+```
+
+or
+
+```
+[WARN] Registered-source recheck at Ensure-AdequateRecoveryPartition : CHANGED (location=<bool> version=<bool> hash=<bool>); captured loc=<captured> ver=<captured>; now loc=<now> ver=<now>
+```
+
+Followed (at the `Ensure-AdequateRecoveryPartition` site) by:
+
+```
+[WARN] Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring C: to its captured size; no partitions have been deleted.
+```
+
+Followed (at the Step 5 deployment site) by:
+
+```
+[WARN] Registered WinRE source changed during candidate preparation - aborting before /disable. The old WinRE route remains intact; no partition changes have been made at this site.
+```
+
+Then the checkpoint is reset to Step 2, `base.wim` and any stale `winre_optimized.wim` are removed, and the run exits with code 2.
+
+**Cause.** The v47 patch 1 pre-`/disable` race detector caught the registered WinRE image changing between the start of the rebuild and the moment before the `/disable` call. The detector captures the registered WinRE's `Location`, `Version` (from `reagentc /info`), and WIM SHA256 at the start of the rebuild, and re-reads all three immediately before the first `/disable` of the execution. Any change — location, version, or hash — aborts the disable.
+
+The race the detector closes is real: Windows Update can service or replace the registered WinRE while the script is preparing its candidate WIM. The candidate WIM was built from the registered image (or the LKG, or GitHub), the registered image changes under the script's feet, and the `/disable` + `/enable` cycle deploys a WIM that no longer corresponds to what the detector could have verified. The abort is protective.
+
+**Named as a race detector, not a lock.** Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update. The microseconds between the re-read and the `/disable` call returning cannot be eliminated without moving work into the disable→enable window, which would violate invariant 3 (minimize the disable→enable window). The detector narrows the window from minutes to those residual microseconds.
+
+**Resolution.**
+
+1. **Do nothing if a Windows Update is currently servicing WinRE on the machine.** The abort is the correct protective response; the WU is going to finish on its own. Wait for the WU to settle, then re-run `WinRE.ps1` on the next scheduled trigger.
+
+2. **If no Windows Update is plausibly servicing WinRE on the machine,** investigate why the registered `Location`, `Version`, or WIM SHA256 changed during candidate preparation. Possible causes:
+   - An antivirus or endpoint-protection product replaced `winre.wim` at the registered location.
+   - An administrator or another tool manually re-registered WinRE to a different location.
+   - A concurrent instance of `WinRE.ps1` (or another WinRE-servicing tool) ran the disable/enable cycle and replaced the registered image.
+
+3. **Check `C:\ProgramData\OEM\Logs\WinREManager.log` for the corresponding entry** on the surrounding lines. The recheck line's `location=<bool> version=<bool> hash=<bool>` triple tells you which field changed.
+
+4. **Re-run `WinRE.ps1`.** The next run captures a fresh fingerprint and proceeds normally. The checkpoint was reset to Step 2 and the staged artifacts were removed, so the run restarts source acquisition cleanly.
+
+**Field status.** The race detector has not fired in the field. The ASUS PRIME H510M-D v47 field run logged `Registered-source recheck at Step 5 deployment : unchanged`. If you see this section's log signature, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — the exact change pattern (location vs. version vs. hash) is useful field data.
+
+## The rebuild ran because the registered WinRE metadata changed (v47 patch 1)
+
+**Symptom.** The run takes the full-update path on a machine that would otherwise have taken the fast path. The state file's `DesiredStateId` matches the current one, but the rebuild runs anyway. This is the v47 drift detector's behavior, and it is a correct response to any of several conditions.
+
+**Log signatures.** Any of the following appears before the full-update path begins:
+
+```
+[INFO] Registered WinRE metadata: <ver>|<sp>; last deployed: <ver>|<sp>
+```
+
+followed by one of:
+
+```
+[INFO] State has no DeployedWinREMetadata anchor (previous deployment could not record it) - rebuilding
+```
+
+or
+
+```
+[INFO] Registered WinRE metadata changed from <old> to <new> - rebuilding
+```
+
+or
+
+```
+[INFO] Registered WinRE metadata could not be read - forcing rebuild so the repair path can replace the image
+```
+
+In the first two cases the rebuild is triggered by a metadata comparison; in the third, by an unreadable registered image.
+
+**Cause.** The v47 patch 1 drift detector compares the currently-registered WinRE's DISM servicing metadata (`Version` + `SPBuild`) against the state file's `DeployedWinREMetadata` anchor. Three conditions force a rebuild:
+
+1. **The state file has no anchor.** This is the case for every v46-or-earlier state file. The absence forces a rebuild on the first v47 run so that the anchor is written. After the first successful v47 run, the state file carries the anchor and subsequent runs evaluate against it. The rebuild is a one-time cost of the v46 → v47 migration.
+2. **The anchor exists but does not match the current registered metadata.** This is the drift case: Windows Update serviced the registered WinRE, changing its `Version` or `SPBuild`. The detector forces a rebuild to bring the deployed WIM back into agreement with the current registered image. This is the intended behavior — Microsoft documents that an LCU bumps `SPBuild` while the base `Version` may remain unchanged, so both are compared.
+3. **The registered metadata is unreadable.** `Get-WimServicingMetadata` failed on the registered WIM. This is a defensive force-rebuild: a valid-looking state file could otherwise let the script take the fast path over an unreadable registered image, which the repair path would then be unable to replace. The rebuild runs so the repair path can replace the image.
+
+**What this replaces.** The v46 WIM-hash-as-rebuild-trigger is retired. Under v46, the fast path compared the deployed WIM's hash at the registered location against the state file's `CurrentImageHash`. A WIM recompression by an external tool changed the hash without changing the semantic desired state, producing a spurious rebuild. The v47 metadata comparison is semantically tighter: it compares the properties that actually indicate a servicing change, not the bytes.
+
+**The tradeoff.** Microsoft documents that a Dynamic Update may change the contents of a serviced WinRE image without changing either `Version` or `SPBuild`. A DU delivered in that manner will not trigger a rebuild on its own. The `WIM_READY` checkpoint layer catches it via source-content-hash binding — an in-flight rebuild is protected because its staged WIM is bound to the source bytes at preparation time — but a completed prior deployment with no in-flight checkpoint will not be flagged. This is the metadata-neutral DU residual; see [CHANGELOG.md](../CHANGELOG.md) under the v47 patch 1 entry.
+
+**Resolution.**
+
+1. **If the log shows `State has no DeployedWinREMetadata anchor`,** nothing needs to be done. This is the expected first-v47-run behavior. The rebuild writes the anchor, and subsequent runs take the fast path unless the metadata changes.
+
+2. **If the log shows `Registered WinRE metadata changed from <old> to <new>`,** the registered WinRE was serviced by Windows Update between the last v47 run and this one. The rebuild is the correct response; no operator action is needed. If the metadata comparison fires on every run — the rebuild happens, the anchor is updated, and the next run's comparison fires again with a new pair of values — investigate whether something on the machine is repeatedly re-servicing the registered WinRE. This is unusual and warrants a bug report.
+
+3. **If the log shows `Registered WinRE metadata could not be read`,** the registered image is unreadable. The rebuild runs to replace it. If the same message fires on the next run, the registered image is persistently unreadable and the machine is not converging — investigate the registered recovery partition's storage state. `Test-WinRE.ps1` Option 1's Build numbers block reports what the harness can see of the registered image; a `(none present at C:\Recovery\WindowsRE\winre.wim)` there plus the production log's persistent unreadable message indicates a real storage problem.
+
+**Field status.** The rebuild-because-of-a-changed-anchor branch and the rebuild-because-of-an-unreadable-registered-image branch have not been exercised in the field. The ASUS PRIME H510M-D v47 field run took the rebuild via the DSI-mismatch branch (state file was stale from v46, so the metadata comparison was subsumed by the DSI mismatch and did not fire). If you see either branch on a machine, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section.
+
+## The destructive replacement was deferred before partition deletion (v45 patch 1; v46 patch 2 and v47 patch 1 added reasons)
+
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: the old recovery partition is still present, no partition was deleted, and the run did not attempt OS-fallback. The deferral is protective: the destructive sequence was about to run, the read-only plan or the pre-shrink check determined that it could not safely complete, and the script stepped back before destroying anything. In one v46 patch 2 sub-case — the pre-deletion resolver guard — WinRE is left `Disabled` because `reagentc /disable` has already run; see "The active WinRE route could not be resolved to a partition" below. In one v47 patch 1 sub-case — the pre-`/disable` race-detector abort — C: may have been pre-shrunk and is restored before the return; see "The pre-`/disable` race detector fired" above. In every other reason, WinRE stays `Enabled` and registered to the old recovery partition.
 
 **Log signature.** The last lines of the run before exit are:
 
@@ -236,7 +427,7 @@ Field case: **HP EliteBook 8 G1i 16 inch Notebook AI PC** with an SD/MMC card re
 
 The second line appears only when the deferral is retry-suppressible; the first appears for every reason.
 
-The most common `<Reason>` values are the following. Each has a distinct resolution. [exit-codes.md](exit-codes.md) carries the full list, including the internal failure reasons (`partition geometry unavailable`, `WinRE disable failed before deletion`, `WinRE disable verification failed before deletion`, `active WinRE location could not be resolved`, and the two `recovery partition deletion failed` variants); those indicate storage-level or OS-level conditions rather than operator-actionable constraints, and are diagnosable from the surrounding log lines.
+The most common `<Reason>` values are the following. Each has a distinct resolution. [exit-codes.md](exit-codes.md) carries the full list, including the internal failure reasons (`partition geometry unavailable`, `WinRE disable failed before deletion`, `WinRE disable verification failed before deletion`, `active WinRE location could not be resolved`, the two `recovery partition deletion failed` variants, and `registered source changed before disable`); those indicate storage-level, OS-level, or Windows-Update-driven conditions rather than operator-actionable constraints, and are diagnosable from the surrounding log lines.
 
 - **`Dedicated recovery partition plan rejected: <specific reason>. No partition or WinRE changes were made.`** — The read-only geometry plan rejected the layout. The `RetrySuppressible` flag is not set; the marker is not written. The nested `<specific reason>` is one of thirteen: the partition inventory contains entries from another disk; another partition overlaps the OS partition geometry; the OS partition's supported-size bounds are unavailable; the requested recovery bucket size is invalid; the requested recovery bucket size exceeds the 2 GiB safety ceiling; the OS partition's geometry is inconsistent with the disk size; a recovery-typed partition exceeds the 2 GiB safety ceiling; a recovery-typed partition overlaps the OS partition geometry; a recovery-typed partition precedes the OS partition; partition extents overlap or are not ordered consistently; a recovery-typed partition is separated from C: by a non-recovery partition; the planned OS partition size would be zero or negative; or the aligned managed extent end precedes the OS partition start.
 - **`Pre-shrink free-space check could not read the C: volume (Get-Volume -DriveLetter C returned nothing). Refusing to shrink C: without verifying the 3 GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed.`** — Fail-closed C: volume-read check. `RetrySuppressible = $false`; the marker is not written; the next run retries naturally.
@@ -245,8 +436,9 @@ The most common `<Reason>` values are the following. Each has a distinct resolut
 - **`OS partition did not land at the planned size; preserving the old recovery route and deferring`** — The shrink returned success but the post-resize verification failed. `RetrySuppressible = $true`; the marker is written.
 - **`Resize rounding leaves only <n> MiB for a <m> MiB bucket; preserving the old route and deferring`** — The actual post-resize geometry leaves less space than the plan's bucket needs. `RetrySuppressible = $true`; the marker is written.
 - **`WinRE is Enabled but its registered location (<location>) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made.`** (v46 patch 2) — The active WinRE route could not be resolved to a partition. `Reason = "active WinRE location could not be resolved"`. Delete-last ordering and route restoration both depend on knowing which partition is active; without it, no partition is protected and a mid-loop failure could leave the machine with no working recovery route. The guard fires **after** `reagentc /disable` has already run, so the machine is left with WinRE `Disabled` and the old recovery partition intact. `RetrySuppressible = $false`; the marker is not written. See "The active WinRE route could not be resolved to a partition" below.
+- **`Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring C: to its captured size; no partitions have been deleted.`** (v47 patch 1) — The pre-`/disable` race detector fired at the `Ensure-AdequateRecoveryPartition` site. `Reason = "registered source changed before disable"`. The abort happens after the pre-shrink but before any partition is deleted, so C: is restored to its captured size and the old WinRE route is intact. `RetrySuppressible = $false`; the marker is not written. See "The pre-`/disable` race detector fired" above.
 
-**Cause.** The v45 patch 1 pipeline runs the risky operation — the shrink — in the reversible window, before `reagentc /disable` and before any partition deletion. The read-only geometry plan checks the layout before any change. Any of the conditions above stops the run before the destructive sequence begins. Except for the v46 patch 2 resolver deferral, the old recovery route is left intact.
+**Cause.** The v45 patch 1 pipeline runs the risky operation — the shrink — in the reversible window, before `reagentc /disable` and before any partition deletion. The read-only geometry plan checks the layout before any change. Any of the conditions above stops the run before the destructive sequence begins. Except for the v46 patch 2 resolver deferral and the v47 patch 1 race-detector abort, the old recovery route is left intact.
 
 The most common causes:
 
@@ -256,6 +448,7 @@ The most common causes:
 - **Oversized recovery partition.** A recovery-typed partition over 2 GiB is present, and the plan refuses to reuse or delete it. Preserve it or use the harness Option 1 to inspect it.
 - **Shrink failure.** C: cannot be shrunk by the required amount even after the sleep-and-defrag retries. Free space on C:, defragment the drive, or reduce the required bucket (which depends on the WIM size).
 - **Unresolvable active route (v46 patch 2).** WinRE is `Enabled` but `reagentc /info` reports a Location that cannot be resolved to a partition on the machine. This is rare; it usually means the registration is stale or the reported location format is not one the resolver understands. See "The active WinRE route could not be resolved to a partition" below.
+- **Registered WinRE source changed (v47 patch 1).** The registered WinRE's location, version, or WIM hash changed during candidate preparation — typically because Windows Update serviced it. See "The pre-`/disable` race detector fired" above.
 
 **The retry-suppressing marker.** When the deferral is retry-suppressible, the main flow writes a sidecar at `C:\Recovery\OEM\winre_partition_deferred.json` containing the current `DesiredStateId` and a `Since` timestamp. On subsequent runs, the marker is honored only if:
 
@@ -273,7 +466,8 @@ If both hold, the run exits `EXIT_WARNING` without repeating the same pre-shrink
 5. **For a transient volume-read failure:** re-run. The deferral is not retry-suppressed, so the next run attempts the pre-shrink again.
 6. **For a genuine shrink failure:** free space on C:, run `defrag C: /x` manually from an elevated shell, and re-run.
 7. **For an unresolvable active route (v46 patch 2):** see "The active WinRE route could not be resolved to a partition" below.
-8. **After resolving the underlying cause, delete both files to force a retry:**
+8. **For a registered-source-changed abort (v47 patch 1):** wait for any pending Windows Update to settle, then re-run. See "The pre-`/disable` race detector fired" above.
+9. **After resolving the underlying cause, delete both files to force a retry:**
 
    ```powershell
    Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force
@@ -284,7 +478,7 @@ If both hold, the run exits `EXIT_WARNING` without repeating the same pre-shrink
 
    If you want to force a retry *without* losing the recorded state, delete only the marker file. The next run will re-attempt the pre-shrink; if it succeeds, the run proceeds; if it fails again, the marker is re-written with a fresh `Since` timestamp.
 
-9. **If the marker is present on a later run and you want to know whether it will be honored,** check the log for the line `Dedicated recovery creation was deferred for this DesiredStateId on <Since>. Existing WinRE route is Enabled and its registered WIM is readable; not repeating the same pre-shrink retries (<staged note>).` — that line confirms the marker was honored.
+10. **If the marker is present on a later run and you want to know whether it will be honored,** check the log for the line `Dedicated recovery creation was deferred for this DesiredStateId on <Since>. Existing WinRE route is Enabled and its registered WIM is readable; not repeating the same pre-shrink retries (<staged note>).` — that line confirms the marker was honored.
 
 ### The active WinRE route could not be resolved to a partition (v46 patch 2)
 
@@ -416,7 +610,7 @@ followed later in the same run by:
    ```
 
    A `LastTaskResult` of `267009` (0x41301) means the task is currently running.
-3. **Wait for the other instance to complete.** A healthy fast-path run finishes in under a second; a full-update run can take 3–5 minutes, and a run that has to download a fresh base WIM can take longer.
+3. **Wait for the other instance to complete.** A healthy fast-path run finishes in a few seconds of CIM/PnP enumeration; a full-update run can take 3–5 minutes, and a run that has to download a fresh base WIM can take longer.
 4. **Re-run `WinRE.ps1` if the machine still needs attention.** There is no cleanup required — the failed process left nothing behind.
 5. **Fix the lock-acquisition condition** so the next run is protected. If the condition cannot be fixed (e.g. the log directory is on a filesystem that does not support `FileShare.None`), consider temporarily disabling the scheduled task while manual invocations run, and rely on the harness (`scripts\Test-WinRE.ps1`) for read-only diagnostics.
 
@@ -484,9 +678,11 @@ Exit code 3. The machine is unchanged. No WIM deployed, no partition touched.
 
 **Cause.** All three cases share the same root cause: the driver manifest fetch failed after its retry budget, and there was no network to fall back to. What distinguishes them is the state file's contents:
 
-- **Case 1** — the state file exists, its `DesiredStateId` is available, and the local safety checks pass (WinRE `Enabled`, exactly one **type-coded** recovery partition on the OS disk, deployed WIM hash matches the stored hash). The script trusts the stored `DesiredStateId` and takes the fast path.
-- **Case 2** — the state file exists and its `DesiredStateId` is available, but the local safety checks do not pass: the deployed WIM hash does not match the stored hash, or a force-upgrade was detected, or the stored driver set version differs from the expected one, or the state file indicates a full update is needed for some other locally-detectable reason. A full update requires the live manifest to resolve the driver set, which is not available. The script defers.
+- **Case 1** — the state file exists, its `DesiredStateId` is available, and the local safety checks pass under v47: WinRE is `Enabled`, exactly one **type-coded** recovery partition is on the OS disk (or `UsedOSFallback = $true` with the active location on the OS partition), and the registered image's DISM servicing metadata matches the state file's `DeployedWinREMetadata` anchor with no force-upgrade or driver-version change. The script trusts the stored `DesiredStateId` and takes the fast path.
+- **Case 2** — the state file exists and its `DesiredStateId` is available, but the local safety checks do not pass: the registered metadata no longer matches the anchor, or a force-upgrade was detected, or the stored driver set version differs from the expected one, or the state file is missing the v47 `DeployedWinREMetadata` anchor (a v46-or-earlier state file), or the state file indicates a full update is needed for some other locally-detectable reason. A full update requires the live manifest to resolve the driver set, which is not available. The script defers.
 - **Case 3** — there is no state file at all, so the script cannot compute a `DesiredStateId` to work with. The live manifest is required for the first deployment on a machine.
+
+**The v46 → v47 transition on offline machines.** Under v47, a v46-or-earlier state file lacks the `DeployedWinREMetadata` anchor. Its absence forces `$needInject = $true` regardless of network state, so Case 2 is what fires on the first v47 run if that run is offline. From the second v47 run onward — after one successful online run has written the anchor — the offline fast path can fire normally. The one-time cost of the v47 migration on offline machines is therefore: the first scheduled v47 run must happen while the machine can reach the driver manifest.
 
 **Resolution (Case 1 — nothing to do).** The machine is healthy. The exit code 2 is a degraded-success signal from the fact that the fast path was taken without a live manifest fetch. The next scheduled run with network performs a full manifest fetch and confirms there has been no hardware drift while offline.
 
@@ -500,7 +696,7 @@ Exit code 3. The machine is unchanged. No WIM deployed, no partition touched.
 
 ## OEM or VMD injection failed (Step 3 → Step 4 pipeline gate)
 
-**Symptom.** The script exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no partition work, no WIM deployment, no `reagentc` calls, and the state file is unchanged (or absent). The difference from the Audit Mode deferral is that the run got much further — the WIM was downloaded or copied to `WorkDir`, mounted, and an OEM or VMD injection attempt was made against it.
+**Symptom.** The script exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no partition work, no WIM deployment, no `reagentc` calls, and the state file is unchanged (or absent). The difference from the Audit Mode deferral is that the run got much further — the WIM was downloaded or copied to `WorkDir`, mounted, stripped (v47 patch 1), and an OEM or VMD injection attempt was made against it.
 
 **Log signature.** The last lines of the run before exit:
 
@@ -541,7 +737,7 @@ Followed by:
 
 The pipeline then exits without running `dism /Export-Image`, without touching any partition, without disabling WinRE, and without writing a state file.
 
-**Cause.** One of the driver-injection steps in Step 3 could not demonstrate success:
+**Cause.** One of the driver-injection steps in Step 3 could not demonstrate success. The strip stage that precedes injection (v47 patch 1) has its own failure modes, documented under "The strip stage failed" above; once the strip succeeds, the recipe-injection step has these failure modes:
 
 - The OEM pack download failed (network error, 404, hash mismatch on a manifest that carries a hash, or a zero-byte download that the length check rejected).
 - The OEM pack extracted but produced zero INF files (the known Lenovo SCCM Package case, or a packaging error for Dell/HP).
@@ -567,7 +763,7 @@ As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` in
 
 **What NOT to do.** Do not attempt to force the pipeline past the gate by editing the script. The gate is the mechanism that prevents a broken WIM from reaching the recovery partition. A machine in this state has a functional existing WinRE or a functional existing state file — whatever it had before the run is still in place. The cost of waiting is one pipeline run after the injection failure is resolved; the cost of bypassing the gate is a recovery environment that cannot see the OS disk.
 
-**Not to be confused with the Audit Mode or OS-fallback BitLocker deferrals.** All three exit with code 2 and leave the state file unchanged, but the log signature is distinct: the Audit Mode deferral logs `Deferring WinRE Manager: Windows is not in a normal-running state`, the OS-fallback BitLocker deferral logs `OS-fallback deferred: C: could not be confirmed fully decrypted`, and the pipeline gate logs `Image injection did not complete. Stopping before Step 4 and before any deployment.` The first two fire before any download or mount; the pipeline gate fires after both. A field engineer reading the log will see the difference immediately.
+**Not to be confused with the strip-failure abort (v47 patch 1) or the Audit Mode or OS-fallback BitLocker deferrals.** All exit with code 2 and leave the state file unchanged, but the log signature is distinct. The strip-failure abort reads `Strip stage failed - candidate rejected.` The injection-failure gate reads `Image injection did not complete. Stopping before Step 4 and before any deployment.` The Audit Mode deferral reads `Deferring WinRE Manager: Windows is not in a normal-running state`. The OS-fallback BitLocker deferral reads `OS-fallback deferred: C: could not be confirmed fully decrypted`. The strip stage runs between mount and injection; the injection gate runs after the strip succeeded. A field engineer reading the log will see the difference immediately.
 
 ## The OS-fallback route deferred because C: is encrypted
 
@@ -579,7 +775,7 @@ As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` in
 [WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=<state>). reagentc will refuse to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state.
 ```
 
-**The compound signature — post-deletion failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The most common post-deletion failure points under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure. The corner is also reachable when the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, or the delete loop itself fails and the previous route could not be restored. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-added-reasons) section above.) The full sequence for the post-deletion case is:
+**The compound signature — post-deletion failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The most common post-deletion failure points under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure. The corner is also reachable when the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, or the delete loop itself fails and the previous route could not be restored. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-and-v47-patch-1-added-reasons) section above.) The full sequence for the post-deletion case is:
 
 ```
 [INFO] Pre-deletion inventory:
@@ -636,7 +832,7 @@ Read the `Conversion Status:` line and act accordingly:
 
   Note that **adding a key protector or arming protection does not resolve this state** — those actions make C: *more* protected, not less. The OS-fallback route requires `FullyDecrypted`.
 
-  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed, which is why it fell back to OS-fallback. The way to use the dedicated-partition route is to resolve whatever caused the destructive failure (insufficient space on C:, a layout problem, etc.) and free the constraint so a retry can succeed. See the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-added-reasons) section above for the constraint-specific resolutions.
+  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed, which is why it fell back to OS-fallback. The way to use the dedicated-partition route is to resolve whatever caused the destructive failure (insufficient space on C:, a layout problem, etc.) and free the constraint so a retry can succeed. See the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-and-v47-patch-1-added-reasons) section above for the constraint-specific resolutions.
 
 - **`Fully Encrypted` with `Protection Off`** — the machine is in a suspended or Waiting-for-Activation state. To use the OS-fallback route you must still decrypt C: (`manage-bde -off C:`), because reagentc refuses on a `FullyEncrypted` volume regardless of protection state.
 
@@ -911,17 +1107,20 @@ dism /Export-Image reported success but <path> does not exist
 
 ## Base WIM download fails
 
-**Symptom.** Step 2 of the full-update path, only reached when there is no usable WIM at the reagentc-registered location or via fallback.
+**Symptom.** Step 2 of the full-update path, only reached when the source-selection chain falls through to the GitHub cold-start branch.
 
 **Log lines.**
 
 ```
 No active or fallback WinRE image found - forcing rebuild
 Step 2: Obtaining base WIM
+Base WIM source selection: neither registered nor hash-validated LKG usable; GitHub cold-start
 7-Zip required
 ```
 
 followed by a download error or a `FATAL` exit.
+
+Under v47 the GitHub cold-start branch is the third tier of the source-selection chain. Reaching it means the registered image was not usable and the hash-validated LKG was either absent or failed its SHA256 validation. The source-selection line above the download tells you which branch was taken.
 
 **Cause.** The GitHub repository hosting the base WIM is unreachable, the parts are missing, or 7-Zip is not installed and could not be installed via `winget`.
 
@@ -930,6 +1129,7 @@ followed by a download error or a `FATAL` exit.
 1. Verify network access to `api.github.com` and the configured `$BaseWinRERepoApi` URL.
 2. Verify 7-Zip is present at `C:\Program Files\7-Zip\7z.exe`. If not, install it via `winget install 7zip.7zip --scope machine` from an elevated shell.
 3. Check the GitHub repository for the expected `winre.7z.NNN` parts. If the parts are missing, point the script at a mirror or restore the parts.
+4. **Consider whether the source-selection chain is what you want.** A machine whose registered image was unusable but whose LKG is valid should not reach GitHub. If the log shows the GitHub cold-start branch but a copy of `C:\Recovery\WindowsRE\winre.wim` exists, check whether its SHA256 matches `state.CurrentImageHash`. If it does, the source-selection chain should have preferred it; a mismatch indicates the LKG was written under a different `DesiredStateId` — the LKG is deliberately not trusted in that case.
 
 **Note (v44 patch 6).** Step 2 now removes any stale `winre.wim` before extraction and any stale `base.wim` before the rename. If a previous run was interrupted between extraction and rename, this cleanup closes the wedge on the next run. If you see a `Removing stale extracted WIM before extraction` or `Removing stale base.wim before rename` line in the log, the cleanup fired as designed.
 
@@ -1065,7 +1265,9 @@ Parser: reagentc location  [FAIL] ...did not match any line
 
 **Resolution.** Automatic. The script falls through to the full-update path. A rebuild on a healthy machine is a no-op for the partition layout; it copies the current WIM, verifies it, and rewrites the state file.
 
-**Expected during the v44 patch 1 and v45 patch 1 rollouts.** Both revisions changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45 changed the `SCRIPT` component. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
+**Expected during the v44 patch 1, v45 patch 1, v46 patch 1, and v47 patch 1 rollouts.** Each revision changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45, v46 patch 1, and v47 patch 1 each changed the `SCRIPT` component. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
+
+Under v47 the first run also writes the `DeployedWinREMetadata` anchor. From the second v47 run onward the drift detector compares against it.
 
 If the state file is repeatedly disappearing on a machine that has already taken one full-update pass under the current version, check:
 
@@ -1073,7 +1275,7 @@ If the state file is repeatedly disappearing on a machine that has already taken
 2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
 3. Whether the loop-breaker is firing because the enable-failure counter reached 3. The state file is deliberately left in place in that case (the operator deletes it manually to reset the counter), but if a cleanup tool is configured to remove anything in `C:\Recovery\OEM\` on a schedule, it will also remove the state file for this reason.
 
-**Not to be confused with the Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink deferral, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation. The pre-shrink deferral additionally writes the sidecar marker at `C:\Recovery\OEM\winre_partition_deferred.json` — see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-added-reasons) section.
+**Not to be confused with the Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink deferral, race-detector abort, or injection-failure deferrals.** If the run exits with `EXIT_WARNING` because a deferral fired, the state file will also be unchanged — but that is not a problem with the state file. The deferrals leave the prior state file intact (or leave it absent if it was absent before); they do not delete it. If a state file existed before the run and still exists after, the deferral is the explanation. If a state file existed before and is gone after, `Restore-OSPartitionSize` or an external cleanup task is the explanation. The pre-shrink deferral additionally writes the sidecar marker at `C:\Recovery\OEM\winre_partition_deferred.json` — see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-and-v47-patch-1-added-reasons) section.
 
 **Not to be confused with the enable-only failure path either.** The enable-only failure path **writes** the state file with a non-`"ok"` `LastEnableResult` and an incremented counter. The state file's `LastUpdated` timestamp will be newer than the run start, and its `EnableFailureAttempts` will be non-zero. If you were expecting the state file to be absent, this is what happened.
 
@@ -1095,7 +1297,7 @@ Do not edit the state file's `UsedOSFallback` field and leave the rest in place;
 
 **Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
 
-**Not to be confused with a deferral.** A machine on which an Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink, injection-failure, or offline-fallback deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
+**Not to be confused with a deferral.** A machine on which an Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink, race-detector abort, injection-failure, or offline-fallback deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
 
 ### OS-fallback, retrying the dedicated path
 
@@ -1246,7 +1448,7 @@ The harness (Option 9, VMD drivers) also logs a warning with the raw CPU string 
 
 **Cause.** This is the fast path. The machine is already in the correct end state.
 
-**Resolution.** None needed. If you want to see what the fast path observed, run `scripts\Test-WinRE.ps1` Option 1. It reports the machine's state from the same vantage point the production script uses. Option S reports whether the state file's `DesiredStateId` matches the ID production would compute right now.
+**Resolution.** None needed. If you want to see what the fast path observed, run `scripts\Test-WinRE.ps1` Option 1. It reports the machine's state from the same vantage point the production script uses. Option S reports whether the state file's `DesiredStateId` matches the ID production would compute right now, and (as of v23) displays the `DeployedWinREMetadata` anchor that production's v47 drift detector compares against.
 
 ## The script runs on every boot
 
@@ -1268,6 +1470,7 @@ Use it to:
 - Verify that the classifier verdict matches what you believe the machine's state to be.
 - Verify that the Audit Mode guard would not defer a live run.
 - Verify that the v45 pre-shrink deferral would not fire on the next live run, by checking whether `Ensure-AdequateRecoveryPartition`'s dry-run plan line appears and what plan it reports.
+- Verify the v47 source-selection chain: the dry-run Step 2 block reports which source the run would prefer and names the LKG fallback.
 
 The dry run does not write to the state file, the checkpoint file, or the deferral marker. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step:
 
@@ -1293,6 +1496,8 @@ The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged 
 
 Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable …` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
 
+The v47 patch 1 race detector is **not** exercised under DryRun. A dry run does not capture a registered-source fingerprint (no `/disable` site is reached, so the SHA256 cost is not justified), and it does not log a recheck. The dry-run's value is in confirming the source-selection chain and the strip-stage plan; the race detector's value is only realized in a live run.
+
 ## Reporting a bug
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
@@ -1309,8 +1514,12 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - Exit code.
 - If the run exited with code 2 and the log shows `Another WinRE Manager instance is already running (program lock file is exclusively held)`, note whether any other `WinRE.ps1` process (scheduled task, manual invocation, RMM tool, Intune remediation) was running at the same time. As of v44 patch 4, this is not a failure — the other instance is doing the work — but the reporter should confirm they are not looking at a machine with a scheduled task stuck in a running state. Check the scheduled task's "Last Run Result" via `Get-ScheduledTaskInfo`.
 - If the run exited with code 2 and the log shows `VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined`, include the raw PnP enumeration error from the line above it (`VMD hardware detection reported N error(s) during PnP enumeration: …`). The specific error text is what distinguishes a service issue from an antivirus/EDR block from a device in an error state.
-- If the run exited with code 2 and the log shows `Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable` or `Offline fallback: using state file's stored DesiredStateId`, note whether the machine was actually offline (no network, DNS failure, proxy) and what the state file's `LastUpdated` timestamp is. This discriminates the offline-fallback deferral (machine unchanged, next scheduled run with network completes the work) from the fast-path-under-offline case (degraded-success, exit 2).
-- If the run exited with code 2 and the log shows `Dedicated replacement deferred before partition deletion`, this is a v45 pre-shrink deferral (v46 patch 2 added two reasons). Include the `<Reason>` string from that log line, the current free space on C:, and the total size of C:. If the reason is `active WinRE location could not be resolved`, include the raw `reagentc /info` output — the Location line is what `Resolve-WinRELocationToPartition` could not map. See "The destructive replacement was deferred before partition deletion" above for the full list of reasons and their resolutions.
+- If the run exited with code 2 and the log shows `Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable` or `Offline fallback: using state file's stored DesiredStateId`, note whether the machine was actually offline (no network, DNS failure, proxy) and what the state file's `LastUpdated` timestamp is. This discriminates the offline-fallback deferral (machine unchanged, next scheduled run with network completes the work) from the fast-path-under-offline case (degraded-success, exit 2). Under v47, also include the state file's `DeployedWinREMetadata` value if present — a missing anchor forces `$needInject = $true` and produces Case 2 rather than Case 1.
+- If the run exited with code 2 and the log shows `Dedicated replacement deferred before partition deletion`, this is a v45 pre-shrink deferral (v46 patch 2 and v47 patch 1 added further reasons). Include the `<Reason>` string from that log line, the current free space on C:, and the total size of C:. If the reason is `active WinRE location could not be resolved`, include the raw `reagentc /info` output — the Location line is what `Resolve-WinRELocationToPartition` could not map. If the reason is `registered source changed before disable`, see the next bullet. See "The destructive replacement was deferred before partition deletion" above for the full list of reasons and their resolutions.
+- **If the run exited with code 2 and the log shows the v47 patch 1 race detector firing** (`Registered-source recheck at <site> : CHANGED` followed by `Registered WinRE source changed during candidate preparation`), include the captured fingerprint line (`Captured registered-source fingerprint: location=…, version=…, hash=…`), the recheck line, and the change triple (`location=<bool> version=<bool> hash=<bool>`). Also note whether any Windows Update activity was in flight at the time. The exact change pattern is useful field data: the race detector has not fired in the field yet.
+- **If the run exited with code 2 and the log shows the v47 patch 1 strip stage failing** (`Strip: initial Get-WindowsDriver enumeration failed`, `Strip: re-enumeration failed`, `Strip: enumeration entry has no Driver field`, `Strip: Remove-WindowsDriver failed`, or `Strip: exhausted iteration budget`), include the exact failure line, the pre-strip inventory log lines (`Strip:   <OEM#.inf> | <provider> | <version> | <orig>`), and the number of packages in the pre-strip inventory. Also include the source-selection line that named the branch the run took, since a machine whose registered image carries non-Microsoft drivers is the case the strip stage exists for. This path has not been exercised in the field.
+- **If the run took the full-update path on a machine that should have been on the fast path, and the log shows `State has no DeployedWinREMetadata anchor`, `Registered WinRE metadata changed from … to …`, or `Registered WinRE metadata could not be read`**, include the state file's `DeployedWinREMetadata` value, the currently-registered WinRE's `Version` and `SPBuild` (from `reagentc /info` and `Get-WindowsImage` on the registered WIM), and the log lines named in "The rebuild ran because the registered WinRE metadata changed" above. The rebuild-because-of-a-changed-anchor and rebuild-because-of-an-unreadable-image branches have not been exercised in the field.
+- **If the log shows `Pre-injection third-party driver count: N` with N > 0 after the strip stage**, include the pre-strip inventory lines from the strip stage and the exact pre-injection count. The strip stage uses the filterless form of `Get-WindowsDriver`, which Microsoft documents as the third-party inventory of a mounted image; the pre-injection count uses the legacy filtered form retained for injection-delta accounting. A disagreement between the two is a real signal about how DISM reports the image, and the project wants field data on when it fires.
 - If the run exited with code 2 and the log shows `Extension-failure fallback: creating recovery partition` or `Extension-failure fallback unavailable`, this is a v45 patch 1 / v46 patch 2 post-delete extension failure. Include the machine's disk layout from `Test-WinRE.ps1` Option 1, the plan's bucket size, the trailing unallocated extent size (if the fallback fired), and the current C: end and disk end.
 - If the run exited with code 2 and the log shows the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`, this is the post-deletion residual that the `[v45 patch 1]` CHANGELOG entry documents. Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run. The project wants field data on this corner — see the "The OS-fallback route deferred because C: is encrypted" section above.
 - If the run exited with code 3 and the log ends with `Cannot rename because item at '<workspace>\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
@@ -1323,7 +1532,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 
 - [exit-codes.md](exit-codes.md) — what each exit code means.
 - [architecture.md](architecture.md) — where each failure mode fits in the pipeline.
-- [testing.md](testing.md) — how to use the harness to diagnose, including the v45 destructive-path regression test plan.
+- [testing.md](testing.md) — how to use the harness to diagnose, including the v45 destructive-path regression test plan and the v47 patch 1 destructive-adjacent coverage gaps.
 - [deployment.md](deployment.md) — the "One instance per machine" precondition for manual invocations and the offline behavior of the scheduled task.
 - [state-and-idempotency.md](state-and-idempotency.md) — the deferral marker's relationship to the deployment identity and the operator reset procedure.
-- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 patch 1 and v46 patch 2 pre-shrink deferral reasons.
+- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 patch 1 and v46 patch 2 pre-shrink deferral reasons, and the v47 patch 1 race detector.

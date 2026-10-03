@@ -32,7 +32,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v22.** The version history is:
+**Current version: v23.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -42,10 +42,21 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v20** mirrors the v44 patch 7 cycle's type-coded active-location classifier (patch 3 of that cycle) and fixes the menu box alignment. See "v20 changes" below.
 - **v21** corrects a DSI-mirror drift and adds `RepairAttempts` to the Option S display. See "v21 changes" below.
 - **v22** mirrors production v46 patch 2's `Get-WinREState` version parsing, adds a parser self-test check for the version regex, and bumps the `$ProductionScriptVersion` default. See "v22 changes" below.
+- **v23** mirrors production v47 patch 1's harness-side changes: `$ProductionScriptVersion` default bumped 46 → 47 and `Show-StateFileParity` now displays the state file's `DeployedWinREMetadata` field. See "v23 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
 The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the machine's state and reports what production would do, but it does not simulate the destructive path or the plan. The shrink-first code paths are exercised on disposable VMs (see "v45 destructive-path regression" below), not through the harness.
+
+### v23 changes
+
+Three changes, all downstream of the v47 patch 1 cycle.
+
+**1. `$ProductionScriptVersion` default bumped 46 → 47.** The harness's `Get-DesiredStateId` mirror carries this default to track production's `$ScriptVersion`. Left at 46 it would report a false `DSI MISMATCH` for every state file v47 production writes, exactly the drift v21 and v22 corrected for earlier bumps. The parameter-header comment continues to name the tracking rule. The harness's own parser self-test (Check 15) still deliberately passes 44 and 43 to prove version-sensitivity; those values are unchanged.
+
+**2. `Show-StateFileParity` now displays `DeployedWinREMetadata`.** The state file's DISM servicing metadata anchor (v47 patch 1's `DeployedWinREMetadata` field, in `<Version>|<SPBuild>` form) renders in the parity output alongside `PendingReboot`, `LastEnableResult`, `EnableFailureAttempts`, and `RepairAttempts`. When present, it renders green. When absent (a v46-or-earlier state file), it renders yellow with a note that production v47 will force a rebuild on the next run because the drift detector has no anchor to compare against. Purely diagnostic; no production decision depends on the harness reading this field.
+
+**3. Harness version string bumped 22 → 23** in the menu title and the startup Rule.
 
 ### v22 changes
 
@@ -142,9 +153,9 @@ The default working directory is `C:\Temp\WinRETest`. All downloads and extracti
 
 **Cleanup guard (v18).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
 
-## Output style (v16; format unchanged in v17 through v22, with v20's menu box alignment and v22's new sections as the only departures)
+## Output style (v16; format unchanged in v17 through v23, with v20's menu box alignment, v22's new sections, and v23's Option S `DeployedWinREMetadata` display as the only departures)
 
-As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section; the rest of Option 1's output format is unchanged from v16.
+As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. The rest of the output format is unchanged from v16.
 
 ### Colour-coded values
 
@@ -344,19 +355,21 @@ The `INDETERMINATE` outcome is new in v18 and mirrors production v44 patch 6.
 
 The diagnostic reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and warns when the value is present and not `IMAGE_STATE_COMPLETE`. Production's Audit Mode guard defers in that state before any state-modifying action. The diagnostic's check mirrors the guard so that a field engineer pre-flighting a freshly imaged machine sees the deferral condition before running production.
 
-### Option S — State file parity check (v15; VMD handling and wording refined in v18, v19, and v21)
+### Option S — State file parity check (v15; VMD handling and wording refined in v18, v19, and v21; `DeployedWinREMetadata` display added in v23)
 
 Read-only. Recomputes the `DesiredStateId` production would compute right now — reading the live driver manifest, resolving the OEM package for this machine's vendor, and detecting VMD hardware presence — then reads the on-disk state file at `C:\Recovery\OEM\winre_state.json` and reports whether production would accept it or treat it as stale.
 
 The output names the computed ID and the stored ID side by side, then prints one of three verdicts:
 
-- **DSI MATCH** (green). The stored deployment ID matches current inputs. The other fast-path gates still apply: WinRE must be Enabled, exactly one **type-coded** recovery partition must exist on the OS disk, and the deployed WIM hash must match `CurrentImageHash`. The harness does not check those three conditions — Option 1 reports them.
+- **DSI MATCH** (green). The stored deployment ID matches current inputs. The other fast-path gates still apply: WinRE must be Enabled, exactly one **type-coded** recovery partition must exist on the OS disk, and the registered image's DISM servicing metadata (`Version` + `SPBuild`) must match the state file's `DeployedWinREMetadata` anchor. The harness does not check those conditions — Option 1 reports the machine state, and the parity display shows `DeployedWinREMetadata` (v23) so a field engineer can see the anchor production's v47 drift detector compares against.
 - **DSI MISMATCH** (yellow). Production will treat the state file as stale and run the full-update path on the next scheduled run. This is expected on the first run after a `DesiredStateId` input change: `ScriptVersion`, `MANIFEST`, `OEMPACK`, CPU vendor/generation, or VMD presence. Subsequent runs take the fast path once the state file is rewritten.
 - **INDETERMINATE** (yellow, v18). The VMD hardware presence check could not complete because of a PnP enumeration error, so the correct driver set cannot be determined and the DSI cannot be computed with confidence. A live production run would defer with `EXIT_WARNING` before committing any state rather than take either the fast path or the full-update path. The harness records `SKIP` in the results with reason `VMD query indeterminate` and prints a paragraph explaining the situation. Resolve the PnP service issue and re-run.
 
 If the state file does not exist, the harness reports that production will take the full-update path (which is correct: `needInject = $true` when there is no state) — except when the VMD query is also indeterminate, in which case the harness records `SKIP` and explains that a live production run would defer rather than start the update (v19).
 
 As of v21 the parity display also includes the state file's `RepairAttempts` field alongside `PendingReboot`, `LastEnableResult`, and `EnableFailureAttempts`. Before v21 the display omitted this field even though the state file carries it; a field engineer diagnosing a pending-reboot loop had to read the JSON directly.
+
+As of v23 the parity display also includes the state file's `DeployedWinREMetadata` field. When present (a state file written by a v47 production run), it renders green. When absent (a v46-or-earlier state file), it renders yellow with a note that production v47 will force a rebuild on the next run because the drift detector has no anchor to compare against. Before v23 the field was silently absent from the display; a field engineer diagnosing a rebuild-on-first-v47-run had to read the JSON directly.
 
 Option S is the field engineer's tool for answering "is this machine about to rebuild?" without running the production script. It does not exercise the offline fallback (v44 patch 5): Option S always performs a live manifest fetch and a live VMD detection, so on an offline machine the harness reports the fetch failure rather than a DSI verdict.
 
@@ -373,7 +386,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Sixteen checks as of v22 (fifteen as of v18, ten before v18). Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions. v19 through v21 did not change the check count or the check contents; v22 added one check.
+Sixteen checks as of v22 (fifteen as of v18, ten before v18); v23 did not change the count or the contents. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions. v19 through v21 did not change the check count or the check contents; v22 added one check.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -470,7 +483,7 @@ Those paths are covered by field testing on representative hardware. See the "Fi
 
 The harness shares code paths with production in the download, extraction, and CPU-generation helpers. It is documented in the file's own docstring which functions are "based on" the production versions and which are harness-specific.
 
-Eight known differences:
+Nine known differences:
 
 - **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test. As of v17, the harness prints an explicit three-line note before the driver loop explaining this. The state-file parity check (Option S) *does* apply the hardware filter, because it is replicating production's DSI computation and production's DSI includes VMD presence.
 - **The harness does not run production's BitLocker helper functions.** The BitLocker sections in the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and apply the same classification the production guard uses — hazardous, ambiguous, or safe — but they do not call `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`. This is intentional: the harness does not exercise production's BitLocker control flow, and a change to that control flow does not require a harness update to remain correct. The v14 update changed the warning text and added the target-partition state block, but did not change the classifier itself.
@@ -478,8 +491,9 @@ Eight known differences:
 - **Network behavior is aligned with production as of v17.** Every `Invoke-RestMethod` and `Invoke-WebRequest` call in the harness carries `-TimeoutSec $NetworkTimeoutSeconds` where `$NetworkTimeoutSeconds = 15`. Before v17, the harness used PowerShell's default ~100-second timeout on each call, so a fully offline machine would take over 10 minutes to fail. The v17 alignment means the harness fails as fast as production does on a bad network. The `Invoke-OemPackDownload` helper's zero-byte check was also restored to match production's ordering: the length check now runs before the hash comparison, so a zero-byte download with an expected hash logs "file is empty" rather than "SHA256 mismatch". Both changes are correctness improvements that make the harness a more faithful replica of production's download path.
 - **VMD query-failure handling, Lenovo resolution, and Option S wording are aligned with production as of v18 and v19.** The harness's VMD presence check now treats a PnP enumeration error as indeterminate (matching production v44 patch 6), and the harness's `Get-LenovoWinPEPack` now sets `$Script:LenovoPackResolution` to the same five states as production. Before v18, an enumeration error in the harness produced a definitive answer, and a malformed Lenovo map entry looked identical to a legitimate no-pack case. Both were drift risks: the harness could disagree with production about what a live run would do. v19 corrected two further Option S wording issues (the state-file-absent-and-VMD-indeterminate case now records `SKIP`; the header and DSI MATCH verdict no longer overstate what DSI equality proves).
 - **The active-location classifier is aligned with production as of v20.** The harness's WinRE classifier now requires a type-coded recovery partition on the OS disk to reach the `DEDICATED` verdict, mirroring patch 3 of the v44 patch 7 cycle. Before v20, the classifier promoted a label-only match to `DEDICATED`, which could have reported `DEDICATED` for a machine whose registered location was a Basic Data partition labelled "Recovery" while production would have taken the full-update path. The harness's `LABEL-ONLY` verdict is informational and has no direct production equivalent; production's active-location classifier logs a WARN in the same situation without stopping.
-- **The `DesiredStateId` mirror is aligned with production as of v21 (and v22).** The harness's `Get-DesiredStateId` carries a `$ProductionScriptVersion` default that must track production's `$ScriptVersion`. It was pinned at 44 while production advanced to 45, which made every Option-S comparison against a v45-written state file report `DSI MISMATCH` incorrectly. The default became 45 in v21 and 46 in v22, and the parameter-header comment states the tracking rule. Before v21, a field engineer running Option S against a machine updated to v45 patch 1 would have seen a false "production will treat this state file as stale" verdict on a machine whose state file production would actually accept; the same failure mode would apply to v46 under the v21 default, and v22 closes it.
+- **The `DesiredStateId` mirror is aligned with production as of v21 (through v23).** The harness's `Get-DesiredStateId` carries a `$ProductionScriptVersion` default that must track production's `$ScriptVersion`. It was pinned at 44 while production advanced to 45, which made every Option-S comparison against a v45-written state file report `DSI MISMATCH` incorrectly. The default became 45 in v21, 46 in v22, and 47 in v23; the parameter-header comment states the tracking rule. Before v21, a field engineer running Option S against a machine updated to v45 patch 1 would have seen a false "production will treat this state file as stale" verdict on a machine whose state file production would actually accept. v22 and v23 close the analogous gaps for v46 and v47.
 - **The reagentc version parser and the Build numbers block are aligned with production as of v22.** The harness's `Get-WinREState` now extracts `Windows RE Version` from `reagentc /info` and returns it as `Version`, and Option 1 renders the "Build numbers" block described above. Both mirror production v46 patch 2's build-drift logging. The harness shows the values; it does not write them to a production log file, and the values do not enter the harness's DSI computation.
+- **`Show-StateFileParity` displays `DeployedWinREMetadata` as of v23.** The state file's DISM servicing metadata anchor (v47 patch 1's `DeployedWinREMetadata` field, in `<Version>|<SPBuild>` form) renders in the parity output alongside the other state-file fields. When present, it renders green; when absent (a v46-or-earlier state file), it renders yellow with a note that production v47 will force a rebuild on the next run because the drift detector has no anchor to compare against. This mirrors production v47 patch 1's `DeployedWinREMetadata` field — the harness shows the value, but no production decision depends on the harness reading it.
 
 The harness has no mirror of the v45 shrink-first pipeline. Option 1 and Option S report the machine's current state and the DSI comparison, but they do not simulate the plan, the pre-shrink, the extension path, or the whole-layout assertion. That is by design: those paths are destructive and cannot be simulated read-only.
 
@@ -492,6 +506,20 @@ The v46 patch 1 cycle added two physical-hardware exercises on top of the VM run
 **`Assert-RecoveryPartitionLayout` has been exercised in the passing case.** The Dell Latitude 3540 and the HP EliteBook 6 G1i 16" both took the v46 patch 1 destructive path on 2026-10-02 and both logged `Verified recovery partition layout: disk 0 partition 4, offset O MiB, size S MiB` before reaching `DEDICATED`. Both runs also confirmed the C:-to-recovery gap and the disk-end trailing reserve were within tolerance, which is what the assertion exists to verify. This is the first physical-hardware exercise of the whole-layout assertion on the v45/v46 pipeline.
 
 **The plan-rejection check has been exercised in the rejecting case.** The Lenovo IdeaPad 3 15IAU7 that motivated v46 patch 1 took the v45 patch 1 pipeline on physical hardware and the post-delete geometry check in `Ensure-AdequateRecoveryPartition` (`$plannedEnd -gt ($diskSizeNow - 1MB)`) correctly rejected the plan: `Get-PartitionPlan` had computed `tailEnd` from a factory-provided partition ending exactly 1 MiB past the disk-end reserve, `AlignedManagedExtentEnd` landed 1 MiB past the reserve, and the post-delete check refused to proceed. The machine fell into OS-fallback with a state file that matched the failing `DesiredStateId`, so subsequent scheduled runs accepted the state and did not retry — the machine stayed in OS-fallback until an operator manually deleted the state file. Under v46 patch 1's clamp the same layout produces a valid plan; the second full-update run (after the state-file reset) reached `DEDICATED`. This is the first physical-hardware failure of the v45 destructive path, and the first time the post-delete check fired outside a test harness.
+
+### v47 patch 1 destructive-path coverage (recommended next step)
+
+The v47 non-destructive paths are field-verified on the ASUS PRIME H510M-D. The v47-specific code paths that remain unexercised on any storage — physical or virtual — are:
+
+- **The strip stage with a non-zero third-party driver set.** The ASUS run's strip was a no-op. The loop that removes published OEM#.inf entries one at a time, re-enumerates, and reaches zero was validated by an earlier real-machine F1/F2/F3 experiment, but has not been exercised inside a v47 production run.
+- **The strip-failure abort path.** The candidate-rejection path (dismount `-Discard`, checkpoint rollback to Step 2, stale-artifact cleanup) has not run in the field.
+- **The source-selection LKG-comparison and GitHub cold-start branches.** The ASUS run took the "registered" branch through its "no hash-validated LKG present" sub-path. The two remaining branches were not reached.
+- **The pre-`/disable` race-detector abort path.** No drift occurred, so the abort branch has not fired.
+- **The metadata-triggered rebuild branch.** The registered metadata matched the last-deployed on the first fast-path run.
+- **The WIM_READY checkpoint save and resume round trip.** The ASUS run completed its deployment in one execution.
+- **The destructive partition paths under v47.** Pre-shrink, partition delete, `New-Partition`, the whole-layout assertion, and the post-delete extension fallback were not reached — the existing recovery partition was reusable.
+
+The v45 destructive-path VM test documented below remains the recommended next step before broad rollout under v47. It should be followed by a canary on a machine with an OEM driver pack so the strip-and-reinject loop runs against a non-empty set. These paths are covered by inspection, by the earlier F1/F2/F3 strip experiment, and by the mocked-geometry test plan documented below.
 
 ### v46 patch 2 hardenings (inside the post-deletion gate)
 

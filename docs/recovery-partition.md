@@ -1,6 +1,6 @@
 # Recovery partition lifecycle
 
-This document covers how WinRE Manager decides what size a recovery partition should be, how it replaces one that is inadequate, and how it recovers if the destructive operations fail. The current design is the v45 patch 1 shrink-first pipeline, with the v46 patch 1 disk-end clamp applied to the geometry plan and the v46 patch 2 pre-deletion resolver guard and extension-fallback bucket cap applied to the destructive sequence.
+This document covers how WinRE Manager decides what size a recovery partition should be, how it replaces one that is inadequate, and how it recovers if the destructive operations fail. The current design is the v45 patch 1 shrink-first pipeline, with the v46 patch 1 disk-end clamp applied to the geometry plan, the v46 patch 2 pre-deletion resolver guard and extension-fallback bucket cap applied to the destructive sequence, and the v47 patch 1 three-source base-WIM selection and third-party driver strip stage applied to the image preparation that precedes the destructive work.
 
 ## The invariant
 
@@ -33,7 +33,19 @@ The invariant exists because Windows Setup and Startup Repair scan all attached 
 
 ### Where the source WIM size comes from
 
-The `wimSizeMiB` used in both thresholds below is the size of the WIM the script intends to deploy. On the full-update path this is `winre_optimized.wim`, produced by `dism /Export-Image /Compress:max` in Step 4. The input to that export is `base.wim`, which the pipeline has mounted, injected with OEM and VMD drivers, and — as of v44 patch 2 — reset with `dism /cleanup-image /StartComponentCleanup /ResetBase`. ResetBase removes superseded components from the image's WinSxS store; the export is what materialises the size reduction on disk as a smaller WIM. The sizing decision therefore uses the post-ResetBase size.
+The `wimSizeMiB` used in both thresholds below is the size of the WIM the script intends to deploy. On the full-update path this is `winre_optimized.wim`, produced by `dism /Export-Image /Compress:max` in Step 4.
+
+Under v47 the pipeline that produces `winre_optimized.wim` sources its base WIM from one of three places, in preference order:
+
+1. **The currently-registered WinRE image.** Used unless the LKG is provably newer by DISM servicing metadata (`Version` + `SPBuild` + `SPLevel`, with `Architecture` required to match).
+2. **The manager's last-known-good copy at `C:\Recovery\WindowsRE\winre.wim`.** Used only when its SHA256 matches `state.CurrentImageHash` — a partial or stale file is not promoted.
+3. **The GitHub base-WIM repository.** Reached only when neither local source is usable.
+
+The v46-era fallback-discovery path that could pick up a WIM outside the registered location is no longer a source-selection candidate.
+
+Once the base WIM is obtained, the pipeline mounts it, strips every third-party driver (v47 patch 1), injects the current OEM and VMD recipe, and — as of v44 patch 2 — runs `dism /cleanup-image /StartComponentCleanup /ResetBase` on the mounted image. The strip stage runs between mount and injection; it removes every published OEM#.inf entry from the image's filterless third-party inventory, re-enumerating after each removal and terminating only when a fresh enumeration returns zero. ResetBase removes superseded components from the image's WinSxS store. The export is what materialises both the strip and the ResetBase savings on disk as a smaller WIM. The sizing decision therefore uses the post-strip, post-ResetBase size.
+
+The strip stage does not change the sizing arithmetic: `wimSizeMiB` is measured on the exported WIM after the strip and after ResetBase, and both thresholds below use that value directly.
 
 On the enable-only path no WIM is rebuilt — the existing deployed WIM's size is used directly.
 
@@ -215,6 +227,12 @@ If WinRE is currently `Enabled`, `reagentc /disable` runs. The script then verif
 
 This step runs **after** the pre-shrink, in the reversible window's tail. If the disable fails, the script restores C: to its original size and calls `Restore-PreviousWinRERoute -PreviousState $stateBefore`. If the previous route is confirmed restored, the function returns `Deferred` with `Reason = "WinRE disable failed before deletion"` or `Reason = "WinRE disable verification failed before deletion"`. Otherwise it returns `$null` and the main flow falls through to OS-fallback. Neither deferral is retry-suppressed — the failure indicates a storage-level or OS-level condition, not a transient constraint.
 
+**Pre-`/disable` race detector (v47 patch 1).** Immediately before this `/disable` call — and before whichever other `/disable` site the execution reaches first — the race detector re-reads the registered WinRE's `Location`, `Version`, and WIM SHA256, and compares them against values captured at the start of the rebuild (`Get-RegisteredWinREFingerprint`). Any change — location, version, or hash — aborts before the disable.
+
+At this site the abort must first restore C: to its captured size, because the pre-shrink has already run. No partitions have been deleted yet and the old WinRE route is still intact, so no route restoration is needed. After the size restore, the script resets the checkpoint to Step 2, removes `base.wim` and any stale `winre_optimized.wim`, and returns `Deferred` with `Reason = "registered source changed before disable"`. The deferral is not retry-suppressed — the drift is a Windows-Update-driven transient, and the next run re-evaluates source selection.
+
+This is a **race detector, not a lock**. Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update, so the microseconds between the re-read and the disable returning cannot be eliminated without moving work into the disable→enable window (which would violate invariant 3). The detector narrows the window from minutes to that residual. See [architecture.md](architecture.md) for the full rationale and [state-and-idempotency.md](state-and-idempotency.md) for the two capture states and their handling.
+
 ### 3a. Pre-deletion resolver guard (v46 patch 2)
 
 Immediately after the disable block and before the pre-deletion inventory, the script resolves the previously-active WinRE location to a partition. If WinRE was `Enabled` before the disable and the location cannot be resolved, the function returns `Deferred` with `Reason = "active WinRE location could not be resolved"`.
@@ -341,7 +359,7 @@ When the pre-shrink sequence (or the pre-flight geometry plan) returns `Deferred
 
 The marker's purpose is to suppress identical retries. A machine whose destructive replacement deferred because C: has insufficient free space will defer again the next run if the constraint has not been resolved. The marker records that fact so the next run can skip the same retries and exit cleanly with `EXIT_WARNING` rather than spending a full-update pass on a plan that will fail the same way.
 
-The marker is written only for `RetrySuppressible = $true` deferrals. The v46 patch 2 pre-deletion resolver deferral (`active WinRE location could not be resolved`) is not retry-suppressed: the condition requires operator action to resolve, and the machine is in a state (WinRE `Disabled` with the old partition intact) where the next run must re-evaluate the registration rather than skip. The same applies to the `WinRE disable failed before deletion` and `recovery partition deletion failed` deferrals.
+The marker is written only for `RetrySuppressible = $true` deferrals. The v46 patch 2 pre-deletion resolver deferral (`active WinRE location could not be resolved`) is not retry-suppressed: the condition requires operator action to resolve, and the machine is in a state (WinRE `Disabled` with the old partition intact) where the next run must re-evaluate the registration rather than skip. The same applies to the `WinRE disable failed before deletion` and `recovery partition deletion failed` deferrals, and to the v47 patch 1 pre-`/disable` race-detector abort (`registered source changed before disable`) — the drift is a Windows-Update-driven transient that the next run re-evaluates, not a stable operator-actionable condition.
 
 On each subsequent run, the marker is honored only when both of the following hold:
 
@@ -502,10 +520,19 @@ The v46 patch 1 plan clamp has been exercised on physical hardware in both direc
 
 The v46 patch 2 pre-deletion resolver guard and the extension-fallback bucket cap are code-review hardenings. Neither has been exercised in the field. They remain gated on the same tests that gate the rest of the post-deletion segment, per [CONTRIBUTING.md](../CONTRIBUTING.md).
 
+**v47 patch 1 coverage.** The v47 patch 1 non-destructive paths are field-verified on an ASUS PRIME H510M-D (2026-10-03). The v47-specific destructive-adjacent paths that remain unexercised on any storage are:
+
+- **The destructive partition paths under v47.** Pre-shrink, partition delete, `New-Partition`, the whole-layout assertion, and the post-delete extension fallback were not reached — the existing recovery partition was reusable.
+- **The v47 pre-`/disable` race-detector abort at the `Ensure-AdequateRecoveryPartition` site.** No drift occurred during candidate preparation, so the abort branch — with its C: size restoration — has not fired in the field.
+- **The strip stage against a non-empty third-party driver set.** The ASUS run's strip was a no-op. The strip-and-reinject loop has not run against a non-empty set inside a v47 production run.
+- **The three-source selection via the LKG or GitHub branches.** The ASUS run took the "registered" branch through its "no hash-validated LKG present" sub-path.
+
+The v45 destructive-path VM test remains the recommended next step before broad rollout under v47, followed by a canary on a machine with an OEM driver pack so the strip-and-reinject loop runs against a non-empty set. See [testing.md](testing.md) for the test plan.
+
 ## Related documents
 
 - [architecture.md](architecture.md) — where the partition lifecycle fits in the pipeline, the invariants list, and the wrong-question narrative.
 - [state-and-idempotency.md](state-and-idempotency.md) — how `GeometryRestoreFailed` and the deferral marker interact with the state file.
 - [troubleshooting.md](troubleshooting.md) — the recovery procedure if the partition is lost, and the reason-by-reason resolution for each pre-shrink deferral.
-- [driver-injection.md](driver-injection.md) — what happens before the partition work.
-- [exit-codes.md](exit-codes.md) — the full list of exit paths, including the v45 pre-shrink deferral and its sub-reasons.
+- [driver-injection.md](driver-injection.md) — what happens before the partition work, including the v47 patch 1 strip stage and the three-source base-WIM selection.
+- [exit-codes.md](exit-codes.md) — the full list of exit paths, including the v45 pre-shrink deferral and its sub-reasons, and the v47 patch 1 race-detector abort.

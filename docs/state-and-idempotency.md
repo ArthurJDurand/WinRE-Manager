@@ -38,6 +38,8 @@ The `CPU` field's job within this scheme is narrow: it distinguishes Intel CPUs 
 
 The v44 patch 1 revision deliberately does **not** go further than this. It does not hash the actual resolved driver list (which would be cleaner in principle — the ID would change exactly when the artifact would change, not when hardware that happens to correlate with the artifact changes) because the manifest `version` field already plays that role when the manifest author maintains it correctly. If a future revision needs to hash the resolved driver set, it should do so together with another `ScriptVersion` bump.
 
+**The `DesiredStateId` does not encode the production recipe.** v47's strip stage is part of the production recipe — what the script *does* to a base image during rebuild — not a deployment input. The v47 patch 1 DSI bump exists because the strip changes the deployed WIM bytes, and the bump is the mechanism by which v47 converges the fleet on the strip-normalized driver set. But future recipe refinements that do not bump `ScriptVersion` would not change the DSI: a machine whose inputs do not otherwise change would keep its earlier-recipe WIM until a natural DSI change — a manifest or OEM pack version bump, a Windows build change, a CPU or VMD change — triggered its next rebuild. The `ScriptVersion` discipline is what closes the gap: a recipe change that materially alters the deployed artifact on healthy machines is expected to ship with a `ScriptVersion` bump and a corresponding migration note.
+
 ### When the ID changes
 
 Any of the following cause the ID to change, which forces a full rebuild on the next run:
@@ -55,16 +57,18 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 - Any cosmetic or logging fix shipped without bumping `ScriptVersion`.
 - Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, the further revisions to patch 5 (including further revision 5), v44 patches 2 through 8, and v46 patch 2 all ship under their respective `ScriptVersion`s without changing the DSI inputs, so the ID is unchanged and healthy machines do not rebuild.
 - A new WIM hash at the registered location. That is a separate check (see below), not part of the ID.
-- A Windows Update that changes the WIM inside the recovery partition without changing the OS build.
+- A Windows Update that changes the WIM inside the recovery partition without changing the OS build. The DSI is unchanged. Under v46 the fast-path WIM-hash comparison would have detected this; under v47 the metadata comparison will not, unless the update also bumped `Version` or `SPBuild`. This is the metadata-neutral DU residual, named in [CHANGELOG.md](../CHANGELOG.md) under the v47 patch 1 entry.
 - A change to the BitLocker policy or the target-preparation logic. The state file does not record BitLocker state; it records the deployment's identity and outcome.
 - A change to the recovery-partition classifier (the v44 patch 7 type-code-authority rule). The classifier affects the fast path's control-flow decision but not the identity of the deployment; a label-only partition on the OS disk changes whether the fast path fires, not what the state file records.
 - A change to the shrink-first ordering or the single-boundary geometry model (v45 patch 1). These change *how* the destructive path produces the target state, not *what* the target state is. The state file does not record partition-layout details.
 - A change to the pre-deletion resolver guard, the extension-failure fallback bucket cap, the deletion-failure rollback reporting, or the layout assertion's fail-closed branch (all v46 patch 2). These change *how* the destructive path fails and recovers, not *what* the target state is. The state file's schema and the fast path's conditions are unchanged.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, the v46 patch 2 build-drift logging and the empty-disk read guard and the four post-review hardenings of `Ensure-AdequateRecoveryPartition`, and the harness's moves from v14 through v22 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
+`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, the v46 patch 2 build-drift logging and the empty-disk read guard and the four post-review hardenings of `Ensure-AdequateRecoveryPartition`, and the harness's moves from v14 through v23 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
 
-The v44 patch 1, v45 patch 1, and v46 patch 1 revisions are the deliberate exceptions. Each changes an input the `DesiredStateId` recipe depends on: v44 added `CPU` and `VMD` to the field list; v45 and v46 patch 1 each changed the value of the `SCRIPT` field. Because the ID includes those inputs, the ID changes on every managed machine, and every managed machine performs one full-update pass on its next run before returning to the fast path. See the migration notes in `CHANGELOG.md`; rolling back any of these three revisions to the preceding one likewise causes a one-time DSI mismatch and rebuild under the older behavior.
+The v44 patch 1, v45 patch 1, v46 patch 1, and v47 patch 1 revisions are the deliberate exceptions. Each changes an input the `DesiredStateId` recipe depends on: v44 added `CPU` and `VMD` to the field list; v45, v46 patch 1, and v47 patch 1 each changed the value of the `SCRIPT` field. Because the ID includes those inputs, the ID changes on every managed machine, and every managed machine performs one full-update pass on its next run before returning to the fast path. See the migration notes in `CHANGELOG.md`; rolling back any of these four revisions to the preceding one likewise causes a one-time DSI mismatch and rebuild under the older behavior.
+
+The v47 patch 1 bump has an additional purpose beyond the field-value change: it is the version boundary that converges the fleet on the strip-normalized driver set introduced in that release. A machine that would have kept its v46-injected OEM/VMD drivers under the v46 lineage model now rebuilds against the strip-normalized base, and every subsequent rebuild produces an image that is a function of the current recipe only. The same bump makes every machine's first v47 run write a `DeployedWinREMetadata` anchor so the v47 drift detector has a baseline.
 
 ## The state file
 
@@ -84,7 +88,8 @@ Path: `C:\Recovery\OEM\winre_state.json`.
     "DeployedDiskNumber":       4,
     "DeployedPartitionNumber":  4,
     "LastEnableResult":         "ok",
-    "EnableFailureAttempts":    0
+    "EnableFailureAttempts":    0,
+    "DeployedWinREMetadata":    "10.0.26100.9545|9545"
 }
 ```
 
@@ -92,7 +97,11 @@ Path: `C:\Recovery\OEM\winre_state.json`.
 
 `LastEnableResult` records the outcome of the last `reagentc /enable` attempt that reached a state-write point. Its values are `"ok"` (exit 0 and status confirmed `Enabled`), `"reboot"` (registration succeeded but a reboot is required), `"failed"` (generic hard failure), and `"bitlocker"` (the target recovery partition was BitLocker-protected, even after `Set-RecoveryPartitionReadyForWinRE` prepared it). `EnableFailureAttempts` counts *consecutive* terminal outcomes — both `"failed"` and `"bitlocker"` increment the counter. Both fields default to `"ok"` / `0` when absent, so a state file written by an earlier version of the script is accepted without triggering a rebuild.
 
-The v46 patch 2 hardenings do not change the schema. None of the new deferral reasons writes a new field; the reasons flow through the existing `Deferred` return path and, where applicable, through the existing `GeometryRestoreFailed` flag and state-file-invalidation mechanism.
+`DeployedWinREMetadata` (v47 patch 1) records the DISM servicing metadata of the WIM that was actually deployed, in the form `<Version>|<SPBuild>` — for example, `10.0.26100.9545|9545`. It is written at the end of every successful deployment and carried forward on non-deployment state writes via a script-scoped value, so a run that does not rebuild preserves the anchor. The v47 drift detector compares the currently-registered WinRE's DISM servicing metadata against this anchor; equality means no rebuild, inequality forces one. Microsoft documents that an LCU bumps `SPBuild` while the base `Version` may remain unchanged, so both are compared.
+
+The field is absent on v46-and-earlier state files. Its absence forces a rebuild on the first v47 run because the drift detector has no anchor to compare against. The tradeoff of comparing metadata rather than the WIM hash is that a Dynamic Update may change a serviced image's contents without changing either field — the metadata-neutral DU residual, named in [CHANGELOG.md](../CHANGELOG.md) under the v47 patch 1 entry. The WIM hash remains in the state file as `CurrentImageHash`; it is used for LKG validation, copy verification, deployment verification, and the pre-`/disable` race detector, but it is no longer a rebuild trigger.
+
+The v46 patch 2 hardenings do not change the schema. The v47 patch 1 release adds the single `DeployedWinREMetadata` field described above. None of the new deferral reasons introduced by either patch writes a new field; the reasons flow through the existing `Deferred` return path and, where applicable, through the existing `GeometryRestoreFailed` flag and state-file-invalidation mechanism.
 
 ### Read semantics
 
@@ -107,11 +116,13 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 `LastEnableResult` and `EnableFailureAttempts` are read with defaults of `"ok"` and `0`. A state file written by an earlier version of the script that does not contain these fields is accepted without triggering a rebuild.
 
+`DeployedWinREMetadata` is read as `$null` when absent. A v46-or-earlier state file lacks the field, and the null value forces a rebuild on the first v47 run — the drift detector has no anchor to compare against, so the run cannot take the fast path. This is the intended v46 → v47 transition; after one full update, the state file carries the anchor and subsequent runs evaluate against it.
+
 ### Partition deferral sidecar
 
 `C:\Recovery\OEM\winre_partition_deferred.json` records a pre-shrink deferral separately from the deployment state. It stores the `DesiredStateId` under which the deferral was written and a `Since` timestamp. The sidecar is not part of the deployment identity, and it is not what the fast path validates against — it is a temporary suppression record that prevents the script from re-attempting the same failing destructive sequence on every scheduled run while an operator resolves the underlying constraint.
 
-`Ensure-AdequateRecoveryPartition` can return `Deferred` for twelve distinct reasons. Only four of them write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
+`Ensure-AdequateRecoveryPartition` can return `Deferred` for thirteen distinct reasons. Only four of them write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
 
 - `post-shrink free space below minimum` — C: does not have enough free space to absorb the planned shrink.
 - `pre-shrink failed` — the shrink operation failed all three attempts.
@@ -120,7 +131,7 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 These four set `RetrySuppressible = $true`, and the main flow writes the marker.
 
-The remaining eight `Deferred` reasons do **not** set `RetrySuppressible`, and no marker is written:
+The remaining nine `Deferred` reasons do **not** set `RetrySuppressible`, and no marker is written:
 
 - `partition geometry unavailable` — the pre-flight `Get-PartitionSupportedSize` or disk-layout read failed. Storage-level condition; retrying is reasonable.
 - Any of the thirteen plan-rejection reasons (`Dedicated recovery partition plan rejected: ...`). These indicate a layout the planner cannot prove safe; a retry will produce the same rejection. Operator review is required.
@@ -130,8 +141,9 @@ The remaining eight `Deferred` reasons do **not** set `RetrySuppressible`, and n
 - `active WinRE location could not be resolved` (v46 patch 2) — WinRE was `Enabled` before the disable, but the registered location could not be resolved to a partition. The destructive sequence is refused before any deletion; because the guard fires after `reagentc /disable` has already run, the machine is left with WinRE `Disabled` and the old recovery partition intact. Operator action is required to re-register the route before a retry makes sense — retrying with the same unresolvable location would produce the same refusal, so the deferral is not retry-suppressed.
 - `recovery partition deletion failed; previous route restored` (v46 patch 2) — a mid-loop deletion failure; `Restore-OSPartitionSize` verified C: at its original size and `Restore-PreviousWinRERoute` confirmed the previous route was restored. The machine is functional again; no suppression is needed.
 - `recovery partition deletion failed; previous route restored but C: geometry restore unverified` (v46 patch 2) — a mid-loop deletion failure; the previous route was restored but `Restore-OSPartitionSize` could not verify C: at its original size. `$Script:GeometryRestoreFailed` is set, so the state file is invalidated and the next run retries from a clean slate. The deferral is not retry-suppressed because the state-file deletion already forces the retry; the sidecar would be redundant.
+- `registered source changed before disable` (v47 patch 1) — the pre-`/disable` race detector fired at the `Ensure-AdequateRecoveryPartition` site: the registered WinRE's `Location`, `Version`, or WIM SHA256 changed between capture at rebuild start and re-read immediately before the `/disable`. The abort restores C: to its captured size and returns before any partition has been deleted. The deferral is not retry-suppressed because the drift is a transient Windows-Update-driven condition; the next run re-evaluates source selection and either retries against the new registered source or falls through to the LKG.
 
-For these eight, the deferral is not a stable operator-actionable condition that a marker would help suppress. A retry may succeed without any operator action, or — in the two v46 patch 2 cases — the state-file invalidation already forces the retry from clean. The sidecar is not written; the next run retries naturally.
+For these nine, the deferral is not a stable operator-actionable condition that a marker would help suppress. A retry may succeed without any operator action; in the two v46 patch 2 deletion-failure cases the state-file invalidation already forces the retry from clean; and in the v47 patch 1 case the next run's source-selection logic is the correct response. The sidecar is not written; the next run retries naturally.
 
 On each subsequent run, the main flow reads the marker and evaluates two conditions:
 
@@ -154,13 +166,18 @@ When the manifest fetch fails after its retry budget (typically a DNS failure, a
 
 Recomputing the DSI offline would require the OEM pack version, which is resolved from the OEM map — a different gist, on the same unavailable network. The first implementation of the offline fallback attempted this and was wrong: on a fully offline machine, the OEM map fetch also fails, so the recomputed DSI contained `OEMPACK=NONE` versus the state file's `OEMPACK=A10`, and the fast path did not fire. The corrected implementation treats the state file's stored `DesiredStateId` as ground truth.
 
-The local safety checks are still fully enforced and do not depend on the manifest:
+The local safety checks are still fully enforced and do not depend on the manifest. Under v47, the fast-path conditions the offline path validates are the same as the online path: `$needInject` must be false, which requires the currently-registered WinRE's DISM servicing metadata (`Version` + `SPBuild`) to match the state file's `DeployedWinREMetadata` anchor, with no force-upgrade, no driver-version change, and no missing-anchor condition firing. The v46-and-earlier deployed-WIM-hash-vs-`CurrentImageHash` comparison no longer gates the fast path; the WIM hash remains in use for LKG validation, copy verification, deployment verification, and the pre-`/disable` race detector.
 
-- WinRE is `Enabled`
-- Exactly one **type-coded** recovery partition exists on the OS disk (a partition detected only by a Recovery/WINRE volume label is not counted)
-- The deployed WIM hash matches the state file's stored `CurrentImageHash`
+The full set of offline fast-path conditions under v47:
 
-If all three pass, the fast path fires and the run exits `EXIT_WARNING` (code 2) because `$Script:offlineFallback = $true` is set. The state file may be rewritten by the fast path to clear stale counters, exactly as it would online; that rewrite preserves the stored `DesiredStateId`. If any of the three checks does not pass, the run exits `EXIT_WARNING` before the full-update pipeline, having done nothing. If the state file does not exist at all, the run throws and exits `EXIT_FATAL` — a first deployment requires the live manifest to compute the initial `DesiredStateId`.
+- WinRE is `Enabled`.
+- The state file's `DesiredStateId` matches the stored value (used directly; the DSI is not recomputed offline).
+- The drift detector reports no change: the registered WinRE's servicing metadata matches the `DeployedWinREMetadata` anchor, and no force-upgrade, driver-version change, or missing-anchor condition applies.
+- The recovery-partition layout is one of the healthy shapes: exactly one **type-coded** recovery partition on the OS disk with the active location on it, or no recovery partition with `UsedOSFallback = $true` in the state file and the active location on the OS partition.
+
+If all pass, the fast path fires and the run exits `EXIT_WARNING` (code 2) because `$Script:offlineFallback = $true` is set. The state file may be rewritten by the fast path to clear stale counters, exactly as it would online; that rewrite preserves the stored `DesiredStateId` and the `DeployedWinREMetadata` anchor. If any condition does not hold, the run exits `EXIT_WARNING` before the full-update pipeline, having done nothing. If the state file does not exist at all, the run throws and exits `EXIT_FATAL` — a first deployment requires the live manifest to compute the initial `DesiredStateId`.
+
+**The v46 → v47 transition on offline machines.** A v46-or-earlier state file lacks `DeployedWinREMetadata`. Its absence forces `$needInject = $true` regardless of network state — the drift detector has no anchor to compare against. On a machine whose first v47 run is offline, the offline guard then fires: the machine needs a full update, but the live manifest is required for that, so the run exits `EXIT_WARNING` without further work. **From the second v47 run onward**, the state file has the anchor written by the first successful online run, and the offline fast path can fire normally. The one-time cost of the v47 migration on offline machines is therefore: the first scheduled v47 run must happen while the machine can reach the driver manifest.
 
 **The residual risk.** A machine whose local hardware changed while offline — a CPU swap, a BIOS update that flipped VMD, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — could take the fast path with a stale `DesiredStateId`. The next successful manifest fetch detects the drift and forces a rebuild. A `LocalInputsId` field in the state file would close this; it is planned as its own version boundary and is referenced in [architecture.md](architecture.md) and [CHANGELOG.md](../CHANGELOG.md).
 
@@ -195,15 +212,16 @@ The fast path fires when:
 
 - WinRE is enabled, AND
 - The state file's `DesiredStateId` matches the current one, AND
-- Exactly one **type-coded** recovery partition exists on the OS disk (a partition detected only by a Recovery/WINRE volume label is not counted), AND
-- The currently-registered partition is on the OS disk and is **type-coded** as a recovery partition, AND
-- The deployed WIM hash at the registered location matches `CurrentImageHash`.
+- The drift detector reports no change: the currently-registered WinRE's DISM servicing metadata (`Version` + `SPBuild`) matches the state file's `DeployedWinREMetadata` anchor, and no force-upgrade, driver-version change, or missing-anchor condition applies, AND
+- The recovery-partition layout is one of the healthy shapes: exactly one **type-coded** recovery partition on the OS disk with the active location on it, or no recovery partition with `UsedOSFallback = $true` in the state file and the active location on the OS partition. A partition detected only by a Recovery/WINRE volume label does not satisfy either condition.
 
-If all five conditions hold, the machine is in the correct end state. The fast path runs `Remove-StrayRecoveryPartitions` (a read-only scan when there are no strays), optionally clears stale `PendingReboot` / `RepairAttempts` / `EnableFailureAttempts` flags and a stale `LastEnableResult`, and exits with `EXIT_SUCCESS`.
+If all conditions hold, the machine is in the correct end state. The fast path runs `Remove-StrayRecoveryPartitions` (a read-only scan when there are no strays), optionally clears stale `PendingReboot` / `RepairAttempts` / `EnableFailureAttempts` flags and a stale `LastEnableResult`, and exits with `EXIT_SUCCESS`.
 
-If any condition fails, the script forces a full rebuild. The conditions above are also the fast-path `elseif` branches — the log records which one failed. The type-coded qualifiers in the third and fourth conditions were added in v44 patch 7: a label-only partition on the OS disk does not satisfy either condition, so a machine whose only recovery-looking partition is label-only never takes the fast path and converges on the full-update path instead. This closes the non-convergence loop described in the `[v44 patch 7]` CHANGELOG entry.
+If any condition fails, the script forces a full rebuild. The conditions above are also the fast-path `elseif` branches — the log records which one failed. The type-coded qualifier in the fourth condition was added in v44 patch 7: a label-only partition on the OS disk does not satisfy either side of the healthy-shape check, so a machine whose only recovery-looking partition is label-only never takes the fast path and converges on the full-update path instead. This closes the non-convergence loop described in the `[v44 patch 7]` CHANGELOG entry.
 
-Under the offline fallback (v44 patch 5), the same five conditions apply, but the `DesiredStateId` used for the comparison is the one read directly from the state file, and the run exits `EXIT_WARNING` even if all five conditions hold. See "Offline fallback trust" above.
+**Note on the WIM hash.** In v46 and earlier, the fast path also compared the deployed WIM's hash at the registered location against the state file's `CurrentImageHash`. That comparison is retired in v47 as a fast-path gate. The WIM hash remains in the state file and is used for LKG validation, copy verification during deployment, deployment verification, and the pre-`/disable` race detector — but the metadata comparison replaces it as the rebuild trigger. The tradeoff is a metadata-neutral Dynamic Update does not trigger a rebuild on its own; see [CHANGELOG.md](../CHANGELOG.md) under the v47 patch 1 entry.
+
+Under the offline fallback (v44 patch 5), the same conditions apply, but the `DesiredStateId` used for the comparison is the one read directly from the state file, and the run exits `EXIT_WARNING` even if all conditions hold. See "Offline fallback trust" above.
 
 ### The loop-breaker
 
@@ -225,7 +243,7 @@ Under `-DryRun` the loop-breaker logs `Would refuse to retry …` and continues,
 
 Path: `C:\ProgramData\OEM\Logs\winre_checkpoint.txt`.
 
-Format: `Step|DesiredStateId|WorkDir|Flag`, one line, e.g. `4|a1b2c3...|D:\Temp\WinREWork|WIM_READY`. Existing two- and three-field checkpoints remain readable. A legacy step-4 checkpoint without `WIM_READY` is treated conservatively and reruns injection.
+Format: `Step|DesiredStateId|WorkDir|Flag|SourceHash`, one line, e.g. `4|a1b2c3...|D:\Temp\WinREWork|WIM_READY|17843AD7F91D14445CDF35CFBDF254CA895149B123E96CD2870C6EFCAD3FED8E`. The fifth field (`SourceHash`) was added in v47 patch 1 and is present only when the staged WIM was prepared from an on-disk source (the registered image or the hash-validated LKG). A checkpoint prepared from a GitHub cold-start has no on-disk source to bind and omits the field. Existing two-, three-, and four-field checkpoints remain readable; legacy four-field `WIM_READY` checkpoints are invalidated on first resume under v47 because they have no source identity to bind against. A legacy step-4 checkpoint without `WIM_READY` is treated conservatively and reruns injection.
 
 ### Purpose
 
@@ -262,6 +280,33 @@ If `base.wim` is missing before Step 4, reset to step 1. A Step 4 checkpoint wit
 
 `WIM_READY` distinguishes a newly verified export from legacy step-4 checkpoints that may have been advanced by older failed-injection behavior. A valid `WIM_READY` checkpoint with an existing optimized WIM skips re-injection and re-export. The flag is crash-resume evidence, not part of the deployment identity.
 
+### The v47 source-hash binding
+
+The v47 `WIM_READY` checkpoint binds to the source-content hash that produced the staged WIM. The checkpoint validator compares the recorded hash against the currently available sources — the registered WIM (if readable) and the hash-validated LKG. A checkpoint whose source is no longer available with the same bytes is invalidated before the optimizer or deploy steps run.
+
+The binding exists because the v47 drift detector cannot detect a metadata-neutral source change: Microsoft documents that a Dynamic Update may change a serviced WinRE image's contents without changing its `Version` or `SPBuild`. Without the binding, a staged WIM prepared from a source that had since been silently replaced could be deployed as though nothing had changed. The binding is the checkpoint layer's independent check against that specific residual.
+
+The fifth field is written at Step 4:
+
+- **Normal Step 2 → Step 4 execution.** `$Script:StagedWimSourceHash` is set by source selection (either the registered WIM's hash or the LKG's hash) and flows through to the checkpoint write.
+- **Resumed Step 3 → Step 4 execution.** Step 2 was skipped, so `$Script:StagedWimSourceHash` is `$null`. The script recovers the hash from `base.wim` at Step 4 by matching its live SHA256 against the registered WIM hash and the hash-validated LKG. If `base.wim` matches neither, the source identity is intentionally left `$null` — a GitHub cold-start or an unknown on-disk source — and the checkpoint's fifth field is omitted. The next resume will invalidate such a checkpoint conservatively.
+
+The validation happens once, after `Get-Checkpoint`, before the step guards:
+
+```powershell
+if ($cp.Valid -and $cp.Step -ge 4 -and $cp.WimReady) {
+    if (-not $cp.SourceHash) {
+        # No recorded source identity: legacy four-field checkpoint or
+        # GitHub cold-start. Invalidate and reset to step 0.
+    } else {
+        # Compare against ActiveLocationHash and the hash-validated LKG.
+        # No match → invalidate and reset to step 0.
+    }
+}
+```
+
+An invalidated checkpoint is removed and `$cp` is re-read (returning a fresh `Step = 0`). The subsequent step guards then run against the invalidated state, and the run restarts from Step 1 as if there were no checkpoint.
+
 ### The v43 patch 4 migration guard
 
 A separate guard runs after `$needInject` has been fully determined:
@@ -282,6 +327,8 @@ This handles the case where a **prior** run failed injection and left a checkpoi
 The placement matters: the guard runs after `$needInject` is decided, so it catches both the "no state file" case and the "valid-but-stale state file" case. An earlier placement (immediately after the state read) would only catch the former.
 
 The `WIM_READY` carve-out is deliberate. A step ≥ 4 checkpoint **with** the `WIM_READY` flag and an existing `winre_optimized.wim` is a valid, resumable checkpoint even when `$needInject` is true: the rebuild that `$needInject` implies has already been completed at the image level, and the remaining work is the same partition-and-deploy sequence the checkpoint was protecting. Resetting to step 2 in that case would discard a valid optimized WIM and re-serialize the whole image for no reason. Only a step ≥ 4 checkpoint **without** the `WIM_READY` flag — a legacy checkpoint from a pre-v45 run, or a run whose export did not verify — is treated as untrustworthy and reset.
+
+**Ordering with the v47 source-hash binding.** The source-hash binding check described in "The v47 source-hash binding" runs before this migration guard. When it invalidates a checkpoint, the checkpoint file has already been removed and the fresh `Get-Checkpoint` call returns `Step = 0`; the migration guard's `$step -ge 4` condition is then false, and the guard is not reached. The two guards address different failure shapes and do not overlap.
 
 ### Checkpoint advance gating (v43 patch 4)
 
@@ -307,7 +354,10 @@ The checkpoint file is deleted:
 - After the enable-only path completes (any outcome).
 - After the pending-reboot path completes.
 - After the full-update path reaches step 6.
-- After a deferral marker is honored — the checkpoint is preserved alongside the staged workspace, because the deferred route is still functional and the staged image remains available for the eventual successful run.
+
+The checkpoint file is **preserved** when:
+
+- A deferral marker is honored and the deferred route is functional — the staged workspace and checkpoint are preserved alongside each other, because the deferred route is still functional and the staged image remains available for the eventual successful run.
 
 If a run is interrupted between `Set-Checkpoint -Step 6` and `Remove-ItemIfExist $CheckpointFile`, the checkpoint file persists. The migration guard handles this on the next run.
 
@@ -332,6 +382,8 @@ The three files — state, checkpoint, and deferral marker — have independent 
 | Present, stale | Any | Any | The machine's `DesiredStateId` has changed. | Full update from step 1. The deferral marker is cleared on read. |
 
 All three files are written atomically (`Write-FileAtomically` uses a temp file + `Move-Item` with retries), so none can be partially written even on power loss.
+
+Under v47, a step-≥4 `WIM_READY` checkpoint whose fifth field is absent, or does not match any currently-available source (registered WIM or hash-validated LKG), is invalidated at resume before the step guards run. The checkpoint is removed and the run restarts from step 0 as if no checkpoint existed. This applies to legacy four-field checkpoints and to GitHub-cold-start checkpoints, both of which have no source identity to bind against. See "The v47 source-hash binding" in the checkpoint section.
 
 ## Why not a database?
 

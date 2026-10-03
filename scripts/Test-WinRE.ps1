@@ -43,7 +43,21 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 22
+    Version : 23
+
+    v23 changes vs v22:
+    1. Bumped Get-DesiredStateId's $ProductionScriptVersion default
+       46 -> 47 to track production's ScriptVersion. Without this bump,
+       Option S reported a false DSI MISMATCH for every state file v47
+       production writes. Same class of drift that v21 (44 -> 45) and
+       v22 (45 -> 46) corrected.
+    2. Show-StateFileParity now displays the state file's
+       DeployedWinREMetadata field when present (the v47 drift anchor),
+       and prints an explanatory note when absent (v46 or earlier
+       state file). Purely diagnostic - does not affect any production
+       decision.
+    3. Harness version string in the menu title and startup Rule
+       bumped 22 -> 23.
 
     v22 changes vs v21:
     1. Mirrored production v46 patch 2's Get-WinREState version parsing.
@@ -676,7 +690,7 @@ function Get-IntelProcessorGeneration {
 }
 
 function Get-DesiredStateId {
-    # Mirror of production v46 patch 2's Get-DesiredStateId. The
+    # Mirror of production v47 patch 1's Get-DesiredStateId. The
     # $ProductionScriptVersion default MUST track production's
     # $ScriptVersion. If it falls behind, Show-StateFileParity reports
     # a false DSI MISMATCH for every state file production has written.
@@ -685,7 +699,7 @@ function Get-DesiredStateId {
         $OEMPackage,
         [Parameter(Mandatory)][string]$ExpectedDriverSetVersion,
         [bool]$VMDPresent = $false,
-        [int]$ProductionScriptVersion = 46
+        [int]$ProductionScriptVersion = 47
     )
     $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
     $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
@@ -1872,6 +1886,21 @@ function Show-StateFileParity {
     Write-KV "LastEnableResult"      "$($state.LastEnableResult)" $(if ($state.LastEnableResult -eq 'ok') { "Green" } else { "Yellow" })
     Write-KV "EnableFailureAttempts" "$($state.EnableFailureAttempts)" $(if ([int]$state.EnableFailureAttempts -gt 0) { "Yellow" } else { "Gray" })
 
+    # v47 drift anchor. Absent on state files written by v46 or earlier.
+    # Presence of this field is what lets production's drift detector
+    # compare the currently-registered WinRE image's servicing metadata
+    # against the metadata of the image production last deployed. When
+    # absent, production forces a rebuild on the next run - the version
+    # boundary converges the fleet onto the v47 anchor.
+    $deployedMeta = $state.DeployedWinREMetadata
+    if (-not $deployedMeta) {
+        Write-KV "DeployedWinREMetadata" "(absent - state file predates the v47 metadata anchor)" "Yellow"
+        Write-Diag "           Production v47 will force a rebuild on the next run because" "Yellow"
+        Write-Diag "           the drift detector has no anchor to compare against." "Yellow"
+    } else {
+        Write-KV "DeployedWinREMetadata" "$deployedMeta" "Green"
+    }
+
     Write-Diag ""
     if (-not $vmdQueryOk) {
         Write-Host "  Verdict: " -NoNewline -ForegroundColor DarkGray
@@ -2481,7 +2510,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v22)"
+    $titleContent = "WinRE Manager Test Harness (v23)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -2529,7 +2558,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v22"
+Rule "WinRE Manager test harness v23"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN
