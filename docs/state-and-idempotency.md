@@ -56,6 +56,7 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 
 - Any cosmetic or logging fix shipped without bumping `ScriptVersion`.
 - Any patch generation shipped under the same `ScriptVersion` that does not change the DSI inputs — v43 patches 2, 3, 4, and 5, the further revisions to patch 5 (including further revision 5), v44 patches 2 through 8, and v46 patch 2 all ship under their respective `ScriptVersion`s without changing the DSI inputs, so the ID is unchanged and healthy machines do not rebuild.
+- **v47 patch 2 is a narrow exception to the above.** It changes the DSI value on a machine whose padded `Win32_ComputerSystemProduct.Version` field is at least four characters long while its trimmed value is shorter than four (observed: ASUS machines that set the field to "1.0 "). The DSI inputs are unchanged; the value that enters the `HW` component has been normalised. Those machines rebuild once on their next scheduled run; all other machines continue on the fast path. See the v47 patch 2 Migration Note in `CHANGELOG.md` for the exact trigger class.
 - A new WIM hash at the registered location. That is a separate check (see below), not part of the ID.
 - A Windows Update that changes the WIM inside the recovery partition without changing the OS build. The DSI is unchanged. Under v46 the fast-path WIM-hash comparison would have detected this; under v47 the metadata comparison will not, unless the update also bumped `Version` or `SPBuild`. This is the metadata-neutral DU residual, named in [CHANGELOG.md](../CHANGELOG.md) under the v47 patch 1 entry.
 - A change to the BitLocker policy or the target-preparation logic. The state file does not record BitLocker state; it records the deployment's identity and outcome.
@@ -64,7 +65,7 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 - A change to the pre-deletion resolver guard, the extension-failure fallback bucket cap, the deletion-failure rollback reporting, or the layout assertion's fail-closed branch (all v46 patch 2). These change *how* the destructive path fails and recovers, not *what* the target state is. The state file's schema and the fast path's conditions are unchanged.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, the v46 patch 2 build-drift logging and the empty-disk read guard and the four post-review hardenings of `Ensure-AdequateRecoveryPartition`, and the harness's moves from v14 through v23 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
+`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow — including the v43 patch 4 checkpoint/state interaction fix, the v43 patch 5 further revision 5 BitLocker policy inversion, the v44 patch 3 destructive-path C: guard (removed in v44 patch 6), the v44 patch 4 program lock, the v44 patch 5 offline fallback and network timeouts, the v44 patch 6 C: guard removal and the VMD fail-closed guard and the Lenovo five-state resolution and the Step 2 stale-file cleanup, the v44 patch 7 classifier-consistency fix and the VMD extraction-directory cleanup and the diagnostic C:-encryption-state logging, the v44 patch 8 workspace-initialization reorder, the v46 patch 2 build-drift logging and the empty-disk read guard and the four post-review hardenings of `Ensure-AdequateRecoveryPartition`, and the harness's moves from v14 through v24 — ship under the same version or without a DSI change, and correct the affected machines on their next run without disturbing the rest.
 
 The v44 patch 1, v45 patch 1, v46 patch 1, and v47 patch 1 revisions are the deliberate exceptions. Each changes an input the `DesiredStateId` recipe depends on: v44 added `CPU` and `VMD` to the field list; v45, v46 patch 1, and v47 patch 1 each changed the value of the `SCRIPT` field. Because the ID includes those inputs, the ID changes on every managed machine, and every managed machine performs one full-update pass on its next run before returning to the fast path. See the migration notes in `CHANGELOG.md`; rolling back any of these four revisions to the preceding one likewise causes a one-time DSI mismatch and rebuild under the older behavior.
 
@@ -101,7 +102,7 @@ Path: `C:\Recovery\OEM\winre_state.json`.
 
 The field is absent on v46-and-earlier state files. Its absence forces a rebuild on the first v47 run because the drift detector has no anchor to compare against. The tradeoff of comparing metadata rather than the WIM hash is that a Dynamic Update may change a serviced image's contents without changing either field — the metadata-neutral DU residual, named in [CHANGELOG.md](../CHANGELOG.md) under the v47 patch 1 entry. The WIM hash remains in the state file as `CurrentImageHash`; it is used for LKG validation, copy verification, deployment verification, and the pre-`/disable` race detector, but it is no longer a rebuild trigger.
 
-The v46 patch 2 hardenings do not change the schema. The v47 patch 1 release adds the single `DeployedWinREMetadata` field described above. None of the new deferral reasons introduced by either patch writes a new field; the reasons flow through the existing `Deferred` return path and, where applicable, through the existing `GeometryRestoreFailed` flag and state-file-invalidation mechanism.
+The v46 patch 2 hardenings do not change the schema. The v47 patch 1 release adds two new fields: the state file's `DeployedWinREMetadata` field (described above) and the checkpoint file's optional fifth `SourceHash` field (described under "The v47 source-hash binding"). None of the new deferral reasons introduced by either patch writes a new field; the reasons flow through the existing `Deferred` return path and, where applicable, through the existing `GeometryRestoreFailed` flag and state-file-invalidation mechanism.
 
 ### Read semantics
 
@@ -122,7 +123,7 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 `C:\Recovery\OEM\winre_partition_deferred.json` records a pre-shrink deferral separately from the deployment state. It stores the `DesiredStateId` under which the deferral was written and a `Since` timestamp. The sidecar is not part of the deployment identity, and it is not what the fast path validates against — it is a temporary suppression record that prevents the script from re-attempting the same failing destructive sequence on every scheduled run while an operator resolves the underlying constraint.
 
-`Ensure-AdequateRecoveryPartition` can return `Deferred` for thirteen distinct reasons. Only four of them write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
+`Ensure-AdequateRecoveryPartition` can return `Deferred` with any of twenty-five distinct reason strings, grouped into thirteen deferral categories. Only four of the categories write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
 
 - `post-shrink free space below minimum` — C: does not have enough free space to absorb the planned shrink.
 - `pre-shrink failed` — the shrink operation failed all three attempts.
@@ -282,30 +283,22 @@ If `base.wim` is missing before Step 4, reset to step 1. A Step 4 checkpoint wit
 
 ### The v47 source-hash binding
 
-The v47 `WIM_READY` checkpoint binds to the source-content hash that produced the staged WIM. The checkpoint validator compares the recorded hash against the currently available sources — the registered WIM (if readable) and the hash-validated LKG. A checkpoint whose source is no longer available with the same bytes is invalidated before the optimizer or deploy steps run.
+The v47 checkpoint binds to the source-content hash that produced the staged WIM. Both Step 3 and Step 4 checkpoints record this binding: a Step 3 checkpoint carries the source hash of the base WIM that entered servicing, and a Step 4 checkpoint carries the same hash for the exported `winre_optimized.wim`. The validator calls `Select-BaseWinRESource` (the same helper Step 2 uses) and requires `$selectionNow.SourceHash -eq $cp.SourceHash`. This makes the two call sites share decision rules by construction, so drift between Step 2 and the validator is structurally impossible.
 
 The binding exists because the v47 drift detector cannot detect a metadata-neutral source change: Microsoft documents that a Dynamic Update may change a serviced WinRE image's contents without changing its `Version` or `SPBuild`. Without the binding, a staged WIM prepared from a source that had since been silently replaced could be deployed as though nothing had changed. The binding is the checkpoint layer's independent check against that specific residual.
 
-The fifth field is written at Step 4:
+The fifth field is written at both Step 3 and Step 4:
 
-- **Normal Step 2 → Step 4 execution.** `$Script:StagedWimSourceHash` is set by source selection (either the registered WIM's hash or the LKG's hash) and flows through to the checkpoint write.
-- **Resumed Step 3 → Step 4 execution.** Step 2 was skipped, so `$Script:StagedWimSourceHash` is `$null`. The script recovers the hash from `base.wim` at Step 4 by matching its live SHA256 against the registered WIM hash and the hash-validated LKG. If `base.wim` matches neither, the source identity is intentionally left `$null` — a GitHub cold-start or an unknown on-disk source — and the checkpoint's fifth field is omitted. The next resume will invalidate such a checkpoint conservatively.
+- **Normal Step 2 to Step 3 execution.** `$Script:StagedWimSourceHash` is set by source selection (either the registered WIM's hash or the LKG's hash) after the copy-integrity check on `base.wim`, and flows through to the Step 3 checkpoint write. A crash between Step 3 and Step 4 previously left a checkpoint with no source identity, and the resume validator (which gated on `$cp.Step -ge 4 -and $cp.WimReady`) did not fire at Step 3; the Step 3 write now binds it.
+- **Resumed Step 3 to Step 4 execution.** Step 2 was skipped, so `$Script:StagedWimSourceHash` is `$null` at entry. When the validator validates the checkpoint, it restores `$Script:StagedWimSourceHash` from the checkpoint's recorded value, so a resumed Step 3 to Step 4 execution writes the correct Step 4 checkpoint. If the validator did not run (a checkpoint written by an older build whose recorded value was not restored), the script recovers the hash from `base.wim` at Step 4 by matching its live SHA256 against the registered WIM hash and the hash-validated LKG. If `base.wim` matches neither, the source identity is intentionally left `$null` (a GitHub cold-start or an unknown on-disk source) and the checkpoint's fifth field is omitted. The next resume will invalidate such a checkpoint conservatively.
 
-The validation happens once, after `Get-Checkpoint`, before the step guards:
+The validation runs once, after `Get-Checkpoint`, before the step guards. The gate is `$cp.Valid -and $cp.Step -ge 3`. When the gate passes and `$cp.SourceHash` is absent, the checkpoint is a legacy v47 patch 1 Step 3 checkpoint or a GitHub cold-start, and it is invalidated. When the gate passes and `$cp.SourceHash` is present, the validator calls `Select-BaseWinRESource` with the live inputs; if no local source is available, or its hash differs from `$cp.SourceHash`, the checkpoint is invalidated. On match, `$Script:StagedWimSourceHash` is restored from `$cp.SourceHash`.
 
-```powershell
-if ($cp.Valid -and $cp.Step -ge 4 -and $cp.WimReady) {
-    if (-not $cp.SourceHash) {
-        # No recorded source identity: legacy four-field checkpoint or
-        # GitHub cold-start. Invalidate and reset to step 0.
-    } else {
-        # Compare against ActiveLocationHash and the hash-validated LKG.
-        # No match → invalidate and reset to step 0.
-    }
-}
-```
+`$ActiveLocationHash` does not participate directly in the comparison. `Select-BaseWinRESource` requires `$ActiveLocationWimPresent` before treating a WIM as the registered source, so a loose fallback-discovery file cannot validate a checkpoint against a source the selection rules would not choose. This closes the same class of gap that the prior `$candidateHashes` array left open, where a staged candidate whose source was no longer what the current selection would prefer could still be accepted.
 
 An invalidated checkpoint is removed and `$cp` is re-read (returning a fresh `Step = 0`). The subsequent step guards then run against the invalidated state, and the run restarts from Step 1 as if there were no checkpoint.
+
+**Legacy Step 3 checkpoints.** A Step 3 checkpoint written by a v47 patch 1 build carries no source hash. The validator's `$cp.Valid -and $cp.Step -ge 3` gate fires on it, sees `$cp.SourceHash` is absent, and invalidates it, forcing a clean rebuild from Step 2 against the current source. This is the correct convergence for a machine whose checkpoint lineage cannot be proven under the patch 2 rules.
 
 ### The v43 patch 4 migration guard
 
@@ -365,6 +358,8 @@ If a run is interrupted between `Set-Checkpoint -Step 6` and `Remove-ItemIfExist
 
 When the VMD hardware presence check is indeterminate, the run removes the checkpoint file before exiting `EXIT_WARNING`. This is deliberate: the deferral is a stop before any work is committed, and a stale checkpoint from an interrupted previous run would otherwise cause the next run to resume from a step that no longer reflects reality. Removing the checkpoint forces the next run to start from step 0, re-evaluate the VMD presence check, and proceed cleanly if the enumeration is now healthy.
 
+**The v47 pre-`/disable` race-detector abort is the only other deferral that removes the checkpoint**, for the same reason: the staged work is tied to a source that has drifted, and resuming from a checkpoint bound to that source would defeat the abort's purpose. Every other deferral path either preserves the checkpoint (the pre-shrink deferral marker path preserves it alongside the staged workspace) or leaves it intact by never having written one. The `active WinRE location could not be resolved` deferral (v46 patch 2) is the notable non-removing case: the checkpoint is left on disk, but the machine is left with WinRE `Disabled` and the next run re-evaluates from the top regardless of what the checkpoint says.
+
 ## Crash consistency
 
 The three files — state, checkpoint, and deferral marker — have independent lifecycles, and their interaction is what the guards above are protecting.
@@ -376,6 +371,7 @@ The three files — state, checkpoint, and deferral marker — have independent 
 | Absent | Present, step ≥ 4 | Absent | Interrupted failed-injection run, or `GeometryRestoreFailed` deleted the state file. | Migration guard resets `$step` to 2. Full update from step 2. |
 | Present, matching | Absent | Absent | Healthy, complete run. | Fast path. |
 | Present, matching | Absent | Present, matching | Pre-shrink deferral with the old route intact. | Marker honored if the route is functional; marker cleared if the route is broken. |
+| Present, matching | Present, step 3 (no WIM_READY) | Present, matching | Pre-shrink deferral from a run whose checkpoint was at step 3 (post-injection, pre-export). | Marker honored if the route is functional; on resume, injection is already done and the run proceeds from step 4. |
 | Present, matching | Present, step < 3 | Absent | Interrupted run that matched the state file. Unusual. | Full update from step 1 or 2. |
 | Present, matching | Present, step ≥ 4 | Absent | Interrupted failed-injection run with a stale-but-valid state file. | Migration guard resets `$step` to 2 (because `$needInject` will be true). Full update from step 2. |
 | Present, matching | Present, `WIM_READY` | Present, matching | Pre-shrink deferral with a staged optimized WIM available. | Marker honored if the route is functional; the staged WIM is reused on the eventual successful run. |

@@ -22,7 +22,7 @@ labels: ['enhancement', 'needs-triage']
 - Would this change the `DesiredStateId` inputs? Adding a new hardware property or deployment input to the ID forces every managed machine to rebuild once on the next run. If so, describe the `Migration Note` the change would need.
 - Would this force a rebuild on healthy machines?
 - Would this alter any exit-code semantics?
-- Does it touch the partition lifecycle, BitLocker state, or the state file?
+- Does it touch the partition lifecycle, BitLocker state, the state file, the checkpoint file (`C:\ProgramData\OEM\Logs\winre_checkpoint.txt`), or the deferral marker (`C:\Recovery\OEM\winre_partition_deferred.json`)? The checkpoint file carries the source-content binding (v47) and the marker governs retry suppression (v45); both are part of the deployment's persistence surface.
 
 ---
 

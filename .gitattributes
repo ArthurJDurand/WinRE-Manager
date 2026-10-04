@@ -27,6 +27,11 @@
 *.lnk binary
 
 # Diff drivers
+# The diff=powershell attribute is only interpreted if the user has set
+#   git config --global diff.powershell.textconv <path-to-converter>
+# Without that config, the attribute is inert. It is declared here so that
+# users who already have the textconv configured get the intended behavior
+# without editing .gitattributes themselves.
 *.ps1  diff=powershell
 *.psm1 diff=powershell
 *.psd1 diff=powershell

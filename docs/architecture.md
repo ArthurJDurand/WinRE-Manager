@@ -269,7 +269,7 @@ For the duration of that window, WinRE is not registered: `reagentc /info` reads
 
 **Inside the window:**
 
-- Pre-`/disable` registered-source fingerprint recheck (the race detector).
+- (Nothing before this line runs after the pre-shrink but before the `/disable`; the fingerprint recheck is the first operation inside the window's entry, immediately before the `/disable` call itself.)
 - Partition delete.
 - Post-delete C: extension.
 - `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, drive-letter assignment.
@@ -437,7 +437,7 @@ These are the invariants the script maintains, in the order they are enforced. E
 
 2. **No failure path leaves C: permanently shrunken.** Every post-shrink failure calls either `Remove-OrphanPartition` (which absorbs freed space back) or `Restore-OSPartitionSize`. Every failure of `Restore-OSPartitionSize` sets `$Script:GeometryRestoreFailed` so the state file is deleted and the next run retries from clean.
 
-3. **The state-write gate is never relaxed.** `Write-WinREState` is only called when `$Script:ImageInjectionComplete` is `$true` and a WIM hash was computed. A failed injection never leaves a state file behind. The one exception is the pending-reboot path, which re-writes the existing state file with an updated `PendingReboot` flag but does not update the hash.
+3. **No new WIM hash is ever written unless injection succeeded.** The full-update path and the final-verification reboot-required path both gate their `Write-WinREState` call on `$Script:ImageInjectionComplete` and a computed WIM hash; a failed injection never advances the state file's recorded hash. Other call sites (the fast path, the enable-only path, the two pending-reboot exits) write the state file for non-deployment reasons and carry the existing `$storedHash` forward unchanged. The invariant is about the recorded WIM hash, not about the presence of a state file.
 
 4. **The pipeline stops before deployment when injection fails.** If `$Script:ImageInjectionComplete = $false` after Step 3, the script exits with `EXIT_WARNING` before Step 4 (`dism /Export-Image`), before Step 5 (partition work), before Step 6 (deployment), and before any `reagentc` call. The abort branch also removes `base.wim` and `winre_optimized.wim` from `WorkDir` so the next run's Step 2 can rename cleanly; this is the v44 patch 3 fix.
 
@@ -499,7 +499,7 @@ These are the invariants the script maintains, in the order they are enforced. E
 
 ## Where the design choices bite
 
-The eighteen most consequential decisions in the whole script are:
+The eighteen most consequential decisions in the whole script, in the order the code reaches them rather than in any ranked order, are:
 
 - **Shrink-first replacement (v45 patch 1).** The risky operation — the shrink — runs in the reversible window, before any partition is destroyed. A failed shrink now returns `Deferred` with the old route intact, closing the v44 residual for the shrink trigger. What changed is when each step runs and what happens if it fails.
 

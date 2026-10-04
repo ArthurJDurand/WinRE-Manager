@@ -38,3 +38,8 @@ LenovoWinPEMap.json
 .env.*
 !.env.example
 secrets.local.*
+
+# Script-owned scratch directory used during full-update runs.
+# The script cleans this itself; it is listed here so a repo-local test run
+# does not leave untracked scratch behind.
+WinREWork/

@@ -8,7 +8,7 @@
 
 ## Versioning
 
-- [ ] `ScriptVersion` unchanged (cosmetic, logging-only, or a logic change that does not modify the deployed WIM, the partition layout, or the `DesiredStateId` inputs)
+- [ ] `ScriptVersion` unchanged (cosmetic, logging-only, or a logic change that does not modify the deployed WIM, the partition layout, or the `DesiredStateId` inputs). Note: a change that alters a DSI *value* on a narrow machine class without changing the DSI *inputs* -- for example, a value-normalisation fix like the v47 patch 2 `Win32_ComputerSystemProduct.Version` trim -- still belongs in this category, but the CHANGELOG entry must describe the affected machine class and the expected one-time rebuild. See the v47 patch 2 Migration Note in `CHANGELOG.md` for the pattern.
 - [ ] `ScriptVersion` bumped because the deployed WIM or partition layout changed
 - [ ] `ScriptVersion` bumped because a `DesiredStateId` input changed (a new hardware property or a new deployment input is now part of the ID)
 - [ ] If bumped, `DesiredStateId` will change and healthy machines rebuild once

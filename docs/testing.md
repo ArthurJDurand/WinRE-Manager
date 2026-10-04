@@ -32,7 +32,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v23.** The version history is:
+**Current version: v24.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -43,10 +43,19 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v21** corrects a DSI-mirror drift and adds `RepairAttempts` to the Option S display. See "v21 changes" below.
 - **v22** mirrors production v46 patch 2's `Get-WinREState` version parsing, adds a parser self-test check for the version regex, and bumps the `$ProductionScriptVersion` default. See "v22 changes" below.
 - **v23** mirrors production v47 patch 1's harness-side changes: `$ProductionScriptVersion` default bumped 46 → 47 and `Show-StateFileParity` now displays the state file's `DeployedWinREMetadata` field. See "v23 changes" below.
+- **v24** mirrors production v47 patch 2 and closes two harness-specific gaps: the active-WIM diagnostic probe now matches production's dual-path resolver, and `Get-ThisMachineProfile` trims `Win32_ComputerSystemProduct.Version` to align with production's DSI computation. See "v24 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
 The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the machine's state and reports what production would do, but it does not simulate the destructive path or the plan. The shrink-first code paths are exercised on disposable VMs (see "v45 destructive-path regression" below), not through the harness.
+
+### v24 changes
+
+Two changes, both downstream of the v47 patch 2 cycle.
+
+**1. The active-WIM diagnostic probe now matches production's dual-path resolver.** The prior code constructed `<registered-location>\Recovery\WindowsRE\winre.wim` unconditionally. That path is correct when `reagentc /info` returns a partition root, but doubles the path when it returns `...\Recovery\WindowsRE` (producing `...\Recovery\WindowsRE\Recovery\WindowsRE\winre.wim` and reporting the active WIM as missing when it is present). Production handles both forms via `Ensure-RecoveryPartitionAccess`, which returns a drive root or the subpath depending on which form the registered location was in. The harness now probes both forms in order (`<location>\Recovery\WindowsRE\winre.wim`, then `<location>\winre.wim`) and uses the first that resolves to a readable file.
+
+**2. `Get-ThisMachineProfile` trims `Win32_ComputerSystemProduct.Version`.** Mirrors production's `Get-HardwareObject` change in v47 patch 2. Some vendors pad the field with trailing whitespace (observed: ASUS sets it to `"1.0 "`); without trimming, the harness's DSI mirror could compute a different `HW` component than production on such machines, causing a false Option-S mismatch.
 
 ### v23 changes
 

@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207.x-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
-[![Version](https://img.shields.io/badge/version-v47%20patch%201-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v47%20patch%202-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ArthurJDurand)
 
@@ -90,11 +90,11 @@ The save-and-run form above is preferable for anything you care about: it isolat
 
 ### Reproducible runs (pinned version)
 
-`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v47.1` for the current v47 patch 1 release:
+`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v47.2` for the current v47 patch 2 release:
 
 ```powershell
 $p = "$env:TEMP\WinRE.ps1"
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v47.1/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
+Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v47.2/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
 powershell -ExecutionPolicy Bypass -File $p -DryRun
 ```
 
@@ -248,7 +248,7 @@ The harness shows what production would see, without changing anything:
 
 ```
   ╔══════════════════════════════════════════════════════════════════╗
-  ║ WinRE Manager Test Harness (v23)                                 ║
+  ║ WinRE Manager Test Harness (v24)                                 ║
   ║ Working directory: C:\Temp\WinRETest                             ║
   ║ Detected: OS=Win11  Vendor=ASUS  MT=Syst  CPU=Intel              ║
   ╚══════════════════════════════════════════════════════════════════╝
@@ -363,7 +363,7 @@ Full matrix and orchestration policy in [`docs/exit-codes.md`](docs/exit-codes.m
 
 ## Version
 
-**Production:** `WinRE.ps1` v47 patch 1. **Harness:** `Test-WinRE.ps1` v23.
+**Production:** `WinRE.ps1` v47 patch 2. **Harness:** `Test-WinRE.ps1` v24.
 
 The v47 patch 1 `ScriptVersion` bump (46 → 47) changes the `DesiredStateId`, so every managed machine performs one full update on its next scheduled run, then returns to the fast path. The v47 release introduces the third-party driver strip stage, so the deployed WIM bytes differ from v46 whenever a rebuild happens — the version boundary converges the fleet on the strip-normalized driver set. See the migration notes in [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -371,7 +371,9 @@ The v47 patch 1 `ScriptVersion` bump (46 → 47) changes the `DesiredStateId`, s
 
 **v47 patch 1 status.** The v47 non-destructive paths are field-verified on physical hardware. On an ASUS PRIME H510M-D (i5-11400, Win11 26300), a v46 → v47 migration correctly triggered a full update via the state-file DSI mismatch branch, took the source-selection "registered" branch (no hash-validated LKG present), ran the strip stage (no-op — the image was already clean), ran ResetBase and the export, reused the existing type-coded recovery partition, and completed `reagentc /disable` → deploy → `/enable` with exit 0. Two subsequent runs took the fast path. The harness at v23 passes all 16 parser self-tests, including the v47 DSI and metadata checks.
 
-**What v47 field data does not yet cover.** The destructive partition paths — pre-shrink, partition delete, `New-Partition`, the whole-layout assertion, and the post-delete extension fallback — have not been exercised under v47 on physical hardware. Nor have the strip stage with a non-zero third-party driver set, the OEM pack or VMD driver injection paths, the metadata-triggered rebuild branch, the pre-`/disable` race-detector abort branch, or the WIM_READY checkpoint save/resume round trip. The v45 destructive-path VM test remains the recommended next step before broad rollout, followed by a canary on a machine with an OEM driver pack so the strip-and-reinject loop runs against a non-empty set.
+**v47 patch 2 status.** The v47 patch 2 non-destructive paths have now been exercised on four physical machines. A Dell Pro Max 16 Premium MA16250 (Core Ultra 7 265H) performed a full rebuild with the Dell WinPE11 A10 OEM pack: 64 third-party drivers injected (49 of 49 matched), the existing 1,000 MiB recovery partition rejected as undersized, a new 1,100 MiB bucket created at offset 975661 MiB, `reagentc /enable` exit 0, `Operating mode: DEDICATED`, and the fast path on the second run. Two ASUS Vivobooks (X1504ZA and X1504VA) ran with C: actively encrypting (— `VolumeStatus=EncryptionInProgress` at 91%) and completed the dedicated-partition destructive sequence successfully; the newly created recovery partition was verified not claimed by the Device Encryption service. A fast-path smoke test on the ASUS PRIME H510M-D confirmed the state file, metadata anchor, and byte-drift comparison work end-to-end. All four runs: `Operating mode: DEDICATED`, exit code 0, `Byte drift from last deployment: NO` on the second run. The v24 harness passes all 16 parser self-tests.
+
+**What v47 field data does not yet cover.** The destructive partition paths — pre-shrink, partition delete, `New-Partition`, the whole-layout assertion, and the post-delete extension fallback — have not been exercised under v47 on physical hardware. Nor have the strip stage with a non-zero third-party driver set, the VMD driver injection path, the metadata-triggered rebuild branch, the pre-`/disable` race-detector abort branch, or the WIM_READY checkpoint save/resume round trip. The v45 destructive-path VM test remains the recommended next step before broad rollout, followed by a canary on a machine with an OEM driver pack so the strip-and-reinject loop runs against a non-empty set.
 
 ## Field-tested hardware
 
@@ -391,6 +393,9 @@ The v47 patch 1 `ScriptVersion` bump (46 → 47) changes the `DesiredStateId`, s
 | Lenovo | V15 G5 IRL (i5-13420H, MT 83GW) | Win11 26200 | v44 patch 6 — first `no-entry` Lenovo OEM state |
 | HP | ProBook 450 G9 (i5-1235U) | Win11 26300 | v44 patch 7 — first 1200 MiB bucket in the field |
 | HP | Laptop 15-fc0xxx (Ryzen 5 7520U) | Win11 26300 | v44 patch 7 — first AMD CPU in the field |
+| Dell | Pro Max 16 Premium MA16250 (Core Ultra 7 265H) | Win11 26300 | **v47 patch 2** — full rebuild with Dell WinPE11 A10 OEM pack; 64 drivers injected; fast path on the second run |
+| ASUS | Vivobook X1504ZA (i3-1215U) | Win11 26300 | **v47 patch 2** — C: actively encrypting at 91% during run; dedicated-partition path completed; new recovery partition not re-claimed by Device Encryption |
+| ASUS | Vivobook X1504VA (i7-1355U) | Win11 26300 | **v47 patch 2** — same shape as X1504ZA |
 
 The v44 patch 7 guard-free destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis). The v45 VM runs additionally confirmed the single-boundary destructive path end-to-end, and the MBR VM run confirmed the MBR partition-attribute path and the program lock. The v46 patch 1 plan-clamp fix is field-verified on the Lenovo IdeaPad 3 15IAU7 that motivated it, and clean-path verification of v46 patch 1 and v46 patch 2 is on record for the Dell Latitude 3540 and two HP EliteBook G1i models. The v47 non-destructive paths are verified on the ASUS PRIME H510M-D. Full history and per-machine evidence are in the [changelog](CHANGELOG.md).
 

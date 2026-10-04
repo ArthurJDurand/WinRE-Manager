@@ -103,7 +103,7 @@ The 1000 MiB minimum exists because smaller partitions cause problems on OEM har
 
 ### Why the 250 MiB target matters
 
-The ASUS 11th-gen case is the canonical example. That machine had a 757 MiB WIM and a 999 MiB recovery partition. After replacing the WIM, the partition had ~197 MiB free — below 250.
+The ASUS 11th-gen case is the canonical example. That machine had a 757 MiB WIM and a 999 MiB recovery partition. After replacing the WIM, the partition had ~197 MiB free (the raw arithmetic 999 minus 757 is 242 MiB; the difference is NTFS filesystem metadata and reserved space, which is why the effective-free check uses `SizeRemaining + existingWinreWimSize` rather than simple subtraction) — below 250.
 
 The previous script policy accepted that partition with a 195 MiB tolerance (200 minus 5). The current policy does not. On that machine, the script now replaces the 999 MiB partition with a properly sized one (a 1100 MiB partition, because WIM + 250 + 30 = 1037 rounds up to 1100). If the OS partition cannot be shrunk enough to make room, the script defers with the old route preserved (v45 patch 1) or falls back to OS-fallback with exit code 2 (in the limited cases where the plan called for it).
 
@@ -153,9 +153,11 @@ The v46 patch 1 fix clamps `tailEnd` to `diskSize − 1 MiB` before aligning, on
 
 The clamp is stated in [architecture.md](architecture.md) invariant 18 and its reasoning is documented as the "ninth direction" of the wrong-question pattern in the same document.
 
+**A note on numbering.** The substeps below (0 through 11) are the internal stages of `Ensure-AdequateRecoveryPartition`. They are not the same as the "eight steps" of the full-update pipeline described in [architecture.md](architecture.md); the eight-step pipeline is the top-level flow (Wipe WorkDir, Obtain base WIM, Mount and inject, Optimize, Ensure a suitable recovery partition, Deploy the WIM, Enforce the single-recovery-partition invariant, Final verification), and this document expands Step 5 into the substeps below.
+
 ## The OS partition resize sequence (v45 patch 1)
 
-The sequence below is the shrink-first pipeline. It replaces the v44 pipeline (disable → delete → extend → shrink → create) with (plan → shrink → disable → delete → extend → create). What changed is **when** each step runs and **what happens if it fails**.
+The sequence below is the shrink-first pipeline. It replaces the v44 pipeline (in v44: disable, then delete → extend → shrink → create; the CHANGELOG's compact list shows only the destructive portion) with (plan → shrink → disable → delete → extend → create). What changed is **when** each step runs and **what happens if it fails**.
 
 ### 0. Audit Mode startup guard
 
@@ -176,7 +178,8 @@ The plan rejects a layout when any of the following holds:
 - The partition inventory contains entries from another disk.
 - Another partition overlaps the OS partition geometry.
 - The OS partition's supported-size bounds are unavailable.
-- The requested bucket size is invalid or exceeds the 2 GiB ceiling.
+- The requested bucket size is invalid.
+- The requested bucket size exceeds the 2 GiB ceiling.
 - The OS partition geometry is inconsistent with the disk size.
 - A type-coded recovery partition exceeds the 2 GiB ceiling.
 - A type-coded recovery partition overlaps the OS partition geometry.
@@ -265,7 +268,7 @@ None of the deletion-failure deferrals is retry-suppressed.
 
 If `ExtendBytes > 0`, the script now extends C: into the space the deleted recovery partitions occupied. `Invoke-OSPartitionExtend` runs three attempts with 5-second spacing between them.
 
-**Extension-failure safe fallback (v45 patch 1; capped at bucket size in v46 patch 2).** If all three attempts fail, the script does not fall through to OS-fallback. It re-queries C:'s actual end and computes:
+**Extension-failure safe fallback (v45 patch 1; bucket cap in v46 patch 2; ceiling-fill in v47 patch 2).** If all three attempts fail, the script does not fall through to OS-fallback. It re-queries C:'s actual end and computes:
 
 ```
 FallbackStart = ceil(ActualOSEnd / 1 MiB) × 1 MiB
@@ -273,11 +276,13 @@ FallbackEnd   = AlignedManagedExtentEnd
 AvailableSize = FallbackEnd - FallbackStart
 ```
 
-If `AvailableSize >= Plan.PlannedPartitionSize`, the script places the recovery partition at `FallbackStart` with size `Plan.PlannedPartitionSize` — **the plan's bucket size, not `AvailableSize`** — sets `$Script:nonFatalWarning = $true`, and continues. The space between the new partition's end and `FallbackEnd` remains an intentional trailing unallocated extent, logged explicitly.
+If `AvailableSize >= Plan.PlannedPartitionSize`, the script places the recovery partition at `FallbackStart` with size `min(AvailableSize, 2 GiB)` — the full available extent, capped at the 2 GiB managed-recovery ceiling — sets `$Script:nonFatalWarning = $true`, and continues. Sizing to `min(AvailableSize, 2 GiB)` fills the available extent up to the ceiling, which eliminates the trailing unallocated extent in the common case; the surplus after a failed extension is typically a few hundred MiB, well under the ceiling. Only when `AvailableSize` exceeds 2 GiB does a trailing unallocated extent remain, and it is logged explicitly.
 
-Before v46 patch 2 the fallback assigned the entire `AvailableSize` to the replacement partition, filling from `FallbackStart` to `FallbackEnd`. On a layout that reclaimed multiple recovery partitions whose combined size exceeded the bucket, that could produce a partition larger than the 2 GiB managed-recovery ceiling. The v46 patch 2 cap sizes the replacement partition to the plan's bucket and logs the residual as the trailing unallocated extent. The cap enforces the same ceiling on the fallback path that the plan already enforces everywhere else, at the cost of a slightly larger unallocated gap on the disk.
+Before v46 patch 2 the fallback assigned the entire `AvailableSize` to the replacement partition without any ceiling. v46 patch 2 introduced the 2 GiB cap but sized the partition to the plan's bucket — the smallest the fallback could produce — leaving the surplus as a trailing unallocated extent on every fallback. v47 patch 2 keeps the ceiling but fills up to it: the cap is what matters, not the bucket.
 
 If `AvailableSize < Plan.PlannedPartitionSize`, the script restores C: to its original size and returns `$null`, and the main flow falls through to OS-fallback.
+
+**The whole-layout assertion reflects the fallback geometry.** The assertion is called with `-ExpectedEndBytes $plannedEnd`, the current plan's own end. On the normal path `$plannedEnd` equals `$plan.AlignedManagedExtentEnd`; when the fallback ran, `$plannedEnd` reflects the fallback geometry. Before v47 patch 2 the assertion was called with `$plan.AlignedManagedExtentEnd`, which the fallback block did not update; any fallback case where the trailing extent exceeded the assertion's 1 MiB tolerance — i.e., any case where the fallback was actually needed — failed the assertion, removed the newly created partition via `Remove-OrphanPartition`, and fell through to the OS-fallback route the fallback existed to avoid.
 
 The fallback exists because exact geometry is a goal, not a reason to leave WinRE disabled. A machine with a working dedicated recovery partition that starts at a slightly different offset and carries a trailing unallocated extent is in a better state than a machine in OS-fallback, and it converges on the next full-update pass.
 

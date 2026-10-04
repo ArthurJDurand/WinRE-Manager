@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v47 patch 1, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v47 patch 1) ==========`) -->
+- **WinRE.ps1 version:** <!-- e.g. v47 patch 2, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v47 patch 2) ==========`) -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
@@ -74,6 +74,14 @@ labels: ['bug', 'needs-triage']
 - `Registered-source recheck at <site> : CHANGED` followed by `Registered WinRE source changed during candidate preparation` — the v47 race detector fired. Include the captured fingerprint line, the recheck line, the change triple (`location=<bool> version=<bool> hash=<bool>`), and whether a Windows Update was in flight.
 - `State has no DeployedWinREMetadata anchor`, `Registered WinRE metadata changed from … to …`, or `Registered WinRE metadata could not be read` — the v47 metadata-based rebuild trigger fired. Include the state file's `DeployedWinREMetadata` value and the currently-registered WinRE's `Version` / `SPBuild`.
 - `CmdletizationQuery_NotFound_DiskNumber` or `No MSFT_Partition objects found with property 'DiskNumber'` — the SD/MMC read. Note the disk number and whether the machine has a card reader or an empty USB enclosure attached.
+- `Base WIM copy hash mismatch: source=..., copied=...` -- the copy-integrity check rejected the candidate. Include the source path, the source hash, the copied hash, and the currently-registered WinRE metadata (in case the source changed during acquisition).
+- `Base WIM copy is unreadable after Copy-Item` -- the copy-integrity check could not read the destination. Include the source path and the source hash.
+- `Checkpoint step N has no recorded source identity` -- a legacy (v47 patch 1 Step 3) or GitHub-sourced checkpoint was invalidated on first resume. Include the checkpoint's recorded Step value.
+- `Checkpoint step N source identity ... does not match the currently-selected source ...` -- the recorded source identity no longer matches the current selection rules. Include the recorded hash, the currently-selected hash, and the source-selection `Reason` string.
+- `Checkpoint step N source identity ... cannot be re-validated` -- no source was available to validate the checkpoint against. Include the recorded hash.
+- `Registered WinRE candidate is present at ... but its servicing metadata could not be read` -- the source-selection helper could not read the registered WIM's DISM servicing metadata. Include the path.
+- `A WIM was discovered at ... but not at the registered location` -- the loose fallback-discovery path found a WIM outside the registered location. Include the path and whether the registered location yielded a readable WIM.
+- `WinRE is registered via OS-fallback (location: ...) but its winre.wim could not be read at that location (status=...) - forcing rebuild` -- the v47 patch 2 OS-fallback missing-WIM guard fired. Include the registered location, the `reagentc /info` status, and whether `C:\Recovery\WindowsRE\winre.wim` exists.
 
 <details>
 <summary>C:\ProgramData\OEM\Logs\WinRE-Manager.log (relevant slice)</summary>

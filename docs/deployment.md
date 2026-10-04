@@ -61,7 +61,7 @@ Confirm exit 0 and `Operating mode: DEDICATED` in the log. Only then expand the 
 
 ### Rule 2 — never leave a machine without a working recovery route: do not interfere with the recovery window
 
-The one case in which the script cannot guarantee a working recovery route on a single run is the post-deletion residual corner: a `New-Partition` or `Format-Volume` failure after the old recovery partition has been deleted, on a machine whose C: is encrypted. The correct operational response is **not to interrupt the script while it is inside the destructive window** — every interruption between the delete and the enable is an opportunity for the machine to land in that corner.
+The one case in which the script cannot guarantee a working recovery route on a single run is the post-deletion residual corner: a failure **after** the old recovery partition has been deleted, on a machine whose C: is encrypted, with no successful retry. The trigger set is wider than the commonly cited `New-Partition` or `Format-Volume` pair: the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, and the recovery-partition deletion itself when the previous route cannot be restored, all reach the same corner. The correct operational response is **not to interrupt the script while it is inside the destructive window** — every interruption between the delete and the enable is an opportunity for the machine to land in that corner.
 
 Concretely:
 
@@ -377,7 +377,7 @@ A run that defers this way leaves the machine unchanged: no WIM deployed, no par
 
 ## Offline behavior (v44 patch 5; fast-path gate updated in v47 patch 1)
 
-The script's network calls — the driver manifest fetch, the OEM map fetches, and the base WIM download — all default to a 15-second timeout. Before v44 patch 5, an offline machine would hang for over 10 minutes across the aggregate of the default 100-second timeouts before failing. That is now capped at roughly 90 seconds in the fully-offline case, dominated by the fixed sleeps in the retry loops rather than by the network timeouts.
+The script's network calls — the driver manifest fetch, the OEM map fetches, and the base WIM download — each default to a 15-second per-call timeout. The timeout applies to each individual request, not to the aggregate; the retry loops (2 attempts for the manifest, 3 for the OEM pack download) can multiply it. Before v44 patch 5, an offline machine would hang for over 10 minutes across the aggregate of the default 100-second timeouts before failing. That is now capped at roughly 90 seconds in the fully-offline case, dominated by the fixed sleeps in the retry loops rather than by the network timeouts.
 
 More importantly, v44 patch 5 adds an **offline fallback** for the manifest fetch. The behavior depends on the state file's contents.
 
@@ -536,7 +536,7 @@ Change `$ScriptVersion` back to 46 and revert the strip stage, the three-source 
 
 The v44 patches 2 through 8 and the v46 patch 2 additions do **not** bump `ScriptVersion` and do **not** change the `DesiredStateId`. They apply to every subsequent run without a state-file action. A machine that is already healthy continues to take the fast path. A machine that was mid-deployment when the patch rolled out continues from where it was — the checkpoint and state-file schemas are unchanged.
 
-The **v47 patch 1** revision is not in this list; it bumps `ScriptVersion` and is documented under "v47 patch 1 migration" above.
+The **v47 patch 2** revision is also not a fleet-wide rebuild: it does not bump `ScriptVersion`, and its only DSI-value change is a one-time event on a narrow machine class (machines with a padded `Win32_ComputerSystemProduct.Version` field). It is documented under `### v47 patch 2 specifically` above. The **v47 patch 1** revision is not in this list; it bumps `ScriptVersion` and is documented under "v47 patch 1 migration" above.
 
 - **v44 patch 2** adds `dism /cleanup-image /StartComponentCleanup /ResetBase` to the full-update pipeline; the size reduction materialises on the next natural rebuild, not immediately.
 - **v44 patch 3** adds the destructive-path C: encryption guard inside `Ensure-AdequateRecoveryPartition` (removed in v44 patch 6) and a `base.wim` cleanup on the injection-failure abort branch (retained).
@@ -713,6 +713,16 @@ Watch for:
 - **Machines that exit 2 with `Checkpoint WIM_READY has no recorded source identity` or `Checkpoint WIM_READY source identity <hash> no longer matches any available source`** — the v47 source-hash binding invalidated a stale checkpoint on resume. The run restarts from Step 0 and rebuilds from the current source. This is a protective invalidation, not a failure. If it fires on a machine whose checkpoint was from a same-source run, the source actually changed during the interval, which the invalidator correctly caught.
 
 Also check the ASUS PRIME H510M-D v47 field-verification transcript in `CHANGELOG.md` for the expected shape of a healthy migration run — the log lines the canary should produce are the same ones.
+
+### v47 patch 2 specifically
+
+The v47 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId` on any machine whose `Win32_ComputerSystemProduct.Version` field is not padded. It ships six hardening fixes on top of v47 patch 1: the OS-fallback missing-WIM guard without a status restriction; the base-WIM copy-integrity check; the machine-type fallback trim; the workspace candidate filter `IsSystem -and -not IsBoot`; the GitHub base-WIM extraction contract change (`return $false` instead of throw); and the `-SuppressSuccessLog` switch on the duplicate `Verified partition` log line. The canary is primarily observational:
+
+- **Confirm the version banner reads `v47 patch 2`.** The startup line reads `========== WinRE Manager Started (v47 patch 2) ==========`.
+- **Confirm the new log signatures are absent on a healthy canary.** A canary that takes the fast path will not emit any of the v47 patch 2 signatures. A canary that runs a full update will show `Copied base WIM from <path>; copy hash verified` after the base-WIM copy. The mismatch branch (`Base WIM copy hash mismatch: source=..., copied=... - rejecting candidate`) is not expected on a healthy canary.
+- **On a machine with a padded `Version` field** (observed: some ASUS), expect a one-time `DesiredStateId` change from the trim fix and one full-update pass. All other machines continue on the fast path.
+- **On a machine with a v47 patch 1 Step 3 checkpoint on disk**, expect that checkpoint to be invalidated on the first v47 patch 2 run and the run to rebuild from Step 2.
+- **The six hardenings are code-review fixes**, not field-verified changes. They are covered by inspection and by the harness parser self-tests, not by the four v47 patch 2 field runs. If a canary hits any of them, capture the full log per the [Reporting a bug](../CONTRIBUTING.md#bug-reports) section.
 
 ## Rolling back
 

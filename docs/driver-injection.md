@@ -26,7 +26,7 @@ For how to host your own manifest and OEM maps, see [self-hosting.md](self-hosti
             "os": ["Win10", "Win11"],
             "match": {
                 "cpuGenMin": 12,
-                "cpuGenMax": 14,
+                "cpuGenMax": 16,
                 "requiredDevices": [
                     "PCI\\VEN_8086&DEV_467F",
                     "PCI\\VEN_8086&DEV_9A0B"
@@ -52,7 +52,7 @@ For how to host your own manifest and OEM maps, see [self-hosting.md](self-hosti
 
 The script reads all `requiredDevices` values from all manifest entries into a single regex, then matches against `Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match $pattern }`. If at least one device matches, VMD hardware is considered present.
 
-If a manifest entry has `requiredDevices` but the machine has no matching device, that driver is skipped. The log records `Skipping <name>: no matching VMD hardware detected`.
+VMD hardware presence is determined once, from the union of all `requiredDevices` values across all manifest entries, matched against present PnP devices. If that machine-wide determination reports VMD absent, every manifest entry that declares `requiredDevices` is skipped. The log records `Skipping <name>: no matching VMD hardware detected` for each skipped entry.
 
 **As of v44 patch 6, the enumeration is fail-closed.** If `Get-PnpDevice` reports an error during the query — for example, the Plug and Play service is in a bad state, an antivirus or EDR product is blocking device enumeration, or a device in an error state is preventing the PnP manager from completing the query — the script treats VMD presence as **indeterminate** rather than as absent. It does not assume the machine has no VMD hardware.
 

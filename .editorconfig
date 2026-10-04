@@ -24,6 +24,7 @@ end_of_line = crlf
 indent_size = 4
 
 [*.{cmd,bat}]
+charset = utf-8
 end_of_line = crlf
 
 [*.md]

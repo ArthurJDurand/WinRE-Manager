@@ -78,6 +78,8 @@ and finally:
 [ERROR] FATAL: WinRE is not enabled at exit
 ```
 
+**No current build emits these log lines.** The delete-and-recreate retry was removed in v43 patch 5 (further revision 5), along with the `Suspend-BitLockerForWinRE` function. v43 patch 5 (further revision 5) and later log a different sequence for the same underlying condition -- the OS-fallback BitLocker deferral (see "The OS-fallback route deferred because C: is encrypted" above) or the enable-only target-preparation failure (see "Target recovery partition could not be made unencrypted" below). The lines above are retained for interpreting historical logs, and match the failure that motivated the v43 patch 5 fix.
+
 **Cause.** The machine was mid-Device-Encryption when the script ran. `ProtectionStatus` read `Off` while `VolumeStatus` read `EncryptionInProgress`. The pre-patch-5 code treated `ProtectionStatus=Off` as sufficient evidence that BitLocker was not a factor, deleted the existing recovery partition, and created a new one. The Device Encryption service claimed the new partition and started encrypting it before the recovery type GUID could be applied. The delete-and-recreate retry hit the same problem. The script fell back to OS-fallback and then `reagentc /enable` refused because C: was actively encrypting.
 
 Two field failures, both on Windows 11 build 26200:
@@ -135,7 +137,7 @@ This gives you OS-fallback WinRE — functional but not the design goal. The ded
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v47 patch 1) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v47 patch 2) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -413,6 +415,106 @@ In the first two cases the rebuild is triggered by a metadata comparison; in the
 3. **If the log shows `Registered WinRE metadata could not be read`,** the registered image is unreadable. The rebuild runs to replace it. If the same message fires on the next run, the registered image is persistently unreadable and the machine is not converging — investigate the registered recovery partition's storage state. `Test-WinRE.ps1` Option 1's Build numbers block reports what the harness can see of the registered image; a `(none present at C:\Recovery\WindowsRE\winre.wim)` there plus the production log's persistent unreadable message indicates a real storage problem.
 
 **Field status.** The rebuild-because-of-a-changed-anchor branch and the rebuild-because-of-an-unreadable-registered-image branch have not been exercised in the field. The ASUS PRIME H510M-D v47 field run took the rebuild via the DSI-mismatch branch (state file was stale from v46, so the metadata comparison was subsumed by the DSI mismatch and did not fire). If you see either branch on a machine, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section.
+
+## The base-WIM copy-integrity check rejected the candidate (v47 patch 2)
+
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) after Step 2, before mount. No WIM was mounted, no partition was touched, WinRE was not disabled. The state file is unchanged (or absent).
+
+**Log signature.** One of:
+
+```
+[ERROR] Base WIM copy hash mismatch: source=<source-hash>, copied=<copied-hash> - rejecting candidate
+```
+
+or
+
+```
+[ERROR] Base WIM copy is unreadable after Copy-Item - rejecting candidate
+```
+
+Followed by removal of `base.wim`, a checkpoint reset to Step 2, and exit code 2.
+
+**Cause.** The copy-integrity check added in v47 patch 2 verifies that the bytes copied to `WorkDir\base.wim` match the selected source's SHA256. A mismatch means the copy failed partway, or the source was replaced by the OS between the hash and the copy. The check exists because the Step 3 and Step 4 checkpoints bind to the source hash; without it, a checkpoint could record a hash that does not describe the bytes that actually entered servicing.
+
+**Resolution.**
+
+1. Re-run `WinRE.ps1`. The checkpoint is at Step 2 and `base.wim` was removed, so the next run re-acquires the source from the selection chain.
+2. If the mismatch recurs, investigate the source. A registered-WIM source that changes during acquisition is the same class of race as the pre-`/disable` race detector catches later; see "The pre-`/disable` race detector fired" above.
+3. If the source was the LKG, verify its SHA256 manually against `state.CurrentImageHash`.
+
+**Field status.** This check has not been exercised in the field.
+
+## The checkpoint validator invalidated a legacy or drifted checkpoint (v47 patch 2)
+
+**Symptom.** A checkpoint file was present at the start of the run, but the run took the full-update path from Step 1 or Step 2 anyway. The state file is unchanged.
+
+**Log signature.** One of:
+
+```
+[WARN] Checkpoint step N has no recorded source identity (legacy or GitHub-sourced checkpoint); invalidating to rebuild from a known source
+```
+
+```
+[WARN] Checkpoint step N source identity <hash> does not match the currently-selected source <hash> (<reason>); invalidating to rebuild
+```
+
+```
+[WARN] Checkpoint step N source identity <hash> cannot be re-validated against the current selection (no selected source, or GitHub cold-start has no on-disk hash); invalidating to rebuild
+```
+
+Followed by removal of the checkpoint file and a re-read returning Step 0.
+
+**Cause.** The v47 patch 2 checkpoint validator calls `Select-BaseWinRESource` on the live inputs and requires the currently-selected source hash to equal the checkpoint's recorded source hash. Any of three conditions triggers invalidation: the checkpoint is a v47 patch 1 Step 3 checkpoint carrying no source hash; the checkpoint was prepared from a GitHub cold-start (no on-disk source to bind); or the source the current selection rules would choose now has a different hash than the checkpoint recorded.
+
+**Resolution.** Automatic. The run restarts from Step 1 against the current source. No operator action is required unless the invalidation fires repeatedly, which indicates the source is changing during preparation; in that case see "The pre-`/disable` race detector fired" above.
+
+**Field status.** This path has not been exercised in the field.
+
+## The source-selection helper could not use a source (v47 patch 2)
+
+**Symptom.** Two distinct diagnostics, both emitted by `Select-BaseWinRESource` during Step 2 or during the checkpoint validator. Neither is an abort on its own; the run continues with the next source in the preference order.
+
+**Log signature A -- registered WIM present but unreadable:**
+
+```
+[WARN] Registered WinRE candidate is present at <path> but its servicing metadata could not be read; treating as not usable
+```
+
+**Log signature B -- WIM found at a location that is not the registered location:**
+
+```
+[WARN] A WIM was discovered at <path> but not at the registered location; not treating it as a registered source
+```
+
+**Cause.** Signature A: `Get-WimServicingMetadata` failed on the registered WIM even though `Test-Path` returned true. The registered image may be corrupt, partially written, or held open by another process. Signature B: a WIM was discovered by the loose fallback-discovery path at a location that is not the reagentc-registered one. Under v47 such a WIM is deliberately excluded from source selection.
+
+**Resolution.**
+
+1. Run `Test-WinRE.ps1` Option 1 and check the "Build numbers" block. If the Active WIM build reads `unknown (active WIM not locatable)`, the registered image is corrupt or unreadable.
+2. If signature A recurs on a machine whose registered WIM is expected to be valid, investigate the registered recovery partition's storage state; the same investigation applies as for the `Registered WinRE metadata could not be read - forcing rebuild` production message.
+3. If signature B appears, the source selection is working as designed; the loose WIM is not a source-selection candidate under v47. A machine that later needs a rebuild will source from the LKG or the GitHub cold-start.
+
+**Field status.** Neither path has been exercised in the field.
+
+## The OS-fallback missing-WIM guard forced a rebuild (v47 patch 2)
+
+**Symptom.** The run takes the full-update path instead of the enable-only path (or instead of the fast path) on a machine whose WinRE is registered via OS-fallback. This is the guard firing correctly.
+
+**Log signature.**
+
+```
+[WARN] WinRE is registered via OS-fallback (location: <location>) but its winre.wim could not be read at that location (status=<status>) - forcing rebuild
+```
+
+**Cause.** Under v47 patch 2, the OS-fallback missing-WIM guard no longer requires WinRE to be `Enabled`. When the active route resolves to the OS partition but no readable WIM exists at the registered location, the machine must rebuild. Without the guard, a machine with WinRE `Disabled` and a matching state file could take the full-update path with `$needInject = $false`, and `$imageToCheck` could fall back to a loose WIM at `C:\Windows\System32\Recovery\winre.wim`, bypassing the strip and injection pipeline entirely.
+
+**Resolution.**
+
+1. If the run subsequently completes successfully (`Operating mode: DEDICATED` or OS-FALLBACK, exit 0), nothing needs to be done. The guard fired, the rebuild ran, the machine is healthy.
+2. If the run exits with code 2 because the rebuild deferred, follow the corresponding deferral section above.
+3. If the registered WIM is consistently unreadable at the OS-fallback location, investigate `C:\Recovery\WindowsRE\winre.wim` directly: the file may be corrupt, ACL-denied, or missing. The harness Option 1 "Target recovery partition state" block reports what the harness can see.
+
+**Field status.** This guard is a v47 patch 2 code-review hardening. It has not been exercised in the field.
 
 ## The destructive replacement was deferred before partition deletion (v45 patch 1; v46 patch 2 and v47 patch 1 added reasons)
 
@@ -1166,7 +1268,7 @@ If C: is encrypted, the OS-fallback gate defers and the machine ends with **neit
 
 If `Restore-OSPartitionSize` also fails, `$Script:GeometryRestoreFailed` is set and the state file is deleted. The next run will re-attempt the destructive path from scratch.
 
-## The post-delete extension failed (v45 patch 1; capped at bucket size in v46 patch 2)
+## The post-delete extension failed (v45 patch 1; bucket cap in v46 patch 2; ceiling-fill in v47 patch 2)
 
 **Symptom.** The plan called for C: to grow into the space the old recovery partitions occupied (the surplus case). The extension ran after the deletions and failed after all retries. The script used its safe fallback and continued with a slightly different recovery partition layout than the plan intended — the recovery partition starts at the current (un-extended) C: end instead of the planned offset, and is sized to the plan's bucket rather than to the full remaining extent.
 
@@ -1177,7 +1279,7 @@ If `Restore-OSPartitionSize` also fails, `$Script:GeometryRestoreFailed` is set 
 [WARN] Post-delete extend attempt 2 failed: ...
 [WARN] Post-delete extend attempt 3 failed: ...
 [WARN] Post-delete C: extension failed after all retries; attempting the safe fallback (recovery partition at the current C: end) so WinRE remains deployable.
-[INFO] Extension-failure fallback: creating recovery partition at <offset> MiB with size <size> MiB (bucket size, not full extent; <trailing> MiB trailing unallocated extent will remain between the recovery partition end and the aligned managed extent end; the C: extension was not performed)
+[INFO] Extension-failure fallback: creating recovery partition at <offset> MiB with size <size> MiB (fills the available extent up to the 2048 MiB managed-recovery ceiling; <trailing> MiB trailing unallocated extent will remain; the C: extension was not performed)
 ```
 
 The run then proceeds to create, format, and deploy into the fallback partition. The exit code is 2 (`EXIT_WARNING`) because `$Script:nonFatalWarning` is set.
@@ -1190,9 +1292,9 @@ If the fallback also fails — the remaining extent after the current C: end is 
 
 **Cause.** `Invoke-OSPartitionExtend` runs three times with 5-second spacing between attempts. It fails when the storage stack refuses to grow C: into the freed space — typically because a file on the volume is unmovable, because a temporary lock is held by a system service, or because the disk has a physical constraint. The extension is a real operation on physical storage, and its failure is a storage-stack condition, not a script bug.
 
-**Why the safe fallback exists.** Exact geometry — C: ending exactly at the planned boundary, recovery partition of exactly the planned size — is a goal, not a reason to leave WinRE disabled. When the extension fails, the script computes the largest recovery partition that fits between the current C: end and `AlignedManagedExtentEnd`. If that is at least the plan's bucket size, it creates the partition there, sized to the bucket. The trade is a trailing unallocated extent between the new recovery partition's end and the aligned managed-extent end; the benefit is that WinRE is deployable and functional. The alternative — restore C:, return `$null`, fall through to OS-fallback on an encrypted C: — leaves the machine degraded when a working dedicated recovery partition was one step away.
+**Why the safe fallback exists.** Exact geometry — C: ending exactly at the planned boundary, recovery partition of exactly the planned size — is a goal, not a reason to leave WinRE disabled. When the extension fails, the script computes the largest recovery partition that fits between the current C: end and `AlignedManagedExtentEnd`. If that is at least the plan's bucket size, it creates the partition there, sized to `min(AvailableSize, 2 GiB)` — the full available extent, capped at the managed-recovery ceiling. This fills the extent in the common case, eliminating the trailing unallocated space; only when the surplus exceeds 2 GiB does a trailing extent remain. The alternative — restore C:, return `$null`, fall through to OS-fallback on an encrypted C: — leaves the machine degraded when a working dedicated recovery partition was one step away.
 
-**v46 patch 2 change.** Before v46 patch 2 the fallback assigned the entire remaining extent — from the current C: end to the aligned managed-extent end — to the replacement partition. On a layout with a large surplus that could exceed the 2 GiB managed-recovery ceiling. The v46 patch 2 cap sizes the replacement partition to the plan's bucket instead, and logs the residual as the trailing unallocated extent named in the log line above. The cap enforces the same policy the rest of the script follows.
+**Evolution of the fallback sizing rule.** Before v46 patch 2 the fallback assigned the entire remaining extent to the replacement partition, which on a layout with a large surplus could exceed the 2 GiB managed-recovery ceiling. v46 patch 2 introduced the ceiling but sized the partition to the plan's bucket — the smallest legal size — leaving the surplus as a trailing unallocated extent on every fallback. v47 patch 2 keeps the ceiling but fills up to it: the partition is sized to `min(AvailableSize, 2 GiB)`, which eliminates the trailing extent whenever the surplus fits under the ceiling.
 
 **Resolution.**
 
@@ -1277,7 +1379,7 @@ Parser: reagentc location  [FAIL] ...did not match any line
 
 **Resolution.** Automatic. The script falls through to the full-update path. A rebuild on a healthy machine is a no-op for the partition layout; it copies the current WIM, verifies it, and rewrites the state file.
 
-**Expected during the v44 patch 1, v45 patch 1, v46 patch 1, and v47 patch 1 rollouts.** Each revision changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45, v46 patch 1, and v47 patch 1 each changed the `SCRIPT` component. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
+**Expected during the v44 patch 1, v45 patch 1, v46 patch 1, v47 patch 1, and v47 patch 2 rollouts.** Each revision changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45, v46 patch 1, and v47 patch 1 each changed the `SCRIPT` component; v47 patch 2 changes the DSI value on one narrow machine class by normalising the `Win32_ComputerSystemProduct.Version` field (machines whose padded value is at least four characters long while its trimmed value is shorter than four). Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
 
 Under v47 the first run also writes the `DeployedWinREMetadata` anchor. From the second v47 run onward the drift detector compares against it.
 
@@ -1500,11 +1602,11 @@ Two checks run under `-DryRun` in read-only form and log a `Would defer …` or 
 
 A dry run that reports either of these is telling you the machine would be deferred on the next live run. Address the underlying condition before running the script for real.
 
-The DryRun contract for the OS-fallback BitLocker gate is that the gate is logged but does not short-circuit. If the OS-fallback route is reached under DryRun, the gate logs `OS-fallback deferred: C: could not be confirmed fully decrypted` and continues — but the deployed WIM plan downstream is not evaluated against C:'s state, because no WIM is deployed under DryRun.
+Under DryRun the OS-fallback BitLocker gate is not reached. The full-update pipeline's DryRun choke point sits above the Step 5 target-preparation block, so a dry run exits before the OS-fallback route is chosen and before the gate is evaluated. If the gate were reachable under DryRun, there is no `-DryRun` check on that exit and it would exit `EXIT_WARNING` unconditionally.
 
 The DryRun contract for the VMD-query-indeterminate deferral (v44 patch 6) is the same: the enumeration error is logged, and the run continues rather than exiting.
 
-The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the specific deferral reason is not surfaced in dry-run mode the way it is in a live run, because DryRun's choke point sits above the reason-returning code. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN]   - Disk …` lines.
+The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the reasons evaluated before the DryRun choke point are surfaced exactly as in a live run, while the reasons only reachable after the choke point or gated on `-not $Script:DryRun` are not. The surfaced group is the plan-rejection reasons (all thirteen), `partition geometry unavailable`, `C: volume could not be read for free-space check`, `post-shrink free space below minimum`, and `active WinRE location could not be resolved` (seventeen of the twenty-five distinct reason strings). The unsurfaced group is the pre-shrink execution paths (`pre-shrink failed`, `pre-shrink verification failed`, `resize rounding reduced planned extent`), the two disable-failure paths, the deletion-failure path, and the registered-source-changed abort. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN]   - Disk …` lines.
 
 Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable …` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
 
