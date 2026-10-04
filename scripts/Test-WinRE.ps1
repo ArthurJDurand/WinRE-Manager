@@ -43,7 +43,26 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 23
+    Version : 24
+
+    v24 changes vs v23:
+    1. Fixed the active-WIM diagnostic probe. The prior code
+       constructed "<registered-location>\Recovery\WindowsRE\winre.wim",
+       which is correct when reagentc /info returns a partition root but
+       doubles the path when it returns "...\Recovery\WindowsRE" --
+       producing "...\Recovery\WindowsRE\Recovery\WindowsRE\winre.wim"
+       and reporting the active WIM as missing when it is present. The
+       harness now probes both forms in order and uses the first that
+       resolves to a readable file, matching production's
+       Ensure-RecoveryPartitionAccess dual-path behavior.
+    2. Harness version string bumped 23 -> 24 in the menu title and
+       startup Rule.
+    3. Trimmed the Version field in Get-ThisMachineProfile, mirroring
+       production's v47 patch 2 Get-HardwareObject change. Some vendors
+       pad Win32_ComputerSystemProduct.Version with trailing whitespace
+       (observed: ASUS sets it to "1.0 "); without trimming, the
+       harness's DSI mirror could compute a different HW component than
+       production on such machines, causing a false Option-S mismatch.
 
     v23 changes vs v22:
     1. Bumped Get-DesiredStateId's $ProductionScriptVersion default
@@ -738,7 +757,10 @@ function Get-ThisMachineProfile {
     }
 
     $model   = if ($cs.Model) { $cs.Model.Trim() } else { "" }
-    $version = $product.Version
+    # Mirror of production's Get-HardwareObject: trim trailing whitespace
+    # from the Version field so the DSI mirror computes the same HW
+    # component production does. See the comment in scripts/WinRE.ps1.
+    $version = if ($product.Version) { $product.Version.Trim() } else { $null }
     $machineType = "UNKN"
     if ($manufacturer -eq "LENOVO") {
         if ($model -match '^([A-Z0-9]{4})')                          { $machineType = $Matches[1] }
@@ -1163,12 +1185,23 @@ function Show-SystemDiagnostic {
     $activeWimSize = 0
     if ($wreState.Location) {
         $locationBase = $wreState.Location.TrimEnd('\')
-        $cand = "$locationBase\Recovery\WindowsRE\winre.wim"
-        if (Test-Path -LiteralPath $cand) {
-            try {
-                $activeWimPath = $cand
-                $activeWimSize = (Get-Item -LiteralPath $cand -Force).Length
-            } catch { }
+        # v24: probe both forms. reagentc /info may return a partition
+        # root (in which case \Recovery\WindowsRE\winre.wim is correct)
+        # or a path that already includes Recovery\WindowsRE (in which
+        # case \winre.wim is correct). Production's
+        # Ensure-RecoveryPartitionAccess handles both; the harness
+        # must match.
+        foreach ($cand in @(
+            (Join-Path $locationBase "Recovery\WindowsRE\winre.wim"),
+            (Join-Path $locationBase "winre.wim")
+        )) {
+            if (Test-Path -LiteralPath $cand -PathType Leaf) {
+                try {
+                    $activeWimPath = $cand
+                    $activeWimSize = (Get-Item -LiteralPath $cand -Force).Length
+                    break
+                } catch { }
+            }
         }
     }
     if ($activeWimPath) {
@@ -2510,7 +2543,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v23)"
+    $titleContent = "WinRE Manager Test Harness (v24)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -2558,7 +2591,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v23"
+Rule "WinRE Manager test harness v24"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

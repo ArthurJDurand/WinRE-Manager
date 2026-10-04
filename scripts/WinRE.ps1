@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 47 (v47 patch 1)
+    Version : 47 (v47 patch 2)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -52,7 +52,6 @@
                 final deployed WIM's SHA256. Logged for evidence only; no
                 gate reads any of these values and none enters
                 DesiredStateId.
-
             - LKG migration bridge: on the first v47 run on a machine whose
                 state file was written by v46 or earlier, the DSI mismatch
                 correctly causes the state reader to return empty, which
@@ -63,6 +62,28 @@
                 migration window. It does NOT make the stale state
                 operationally authoritative and is used only at
                 LKG-validation call sites.
+            - Source-selection is a single shared helper (v47 patch 2).
+                Step 2 and the checkpoint validator call the same
+                function, so decision-rule drift between the two call
+                sites is structurally impossible. The Step 3 checkpoint
+                also binds to the source hash, and the base.wim copy is
+                hash-verified immediately after Copy-Item so the recorded
+                source identity describes the bytes that actually entered
+                servicing.
+            - DSI input hygiene: Win32_ComputerSystemProduct.Version is
+                trimmed before being used as the machine-type fallback.
+                Some vendors (ASUS) pad it with trailing whitespace; the
+                value is deterministic either way, but the trimmed form
+                is the correct one and prevents a vendor-DMI-string quirk
+                from leaking into the HW component of DesiredStateId.
+            - The missing-WIM guard on the OS-fallback route does not
+                consult WinRE status. With WinRE Disabled and a matching
+                state file, the fast path is skipped but the full-update
+                path is still entered with $needInject = $false; without
+                the guard, $imageToCheck could fall back to a loose WIM
+                at C:\Windows\System32\Recovery\winre.wim, bypassing the
+                strip/injection/rebuild pipeline entirely. The DEDICATED
+                route has the same shape.
 
         Known gap:
             - Offline fallback trusts stored DesiredStateId; LocalInputsId would
@@ -94,6 +115,11 @@
         after manage-bde -off. Decrypt in place.
       - Failed-injection abort removes base.wim too, else step 2 fails
         on the next run at Rename-Item.
+      - Workspace candidate filtering uses IsSystem AND NOT IsBoot, not
+        IsSystem alone. On legacy/BIOS single-volume machines, C: is
+        both IsSystem and IsBoot; excluding IsSystem unconditionally
+        made the OS-volume fallback in Get-WorkDirPlan unreachable on
+        those machines.
 #>
 
 [CmdletBinding()]
@@ -111,7 +137,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 47
-$ScriptPatchLevel = "1"
+$ScriptPatchLevel = "2"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -339,7 +365,16 @@ function Get-WorkDirCandidates {
 
         $driveLetter = ([string]$volume.DriveLetter).ToUpperInvariant()
         $partition = Get-Partition -DriveLetter $driveLetter -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $partition -or $partition.IsSystem) { continue }
+        if (-not $partition) { continue }
+        # Exclude the UEFI System Partition (IsSystem, not IsBoot) while
+        # allowing the OS partition on legacy/BIOS layouts, where C: is
+        # both IsBoot and IsSystem. Excluding IsSystem unconditionally
+        # made the OS-volume fallback in Get-WorkDirPlan unreachable on
+        # those machines. The ESP cannot pass the earlier NTFS filter in
+        # any case, but the explicit IsBoot qualification is the correct
+        # predicate for "a partition we are allowed to write scratch
+        # data to".
+        if ($partition.IsSystem -and -not $partition.IsBoot) { continue }
 
         $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction SilentlyContinue
         if (-not $disk -or $disk.IsOffline -or $disk.BusType.ToString() -notin $InternalWorkspaceBusTypes) { continue }
@@ -853,7 +888,8 @@ function Assert-PartitionSizeAfterResize {
         [Parameter(Mandatory)][int]$DiskNumber,
         [Parameter(Mandatory)][int]$PartitionNumber,
         [Parameter(Mandatory)][int64]$ExpectedSizeBytes,
-        [int64]$ToleranceBytes = 1MB
+        [int64]$ToleranceBytes = 1MB,
+        [switch]$SuppressSuccessLog
     )
     try {
         $re = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
@@ -870,7 +906,9 @@ function Assert-PartitionSizeAfterResize {
             Write-Log "Assert-PartitionSizeAfterResize: partition $DiskNumber/$PartitionNumber size $([math]::Round($re.Size/1MB,2)) MiB, expected $([math]::Round($ExpectedSizeBytes/1MB,2)) MiB, delta $([math]::Round($delta/1MB,2)) MiB > tolerance $([math]::Round($ToleranceBytes/1MB,2)) MiB" -Level ERROR
             return $false
         }
-        Write-Log "Verified partition $DiskNumber/$PartitionNumber size $([math]::Round($re.Size/1MB,2)) MiB (expected $([math]::Round($ExpectedSizeBytes/1MB,2)) MiB)"
+        if (-not $SuppressSuccessLog) {
+            Write-Log "Verified partition $DiskNumber/$PartitionNumber size $([math]::Round($re.Size/1MB,2)) MiB (expected $([math]::Round($ExpectedSizeBytes/1MB,2)) MiB)"
+        }
         return $true
     } catch {
         Write-Log "Assert-PartitionSizeAfterResize: query failed for $DiskNumber/$PartitionNumber - $_" -Level ERROR
@@ -1400,7 +1438,13 @@ function Ensure-AdequateRecoveryPartition {
 
         if (-not $Script:DryRun) {
             $osPart = Get-OSPartition
-            if (-not $osPart -or -not (Assert-PartitionSizeAfterResize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber -ExpectedSizeBytes $plan.PlannedOSPartitionSize)) {
+            # The shrink already verified the resize internally
+            # (Invoke-OSPartitionShrink calls Assert-PartitionSizeAfterResize
+            # after each attempt). This re-check confirms the same thing on
+            # a fresh Get-OSPartition read; keep the check as a defensive
+            # confirmation but suppress its success log line so the run
+            # log has exactly one "Verified partition" line per shrink.
+            if (-not $osPart -or -not (Assert-PartitionSizeAfterResize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber -ExpectedSizeBytes $plan.PlannedOSPartitionSize -SuppressSuccessLog)) {
                 Restore-OSPartitionSize -Reason "pre-destructive shrink verification failure" -TargetSizeBytes $initialOSSize | Out-Null
                 Write-Log "OS partition did not land at the planned size; preserving the old recovery route and deferring" -Level ERROR
                 return @{ Status = "Deferred"; Reason = "pre-shrink verification failed"; RetrySuppressible = $true }
@@ -1627,25 +1671,24 @@ function Ensure-AdequateRecoveryPartition {
                     $fallbackEnd = [int64]$plan.AlignedManagedExtentEnd
                     $fallbackSize = [int64]($fallbackEnd - $fallbackStart)
                     if ($fallbackSize -ge $plan.PlannedPartitionSize) {
-                        # Create only the planned bucket size; the remainder
-                        # between the new partition's end and the aligned
-                        # managed extent end is an explicitly logged trailing
-                        # unallocated extent. It is not assigned to the
-                        # recovery partition, because doing so could exceed
-                        # the 2 GiB managed-recovery ceiling when the plan
-                        # reclaimed multiple recovery partitions whose
-                        # combined size exceeds the bucket. Exact-fit
-                        # geometry is preferred when the C: extension
-                        # succeeds; when it fails, a correctly sized WinRE
-                        # partition takes precedence over consuming the
-                        # residual space.
-                        $fallbackTrailingExtent = [int64]($fallbackEnd - ($fallbackStart + $plan.PlannedPartitionSize))
-                        Write-Log "Extension-failure fallback: creating recovery partition at $([math]::Round($fallbackStart/1MB,3)) MiB with size $([math]::Round($plan.PlannedPartitionSize/1MB,3)) MiB (bucket size, not full extent; $([math]::Round($fallbackTrailingExtent/1MB,3)) MiB trailing unallocated extent will remain between the recovery partition end and the aligned managed extent end; the C: extension was not performed)"
+                        # Fill the available extent up to the 2 GiB managed-
+                        # recovery ceiling. This eliminates the trailing
+                        # unallocated extent in the common case (the old
+                        # recovery partitions were only slightly larger than
+                        # the new bucket), while still respecting the ceiling
+                        # that prevents the recovery partition from growing
+                        # past 2 GiB. Only when the surplus exceeds the
+                        # ceiling does a trailing unallocated extent remain,
+                        # and it is logged explicitly.
+                        $maxManagedBytes = [int64]($MaxManagedRecoveryPartitionMiB * 1MB)
+                        $fallbackPartitionSize = [int64][Math]::Min($fallbackSize, $maxManagedBytes)
+                        $fallbackTrailingExtent = [int64]($fallbackEnd - ($fallbackStart + $fallbackPartitionSize))
+                        Write-Log "Extension-failure fallback: creating recovery partition at $([math]::Round($fallbackStart/1MB,3)) MiB with size $([math]::Round($fallbackPartitionSize/1MB,3)) MiB (fills the available extent up to the $([math]::Round($maxManagedBytes/1MB)) MiB managed-recovery ceiling; $([math]::Round($fallbackTrailingExtent/1MB,3)) MiB trailing unallocated extent will remain; the C: extension was not performed)"
                         $plan.PlannedOSPartitionSize = [int64]$fallbackOSPart.Size
                         $plan.PlannedOSPartitionEnd = $fallbackOSEnd
                         $plan.PlannedPartitionStart = $fallbackStart
-                        # PlannedPartitionSize is left at the bucket size.
-                        $plan.PlannedAvailableBytes = $plan.PlannedPartitionSize
+                        $plan.PlannedPartitionSize = $fallbackPartitionSize
+                        $plan.PlannedAvailableBytes = $fallbackPartitionSize
                         $plan.FallbackTrailingExtentBytes = $fallbackTrailingExtent
                         $Script:nonFatalWarning = $true
                         $fallbackUsable = $true
@@ -1723,7 +1766,7 @@ function Ensure-AdequateRecoveryPartition {
     # expected. Re-query and verify; on failure, remove the orphan and
     # return $null so the caller falls back as it does for Format-Volume
     # failure.
-    if (-not (Assert-RecoveryPartitionLayout -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -ExpectedOffsetBytes $newOffset -ExpectedSizeBytes $newSize -ExpectedEndBytes $plan.AlignedManagedExtentEnd)) {
+    if (-not (Assert-RecoveryPartitionLayout -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -ExpectedOffsetBytes $newOffset -ExpectedSizeBytes $newSize -ExpectedEndBytes $plannedEnd)) {
         Write-Log "Recovery partition did not land at the planned geometry - removing it and deferring" -Level ERROR
         Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "post-creation geometry assertion failed" -TargetOSPartitionSizeBytes $initialOSSize | Out-Null
         return $null
@@ -2163,7 +2206,13 @@ function Get-HardwareObject {
     Write-Log "Intel generation: $(if ($gen) { $gen } else { 'N/A' })"
 
     $model = if ($cs.Model) { $cs.Model.Trim() } else { "" }
-    $version = $product.Version
+    # Some vendors pad Win32_ComputerSystemProduct.Version with trailing
+    # whitespace (observed: ASUS sets it to "1.0 "). The value is used as
+    # the machine-type fallback on non-Lenovo machines when the field is
+    # at least four characters long; without trimming, the whitespace
+    # leaks into the HW component of DesiredStateId. The value stays
+    # deterministic either way, but a trimmed form is the correct one.
+    $version = if ($product.Version) { $product.Version.Trim() } else { $null }
     $machineType = "UNKN"
     if ($Manufacturer -eq "LENOVO") {
         if ($model -match '^([A-Z0-9]{4})')             { $machineType = $Matches[1]; Write-Log "Lenovo machine type from ComputerSystem.Model: $machineType" }
@@ -2315,6 +2364,92 @@ function Get-LKGWinREImagePath {
         return $null
     }
     return @{ Path = $candidate; Hash = $hash }
+}
+
+# v47 patch 2: canonical source-selection helper. Called from Step 2
+# (to acquire the base WIM) and from the checkpoint validator (to
+# prove a staged candidate was built from the source the current
+# selection rules would choose). Sharing the implementation makes
+# drift between the two call sites structurally impossible.
+#
+# Returns a hashtable with non-null SourcePath, SourceHash, Reason,
+# and Branch when a local source is usable. Returns $null when
+# neither local source is usable and the caller should fall through
+# to the GitHub cold-start.
+#
+# The function does NOT consult $WinREState.Status. A disabled
+# WinRE route can have a valid registered WIM; the source decision
+# depends on whether the registered location yielded a readable WIM
+# ($ActiveLocationWimPresent), the LKG's hash validity, and the
+# metadata comparison — not on whether WinRE happens to be Enabled
+# or Disabled at the moment the decision is made.
+function Select-BaseWinRESource {
+    param(
+        [AllowEmptyString()][string]$ActiveLocationImage,
+        [AllowNull()][string]$ActiveLocationHash,
+        [bool]$ActiveLocationWimPresent,
+        [AllowEmptyString()][string]$LkgStoredHash
+    )
+
+    $lkgResult = Get-LKGWinREImagePath -StoredHash $LkgStoredHash
+    $lkgPath   = if ($lkgResult) { $lkgResult.Path } else { $null }
+    $regMeta   = if ($ActiveLocationWimPresent -and $ActiveLocationImage) {
+        Get-WimServicingMetadata -WimPath $ActiveLocationImage
+    } else { $null }
+    $regUsable = [bool]($ActiveLocationWimPresent -and $ActiveLocationImage -and $regMeta)
+    $lkgUsable = [bool]$lkgResult
+
+    # Diagnostic logging for the two edge cases. Kept from the inline
+    # logic to preserve the same operator-facing evidence.
+    if (-not $regUsable -and $ActiveLocationWimPresent -and $ActiveLocationImage) {
+        Write-Log "Registered WinRE candidate is present at $ActiveLocationImage but its servicing metadata could not be read; treating as not usable" -Level WARN
+    }
+    if (-not $ActiveLocationWimPresent -and $ActiveLocationImage) {
+        Write-Log "A WIM was discovered at $ActiveLocationImage but not at the registered location; not treating it as a registered source" -Level WARN
+    }
+
+    if ($regUsable -and $lkgUsable) {
+        $lkgMeta = Get-WimServicingMetadata -WimPath $lkgPath
+        $cmp = Compare-WimServicingMetadata -MetaA $regMeta -MetaB $lkgMeta
+        if ($cmp -eq 'A-older') {
+            return @{
+                SourcePath = $lkgPath
+                SourceHash = $lkgResult.Hash
+                Reason     = "registered older than LKG (reg=$($regMeta.Version)/$($regMeta.SPBuild), lkg=$($lkgMeta.Version)/$($lkgMeta.SPBuild))"
+                Branch     = "lkg-newer"
+            }
+        } elseif ($cmp -eq 'A-newer-or-equal') {
+            return @{
+                SourcePath = $ActiveLocationImage
+                SourceHash = $ActiveLocationHash
+                Reason     = "registered at least as new as LKG (reg=$($regMeta.Version)/$($regMeta.SPBuild), lkg=$($lkgMeta.Version)/$($lkgMeta.SPBuild))"
+                Branch     = "registered-newer"
+            }
+        } else {
+            return @{
+                SourcePath = $lkgPath
+                SourceHash = $lkgResult.Hash
+                Reason     = "metadata comparison indeterminate; using hash-validated LKG"
+                Branch     = "indeterminate-lkg"
+            }
+        }
+    } elseif ($regUsable) {
+        return @{
+            SourcePath = $ActiveLocationImage
+            SourceHash = $ActiveLocationHash
+            Reason     = "no hash-validated LKG present; using registered"
+            Branch     = "registered-only"
+        }
+    } elseif ($lkgUsable) {
+        return @{
+            SourcePath = $lkgPath
+            SourceHash = $lkgResult.Hash
+            Reason     = "registered not usable; using hash-validated LKG"
+            Branch     = "lkg-only"
+        }
+    } else {
+        return $null
+    }
 }
 
 # =========================== REGISTERED-SOURCE FINGERPRINT ===========================
@@ -3188,7 +3323,13 @@ function Get-GitHubBaseWinRE {
     }
     & $7Zip x (Join-Path $WorkDir $parts[0].name) -o"$WorkDir" -w"$WorkDir\scratch" -y | Out-Null
     if (-not (Test-Path -LiteralPath $extractedWim -PathType Leaf)) {
-        throw "GitHub base WIM extraction did not produce winre.wim"
+        # Return $false rather than throwing: the function's documented
+        # contract is $true on success / $false on unrecoverable failure,
+        # and both call sites handle $false by exiting EXIT_FATAL. The
+        # outer try/catch would also catch a throw, but the contract is
+        # cleaner if this path returns.
+        Write-Log "GitHub base WIM extraction did not produce winre.wim" -Level ERROR
+        return $false
     }
     $staleBase = Join-Path $WorkDir "base.wim"
     if (Test-Path -LiteralPath $staleBase) {
@@ -3753,25 +3894,52 @@ try {
         }
     }
 
-    if ($activeOnRecovery -and -not $ActiveLocationWimPresent -and $WinREState.Status -eq "Enabled") {
+    if ($activeOnRecovery -and -not $ActiveLocationWimPresent) {
+        # v47 patch 2: the guard no longer requires WinRE status to be
+        # "Enabled". A machine whose WinRE is Disabled, whose registered
+        # location resolves to a valid type-coded recovery partition,
+        # and whose registered winre.wim is missing or corrupt must
+        # rebuild, not enter the enable-only path against a missing WIM.
         if ($Script:DryRun -and $WinREState.Location -match '^\\\\\?\\GLOBALROOT') {
             Write-Log "[DRY RUN] Cannot verify winre.wim at the reagentc-registered GLOBALROOT location without a drive letter (which DryRun does not assign). A live run would Test-Path the WIM and force a rebuild only if it is missing or unreadable." -Level INFO
         } else {
-            Write-Log "WinRE is registered on recovery partition $($activePart.DiskNumber)/$($activePart.PartitionNumber) but its winre.wim could not be read at that location - forcing rebuild" -Level WARN
+            Write-Log "WinRE is registered on recovery partition $($activePart.DiskNumber)/$($activePart.PartitionNumber) but its winre.wim could not be read at that location (status=$($WinREState.Status)) - forcing rebuild" -Level WARN
             $needInject = $true
         }
     }
-    # v47: mirror of the guard above for the OS-fallback route. The
-    # registered location there is C:\Recovery\WindowsRE, and the fast
-    # path's OS-fallback branch accepts the machine on the classifier
-    # verdict alone; it does not re-check that the WIM at that location
-    # is readable. Without this guard, a machine whose registered
-    # OS-fallback winre.wim has gone missing could take the fast path on
-    # the strength of a WIM discovered by the loose fallback path
-    # ($FallbackImage), which is not the registered source. Force a
-    # rebuild so the repair path replaces the registered image.
-    elseif ($activeOnOSFallback -and -not $ActiveLocationWimPresent -and $WinREState.Status -eq "Enabled") {
-        Write-Log "WinRE is registered via OS-fallback (location: $($WinREState.Location)) but its winre.wim could not be read at that location - forcing rebuild" -Level WARN
+    # v47 patch 2 follow-up: mirror of the guard above for the OS-fallback
+    # route, without a status restriction.
+    #
+    # The registered location there is C:\Recovery\WindowsRE. When that
+    # WIM is missing or unreadable AND the active route resolves to the
+    # OS partition, the machine must rebuild. The status-Enabled
+    # restriction was incorrect: with WinRE Disabled and the state file
+    # matching, the fast path is skipped (its status check fails), but
+    # the full-update path is entered with $needInject = $false, and
+    # $imageToCheck can fall back to a loose WIM at
+    # C:\Windows\System32\Recovery\winre.wim. That bypasses the v47
+    # strip/injection/rebuild pipeline entirely - which is exactly the
+    # path the strip stage exists to close.
+    elseif ($activeOnOSFallback -and -not $ActiveLocationWimPresent) {
+        Write-Log "WinRE is registered via OS-fallback (location: $($WinREState.Location)) but its winre.wim could not be read at that location (status=$($WinREState.Status)) - forcing rebuild" -Level WARN
+        $needInject = $true
+    }
+
+    # v47 patch 2 follow-up: WinRE Disabled with no resolvable registered
+    # route at all. Neither missing-WIM guard above fires because both
+    # require an active route. Without this guard, the full-update path is
+    # entered with $needInject = $false and $imageToCheck pointing at a
+    # loose fallback WIM (typically C:\Windows\System32\Recovery\Winre.wim
+    # or the manager's own C:\Recovery\WindowsRE\winre.wim), which bypasses
+    # the v47 strip/injection/rebuild pipeline entirely. Force a rebuild so
+    # the deployed image comes from the managed source-selection hierarchy
+    # and is normalized by the strip stage.
+    if (-not $needInject -and
+        $WinREState.Status -eq "Disabled" -and
+        -not $activeOnRecovery -and
+        -not $activeOnOSFallback) {
+        $regLoc = if ($WinREState.Location) { $WinREState.Location } else { '(no registered location)' }
+        Write-Log "WinRE is Disabled and its registered recovery route ($regLoc) cannot be resolved to a dedicated partition or the OS-fallback path - forcing a rebuild through the managed source pipeline so the deployed image is normalized and verified" -Level WARN
         $needInject = $true
     }
 
@@ -4049,30 +4217,47 @@ try {
     # Initialize scratch only after all no-op and enable-only paths exit.
     $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
 
-    # v47: a WIM_READY checkpoint is bound to the source-content hash that
-    # produced the staged WIM. The metadata comparison in the drift
-    # detector cannot detect a metadata-neutral source change (Microsoft
-    # documents that a Dynamic Update may not bump Version or SPBuild).
-    # The staged WIM must be invalidated if the source it was prepared
-    # from is no longer present with the same bytes. Legacy checkpoints
-    # without a source hash are also invalidated.
-    if ($cp.Valid -and $cp.Step -ge 4 -and $cp.WimReady) {
+    # v47 patch 2: source-hash binding applies at Step 3 as well as
+    # Step 4. A Step 3 checkpoint carries the source hash of the staged
+    # base.wim (pre-strip, pre-injection), so a resume can prove the
+    # staged artifact was built from the source the current selection
+    # rules would choose. The validator runs the same
+    # Select-BaseWinRESource helper that Step 2 uses, so the decision
+    # rules are guaranteed identical.
+    #
+    # Two conservative rules:
+    #   - A checkpoint without a recorded SourceHash (legacy v47 patch 1
+    #     Step 3 checkpoints, or a GitHub cold-start) is invalidated.
+    #   - A currently-selected source without a SourceHash (GitHub
+    #     cold-start, or a selection that returned no usable local
+    #     source) cannot validate a resumable checkpoint.
+    if ($cp.Valid -and $cp.Step -ge 3) {
         $storedSourceHash = $cp.SourceHash
         if (-not $storedSourceHash) {
-            Write-Log "Checkpoint WIM_READY has no recorded source identity (legacy or GitHub-sourced checkpoint); invalidating to rebuild from a known source" -Level WARN
+            Write-Log "Checkpoint step $($cp.Step) has no recorded source identity (legacy or GitHub-sourced checkpoint); invalidating to rebuild from a known source" -Level WARN
             Remove-ItemIfExist $CheckpointFile
             $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
         } else {
-            $candidateHashes = @()
-            if ($ActiveLocationHash) { $candidateHashes += $ActiveLocationHash }
-            $lkgForCheck = Get-LKGWinREImagePath -StoredHash $lkgStoredHash
-            if ($lkgForCheck) { $candidateHashes += $lkgForCheck.Hash }
-            if ($candidateHashes -notcontains $storedSourceHash) {
-                Write-Log "Checkpoint WIM_READY source identity $storedSourceHash no longer matches any available source (registered=$(if ($ActiveLocationHash) { $ActiveLocationHash } else { 'none' }), lkg=$(if ($lkgForCheck) { $lkgForCheck.Hash } else { 'none' })); invalidating to rebuild from the current source" -Level WARN
+            $selectionNow = Select-BaseWinRESource `
+                -ActiveLocationImage $ActiveLocationImage `
+                -ActiveLocationHash $ActiveLocationHash `
+                -ActiveLocationWimPresent $ActiveLocationWimPresent `
+                -LkgStoredHash $lkgStoredHash
+
+            if (-not $selectionNow -or -not $selectionNow.SourceHash) {
+                Write-Log "Checkpoint step $($cp.Step) source identity $storedSourceHash cannot be re-validated against the current selection (no selected source, or GitHub cold-start has no on-disk hash); invalidating to rebuild" -Level WARN
+                Remove-ItemIfExist $CheckpointFile
+                $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
+            } elseif ($selectionNow.SourceHash -ne $storedSourceHash) {
+                Write-Log "Checkpoint step $($cp.Step) source identity $storedSourceHash does not match the currently-selected source $($selectionNow.SourceHash) ($($selectionNow.Reason)); invalidating to rebuild" -Level WARN
                 Remove-ItemIfExist $CheckpointFile
                 $cp = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
             } else {
-                Write-Log "Checkpoint WIM_READY source identity $storedSourceHash matches an available source"
+                Write-Log "Checkpoint step $($cp.Step) source identity $storedSourceHash matches the currently-selected source"
+                # v47 patch 2: restore the staged source hash so a
+                # resumed Step 3 → Step 4 execution writes the correct
+                # checkpoint at Step 4.
+                $Script:StagedWimSourceHash = $storedSourceHash
             }
         }
     }
@@ -4254,78 +4439,47 @@ try {
                     exit $EXIT_FATAL
                 }
             } else {
-                # v47: source selection. The registered image is usable
-                # only when its servicing metadata can be read. The LKG
-                # is usable only when its SHA256 matches
-                # state.CurrentImageHash. If neither is usable, fall
-                # through to the GitHub cold-start baseline; the loose
-                # $FallbackImage discovery is not a designed source and
-                # is not used here.
-                $lkgResult = Get-LKGWinREImagePath -StoredHash $lkgStoredHash
-                $lkgPath   = if ($lkgResult) { $lkgResult.Path } else { $null }
-                # v47: only treat the candidate as "registered" when discovery
-                # found a readable WIM at the registered location.
-                # $ActiveLocationImage can be populated by fallback discovery
-                # when the registered location did not produce a WIM; in that
-                # case $ActiveLocationWimPresent is $false and the fallback is
-                # not a designed source. Source-selection chain is
-                # registered -> LKG -> GitHub. Gate accordingly.
-                $regMeta   = if ($ActiveLocationWimPresent -and $ActiveLocationImage) { Get-WimServicingMetadata -WimPath $ActiveLocationImage } else { $null }
-                $regUsable = [bool]($ActiveLocationWimPresent -and $ActiveLocationImage -and $regMeta)
-                $lkgUsable = [bool]$lkgResult
+                # v47 patch 2: source selection via the shared helper, so
+                # the checkpoint validator uses exactly the same decision
+                # rules. The helper handles the registered → LKG → GitHub
+                # preference order and does not consult WinRE status.
+                $selection = Select-BaseWinRESource `
+                    -ActiveLocationImage $ActiveLocationImage `
+                    -ActiveLocationHash $ActiveLocationHash `
+                    -ActiveLocationWimPresent $ActiveLocationWimPresent `
+                    -LkgStoredHash $lkgStoredHash
 
-                if (-not $regUsable -and $ActiveLocationWimPresent -and $ActiveLocationImage) {
-                    Write-Log "Registered WinRE candidate is present at $ActiveLocationImage but its servicing metadata could not be read; treating as not usable" -Level WARN
-                }
-                if (-not $ActiveLocationWimPresent -and $ActiveLocationImage) {
-                    Write-Log "A WIM was discovered at $ActiveLocationImage but not at the registered location; not treating it as a registered source" -Level WARN
-                }
+                if ($selection -and $selection.SourcePath) {
+                    Write-Log "Base WIM source selection: $($selection.Reason) -> $($selection.SourcePath)"
+                    Copy-Item $selection.SourcePath "$WorkDir\base.wim" -Force
 
-                $selectedSource = $null
-                $selectedSourceHash = $null
-                $selectedReason = $null
-                if ($regUsable -and $lkgUsable) {
-                    $lkgMeta = Get-WimServicingMetadata -WimPath $lkgPath
-                    $cmp = Compare-WimServicingMetadata -MetaA $regMeta -MetaB $lkgMeta
-                    if ($cmp -eq 'A-older') {
-                        $selectedSource = $lkgPath
-                        $selectedSourceHash = $lkgResult.Hash
-                        $selectedReason = "registered older than LKG (reg=$($regMeta.Version)/$($regMeta.SPBuild), lkg=$($lkgMeta.Version)/$($lkgMeta.SPBuild))"
-                    } elseif ($cmp -eq 'A-newer-or-equal') {
-                        $selectedSource = $ActiveLocationImage
-                        $selectedSourceHash = $ActiveLocationHash
-                        $selectedReason = "registered at least as new as LKG (reg=$($regMeta.Version)/$($regMeta.SPBuild), lkg=$($lkgMeta.Version)/$($lkgMeta.SPBuild))"
-                    } else {
-                        # Indeterminate comparison (metadata shape mismatch
-                        # or unparseable fields). The registered image is
-                        # not proven at least as new as the LKG, so the
-                        # hash-validated LKG wins.
-                        $selectedSource = $lkgPath
-                        $selectedSourceHash = $lkgResult.Hash
-                        $selectedReason = "metadata comparison indeterminate; using hash-validated LKG"
+                    # v47 patch 2: verify the copy. The checkpoint
+                    # SourceHash must identify the exact bytes that
+                    # entered servicing, not the bytes we intended to
+                    # copy. A copy that failed partway, or that read
+                    # from a source the OS replaced between the hash
+                    # and the copy, would otherwise leave base.wim with
+                    # content different from the recorded hash.
+                    $copiedHash = Get-LiveWimHash -WimPath "$WorkDir\base.wim"
+                    if (-not $copiedHash) {
+                        Write-Log "Base WIM copy is unreadable after Copy-Item - rejecting candidate" -Level ERROR
+                        Remove-ItemIfExist "$WorkDir\base.wim"
+                        Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+                        exit $EXIT_WARNING
                     }
-                } elseif ($regUsable) {
-                    $selectedSource = $ActiveLocationImage
-                    $selectedSourceHash = $ActiveLocationHash
-                    $selectedReason = "no hash-validated LKG present; using registered"
-                } elseif ($lkgUsable) {
-                    $selectedSource = $lkgPath
-                    $selectedSourceHash = $lkgResult.Hash
-                    $selectedReason = "registered not usable; using hash-validated LKG"
+                    if ($copiedHash -ne $selection.SourceHash) {
+                        Write-Log "Base WIM copy hash mismatch: source=$($selection.SourceHash), copied=$copiedHash - rejecting candidate" -Level ERROR
+                        Remove-ItemIfExist "$WorkDir\base.wim"
+                        Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+                        exit $EXIT_WARNING
+                    }
+                    Write-Log "Copied base WIM from $($selection.SourcePath); copy hash verified"
+                    $Script:StagedWimSourceHash = $copiedHash
                 } else {
-                    $selectedReason = "neither registered nor hash-validated LKG usable; GitHub cold-start"
-                }
-
-                if ($selectedSource) {
-                    Write-Log "Base WIM source selection: $selectedReason -> $selectedSource"
-                    Copy-Item $selectedSource "$WorkDir\base.wim" -Force
-                    Write-Log "Copied base WIM from $selectedSource"
-                    $Script:StagedWimSourceHash = $selectedSourceHash
-                } else {
-                    Write-Log "Base WIM source selection: $selectedReason"
+                    Write-Log "Base WIM source selection: neither registered nor hash-validated LKG usable; GitHub cold-start"
                     # GitHub cold-start: no on-disk source to fingerprint.
-                    # A WIM_READY checkpoint prepared from a GitHub source
-                    # will be treated as stale on resume, which is safe.
+                    # A checkpoint prepared from a GitHub source will be
+                    # treated as stale on resume, which is safe.
                     $Script:StagedWimSourceHash = $null
                     if (-not (Get-GitHubBaseWinRE -WorkDir $WorkDir -Hardware $Hardware)) {
                         Write-Log "GitHub base WIM retrieval failed" -Level FATAL
@@ -4592,7 +4746,11 @@ try {
 
         Dismount-WindowsImage -Path $MountDir -Save; Remove-ItemIfExist $MountDir
         if ($Script:ImageInjectionComplete) {
-            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 3 -DesiredStateId $DesiredStateId
+            # v47 patch 2: bind the Step 3 checkpoint to the source-content
+            # hash. A crash between Step 3 and Step 4 previously left a
+            # checkpoint with no source identity, and the resume validator
+            # (which gated on $cp.Step -ge 4) did not fire at Step 3.
+            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 3 -DesiredStateId $DesiredStateId -SourceHash $Script:StagedWimSourceHash
         } else {
             Write-Log "Checkpoint NOT advanced to step 3 - image injection did not complete; next run will retry step 3" -Level WARN
         }
