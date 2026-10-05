@@ -45,7 +45,7 @@ For how to host your own manifest and OEM maps, see [self-hosting.md](self-hosti
 - **`drivers[].os`** — array of OS identifiers the driver supports. Valid values: `"Win10"`, `"Win11"`.
 - **`drivers[].match.cpuGenMin`** — minimum Intel CPU generation.
 - **`drivers[].match.cpuGenMax`** — maximum Intel CPU generation.
-- **`drivers[].match.requiredDevices`** — array of device hardware IDs. If set, the driver is only downloaded if a matching PnP device is present on the machine. If absent or empty, the driver is downloaded regardless of hardware.
+- **`drivers[].match.requiredDevices`** — array of device hardware IDs. The union of all `requiredDevices` values across all manifest entries is matched against present PnP devices in a single query; if any device matches, VMD hardware is considered present. A driver entry that declares `requiredDevices` is downloaded only when that machine-wide check succeeds. If `requiredDevices` is absent or empty on an entry, the entry is downloaded regardless of hardware.
 - **`drivers[].driverUrl`** — URL to a `.7z` archive containing one or more driver INFs.
 
 ### VMD hardware presence (fail-closed as of v44 patch 6)

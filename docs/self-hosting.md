@@ -69,7 +69,7 @@ Each builder writes its output to `scripts\Maps\<Name>WinPEMap.json` if the `scr
 The output is a single JSON file per vendor. Hosting options, in roughly increasing complexity:
 
 - **GitHub Gist.** Copy the file into your own gist. The raw URL of the gist file is what the production script will fetch.
-- **Internal HTTPS endpoint.** Any web server that serves static files over HTTPS. The path should be stable because it goes into the production script's configuration.
+- **Internal HTTPS endpoint.** Any web server that serves static files over HTTPS. Copy the generated JSON file to a stable path the server exposes; the URL of that path is what the production script fetches. The path should be stable because it goes into the production script's configuration. The URL must be reachable by every machine in the fleet and must serve the file directly, without an authentication prompt or an HTML wrapper.
 - **Azure Blob Storage static website, S3 static hosting, an internal CDN.** Same idea: a stable HTTPS URL that returns the JSON.
 
 The URL must end in a form that `Invoke-RestMethod` treats as a raw JSON response. If your hosting returns an HTML wrapper (a "file preview" page, for example), the script will fail to parse the response and log the parse error.

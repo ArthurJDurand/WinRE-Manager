@@ -101,7 +101,7 @@ Under `-DryRun` the check logs the enumeration error and continues; the exit is 
 The full-update path.
 
 **Step 1 — Wipe WorkDir.**
-Delete `C:\Temp\WinREWork\mount` and `C:\Temp\WinREWork\base.wim`. Checkpoint as `Step=1`.
+Delete `<WorkDir>\mount` and `<WorkDir>\base.wim` under the workspace selected in this run. Checkpoint as `Step=1`.
 
 **Step 2 — Obtain base WIM.**
 Source selection (v47). The base WIM is sourced from one of three places, in preference order: the currently-registered WinRE image, the manager's last-known-good copy at `C:\Recovery\WindowsRE\winre.wim`, or the GitHub repository. The registered image wins unless the LKG is provably newer by DISM servicing metadata (`Version` + `SPBuild` + `SPLevel`, with `Architecture` required to match); the LKG is trusted only when its SHA256 matches `state.CurrentImageHash`; GitHub is the last resort. A WIM found by the loose fallback-discovery path is no longer a source-selection candidate. Copy the selected source to `WorkDir\base.wim`; record the source's SHA256 for the Step 4 checkpoint. Checkpoint as `Step=2`.
@@ -173,7 +173,7 @@ Re-read WinRE state. Classify the registered location: `DEDICATED` (recovery par
 | **Log file** | `C:\ProgramData\OEM\Logs\WinRE-Manager.log` | Append-only event log. | Rotated by the operator, not by the script. |
 | **Program lock file** | `C:\ProgramData\OEM\Logs\WinREManager.lock` | Exclusive-handle target for the single-instance guarantee (v44 patch 4). | Persists across runs; the file's existence is not the lock, the open handle is. |
 | **Partition deferral marker** | `C:\Recovery\OEM\winre_partition_deferred.json` | Suppresses identical retries of the pre-shrink deferral while the old route remains verified functional (v45 patch 1). | Persists across runs until cleared; cleared on DSI mismatch, on the route becoming non-functional, or when the fast path would fire. |
-| **WorkDir** | `C:\Temp\WinREWork` | Scratch space for mounts, downloads, and intermediate WIMs. | Deleted at Step 6. |
+| **WorkDir** | Selected at run time from an eligible fixed NTFS volume on an allowlisted internal/virtual bus; recorded in the checkpoint. | Scratch space for mounts, downloads, and intermediate WIMs. | Deleted at Step 6. |
 
 See [state-and-idempotency.md](state-and-idempotency.md) for the schemas and the crash-consistency model.
 
@@ -252,7 +252,7 @@ Rule 1 is about not damaging what is there. Rule 2 is about what happens after a
 | The state file is invalidated when C: geometry cannot be verified, forcing a clean retry from scratch. | `$Script:GeometryRestoreFailed` → state-file deletion in `Write-WinREState`. |
 | A strip failure preserves the machine's existing recovery route. | v47 strip hard gate — candidate rejection happens before any partition work or `reagentc` call. |
 
-**The residual corner, named honestly.** Rule 2 cannot be *guaranteed* in the case where the old recovery partition has already been deleted, a later step fails, and C: is encrypted — the OS-fallback gate refuses on encrypted C:, so the machine ends with neither a dedicated partition nor a working route until the next run. The v45 shrink-first reorder narrowed this corner without closing it: the shrink is no longer the trigger, but a post-deletion create, format, layout-assertion, drive-letter, or extension failure is. The gating post-deletion failure test documented in [testing.md](testing.md) is the mechanism that will close it.
+**The residual corner, named honestly.** Rule 2 cannot be *guaranteed* in the case where the old recovery partition has already been deleted, a later step fails, and C: is encrypted — the OS-fallback gate refuses on encrypted C:, so the machine ends with neither a dedicated partition nor a working route until the next run. The v45 shrink-first reorder narrowed this corner without closing it: the shrink is no longer the trigger, but a post-deletion create, format, layout-assertion, drive-letter, or extension failure is. The gating post-deletion failure test documented in [testing.md](testing.md) is the mechanism that will close it.**A second residual, narrower in scope.** A layout that places a non-recovery partition between C: and the type-coded recovery partition cannot be reconciled by the current single-boundary geometry model. The plan requires the recovery partition to abut C:, and native tooling cannot shift a partition's start rightward without moving its data. Production defers stably with the enriched rejection reason naming the intervening partition; the machine does not converge to the modern layout automatically. The manual path is to remove the intervening partition or to shrink it from the right and extend the recovery partition leftward by hand. The v48 design candidate (shrink the intervening partition automatically) is the design response; it is not part of v47 patch 3.
 
 ### Rule 3 — minimize the `reagentc /disable` → `reagentc /enable` window
 

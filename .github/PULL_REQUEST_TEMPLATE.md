@@ -23,9 +23,9 @@
 
 ## Testing
 
-- [ ] Parser check passes: `Get-Command .\scripts\WinRE.ps1 -ErrorAction Stop | Out-Null`
+- [ ] Parser check passes: `[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\WinRE.ps1).Path, [ref]$null, [ref]$null)` (throws on any syntax error; preferred form per `CONTRIBUTING.md` style section)
 - [ ] `.\scripts\WinRE.ps1 -DryRun` completes
-- [ ] `.\scripts\Test-WinRE.ps1 -NonInteractive` completes
+- [ ] `.\scripts\Test-WinRE.ps1 -NonInteractive` completes with exit code 0 (v25+; a non-zero exit means the harness recorded FAILs)
 - [ ] `.\scripts\Test-WinRE.ps1` completes interactively (menu path exercised)
 - [ ] Field-tested on a GPT machine
 - [ ] Field-tested on an MBR machine

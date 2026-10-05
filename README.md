@@ -314,7 +314,7 @@ The full-update pipeline is a narrative of preparation-then-action. This section
 
 **Known limitation — destructive failure after deletion on encrypted C:.** In v45 the pre-shrink is outside the destructive window, so a shrink failure no longer reaches this corner. A failure of `New-Partition` or `Format-Volume` **after** the old recovery partition has already been deleted, on a machine whose C: is encrypted, can still leave the machine with neither a dedicated recovery partition nor OS-fallback — the OS-fallback gate refuses on encrypted C:. The correct fix is a post-failure check in the post-deletion segment, tracked for a future patch. The corner has not been exercised in the field. See [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
-After freeing space or correcting a blocked layout, clear both deferral records to force a retry:
+**Known limitation — non-adjacent recovery partition.** A machine whose OS disk order places a non-recovery partition between C: and the type-coded recovery partition does not converge to DEDICATED automatically. The single-boundary geometry model requires the recovery partition to abut C:, and native tooling cannot shift a partition's start rightward without moving its data. Production defers with a clear log line naming the intervening partition; the manual path is to remove or shrink it. See [`docs/troubleshooting.md`](docs/troubleshooting.md).After freeing space or correcting a blocked layout, clear both deferral records to force a retry:
 
 ```powershell
 Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
