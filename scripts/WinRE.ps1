@@ -14,10 +14,10 @@
                 Prepare the target before reagentc; never change C:'s BitLocker state.
             - Only type-coded recovery partitions qualify for reuse/deletion.
                 Partitions over 2 GiB are preserved for operator review. The
-                post-delete extension-failure fallback preserves this ceiling:
-                it sizes the replacement partition to the planned bucket, not
-                to the full remaining extent, and logs any trailing
-                unallocated extent explicitly.
+                post-delete extension-failure fallback preserves this ceiling
+                by sizing the replacement partition to min(AvailableSize, 2 GiB):
+                it fills the available extent in the common case, and only
+                logs a trailing unallocated extent when the surplus exceeds 2 GiB.
             - Read-only geometry planning precedes partition changes. C: is resized
                 to end where the recovery partition begins; the recovery partition
                 fills the aligned extent up to that boundary. The plan clamps the
@@ -76,14 +76,20 @@
                 value is deterministic either way, but the trimmed form
                 is the correct one and prevents a vendor-DMI-string quirk
                 from leaking into the HW component of DesiredStateId.
-            - The missing-WIM guard on the OS-fallback route does not
-                consult WinRE status. With WinRE Disabled and a matching
-                state file, the fast path is skipped but the full-update
-                path is still entered with $needInject = $false; without
-                the guard, $imageToCheck could fall back to a loose WIM
-                at C:\Windows\System32\Recovery\winre.wim, bypassing the
-                strip/injection/rebuild pipeline entirely. The DEDICATED
-                route has the same shape.
+            - Any registered WinRE route that does not resolve to a
+                dedicated recovery partition on the OS disk or to the
+                OS-fallback route forces a rebuild. This covers the
+                missing/unreadable WIM case on either recognized route
+                (the guards do not consult WinRE status: with WinRE
+                Disabled and a matching state file, the fast path is
+                skipped but the full-update path would otherwise be
+                entered with $needInject = $false, and $imageToCheck
+                could fall back to a loose WIM at
+                C:\Windows\System32\Recovery\winre.wim), a registration
+                on a secondary disk, and a label-only registration on
+                the OS disk. The v47 strip/injection/rebuild pipeline
+                is the only path that produces the deployed image when
+                the source is not provably current.
 
         Known gap:
             - Offline fallback trusts stored DesiredStateId; LocalInputsId would
@@ -3925,21 +3931,29 @@ try {
         $needInject = $true
     }
 
-    # v47 patch 2 follow-up: WinRE Disabled with no resolvable registered
-    # route at all. Neither missing-WIM guard above fires because both
-    # require an active route. Without this guard, the full-update path is
-    # entered with $needInject = $false and $imageToCheck pointing at a
-    # loose fallback WIM (typically C:\Windows\System32\Recovery\Winre.wim
-    # or the manager's own C:\Recovery\WindowsRE\winre.wim), which bypasses
-    # the v47 strip/injection/rebuild pipeline entirely. Force a rebuild so
-    # the deployed image comes from the managed source-selection hierarchy
-    # and is normalized by the strip stage.
+    # v47 patch 2 supplement: any registered WinRE route that is not
+    # recognized as either a dedicated recovery partition on the OS disk
+    # or the OS-fallback route cannot take an image-current /
+    # deploy-existing-image path. Without this guard, the following
+    # state bypasses the managed rebuild pipeline entirely:
+    #   WinRE Enabled + registered location on a secondary disk, or
+    #   WinRE Enabled + registered location is label-only on the OS disk,
+    # or the corresponding Disabled forms. In each case neither
+    # $activeOnRecovery nor $activeOnOSFallback is set, the fast path
+    # does not fire, and the full-update path is entered with
+    # $needInject = $false and $imageToCheck pointing at the raw
+    # currently-registered WIM (or a loose fallback WIM) - deploying it
+    # without the v47 strip/injection/rebuild pipeline.
+    #
+    # Force the managed rebuild path whenever no recognized route exists,
+    # regardless of WinRE status. This subsumes the earlier Disabled-only
+    # form of the guard and covers the secondary-disk and label-only
+    # Enabled cases as well.
     if (-not $needInject -and
-        $WinREState.Status -eq "Disabled" -and
         -not $activeOnRecovery -and
         -not $activeOnOSFallback) {
         $regLoc = if ($WinREState.Location) { $WinREState.Location } else { '(no registered location)' }
-        Write-Log "WinRE is Disabled and its registered recovery route ($regLoc) cannot be resolved to a dedicated partition or the OS-fallback path - forcing a rebuild through the managed source pipeline so the deployed image is normalized and verified" -Level WARN
+        Write-Log "WinRE registered route ($regLoc) is not a recognized dedicated OS-disk recovery partition or OS-fallback route - forcing rebuild through the managed source pipeline so the deployed image is selected, stripped, re-injected, exported, and then deployed" -Level WARN
         $needInject = $true
     }
 
