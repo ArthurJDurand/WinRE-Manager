@@ -46,7 +46,7 @@ These limitations were documented in a release entry and have since been closed.
 ## [v47 patch 3] — 2026-10-05
 
 Post-review correctness fixes in `WinRE.ps1`, a comment-accuracy fix in the race-detector
-block, the harness's move to v25, and three hardening changes in the map builders.
+block, the harness's move to v25, and several hardening changes across the three map builders.
 `ScriptVersion` remains 47; `ScriptPatchLevel` moves from 2 to 3. No fleet-wide rebuild is
 forced.
 

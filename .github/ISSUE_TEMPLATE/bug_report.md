@@ -83,6 +83,8 @@ labels: ['bug', 'needs-triage']
 - `A WIM was discovered at ... but not at the registered location` -- the loose fallback-discovery path found a WIM outside the registered location. Include the path and whether the registered location yielded a readable WIM.
 - `WinRE is registered via OS-fallback (location: ...) but its winre.wim could not be read at that location (status=...) - forcing rebuild` -- the v47 patch 2 OS-fallback missing-WIM guard fired. Include the registered location, the `reagentc /info` status, and whether `C:\Recovery\WindowsRE\winre.wim` exists.
 - `All three methods failed for <letter>: - <diagnostic>` -- drive-letter assignment exhausted one of the 26 candidate letters. The `<diagnostic>` names the reason (for example `diskpart: The specified drive letter is not free to be assigned` for a letter reserved by a mapped network drive). Include the diagnostic string, the full `All three methods failed for ...` lines from the log, and the current drive letters reported by `Get-PSDrive -PSProvider FileSystem` and `net use`.
+- `Invoke-DriveLetterAssignment: target partition <n>/<m> no longer exists` -- the target partition was removed mid-search. Include what deleted it (a concurrent tool, an operator action, or a failed prior step) and the current partition inventory from `Get-Partition`.
+- `Invoke-DriveLetterAssignment: target disk <n> is <offline|status>` -- the disk holding the target partition went offline or is not Online. Include the disk state from `Get-Disk -Number <n> | Format-List` and whether the disk came back online after the run.
 
 <details>
 <summary>C:\ProgramData\OEM\Logs\WinRE-Manager.log (relevant slice)</summary>
