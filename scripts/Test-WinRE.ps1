@@ -1725,7 +1725,7 @@ function Show-SystemDiagnostic {
     if ($missingDismCmd.Count -eq 0) {
         Write-Host "  " -NoNewline
         Write-Host "[OK]  " -NoNewline -ForegroundColor Green
-        Write-Host "DISM cmdlets: all 5 present (Mount/Dismount/Get-WindowsImage, Add/Get-WindowsDriver)" -ForegroundColor Gray
+        Write-Host "DISM cmdlets: all 6 present (Mount/Dismount/Get-WindowsImage, Add/Get/Remove-WindowsDriver)" -ForegroundColor Gray
         Record "Parser: DISM cmdlets" $true "all present"
     } else {
         Write-Host "  " -NoNewline

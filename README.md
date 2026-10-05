@@ -92,11 +92,11 @@ The save-and-run form above is preferable for anything you care about: it isolat
 
 ### Reproducible runs (pinned version)
 
-`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v47.2` for the current v47 patch 2 release:
+`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v47.3` for the current v47 patch 3 release:
 
 ```powershell
 $p = "$env:TEMP\WinRE.ps1"
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v47.2/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
+Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v47.3/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
 powershell -ExecutionPolicy Bypass -File $p -DryRun
 ```
 
@@ -373,7 +373,7 @@ The v47 patch 1 `ScriptVersion` bump (46 → 47) changes the `DesiredStateId`, s
 
 **v47 patch 1 status.** The v47 non-destructive paths are field-verified on physical hardware. On an ASUS PRIME H510M-D (i5-11400, Win11 26300), a v46 → v47 migration correctly triggered a full update via the state-file DSI mismatch branch, took the source-selection "registered" branch (no hash-validated LKG present), ran the strip stage (no-op — the image was already clean), ran ResetBase and the export, reused the existing type-coded recovery partition, and completed `reagentc /disable` → deploy → `/enable` with exit 0. Two subsequent runs took the fast path. The harness at v23 passes all 16 parser self-tests, including the v47 DSI and metadata checks.
 
-**v47 patch 2 status.** The v47 patch 2 non-destructive paths have now been exercised on four physical machines. A Dell Pro Max 16 Premium MA16250 (Core Ultra 7 265H) performed a full rebuild with the Dell WinPE11 A10 OEM pack: 64 third-party drivers injected (49 of 49 matched), the existing 1,000 MiB recovery partition rejected as undersized, a new 1,100 MiB bucket created at offset 975661 MiB, `reagentc /enable` exit 0, `Operating mode: DEDICATED`, and the fast path on the second run. Two ASUS Vivobooks (X1504ZA and X1504VA) ran with C: actively encrypting (— `VolumeStatus=EncryptionInProgress` at 91%) and completed the dedicated-partition destructive sequence successfully; the newly created recovery partition was verified not claimed by the Device Encryption service. A fast-path smoke test on the ASUS PRIME H510M-D confirmed the state file, metadata anchor, and byte-drift comparison work end-to-end. All four runs: `Operating mode: DEDICATED`, exit code 0, `Byte drift from last deployment: NO` on the second run. The v24 harness passes all 16 parser self-tests.
+**v47 patch 2 status.** The v47 patch 2 non-destructive paths have now been exercised on four physical machines. A Dell Pro Max 16 Premium MA16250 (Core Ultra 7 265H) performed a full rebuild with the Dell WinPE11 A10 OEM pack: 64 third-party drivers injected (49 of 49 matched), the existing 1,000 MiB recovery partition rejected as undersized, a new 1,100 MiB bucket created at offset 975661 MiB, `reagentc /enable` exit 0, `Operating mode: DEDICATED`, and the fast path on the second run. Two ASUS Vivobooks (X1504ZA and X1504VA) ran with C: actively encrypting (`VolumeStatus=EncryptionInProgress` at 91%) and completed the dedicated-partition destructive sequence successfully; the newly created recovery partition was verified not claimed by the Device Encryption service. A fast-path smoke test on the ASUS PRIME H510M-D confirmed the state file, metadata anchor, and byte-drift comparison work end-to-end. All four runs: `Operating mode: DEDICATED`, exit code 0, `Byte drift from last deployment: NO` on the second run. The v24 harness passes all 16 parser self-tests.
 
 **What v47 field data does not yet cover.** The destructive partition paths — pre-shrink, partition delete, `New-Partition`, the whole-layout assertion, and the post-delete extension fallback — have not been exercised under v47 on physical hardware. Nor have the strip stage with a non-zero third-party driver set, the VMD driver injection path, the metadata-triggered rebuild branch, the pre-`/disable` race-detector abort branch, or the WIM_READY checkpoint save/resume round trip. The v45 destructive-path VM test remains the recommended next step before broad rollout, followed by a canary on a machine with an OEM driver pack so the strip-and-reinject loop runs against a non-empty set.
 

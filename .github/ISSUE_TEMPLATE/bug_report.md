@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v47 patch 2, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v47 patch 2) ==========`) -->
+- **WinRE.ps1 version:** <!-- e.g. v47 patch 3, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v47 patch 3) ==========`) -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
