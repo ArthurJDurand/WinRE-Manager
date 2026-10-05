@@ -420,6 +420,8 @@ The v44 patch 7 guard-free destructive path is field-verified on encrypted C: ac
 
 Bug reports and PRs welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+Questions and general discussion: [GitHub Discussions](https://github.com/ArthurJDurand/WinRE-Manager/discussions).
+
 ## Security
 
 For security issues, see [`SECURITY.md`](SECURITY.md). Do not file public issues for vulnerabilities.

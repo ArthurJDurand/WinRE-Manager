@@ -9,6 +9,10 @@ Thanks for considering a contribution. This project is a self-healing production
 3. Capture the log at `C:\ProgramData\OEM\Logs\WinRE-Manager.log`.
 4. Check [docs/troubleshooting.md](docs/troubleshooting.md).
 
+## Questions and general discussion
+
+For deployment help, "does this work on X", design discussions, and other content that isn't a bug report or a feature request, use [GitHub Discussions](https://github.com/ArthurJDurand/WinRE-Manager/discussions). Bug reports and feature requests go to Issues, using the templates. Do not post security issues publicly â€” see [SECURITY.md](SECURITY.md).
+
 ## Bug reports
 
 Use the issue template. Include:
