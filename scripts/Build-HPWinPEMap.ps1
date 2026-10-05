@@ -47,7 +47,7 @@ Write-T "Fetching HP WinPE page ..." -L INFO
 $html = $null
 for ($retry = 1; $retry -le 3; $retry++) {
     try {
-        $r = Invoke-WebRequest -Uri $pageUrl -Headers $Headers -UseBasicParsing -ErrorAction Stop
+        $r = Invoke-WebRequest -Uri $pageUrl -Headers $Headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
         $html = $r.Content
         break
     } catch {

@@ -33,6 +33,11 @@
     Does NOT modify WinRE, partitions, BitLocker, drive letters, or the
     state file. No admin required. All work is confined to $TestDir.
 
+    The harness uses Say / Write-Diag / Write-KV for its own output,
+    which internally call Write-Host. CONTRIBUTING.md forbids Write-Host
+    in production code paths; the harness is a separate UI and is not
+    subject to that rule.
+
 .PARAMETER TestDir
     Working directory. Default C:\Temp\WinRETest.
 
@@ -43,7 +48,52 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 24
+    Version : 25
+
+    v25 changes vs v24:
+    1. Added Remove-WindowsDriver to the DISM cmdlet availability
+       check (Parser: DISM cmdlets). Production v47 strip stage
+       hard-depends on Remove-WindowsDriver, so a host without it
+       cannot run the strip-and-reinject pipeline. The self-test now
+       requires all six cmdlets: Mount-WindowsImage,
+       Dismount-WindowsImage, Get-WindowsImage, Add-WindowsDriver,
+       Get-WindowsDriver, Remove-WindowsDriver.
+    2. Added BusType to the Get-Disk shape check. Production v45
+       patch 1 reads $disk.BusType in Get-WorkDirCandidates and
+       gates workspace eligibility against an internal-bus
+       allowlist. A Get-Disk shape change that removed or renamed
+       the property would silently make every workspace candidate
+       ineligible on that host.
+    3. NonInteractive mode now exits non-zero when the run recorded
+       any FAIL results (1 for failures, 0 otherwise). CI and cron
+       consumers can now treat the harness as a regression gate
+       rather than a reporter. SKIPs are still reported in the
+       output and do not affect the exit code.
+    4. Test-OemMaps now only calls Get-LenovoWinPEPack when the
+       detected vendor is LENOVO. On Dell and HP machines whose
+       Win32_ComputerSystemProduct.Version populates the machine-type
+       fallback, the previous code reached Get-LenovoWinPEPack with
+       a non-null, non-UNKN machine type, which fetched the Lenovo
+       map from the gist and then returned no-entry for a machine
+       type that is not a Lenovo machine type. The guard skips the
+       call entirely on non-Lenovo hardware.
+    5. Added a Compare-WimServicingMetadata mirror and an eight-case
+       regression self-test (Parser: Compare-WimServicingMetadata).
+       Production v47 source-selection logic uses this comparator
+       to decide which of the registered WinRE and the LKG is at
+       least as new; the harness now verifies that a change to the
+       comparison rules, the DISM servicing-metadata shape, or the
+       interpretation of Version / SPBuild / SPLevel / Architecture
+       is caught before production is touched. The test covers
+       newer-Version, older-Version, tied-Version with higher and
+       lower SPBuild, tied Version and SPBuild, architecture
+       mismatch, invalid Version, and invalid SPBuild.
+    6. Option S DSI-mismatch detail sentence now names all seven
+       DesiredStateId components. HW (Manufacturer|Model|MachineType)
+       and OS (build) were previously omitted even though they are
+       two of the seven fields and change more often in the field
+       than SCRIPT.
+    7. Menu title and startup Rule bumped 24 -> 25.
 
     v24 changes vs v23:
     1. Fixed the active-WIM diagnostic probe. The prior code
@@ -713,6 +763,8 @@ function Get-DesiredStateId {
     # $ProductionScriptVersion default MUST track production's
     # $ScriptVersion. If it falls behind, Show-StateFileParity reports
     # a false DSI MISMATCH for every state file production has written.
+    # If production ever adds or removes a DSI component, mirror the
+    # change here AND in Show-StateFileParity mismatch detail.
     param(
         [Parameter(Mandatory)]$Hardware,
         $OEMPackage,
@@ -785,6 +837,36 @@ function Get-ThisMachineProfile {
         CPUVendor     = $cpuVendor
         CPUGeneration = $gen
     }
+}
+
+# =========================== WIM SERVICING METADATA (mirror of WinRE.ps1) ===========================
+function Compare-WimServicingMetadata {
+    param($MetaA, $MetaB)
+    if (-not $MetaA -or -not $MetaB) { return $null }
+    if ($MetaA.Architecture -and $MetaB.Architecture -and
+        $MetaA.Architecture -ne $MetaB.Architecture) { return $null }
+
+    $vA = $null; $vB = $null
+    try { $vA = [System.Version]([string]$MetaA.Version) } catch { }
+    try { $vB = [System.Version]([string]$MetaB.Version) } catch { }
+    if (-not $vA -or -not $vB) { return $null }
+    if ($vA -gt $vB) { return "A-newer-or-equal" }
+    if ($vA -lt $vB) { return "A-older" }
+
+    $sA = 0; $sB = 0
+    if (-not [int]::TryParse([string]$MetaA.SPBuild, [ref]$sA)) { return $null }
+    if (-not [int]::TryParse([string]$MetaB.SPBuild, [ref]$sB)) { return $null }
+    if ($sA -gt $sB) { return "A-newer-or-equal" }
+    if ($sA -lt $sB) { return "A-older" }
+
+    $lA = 0; $lB = 0
+    if ([int]::TryParse([string]$MetaA.SPLevel, [ref]$lA) -and
+        [int]::TryParse([string]$MetaB.SPLevel, [ref]$lB)) {
+        if ($lA -gt $lB) { return "A-newer-or-equal" }
+        if ($lA -lt $lB) { return "A-older" }
+    }
+
+    return "A-newer-or-equal"
 }
 
 # =========================== SYSTEM INFO HELPERS (based on WinRE.ps1) ===========================
@@ -939,7 +1021,7 @@ function Show-SystemDiagnostic {
         } elseif ($isTypedRecovery -and $isActiveOSDisk) {
             Write-KV "Classification" "DEDICATED (WinRE on type-coded recovery partition on the OS disk)" "Green"
         } elseif ($isTypedRecovery) {
-            Write-KV "Classification" "RECOVERY-ON-SECONDARY (type-coded recovery partition on a non-OS disk - production forces a full rebuild)" "Yellow"
+            Write-KV "Classification" "RECOVERY-ON-SECONDARY (harness-only verdict; type-coded recovery partition on a non-OS disk; production forces a rebuild through the managed pipeline)" "Yellow"
         } elseif ($isLabelRecovery -and $isActiveOSDisk) {
             Write-KV "Classification" "LABEL-ONLY (Recovery/WINRE label but not type-coded - production does NOT treat as DEDICATED)" "Yellow"
         } else {
@@ -1634,7 +1716,7 @@ function Show-SystemDiagnostic {
     # validate the injection path.
     $dismCmds = @(
         "Mount-WindowsImage", "Dismount-WindowsImage", "Get-WindowsImage",
-        "Add-WindowsDriver", "Get-WindowsDriver"
+        "Add-WindowsDriver", "Get-WindowsDriver", "Remove-WindowsDriver"
     )
     $missingDismCmd = @()
     foreach ($cmd in $dismCmds) {
@@ -1658,7 +1740,7 @@ function Show-SystemDiagnostic {
     try {
         $sampleDisk = Get-Disk -ErrorAction Stop | Select-Object -First 1
         if ($sampleDisk) {
-            $diskProps = @("Number", "FriendlyName", "PartitionStyle", "Size", "BootFromDisk", "IsSystem", "IsBoot")
+            $diskProps = @("Number", "FriendlyName", "PartitionStyle", "Size", "BootFromDisk", "IsSystem", "IsBoot", "BusType")
             $diskMissing = @()
             foreach ($prop in $diskProps) {
                 if ($null -eq $sampleDisk.PSObject.Properties[$prop]) { $diskMissing += $prop }
@@ -1806,6 +1888,48 @@ function Show-SystemDiagnostic {
     }
 
     Write-Diag ""
+        try {
+        $cmpCases = @(
+            @{ Name = "A newer Version";                A = @{Version="10.0.26200.1000"; SPBuild="1000"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; Expected = "A-newer-or-equal" }
+            @{ Name = "A older Version";                A = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26200.1000"; SPBuild="1000"; SPLevel="0"; Architecture="x64"}; Expected = "A-older" }
+            @{ Name = "Version tied, A higher SPBuild"; A = @{Version="10.0.26100.1000"; SPBuild="1000"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.900"; SPBuild="900"; SPLevel="0"; Architecture="x64"}; Expected = "A-newer-or-equal" }
+            @{ Name = "Version tied, A lower SPBuild";  A = @{Version="10.0.26100.900"; SPBuild="900"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.1000"; SPBuild="1000"; SPLevel="0"; Architecture="x64"}; Expected = "A-older" }
+            @{ Name = "Version and SPBuild tied";      A = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; Expected = "A-newer-or-equal" }
+            @{ Name = "Architecture mismatch";          A = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="arm64"}; Expected = $null }
+            @{ Name = "Invalid Version";                A = @{Version="not-a-version"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; Expected = $null }
+            @{ Name = "Invalid SPBuild";                A = @{Version="10.0.26100.9545"; SPBuild="not-numeric"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; Expected = $null }
+        )
+        $cmpFailures = @()
+        foreach ($case in $cmpCases) {
+            $got = Compare-WimServicingMetadata -MetaA $case.A -MetaB $case.B
+            $exp = $case.Expected
+            $ok = if ($null -eq $exp -and $null -eq $got) { $true }
+                  elseif ($null -eq $exp -or $null -eq $got) { $false }
+                  else { "$got" -eq "$exp" }
+            if (-not $ok) {
+                $gotText = if ($null -eq $got) { "<null>" } else { "$got" }
+                $expText = if ($null -eq $exp) { "<null>" } else { "$exp" }
+                $cmpFailures += "$($case.Name): expected $expText, got $gotText"
+            }
+        }
+        if ($cmpFailures.Count -eq 0) {
+            Write-Host "  " -NoNewline
+            Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+            Write-Host "Compare-WimServicingMetadata: $($cmpCases.Count) regression cases matched" -ForegroundColor Gray
+            Record "Parser: Compare-WimServicingMetadata" $true "$($cmpCases.Count) cases"
+        } else {
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " Compare-WimServicingMetadata failures ($($cmpFailures.Count) of $($cmpCases.Count)):" -ForegroundColor Gray
+            foreach ($f in $cmpFailures) { Write-Host "          $f" -ForegroundColor Red }
+            Record "Parser: Compare-WimServicingMetadata" $false "$($cmpFailures.Count) failure(s)"
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Compare-WimServicingMetadata threw: $_" -ForegroundColor Gray
+        Record "Parser: Compare-WimServicingMetadata" $false "$_"
+    }
     Write-Diag "  Diagnostic complete. Parser self-test results are in the summary." "Green"
 }
 
@@ -1958,7 +2082,7 @@ function Show-StateFileParity {
         Write-Host " - production will treat the state file as stale" -ForegroundColor Gray
         Write-Diag "           and run the full-update path (rebuild + redeploy)." "DarkGray"
         Write-Diag "           Expected on the first run after a DesiredStateId input" "DarkGray"
-        Write-Diag "           change: ScriptVersion, MANIFEST, OEMPACK, CPU vendor/" "DarkGray"
+        Write-Diag "           change: HW, OS, ScriptVersion, MANIFEST, OEMPACK, CPU/" "DarkGray"
         Write-Diag "           generation, or VMD presence. Subsequent runs take the" "DarkGray"
         Write-Diag "           fast path once the state file is rewritten." "DarkGray"
         Record "State file parity" $true "DSI mismatch (rebuild will run)"
@@ -2134,7 +2258,7 @@ function Test-OemMaps {
     # incomplete-injection conditions and marks the run with
     # ImageInjectionComplete = $false. Only unknown-mt and no-entry are
     # legitimate "no pack available" answers that let production proceed.
-    $l = Get-LenovoWinPEPack -Hardware $fakeHardware
+    $l = if ($profile.Vendor -eq 'LENOVO') { Get-LenovoWinPEPack -Hardware $fakeHardware } else { $null }
     if ($l) {
         Write-KV "Lenovo" "Name=$($l.Name)  Version=$($l.Version)  ArchiveType=$($l.ArchiveType)" "Green"
         Write-Diag "    URL=$($l.DownloadUrl)" "DarkGray"
@@ -2543,7 +2667,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v24)"
+    $titleContent = "WinRE Manager Test Harness (v25)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -2591,7 +2715,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v24"
+Rule "WinRE Manager test harness v25"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN
@@ -2603,7 +2727,8 @@ if ($NonInteractive) {
     Show-Summary
     Invoke-HarnessCleanup -NonInteractive
     Say "Done."
-    exit 0
+    $failedCount = @($Script:Results | Where-Object { $_.State -eq "FAIL" }).Count
+    if ($failedCount -gt 0) { exit 1 } else { exit 0 }
 }
 
 # NOTE: PowerShell's `break` inside a switch terminates the switch, not the

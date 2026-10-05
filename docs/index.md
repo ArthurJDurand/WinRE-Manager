@@ -3,7 +3,7 @@
 **A self-healing Windows Recovery Environment manager for Windows 10 and 11.**
 
 [![Docs](https://img.shields.io/badge/docs-ArthurJDurand.github.io-4B32C3)](https://ArthurJDurand.github.io/WinRE-Manager/)
-[![Version](https://img.shields.io/badge/version-v47%20patch%202-blue)](../CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v47%20patch%203-blue)](../CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)](../README.md)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)](../README.md)
 
@@ -89,11 +89,11 @@ The save-and-run form above is preferable for anything you care about: it isolat
 
 ### Reproducible runs (pinned version)
 
-`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v47.2` for the current v47 patch 2 release:
+`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v47.3` for the current v47 patch 3 release:
 
 ```powershell
 $p = "$env:TEMP\WinRE.ps1"
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v47.2/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
+Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v47.3/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
 powershell -ExecutionPolicy Bypass -File $p -DryRun
 ```
 
@@ -281,10 +281,10 @@ This is what makes the deployment identity — `DesiredStateId` — a reliable f
 
 | Component | Version |
 |---|---|
-| `scripts/WinRE.ps1` | **v47 patch 2** |
-| `scripts/Test-WinRE.ps1` (read-only harness) | **v24** |
+| `scripts/WinRE.ps1` | **v47 patch 3** |
+| `scripts/Test-WinRE.ps1` (read-only harness) | **v25** |
 
-**Migration.** `ScriptVersion` remains 47; `ScriptPatchLevel` moves from 1 to 2. No fleet-wide rebuild is forced. A machine already on v47 patch 1 continues on the fast path. Two narrow exceptions: a machine with a v47 patch 1 Step 3 checkpoint on disk rebuilds once on its first v47 patch 2 run (legacy checkpoints carry no source hash and are invalidated), and a machine whose padded `Win32_ComputerSystemProduct.Version` field is exactly four characters (observed: ASUS) sees a one-time `DesiredStateId` change from the Version-trim fix. Full notes are in the [changelog](../CHANGELOG.md).
+**Migration.** `ScriptVersion` remains 47; `ScriptPatchLevel` moves from 2 to 3. No fleet-wide rebuild is forced. A machine already on v47 patch 2 continues on the fast path. The v47 patch 3 changes are three correctness corrections on error paths, one DryRun fidelity fix, one wording correction, and one defensive hardening in the enable-only escalation; none of them affects the fast path or the deployed WIM recipe. Full notes are in the [changelog](../CHANGELOG.md).
 
 **Field-testing status.** The v45 destructive path has completed end-to-end on a disposable Hyper-V VM, and the MBR attribute path (`set id=27`) has been exercised on a Win10 MBR VM. The v46 patch 1 plan-clamp fix is field-verified on the Lenovo IdeaPad 3 15IAU7 that motivated it — the plan-rejection corner is documented in [troubleshooting](troubleshooting.md) — and the clean-path v46 destructive pipeline is on record for the Dell Latitude 3540 and two HP EliteBook G1i models.
 

@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Current status
 
-**Production:** `WinRE.ps1` **v47 patch 2** (`ScriptVersion = 47`, `ScriptPatchLevel = "2"`).
-**Harness:** `Test-WinRE.ps1` **v24**.
+**Production:** `WinRE.ps1` **v47 patch 3** (`ScriptVersion = 47`, `ScriptPatchLevel = "3"`).
+**Harness:** `Test-WinRE.ps1` **v25**.
 
 The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker. Production and harness are deliberately decoupled: a harness move never forces a managed-machine rebuild.
 
@@ -40,6 +40,150 @@ These limitations were documented in a release entry and have since been closed.
 
 - **Post-deletion segment of `Ensure-AdequateRecoveryPartition`.** Changes to the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths are gated on the deliberate post-deletion failure test running and its result being recorded. See [CONTRIBUTING.md](CONTRIBUTING.md) for the scope of the gate.
 - **Pre-shrink segment (plan, pre-shrink, verification, deferral) is not gated.** The v45 reorder placed the risky step in the reversible window, which closes the v44 residual for the shrink case.
+
+---
+
+## [v47 patch 3] — 2026-10-05
+
+Post-review correctness fixes in `WinRE.ps1`, a comment-accuracy fix in the race-detector
+block, the harness's move to v25, and three hardening changes in the map builders.
+`ScriptVersion` remains 47; `ScriptPatchLevel` moves from 2 to 3. No fleet-wide rebuild is
+forced.
+
+The changes were driven by a two-reviewer code pass over the v47 patch 2 scripts. Neither
+reviewer found a fleet-wide defect; the fixes are three correctness corrections on error
+paths, one DryRun fidelity fix, one wording correction, and one defensive hardening in
+the enable-only escalation. The post-active-deletion recovery-route corner remains the
+project's one outstanding architectural item and is not touched by this patch.
+
+### Fixed
+
+- **Final-verification resolver now retries before declaring FATAL.** The Step 8 block
+  resolves the registered WinRE location to a partition via
+  `Resolve-WinRELocationToPartition`. A single failed resolution after a successful
+  `reagentc /enable` exited `EXIT_FATAL` on a transient storage-stack or Mount-Manager
+  read. The block now retries up to three times at one-second intervals, re-reading
+  `reagentc /info` between attempts. If all three attempts fail, the script still exits
+  `EXIT_FATAL` — the fail-closed behaviour of the final verification is preserved; only
+  the transient-failure window is narrowed. The FATAL log line now names the location
+  from the final read rather than the first.
+
+- **DryRun and live execution now agree on the enable-only escalation.** When the
+  enable-only path entered with `$activeOnRecovery = $true` and no target partition
+  could be resolved, the live path set `$needEnableOnly = $false` and escalated to the
+  full-update path, while the DryRun path set `$enableResult = "ok"` and exited
+  `EXIT_SUCCESS`. A dry run on such a machine reported success where a live run would
+  have escalated. Both paths now take the same escalation.
+
+- **`Remove-ItemIfExist` verifies removal before logging success.** The helper ran
+  `Remove-Item ... -ErrorAction SilentlyContinue` and then logged `Removed: $Path`
+  unconditionally. On a locked file, an ACL-denied file, or a reparse-point containment
+  case, the log claimed a removal that had not occurred. The success line is now emitted
+  only after `Test-Path` confirms the path is gone; if the path survives, the helper
+  logs `Could not confirm removal: $Path` at WARN. No behaviour change on the happy path.
+
+- **Enable-only "no target partition found" escalation forces the managed rebuild
+  pipeline.** The `if (-not $targetPart)` branch inside the enable-only path was reached
+  only in a state inconsistent with the enable-only entry conditions (WinRE registered
+  on a type-coded recovery partition on the OS disk, yet no target resolvable and no
+  fallback partition list). The branch escalated to the full-update path with
+  `$needInject = $false`, which would have caused the full-update block to reuse the
+  existing WIM as-is. It now sets `$needInject = $true` before
+  `$needEnableOnly = $false`, so the full-update path runs the managed source pipeline.
+  This branch has not been observed in the field.
+
+### Changed
+
+- **`reagentc /setreimage` failure wording corrected.** The enable-only path's
+  `/setreimage` failure branch logged "Falling through to full update to rebuild and
+  re-set the path", but the branch does not force a WIM rebuild — it re-deploys and
+  re-registers the current image. The wording now reads "Falling through to the full
+  recovery deployment path to re-set and verify the WinRE route". No behaviour change.
+
+- **Race-detector comment corrected.** The pre-`/disable` recheck comment in
+  `Get-RegisteredWinREFingerprint` described the residual window as "the microseconds
+  between the re-read and `/disable` returning". The residual is the interval between
+  the final re-read and `reagentc /disable` completing, which can be seconds. The
+  comment now states that.
+
+### Changed (harness)
+
+- **`Test-WinRE.ps1` moved to v25.** Six behavioural changes and one comment set, all
+  downstream of the v47 patch 2 production review.
+
+  - **`Remove-WindowsDriver` added to the DISM cmdlet availability check.** Production's
+    v47 strip stage hard-depends on `Remove-WindowsDriver`. The harness previously
+    reported `[OK]` on a host where the strip stage could not run.
+  - **`BusType` added to the `Get-Disk` shape check.** Production's v45 patch 1
+    workspace selector reads `$disk.BusType` and gates against an internal-bus
+    allowlist. A `Get-Disk` shape change that removed or renamed the property would
+    silently make every workspace candidate ineligible and force a `no eligible
+    workspace` deferral on every run.
+  - **`-NonInteractive` exits non-zero when the run records any FAIL results.** A CI or
+    cron consumer checking `$LASTEXITCODE` previously saw success even when FAIL results
+    were recorded. The harness now exits `1` when at least one FAIL is present and `0`
+    otherwise; SKIPs do not affect the exit code.
+  - **`Test-OemMaps` only calls `Get-LenovoWinPEPack` on Lenovo hardware.** On Dell and
+    HP machines whose `Win32_ComputerSystemProduct.Version` populates the machine-type
+    fallback, `Get-LenovoWinPEPack` reached the map-load block, fetched the ~1 MB
+    Lenovo map from the gist, and returned `no-entry` for a machine type that is not a
+    Lenovo machine type. The call is now guarded on the detected vendor.
+  - **`Compare-WimServicingMetadata` mirror and regression self-test added.** A new
+    eight-case self-test (`Parser: Compare-WimServicingMetadata`) covers
+    newer-Version, older-Version, tied-Version with higher and lower `SPBuild`, tied
+    `Version` and `SPBuild`, architecture mismatch, invalid `Version`, and invalid
+    `SPBuild`. Production's v47 source-selection logic uses this comparator; the
+    self-test verifies the comparator's decision rules on a host where the source
+    pipeline would otherwise be untested.
+  - **Option S DSI-mismatch detail sentence now names all seven `DesiredStateId`
+    components.** `HW` and `OS` were previously omitted even though they are two of the
+    seven fields and change more often in the field than `SCRIPT`.
+  - **Comment-only:** classifier message marks `RECOVERY-ON-SECONDARY` as a harness-only
+    verdict; `Get-DesiredStateId` carries a DSI-component-mirror discipline note;
+    `.DESCRIPTION` documents the harness's `Write-Host` usage exception.
+
+### Changed (map builders)
+
+- **`-TimeoutSec 15` added to the three builder download paths** (`Build-DellWinPEMap.ps1`,
+  `Build-HPWinPEMap.ps1`, `Build-LenovoWinPEMap.ps1`). Matches the runtime policy.
+  On a clean run the change is a no-op; on a stalled vendor CDN it converts an unbounded
+  hang into a bounded retry.
+- **`Build-LenovoWinPEMap.ps1` guards the `osId` sort** against non-numeric values with a
+  `try { [int]$_.osId } catch { 0 }` fallback. Under the file's
+  `$ErrorActionPreference = "Continue"`, a malformed `osId` previously produced a
+  non-terminating conversion error and left the sort behaviour ambiguous; the guard makes
+  the fallback deterministic.
+- **`Build-LenovoWinPEMap.ps1` refuses to publish an empty map.** A `finalMap.Count -le 0`
+  check now runs before the `Set-Content` and throws with a clear message. Previously, a
+  shape change to `RecipeCard.json` that produced an empty map would have been silently
+  published, and the runtime would then return `no-entry` for every machine type.
+
+### Migration Note
+
+`ScriptVersion` remains 47, so the `SCRIPT` component of `DesiredStateId` is unchanged and
+no fleet-wide rebuild is forced. `ScriptPatchLevel` moves from 2 to 3, visible in the
+startup banner (`WinRE Manager Started (v47 patch 3)`) and in the harness menu
+(`WinRE Manager Test Harness (v25)`). A machine already on v47 patch 2 continues on the
+fast path.
+
+### Unchanged
+
+The deployed WIM production recipe is unchanged. The strip stage, the source-selection
+preference order, the metadata-based drift detector, the pre-`/disable` race detector,
+the three-source selection chain, and the `DeployedWinREMetadata` anchor are all
+unchanged. The state file schema, the checkpoint file format, and the deferral marker
+schema are unchanged. No `DesiredStateId` change. The partition geometry on the
+successful path is unchanged; the two enable-only escalation branches (W2 and W4b)
+change behaviour only on branches not observed in the field.
+
+### Field verification
+
+Pending. The five behavioural changes in `WinRE.ps1` (final-verification retry, DryRun
+enable-only fidelity, removal-log verification, `reagentc /setreimage` wording,
+`-not $targetPart` managed-rebuild escalation) are code-review corrections on error
+paths and have not been exercised on physical hardware. They are covered by parser
+checks, the harness's updated parser self-test (including the new
+`Compare-WimServicingMetadata` regression), and by inspection.
 
 ---
 
@@ -82,6 +226,12 @@ A subsequent code review identified a fifth correctness issue in the OS-fallback
 - **Extension-failure fallback now fills the available extent up to the 2 GiB managed-recovery ceiling.** Previously the fallback sized the replacement partition to the plan's bucket — the smallest legal size — leaving the surplus as a trailing unallocated extent on every fallback. The fallback now sizes the partition to `min(AvailableSize, 2 GiB)`. The surplus after a failed extension is typically a few hundred MiB, well under the ceiling, so the trailing extent is eliminated in the common case. When the surplus exceeds 2 GiB, the trailing extent remains and is logged explicitly. The v46 patch 2 bucket cap this replaces enforced the ceiling but paid for it with a permanent gap; the ceiling is what matters, not the bucket.
 
 - **Unrecognized-route guard forces a rebuild.** Any registered WinRE route that is not a type-coded recovery partition on the OS disk, and is not the OS-fallback route, forces `$needInject = $true`. This covers three cases that the two missing-WIM guards alone do not: a machine whose WinRE is `Disabled` with no resolvable registered route; a machine whose WinRE is `Enabled` and registered to a recovery partition on a secondary disk; and a machine whose registered location is a label-only partition on the OS disk (matching by volume label but not by type code). In each case the fast path does not fire (neither `$activeOnRecovery` nor `$activeOnOSFallback` is set), but without the guard the full-update path would be entered with `$needInject = $false` and `$imageToCheck` pointing at the raw currently-registered WIM or a loose fallback WIM — bypassing the v47 strip, injection, and rebuild pipeline entirely. The guard forces the managed pipeline so the deployed image is sourced through the source-selection hierarchy and normalized by the strip stage.
+
+- **Drive-letter assignment now verifies the target partition, not just that the letter resolves.** `Get-AvailableDriveLetter` built its "in use" set from `(Get-Volume).DriveLetter`, which does not include mapped network drives: `net use Z: \\server\share` is registered with the Lanman redirector, not as a volume, so `Get-Volume` never sees it. On a machine with a mapped `Z:`, the function would report `Z` as free; all three assignment methods (`Set-Partition`, `Add-PartitionAccessPath`, `diskpart assign letter`) would fail silently 
+—
+ diskpart prints `The specified drive letter is not free to be assigned` on stdout, which the code piped to `Out-Null` and never checked 
+—
+ and the subsequent `Test-Path "Z:\"` would succeed because the share resolves. The function would then return `Z` as "assigned", the script would `New-DirectoryIfNotExists "Z:\Recovery\WindowsRE"` on the network share, and `Deploy-WimToPartition` would copy `winre.wim` to the share rather than to the newly created recovery partition. The recovery partition would be left unassigned; `reagentc /setreimage` would point at a path with no WIM; `reagentc /enable` would fail. Two changes close this. `Test-DriveLetterInUse` now consults `Get-Volume`, the `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\DOS Devices` registry key (which is where mapped network drives and subst reservations live), and `Test-Path` as a final safety net. And `Invoke-DriveLetterAssignment` now re-queries the specific partition after each of the three assignment methods and requires its `DriveLetter` to match; diskpart's stdout is captured and logged when the assignment did not take. The loop also bails out at the top of each iteration if the target partition no longer exists, or if its disk has gone offline or is not Online, so a target that has been removed mid-search returns `$null` immediately instead of retrying all 26 letters. When all three methods fail for a given letter, the error from the last method is logged, so the operator sees why the search is exhausting candidates.
 
 ### Added
 

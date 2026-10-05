@@ -334,9 +334,23 @@ If `Set-RecoveryPartitionAttributes` returns `$false`, the script logs a WARN an
 
 A drive letter is assigned via `Invoke-DriveLetterAssignment`, which tries the preferred letter, then every other candidate, using three methods per letter (`Set-Partition`, `Add-PartitionAccessPath`, `diskpart assign`).
 
+**Letter availability is checked against three sources.** Before a candidate letter is tried, `Test-DriveLetterInUse` returns `$true` if any of the following holds:
+
+- `Get-Volume -DriveLetter <letter>` returns a local volume.
+- The Mount Manager's DOS Devices registry key (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\DOS Devices`) has an entry for `<letter>:`. Mapped network drives (`net use Z: \\server\share`) and `subst` reservations live in this key and do not appear in `Get-Volume`. Without this check, a mapped `Z:` was silently selected as "free"; all three assignment methods failed; and the old `Test-Path "Z:\"` check succeeded because the share resolved, so the function returned `Z` as "assigned" and the WIM was written to the network share instead of the recovery partition.
+- `Test-Path "<letter>:\"` returns `$true` (final safety net).
+
+Candidates in use are skipped, unless the letter is already owned by the target partition (the preferred-letter case below).
+
+**Each assignment method is verified against the target partition.** After `Set-Partition`, `Add-PartitionAccessPath`, or `diskpart assign letter=X`, the function re-queries the specific disk and partition and requires its `DriveLetter` to equal the letter just assigned. A bare `Test-Path "X:\"` is not sufficient: a mapped network drive at X: would resolve to the share and read as a successful assignment even though the target partition never received a letter.
+
+**Bail-outs.** At the top of each candidate iteration, the function aborts with a single ERROR if the target partition no longer exists, or if its disk is offline or not `Online`. Both cases would fail identically for all 26 candidates and produce 26 WARN lines; the bail-out returns `$null` immediately, and the caller handles it the same way as a genuine exhaustion.
+
+**Per-method error capture.** When all three methods fail for a given letter, the function logs the error from the last method: the exception message from the cmdlet, or a "returned but the letter did not resolve" note if the API succeeded without effect, or diskpart's stdout. The final log line reads `All three methods failed for <letter>: - <diagnostic>`, so an operator sees why the search is exhausting candidates rather than a bare "failed".
+
 **Preferred letter reuse.** If the current run has already held a drive letter on a recovery partition earlier in this run (tracked in `$Script:tempDriveLetters`), the helper prefers that letter over a fresh one from `Get-AvailableDriveLetter`. Windows caches letter-to-volume mappings in `MountedDevices`; reusing a letter the script held earlier is more likely to succeed cleanly than picking a fresh one, and it avoids the assign-remove-reassign churn that can leave stale entries. The fallback chain is unchanged: if the preferred letter fails, the helper moves on.
 
-If no drive letter can be assigned — all 26 candidates fail — the script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
+If no drive letter can be assigned — all 26 candidates fail, or the function bailed out early — the script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
 
 ### 10. Verify encryption state (early check)
 

@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 47 (v47 patch 2)
+    Version : 47 (v47 patch 3)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -91,6 +91,25 @@
                 is the only path that produces the deployed image when
                 the source is not provably current.
 
+            - Drive-letter assignment verifies the target partition, not
+                just that the letter resolves. A mapped network drive at Z:
+                (or any letter) is reserved in the Mount Manager's DOS
+                Devices namespace and does not appear in Get-Volume, so the
+                old Get-AvailableDriveLetter could report it as free; the
+                three assignment methods would all fail silently, and the
+                old Test-Path "X:\" check would succeed because the share
+                resolves. Test-DriveLetterInUse now consults Get-Volume,
+                the DOS Devices key, and Test-Path; Invoke-DriveLetterAssignment
+                re-queries the specific partition after each method and
+                requires its DriveLetter to match. The function bails
+                out immediately if the target partition no longer
+                exists or if its disk is offline / not Online, rather
+                than retrying all 26 letters against a target that
+                cannot accept a letter. When all three methods fail
+                for a given letter, the error from the last method is
+                logged, so the operator sees why the search is
+                exhausting candidates.
+
         Known gap:
             - Offline fallback trusts stored DesiredStateId; LocalInputsId would
                 close the residual hardware-drift risk.
@@ -143,7 +162,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 47
-$ScriptPatchLevel = "2"
+$ScriptPatchLevel = "3"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -224,7 +243,11 @@ function Remove-ItemIfExist {
     } else {
         Remove-Item $Path -Force -ErrorAction SilentlyContinue
     }
-    Write-Log "Removed: $Path"
+    if (-not (Test-Path $Path)) {
+        Write-Log "Removed: $Path"
+    } else {
+        Write-Log "Could not confirm removal: $Path" -Level WARN
+    }
 }
 
 function Write-FileAtomically {
@@ -353,10 +376,36 @@ function Get-OSDisk {
     return Get-Disk -Number $osPart.DiskNumber -ErrorAction SilentlyContinue
 }
 
+# A drive letter is "in use" if any of the following is true:
+#   - a local volume claims it (Get-Volume)
+#   - a DOS device name for it is registered with the Mount Manager
+#     (mapped network drives, subst, and any other reservation)
+#   - the drive root resolves to something (final safety net)
+#
+# The DOS Devices registry key is the authoritative source for the
+# DOS namespace. Mapped network drives do not appear in Get-Volume,
+# so a machine with `net use Z: \\server\share` has a reserved Z: that
+# Get-Volume alone does not see. That gap let Invoke-DriveLetterAssignment
+# pick a mapped letter, fail all three assignment methods silently, and
+# then return the letter as "assigned" because Test-Path "Z:\" resolved
+# to the network share.
+function Test-DriveLetterInUse {
+    param([Parameter(Mandatory)][string]$Letter)
+    $letterUpper = $Letter.TrimEnd(':').ToUpperInvariant()
+    if (Get-Volume -DriveLetter $letterUpper -ErrorAction SilentlyContinue) { return $true }
+    try {
+        $dosDevices = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\DOS Devices' -ErrorAction SilentlyContinue
+        if ($dosDevices -and $dosDevices.PSObject.Properties.Name -contains "${letterUpper}:") { return $true }
+    } catch { }
+    if (Test-Path "${letterUpper}:\" -ErrorAction SilentlyContinue) { return $true }
+    return $false
+}
+
 function Get-AvailableDriveLetter {
     $letters = 90..68 | ForEach-Object { [char]$_ }
-    $used = (Get-Volume).DriveLetter
-    foreach ($l in $letters) { if ($l -notin $used) { return $l } }
+    foreach ($l in $letters) {
+        if (-not (Test-DriveLetterInUse -Letter $l)) { return $l }
+    }
     return $null
 }
 
@@ -468,6 +517,19 @@ function Invoke-DriveLetterAssignment {
     $preferred = $PreferredLetter.TrimEnd(':').ToUpper()
     if ($Script:DryRun) { return $preferred }
 
+    # Verify that a candidate letter actually resolves to the specific
+    # partition we are trying to assign. A bare Test-Path "X:\" is not
+    # sufficient: a mapped network drive at X: would resolve and cause
+    # the function to return a letter the partition does not own.
+    $letterResolvesToPartition = {
+        param($letter)
+        try {
+            $probe = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
+            if (-not $probe.DriveLetter) { return $false }
+            return ([string]$probe.DriveLetter).ToUpperInvariant() -eq $letter
+        } catch { return $false }
+    }
+
     $candidates = [System.Collections.Generic.List[string]]::new()
     $candidates.Add($preferred)
     foreach ($l in (90..68 | ForEach-Object { [char]$_ })) {
@@ -476,45 +538,72 @@ function Invoke-DriveLetterAssignment {
     }
 
     foreach ($letterChar in $candidates) {
-        $existing = Get-Volume -DriveLetter $letterChar -ErrorAction SilentlyContinue
-        if ($existing) {
-            $existingPart = Get-Partition -Volume $existing -ErrorAction SilentlyContinue
-            if ($existingPart -and -not ($existingPart.DiskNumber -eq $DiskNumber -and $existingPart.PartitionNumber -eq $PartitionNumber)) {
+        # Bail out if the target partition itself is gone or its disk
+        # is not online. Every assignment method would fail identically,
+        # and retrying all 26 letters would burn three method attempts
+        # per letter and emit 26 WARN lines for a target that cannot
+        # accept a letter.
+        if (-not (Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue)) {
+            Write-Log "Invoke-DriveLetterAssignment: target partition $DiskNumber/$PartitionNumber no longer exists - aborting letter search" -Level ERROR
+            return $null
+        }
+        $targetDiskProbe = Get-Disk -Number $DiskNumber -ErrorAction SilentlyContinue
+        if ($targetDiskProbe -and ($targetDiskProbe.IsOffline -or $targetDiskProbe.OperationalStatus -ne 'Online')) {
+            $diskState = if ($targetDiskProbe.IsOffline) { 'offline' } else { "$($targetDiskProbe.OperationalStatus)" }
+            Write-Log "Invoke-DriveLetterAssignment: target disk $DiskNumber is $diskState - aborting letter search (bring the disk online and re-run)" -Level ERROR
+            return $null
+        }
+
+        if (Test-DriveLetterInUse -Letter $letterChar) {
+            $owningPart = Get-Partition -DriveLetter $letterChar -ErrorAction SilentlyContinue
+            if (-not ($owningPart -and $owningPart.DiskNumber -eq $DiskNumber -and $owningPart.PartitionNumber -eq $PartitionNumber)) {
                 continue
             }
         }
 
+        # Capture the most diagnostic error from the last method that
+        # failed, so an all-methods-failed line explains why the
+        # search is exhausting candidates. Each method overwrites
+        # $diag on failure.
+        $diag = $null
+
         try {
             $part = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
             $part | Set-Partition -NewDriveLetter $letterChar -ErrorAction Stop
-            for ($i = 0; $i -lt 5; $i++) { if (Test-Path "${letterChar}:\") { break }; Start-Sleep 1 }
-            if (Test-Path "${letterChar}:\") {
+            for ($i = 0; $i -lt 5; $i++) { if (& $letterResolvesToPartition $letterChar) { break }; Start-Sleep 1 }
+            if (& $letterResolvesToPartition $letterChar) {
                 if ($letterChar -ne $preferred) { Write-Log "Assigned ${letterChar}: (preferred ${preferred}: was unavailable)" -Level WARN }
                 return $letterChar
             }
-        } catch { }
+            $diag = "Set-Partition returned but the letter did not resolve to the target partition"
+        } catch { $diag = "Set-Partition: $($_.Exception.Message)" }
 
         try {
             $part = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
             $part | Add-PartitionAccessPath -AccessPath "${letterChar}:" -ErrorAction Stop
-            for ($i = 0; $i -lt 5; $i++) { if (Test-Path "${letterChar}:\") { break }; Start-Sleep 1 }
-            if (Test-Path "${letterChar}:\") {
+            for ($i = 0; $i -lt 5; $i++) { if (& $letterResolvesToPartition $letterChar) { break }; Start-Sleep 1 }
+            if (& $letterResolvesToPartition $letterChar) {
                 if ($letterChar -ne $preferred) { Write-Log "Assigned ${letterChar}: (preferred ${preferred}: was unavailable)" -Level WARN }
                 return $letterChar
             }
-        } catch { }
+            $diag = "Add-PartitionAccessPath returned but the letter did not resolve to the target partition"
+        } catch { $diag = "Add-PartitionAccessPath: $($_.Exception.Message)" }
 
         try {
-            $script = "select disk $DiskNumber`nselect partition $PartitionNumber`nassign letter=$letterChar"
-            $script | diskpart | Out-Null
-            for ($i = 0; $i -lt 5; $i++) { if (Test-Path "${letterChar}:\") { break }; Start-Sleep 1 }
-            if (Test-Path "${letterChar}:\") {
+            $dpScript = "select disk $DiskNumber`nselect partition $PartitionNumber`nassign letter=$letterChar"
+            $diskpartOutput = $dpScript | diskpart 2>&1
+            for ($i = 0; $i -lt 5; $i++) { if (& $letterResolvesToPartition $letterChar) { break }; Start-Sleep 1 }
+            if (& $letterResolvesToPartition $letterChar) {
                 if ($letterChar -ne $preferred) { Write-Log "Assigned ${letterChar}: (preferred ${preferred}: was unavailable)" -Level WARN }
                 return $letterChar
             }
-        } catch { }
+            $dpText = ($diskpartOutput | Out-String).Trim()
+            if ($dpText) { $diag = "diskpart: $dpText" }
+            else { $diag = "diskpart returned but the letter did not resolve to the target partition" }
+        } catch { $diag = "diskpart: $($_.Exception.Message)" }
 
-        Write-Log "All methods failed for ${letterChar}: - trying another letter" -Level WARN
+        $diagText = if ($diag) { $diag } else { 'no diagnostic captured' }
+        Write-Log "All three methods failed for ${letterChar}: - $diagText" -Level WARN
         try { & cmd /c "mountvol ${letterChar}: /d 2>&1" | Out-Null } catch { }
     }
 
@@ -2465,10 +2554,10 @@ function Select-BaseWinRESource {
 # The detector catches that drift and aborts before disabling.
 #
 # This is NOT a lock. Microsoft does not document reagentc /disable as
-# atomic with respect to Windows Update, so the microseconds between
-# the recheck and /disable returning cannot be eliminated without
-# moving work into the disable->enable window and violating invariant
-# 3. The detector narrows the window from minutes to that residual.
+# atomic with respect to Windows Update, so the residual interval between
+# the final re-read and /disable completing cannot be eliminated without
+# moving work into the disable->enable window and violating invariant 3.
+# The detector narrows the exposure to that residual interval.
 #
 # Get-RegisteredWinREFingerprint returns a hashtable with a Status
 # field:
@@ -4127,7 +4216,7 @@ try {
                 Write-Log "reagentc /setreimage: exit=$setImageExit, output=$setImageOutput"
                 if ($setImageExit -ne 0) {
                     Write-Log "reagentc /setreimage failed in enable-only path: $setImageOutput" -Level ERROR
-                    Write-Log "Falling through to full update to rebuild and re-set the path" -Level WARN
+                    Write-Log "Falling through to the full recovery deployment path to re-set and verify the WinRE route" -Level WARN
                     $Script:nonFatalWarning = $true
                     $needEnableOnly = $false
                 } else {
@@ -4142,12 +4231,9 @@ try {
                 $enableResult = "ok"
             }
         } else {
-            if (-not $Script:DryRun) {
-                Write-Log "Enable-only path: no recovery partition found - escalating to full update" -Level WARN
-                $needEnableOnly = $false
-            } else {
-                $enableResult = "ok"
-            }
+            Write-Log "Enable-only path: no recovery partition found - escalating to full update with a managed rebuild" -Level WARN
+            $needInject = $true
+            $needEnableOnly = $false
         }
 
         if ($needEnableOnly -and ($enableResult -eq "ok" -or $enableResult -eq "reboot")) {
@@ -5140,9 +5226,18 @@ try {
 
     if ($finalState.Status -eq "Enabled") {
         if ($finalState.Location) {
-            $finalPart = Resolve-WinRELocationToPartition -Location $finalState.Location
+            $finalPart = $null
+            for ($vfAttempt = 1; $vfAttempt -le 3 -and -not $finalPart; $vfAttempt++) {
+                if ($vfAttempt -gt 1) {
+                    Start-Sleep -Seconds 1
+                    $finalState = Get-WinREState
+                }
+                if ($finalState.Location) {
+                    $finalPart = Resolve-WinRELocationToPartition -Location $finalState.Location
+                }
+            }
             if (-not $finalPart) {
-                Write-Log "FATAL: WinRE location cannot be resolved to a partition: $($finalState.Location)" -Level ERROR
+                Write-Log "FATAL: WinRE location could not be resolved after 3 verification attempts: $($finalState.Location)" -Level ERROR
                 exit $EXIT_FATAL
             }
 

@@ -78,7 +78,7 @@ if (-not (Test-Path $CiExe)) {
     New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null
     $tarball = Join-Path $ArchiveDir "ci.tar.gz"
     try {
-        Invoke-WebRequest -Uri "https://github.com/lexiforest/curl-impersonate/releases/download/v2.2.3/curl-impersonate-v2.2.3.i686-win32.tar.gz" -OutFile $tarball -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri "https://github.com/lexiforest/curl-impersonate/releases/download/v2.2.3/curl-impersonate-v2.2.3.i686-win32.tar.gz" -OutFile $tarball -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
         $7z = "C:\Program Files\7-Zip\7z.exe"
         if (Test-Path $7z) {
             & $7z x $tarball -o"$ArchiveDir" -y 2>&1 | Out-Null
@@ -286,7 +286,7 @@ foreach ($mt in $machineTypeMap.Keys) {
     if ($candidates.Count -eq 0) { continue }
 
     # Pick highest OS version
-    $best = $candidates | Sort-Object { [int]$_.osId } -Descending | Select-Object -First 1
+    $best = $candidates | Sort-Object { try { [int]$_.osId } catch { 0 } } -Descending | Select-Object -First 1
 
     $finalMap[$mt] = @{
         model = $best.model
@@ -305,6 +305,11 @@ foreach ($mt in $machineTypeMap.Keys) {
 # ═══════════════════════════════════════════════════════════════════════
 # WRITE OUTPUT
 # ═══════════════════════════════════════════════════════════════════════
+if ($finalMap.Count -le 0) {
+    Write-T "Generated Lenovo map is empty - refusing to publish" -L ERROR
+    throw "Generated Lenovo map is empty"
+}
+
 $output = @{
     Generated = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
     Count     = $finalMap.Count

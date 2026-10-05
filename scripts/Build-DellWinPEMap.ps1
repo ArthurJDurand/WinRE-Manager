@@ -52,7 +52,7 @@ Write-T "Downloading Dell catalog CAB ..." -L INFO
 for ($retry = 1; $retry -le 3; $retry++) {
     if (Test-Path $cabPath) { Remove-Item $cabPath -Force -ErrorAction SilentlyContinue }
     try {
-        Invoke-WebRequest -Uri $CabUrl -OutFile $cabPath -Headers $Headers -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $CabUrl -OutFile $cabPath -Headers $Headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
         if ((Test-Path $cabPath) -and (Get-Item $cabPath).Length -gt 0) { break }
         Write-T "Attempt $retry produced a zero-byte file" -L WARN
     } catch {

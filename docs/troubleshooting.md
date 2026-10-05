@@ -1306,23 +1306,52 @@ If the fallback also fails — the remaining extent after the current C: end is 
 
 **Symptom.** The script cannot assign a drive letter to the newly created recovery partition.
 
-**Log lines.**
+**Log signatures.** One or more of:
 
 ```
 No drive letter available
 ```
 
-or
-
 ```
 Exhausted all candidate letters for disk <n> part <m>
 ```
 
-**Cause.** All 26 drive letters are in use by volumes or mapped drives.
+```
+Invoke-DriveLetterAssignment: target partition <n>/<m> no longer exists - aborting letter search
+```
+
+```
+Invoke-DriveLetterAssignment: target disk <n> is <offline|status> - aborting letter search (bring the disk online and re-run)
+```
+
+```
+All three methods failed for <letter>: - <diagnostic>
+```
+
+The last form is the per-letter diagnostic — the error from the last of the three assignment methods (`Set-Partition`, `Add-PartitionAccessPath`, `diskpart assign`). It names the specific reason each letter is being rejected, for example `diskpart: The specified drive letter is not free to be assigned` for a letter reserved by a mapped network drive.
+
+**Cause.** Different root causes for different signatures:
+
+- **`No drive letter available`** 
+—
+ `Get-AvailableDriveLetter` returned nothing because every letter from D: to Z: is already reserved. Reservations are checked against `Get-Volume`, the Mount Manager's DOS Devices registry key (which is where mapped network drives and `subst` reservations live), and a `Test-Path` fallback. A letter reserved by `net use` or `subst` is now correctly seen as in-use and skipped.
+- **`Exhausted all candidate letters`** 
+—
+ the letter loop tried every candidate and none of the three assignment methods took. The `All three methods failed for <letter>: - <diagnostic>` line immediately above names the specific reason.
+- **`target partition <n>/<m> no longer exists`** 
+—
+ the target partition was deleted mid-search. Rare; usually indicates a concurrent process removed it.
+- **`target disk <n> is <offline|status>`** 
+—
+ the disk the target partition lives on has gone offline or is in a non-Online state. The function refuses to burn through 26 letters against a target that cannot accept one.
 
 **Resolution.** Manual. The script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
 
-Before retrying, free a drive letter. Check `Get-PSDrive -PSProvider FileSystem` and `net use` for mapped drives that can be removed.
+Before retrying:
+
+1. **Free a drive letter.** Check `Get-PSDrive -PSProvider FileSystem` and `net use` for mapped drives that can be removed. A mapped `Z:` (or any mapped letter) is a common cause and is now correctly detected by the availability check.
+2. **If the signature is the offline-disk bail-out**, bring the disk online and re-run: `Get-Disk -Number <n> | Set-Disk -IsOffline $false`.
+3. **If the signature is `All three methods failed` with an unusual diagnostic**, investigate the target partition and its disk with `Get-Disk -Number <n> | Format-List` and `Get-Partition -DiskNumber <n>` before re-running. The diagnostic string names the specific failure.
 
 ## `Get-BitLockerVolume` returns null
 
