@@ -92,10 +92,10 @@ Before you submit:
 Get-Command .\scripts\WinRE.ps1 -ErrorAction Stop | Out-Null
 
 # 2. Dry run on a real machine (VM preferred)
-.\scripts\WinRE.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -DryRun
 
 # 3. Harness
-.\scripts\Test-WinRE.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\Test-WinRE.ps1
 ```
 
 Use mocked geometry tests and a disposable Windows VM for partition-path changes. Physical GPT/MBR canary runs are recommended before broad fleet rollout; for changes to the post-deletion segment of the destructive path they are required — see the gating note above. Never force a shrink failure on a production client.

@@ -30,6 +30,8 @@ From inside any PowerShell (or cmd.exe), you can also open a fresh elevated wind
 Start-Process powershell -Verb RunAs
 ```
 
+> **Execution policy note.** The Quick Start commands invoke the downloaded scripts through `powershell -ExecutionPolicy Bypass -File`. That flag applies only to the child process running the script; it does not change your machine's execution policy. If you run a downloaded script directly (`& $p` or `.\script.ps1`), your policy may block it. See [One-liners (advanced)](#one-liners-advanced) for the direct-execution alternatives and their trade-offs.
+
 ### 2. Read-only diagnostic (no elevation required)
 
 Changes nothing. Prints the current WinRE state, partition layout, driver inventory, and deployment inputs. Safe to run on a production machine at any time.
@@ -37,7 +39,7 @@ Changes nothing. Prints the current WinRE state, partition layout, driver invent
 ```powershell
 $p = "$env:TEMP\Test-WinRE.ps1"
 Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/Test-WinRE.ps1' -UseBasicParsing -OutFile $p
-& $p
+powershell -ExecutionPolicy Bypass -File $p
 ```
 
 The harness opens an interactive menu. **Option 1** is the system diagnostic.
@@ -77,10 +79,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1               # ele
 If you want the shortest possible invocation and accept that the script runs in your current session — including its final `exit` — use:
 
 ```powershell
-irm 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/Test-WinRE.ps1' -UseBasicParsing | iex
+Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/Test-WinRE.ps1' -UseBasicParsing | Invoke-Expression
 ```
 
-For `WinRE.ps1` with parameters, use the scriptblock form:
+**`Invoke-Expression` cannot pass parameters.** For `WinRE.ps1` with `-DryRun` or any other switch, use the scriptblock form. It has the same current-session caveat, but the arguments work:
 
 ```powershell
 & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/WinRE.ps1' -UseBasicParsing))) -DryRun

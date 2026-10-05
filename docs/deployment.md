@@ -12,9 +12,11 @@ For a single broken machine, run the production script once from an **elevated**
 
 ```powershell
 # Elevated PowerShell (Run as Administrator)
-.\scripts\WinRE.ps1 -DryRun   # walk the flow, log every decision, change nothing
-.\scripts\WinRE.ps1           # actually deploy
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -DryRun   # walk the flow, log every decision, change nothing
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1           # actually deploy
 ```
+
+The `-ExecutionPolicy Bypass -File` form applies the bypass only to the child process; it does not change the machine's execution policy.
 
 If you want to inspect the machine first, run the read-only harness (`Test-WinRE.ps1`). It requires no elevation and modifies nothing. See the [README](../README.md) for the harness menu options.
 
@@ -52,9 +54,9 @@ The script's destructive sequence is protected by a read-only plan, a fail-close
 Before pushing to a fleet, run on one machine end-to-end:
 
 ```powershell
-.\scripts\Test-WinRE.ps1            # read-only, no elevation
-.\scripts\WinRE.ps1 -DryRun          # walk the flow, log every decision, change nothing
-.\scripts\WinRE.ps1                  # actually deploy
+powershell -ExecutionPolicy Bypass -File .\scripts\Test-WinRE.ps1            # read-only, no elevation
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -DryRun          # walk the flow, log every decision, change nothing
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1                  # actually deploy
 ```
 
 Confirm exit 0 and `Operating mode: DEDICATED` in the log. Only then expand the ring.
