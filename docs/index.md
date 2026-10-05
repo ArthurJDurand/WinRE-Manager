@@ -282,7 +282,7 @@ This is what makes the deployment identity — `DesiredStateId` — a reliable f
 | Component | Version |
 |---|---|
 | `scripts/WinRE.ps1` | **v47 patch 3** |
-| `scripts/Test-WinRE.ps1` (read-only harness) | **v25** |
+| `scripts/Test-WinRE.ps1` (read-only harness) | **v26** |
 
 **Migration.** `ScriptVersion` remains 47; `ScriptPatchLevel` moves from 2 to 3. No fleet-wide rebuild is forced. A machine already on v47 patch 2 continues on the fast path. The v47 patch 3 changes are three correctness corrections on error paths, one DryRun fidelity fix, one wording correction, and one defensive hardening in the enable-only escalation; none of them affects the fast path or the deployed WIM recipe. Full notes are in the [changelog](../CHANGELOG.md).
 

@@ -32,7 +32,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v24.** The version history is:
+**Current version: v26.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -44,10 +44,34 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v22** mirrors production v46 patch 2's `Get-WinREState` version parsing, adds a parser self-test check for the version regex, and bumps the `$ProductionScriptVersion` default. See "v22 changes" below.
 - **v23** mirrors production v47 patch 1's harness-side changes: `$ProductionScriptVersion` default bumped 46 → 47 and `Show-StateFileParity` now displays the state file's `DeployedWinREMetadata` field. See "v23 changes" below.
 - **v24** mirrors production v47 patch 2 and closes two harness-specific gaps: the active-WIM diagnostic probe now matches production's dual-path resolver, and `Get-ThisMachineProfile` trims `Win32_ComputerSystemProduct.Version` to align with production's DSI computation. See "v24 changes" below.
+- **v25** mirrors production v47 patch 3: `Remove-WindowsDriver` added to the DISM cmdlet availability check, `BusType` added to the `Get-Disk` shape check, `-NonInteractive` exits non-zero on any FAIL, `Test-OemMaps` guards the Lenovo call on vendor, `Compare-WimServicingMetadata` mirror and regression self-test added, and the Option S DSI-mismatch detail sentence names all seven components. See "v25 changes" below.
+- **v26** adds a Plan adjacency preview to Option 1 - a read-only mirror of the geometric and partition-identity subset of production's `Get-PartitionPlan` rejection checks. See "v26 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
 The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the machine's state and reports what production would do, but it does not simulate the destructive path or the plan. The shrink-first code paths are exercised on disposable VMs (see "v45 destructive-path regression" below), not through the harness.
+
+### v26 changes
+
+One diagnostic addition, downstream of the production v47 patch 3 plan-rejection enrichment.
+
+**Plan adjacency preview.** Option 1 now runs a read-only mirror of the geometric and partition-identity subset of production's `Get-PartitionPlan` rejection checks against the current layout. On a clean layout the section prints two green lines confirming the layout would not be rejected on the checks evaluated; on a separated-recovery or oversized-recovery layout it prints the enriched rejection reason(s) that production would log. The preview does not compute a bucket size or a planned extent, so the rejections related to planned-extent sizing are not evaluated. A clean preview is not a claim that the full plan would succeed, and the section says so explicitly. A new `Get-HarnessPartitionRef` helper renders a partition the same way production's `Format-PartitionRef` does.
+
+The parser self-test count is unchanged. The preview is diagnostic and does not record a PASS/FAIL/SKIP result.
+
+### v25 changes
+
+Six functional changes and one comment set, all downstream of the production v47 patch 3 cycle. See the [v47 patch 3](../CHANGELOG.md) entry for the full context.
+
+- `Remove-WindowsDriver` added to the DISM cmdlet availability check.
+- `BusType` added to the `Get-Disk` shape check.
+- `-NonInteractive` exits non-zero when any FAIL result is recorded.
+- `Test-OemMaps` only calls `Get-LenovoWinPEPack` on Lenovo hardware.
+- `Compare-WimServicingMetadata` mirror and eight-case regression self-test added - a new parser self-test check.
+- Option S DSI-mismatch detail sentence names all seven `DesiredStateId` components.
+- Comment-only clarifications in the classifier, `Get-DesiredStateId`, and `.DESCRIPTION`.
+
+The parser self-test count moved from sixteen to seventeen with the `Compare-WimServicingMetadata` check.
 
 ### v24 changes
 
@@ -162,7 +186,7 @@ The default working directory is `C:\Temp\WinRETest`. All downloads and extracti
 
 **Cleanup guard (v18).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
 
-## Output style (v16; format unchanged in v17 through v23, with v20's menu box alignment, v22's new sections, and v23's Option S `DeployedWinREMetadata` display as the only departures)
+## Output style (v16; extended in v17 through v26, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, and v26's Plan adjacency preview section as the departures)
 
 As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. The rest of the output format is unchanged from v16.
 
@@ -230,6 +254,7 @@ Read-only information gathering. Dumps:
 - Recovery partitions per `Get-RecoveryPartitions`, with `isTyped`, `isLabel`, and `onOsDisk` annotations.
 - The OS partition's `SizeMin`, `SizeMax`, shrinkable bytes, extendable bytes, and `S == M` status.
 - The bucket sizing preview: for the active WIM's size, what bucket the production script would compute.
+- **The Plan adjacency preview (v26):** a read-only check that mirrors the geometric and partition-identity subset of production's `Get-PartitionPlan` rejection checks against the current layout. On a clean layout it reports that production would not reject the layout on the checks evaluated; on a separated-recovery or oversized-recovery layout it prints the enriched rejection reason(s). The preview does not compute a bucket size or a planned extent, so the planned-extent rejections are not evaluated.
 - **The Build numbers block (v22):** the registered WinRE version (from `reagentc /info`), the active WIM build (from `Get-WindowsImage` on the registered WIM), and the backup WIM build (from `Get-WindowsImage` on `C:\Recovery\WindowsRE\winre.wim`, or `(none present)` when the file is absent).
 - The Windows Setup state (`ImageState`), with a warning when the value is present and is not `IMAGE_STATE_COMPLETE`.
 - BitLocker on C: (`ProtectionStatus`, `VolumeStatus`, `EncryptionMethod`, `EncryptionPercentage`), **plus a hazard warning for the four mid-operation states and a separate ambiguity warning for `Fully Encrypted + Protection Off`** (v12, warning text updated in v14).
@@ -395,7 +420,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Sixteen checks as of v22 (fifteen as of v18, ten before v18); v23 did not change the count or the contents. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions. v19 through v21 did not change the check count or the check contents; v22 added one check.
+Seventeen checks as of v25 (sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, and v26 did not change the count or the contents. v25 added the `Compare-WimServicingMetadata` regression check. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions. v19 through v21 did not change the check count or the check contents; v22 added one check.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -410,11 +435,12 @@ Sixteen checks as of v22 (fifteen as of v18, ten before v18); v23 did not change
 | 8 | WinRE location resolution | The reagentc location resolves to a partition. SKIP if location is empty. | v1 |
 | 9 | Get-RecoveryPartitions | Returns at least one partition. | v1 |
 | 10 | Get-PartitionSupportedSize | Returns `SizeMin` and `SizeMax`. SKIP if no OS partition. | v1 |
-| 11 | DISM cmdlets | `Mount-WindowsImage`, `Dismount-WindowsImage`, `Get-WindowsImage`, `Add-WindowsDriver`, `Get-WindowsDriver` are all present. | v18 |
-| 12 | Get-Disk shape | `Number`, `FriendlyName`, `PartitionStyle`, `Size`, `BootFromDisk`, `IsSystem`, `IsBoot` are present. | v18 |
+| 11 | DISM cmdlets | `Mount-WindowsImage`, `Dismount-WindowsImage`, `Get-WindowsImage`, `Add-WindowsDriver`, `Get-WindowsDriver`, `Remove-WindowsDriver` are all present. | v18 (extended v25) |
+| 12 | Get-Disk shape | `Number`, `FriendlyName`, `PartitionStyle`, `Size`, `BootFromDisk`, `IsSystem`, `IsBoot`, `BusType` are present. | v18 (extended v25) |
 | 13 | Get-Volume shape | `DriveLetter`, `FileSystemLabel`, `FileSystem`, `Size`, `SizeRemaining`, `DriveType`, `HealthStatus`, `UniqueId` are present. SKIP if no lettered volume to sample. | v18 |
 | 14 | CPU generation parser | Fourteen regression cases: 11th/12th/13th Gen, Core, Core Ultra, and negative cases for AMD/Celeron/Pentium/Xeon/Atom return the expected values. | v18 |
 | 15 | DesiredStateId | 64-hex, deterministic across repeat calls, VMD-sensitive, ScriptVersion-sensitive. | v18 |
+| 16 | Compare-WimServicingMetadata | Eight regression cases covering the DISM servicing-metadata comparison rules. | v25 |
 
 ### What a FAIL means
 
@@ -471,7 +497,7 @@ Runs `Invoke-AllRelevant`, prints the summary, exits.
 
 `-NonInteractive` runs the download and extraction tests. It does not run the System Diagnostic (Option 1) or the State file parity check (Option S), so the BitLocker warnings, the target-partition state block, the `ImageState` check, the Build numbers block, and the DSI comparison are not printed in this mode. If you need any of those, run the harness interactively and choose Option 1 or Option S.
 
-The exit code is always 0, regardless of results. The summary is the source of truth. If a pipeline consumer is added later, the minimal change to make the exit code reflect pass/fail is to count FAIL records in `$Script:Results` and exit non-zero when any exist. This is documented in the v11 changelog but not implemented, on the grounds that no consumer currently needs it.
+The exit code is 0 when no FAIL results were recorded, and 1 when at least one FAIL was recorded (v25+). SKIPs do not affect the exit code. The summary remains the authoritative view of what ran. The behavior was introduced in v25 so that CI and cron consumers can treat the harness as a regression gate rather than a reporter.
 
 ## What the harness does not test
 
@@ -492,7 +518,7 @@ Those paths are covered by field testing on representative hardware. See the "Fi
 
 The harness shares code paths with production in the download, extraction, and CPU-generation helpers. It is documented in the file's own docstring which functions are "based on" the production versions and which are harness-specific.
 
-Nine known differences:
+Ten known differences:
 
 - **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test. As of v17, the harness prints an explicit three-line note before the driver loop explaining this. The state-file parity check (Option S) *does* apply the hardware filter, because it is replicating production's DSI computation and production's DSI includes VMD presence.
 - **The harness does not run production's BitLocker helper functions.** The BitLocker sections in the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and apply the same classification the production guard uses — hazardous, ambiguous, or safe — but they do not call `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`. This is intentional: the harness does not exercise production's BitLocker control flow, and a change to that control flow does not require a harness update to remain correct. The v14 update changed the warning text and added the target-partition state block, but did not change the classifier itself.
@@ -503,6 +529,7 @@ Nine known differences:
 - **The `DesiredStateId` mirror is aligned with production as of v21 (through v23).** The harness's `Get-DesiredStateId` carries a `$ProductionScriptVersion` default that must track production's `$ScriptVersion`. It was pinned at 44 while production advanced to 45, which made every Option-S comparison against a v45-written state file report `DSI MISMATCH` incorrectly. The default became 45 in v21, 46 in v22, and 47 in v23; the parameter-header comment states the tracking rule. Before v21, a field engineer running Option S against a machine updated to v45 patch 1 would have seen a false "production will treat this state file as stale" verdict on a machine whose state file production would actually accept. v22 and v23 close the analogous gaps for v46 and v47.
 - **The reagentc version parser and the Build numbers block are aligned with production as of v22.** The harness's `Get-WinREState` now extracts `Windows RE Version` from `reagentc /info` and returns it as `Version`, and Option 1 renders the "Build numbers" block described above. Both mirror production v46 patch 2's build-drift logging. The harness shows the values; it does not write them to a production log file, and the values do not enter the harness's DSI computation.
 - **`Show-StateFileParity` displays `DeployedWinREMetadata` as of v23.** The state file's DISM servicing metadata anchor (v47 patch 1's `DeployedWinREMetadata` field, in `<Version>|<SPBuild>` form) renders in the parity output alongside the other state-file fields. When present, it renders green; when absent (a v46-or-earlier state file), it renders yellow with a note that production v47 will force a rebuild on the next run because the drift detector has no anchor to compare against. This mirrors production v47 patch 1's `DeployedWinREMetadata` field — the harness shows the value, but no production decision depends on the harness reading it.
+- **The Plan adjacency preview is a mirror, not a simulation.** Option 1's preview evaluates the geometric and partition-identity subset of `Get-PartitionPlan`'s rejection checks read-only. It does not compute a bucket size, does not run the pre-shrink, does not choose a target partition, and does not exercise the extension path or the whole-layout assertion. A clean preview confirms the layout would not be rejected on the checks evaluated; it is not a prediction that the full plan would succeed.
 
 The harness has no mirror of the v45 shrink-first pipeline. Option 1 and Option S report the machine's current state and the DSI comparison, but they do not simulate the plan, the pre-shrink, the extension path, or the whole-layout assertion. That is by design: those paths are destructive and cannot be simulated read-only.
 

@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## Current status
 
 **Production:** `WinRE.ps1` **v47 patch 3** (`ScriptVersion = 47`, `ScriptPatchLevel = "3"`).
-**Harness:** `Test-WinRE.ps1` **v25**.
+**Harness:** `Test-WinRE.ps1` **v26**.
 
 The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker. Production and harness are deliberately decoupled: a harness move never forces a managed-machine rebuild.
 
@@ -46,7 +46,7 @@ These limitations were documented in a release entry and have since been closed.
 ## [v47 patch 3] — 2026-10-05
 
 Post-review correctness fixes in `WinRE.ps1`, a comment-accuracy fix in the race-detector
-block, the harness's move to v25, and several hardening changes across the three map builders.
+block, the harness's move to v26, and several hardening changes across the three map builders.
 `ScriptVersion` remains 47; `ScriptPatchLevel` moves from 2 to 3. No fleet-wide rebuild is
 forced.
 
@@ -91,6 +91,21 @@ project's one outstanding architectural item and is not touched by this patch.
   existing WIM as-is. It now sets `$needInject = $true` before
   `$needEnableOnly = $false`, so the full-update path runs the managed source pipeline.
   This branch has not been observed in the field.
+- **Plan rejections now name the offending partition(s).** Seven of
+  `Get-PartitionPlan`'s thirteen rejection reasons depend on identifying a
+  specific partition, and previously they named only the category of the
+  problem. A new helper, `Format-PartitionRef`, renders a partition as
+  `disk X part Y, N MiB, label=<label>, type=<type>`. The seven enriched
+  reasons cover cross-disk inventory, overlap with C:, oversized
+  recovery-typed partition, recovery-typed overlap with C:, recovery-typed
+  precedes C:, extent overlap / ordering, and separated-from-C:. The stable
+  prefix of each reason string is unchanged, so existing log parsers and the
+  docs continue to match; the object references are appended as a
+  parenthetical suffix. Motivated by a 2026-10-05 field log on an AMD
+  Ryzen 7 5825U whose layout placed a non-recovery partition between C: and
+  the type-coded recovery partition; the plan correctly deferred, but the
+  reason string named the category without naming the partition. `.NOTES`
+  gains a corresponding design-invariant bullet and Critical Lesson entry.
 
 ### Changed
 
@@ -108,7 +123,14 @@ project's one outstanding architectural item and is not touched by this patch.
 
 ### Changed (harness)
 
-- **`Test-WinRE.ps1` moved to v25.** Six behavioural changes and one comment set, all
+- **`Test-WinRE.ps1` moved to v26.** Two change sets ship under one release: the
+  v25 changes (six behavioural changes and one comment set, downstream of the
+  v47 patch 2 production review) and the v26 change (Option 1 Plan adjacency
+  preview, downstream of the v47 patch 3 plan-rejection enrichment). The
+  v24 -> v26 jump is captured here; the harness's own `.NOTES` block carries
+  the per-version detail.
+
+  The v25 changes:
   downstream of the v47 patch 2 production review.
 
   - **`Remove-WindowsDriver` added to the DISM cmdlet availability check.** Production's
@@ -142,6 +164,12 @@ project's one outstanding architectural item and is not touched by this patch.
     verdict; `Get-DesiredStateId` carries a DSI-component-mirror discipline note;
     `.DESCRIPTION` documents the harness's `Write-Host` usage exception.
 
+  - **Plan adjacency preview added (v26).** Option 1 gained a "Plan adjacency
+    preview" section that mirrors the read-only geometric and
+    partition-identity subset of `Get-PartitionPlan`'s rejection checks
+    against the current layout. A new `Get-HarnessPartitionRef` helper renders
+    a partition the same way production's `Format-PartitionRef` does.
+
 ### Changed (map builders)
 
 - **`-TimeoutSec 15` added to the three builder download paths** (`Build-DellWinPEMap.ps1`,
@@ -163,7 +191,7 @@ project's one outstanding architectural item and is not touched by this patch.
 `ScriptVersion` remains 47, so the `SCRIPT` component of `DesiredStateId` is unchanged and
 no fleet-wide rebuild is forced. `ScriptPatchLevel` moves from 2 to 3, visible in the
 startup banner (`WinRE Manager Started (v47 patch 3)`) and in the harness menu
-(`WinRE Manager Test Harness (v25)`). A machine already on v47 patch 2 continues on the
+(`WinRE Manager Test Harness (v26)`). A machine already on v47 patch 2 continues on the
 fast path.
 
 ### Unchanged

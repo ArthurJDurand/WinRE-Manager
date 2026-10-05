@@ -189,7 +189,7 @@ The plan rejects a layout when any of the following holds:
 - The planned OS partition size would be zero or negative.
 - The aligned managed extent end precedes the OS partition start.
 
-Any of those conditions produces `Deferred` with the corresponding `Reason`, and no partition or WinRE change is made. `RetrySuppressible` is not set for plan rejections — the layout requires operator review, and retrying would produce the same rejection.
+Any of those conditions produces `Deferred` with the corresponding `Reason`, and no partition or WinRE change is made. `RetrySuppressible` is not set for plan rejections — the layout requires operator review, and retrying would produce the same rejection. Since v47 patch 3, the seven partition-identity rejection reasons (cross-disk inventory, overlap with C:, oversized recovery-typed partition, recovery-typed overlap with C:, recovery-typed precedes C:, extent overlap / ordering, and separated-from-C:) name the offending partition(s) - disk number, partition number, size, volume label, and type code - so the log identifies the layout the operator needs to resolve without requiring a separate harness run.
 
 If the plan is valid, the script logs a summary line:
 
@@ -244,7 +244,7 @@ The guard exists because both the delete-last ordering (step 4) and `Restore-Pre
 
 The guard fires **after** `reagentc /disable` has already run, so a machine that reaches this deferral is left with WinRE `Disabled` and the old recovery partition intact. This is narrower than the pre-shrink deferrals, which leave the old route `Enabled`. A subsequent run sees WinRE `Disabled` and either re-registers the existing partition or — if the resolver still cannot map the location — hits the same guard. See [troubleshooting.md](troubleshooting.md) for the re-registration recovery procedure.
 
-`RetrySuppressible` is not set for this deferral — the condition requires operator action to resolve, and retrying would produce the same rejection.
+`RetrySuppressible` is not set for this deferral — the condition requires operator action to resolve, and retrying would produce the same rejection. Since v47 patch 3, the seven partition-identity rejection reasons (cross-disk inventory, overlap with C:, oversized recovery-typed partition, recovery-typed overlap with C:, recovery-typed precedes C:, extent overlap / ordering, and separated-from-C:) name the offending partition(s) - disk number, partition number, size, volume label, and type code - so the log identifies the layout the operator needs to resolve without requiring a separate harness run.
 
 **Field status.** This guard is a v46 patch 2 code-review hardening. It has not been exercised in the field.
 

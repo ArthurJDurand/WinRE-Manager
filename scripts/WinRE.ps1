@@ -26,6 +26,15 @@
                 past the disk-end reserve. Shrink runs before route destruction;
                 extend runs after the old recovery partitions are gone. Rollback
                 targets the original C: size, never SizeMax.
+            - Plan rejections name the offending object: any layout rejection
+                whose cause is a specific partition (cross-disk inventory,
+                overlap with C:, oversized recovery-typed partition,
+                non-contiguous separation from C:, or an overrun of the
+                extent ordering) logs the disk/partition number, size,
+                label where readable, and type code where relevant, so the
+                operator can act on the log without re-running the harness.
+                A rejection that says a layout is wrong without naming
+                which partition is wrong is a log the operator cannot act on.
             - Pre-shrink deferral preserves the old route. Its sidecar marker only
                 suppresses retries while that route and its registered WIM are valid.
             - The destructive sequence fails closed before deletion if the active
@@ -135,6 +144,11 @@
                 push the aligned boundary past the reserve and the post-delete
                 geometry check would reject the plan. Plan before destroying the
                 old route; never roll back to SizeMax.
+      - Plan rejections name the offending partition. The plan's refusal
+        reasons are what an operator sees in the log, and a reason that
+        names only the category of the problem leaves them with no way
+        to identify which partition is in the way. Log the disk number,
+        partition number, size, label, and type code.
       - Audit Mode guard runs before any state-modifying action.
       - A partition claimed by Device Encryption does not re-encrypt
         after manage-bde -off. Decrypt in place.
@@ -1178,6 +1192,46 @@ function Remove-OrphanPartition {
     return $true
 }
 
+# Build a short, log-friendly identifier for a partition. Used in
+# Get-PartitionPlan rejection reasons so a rejection names the
+# specific partition that triggered it -- disk/partition number, size,
+# volume label where readable, and type code where requested -- rather
+# than only naming the category of the problem. A rejection that says
+# a layout is wrong without naming which partition is wrong is a log
+# the operator cannot act on.
+function Format-PartitionRef {
+    param(
+        [Parameter(Mandatory)]$Partition,
+        [switch]$WithType
+    )
+    $ref = "disk $($Partition.DiskNumber) part $($Partition.PartitionNumber)"
+    try {
+        $sizeMiB = [math]::Round([int64]$Partition.Size / 1MB, 1)
+        $ref = "$ref, $sizeMiB MiB"
+    } catch { }
+    try {
+        $vol = Get-Volume -Partition $Partition -ErrorAction SilentlyContinue
+        if ($vol -and $vol.FileSystemLabel) {
+            $ref = "$ref, label='$($vol.FileSystemLabel)'"
+        }
+    } catch { }
+    if ($WithType) {
+        $typeName = 'unknown'
+        if     ($Partition.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') { $typeName = 'Recovery (GPT)' }
+        elseif ($Partition.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}') { $typeName = 'EFI' }
+        elseif ($Partition.GptType -eq '{e3c9e316-0b5c-4db8-817d-f92df00215ae}') { $typeName = 'MSR' }
+        elseif ($Partition.GptType -eq '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}') { $typeName = 'Basic Data' }
+        elseif ($Partition.MbrType -eq 0x27) { $typeName = 'Recovery (MBR)' }
+        elseif ($Partition.MbrType -eq 0x07) { $typeName = 'NTFS (MBR)' }
+        elseif ($Partition.MbrType -eq 0x0c) { $typeName = 'FAT32 (MBR)' }
+        elseif ($Partition.MbrType -eq 0x0b) { $typeName = 'FAT32 (MBR)' }
+        elseif ($Partition.MbrType -eq 0xef) { $typeName = 'EFI (MBR)' }
+        elseif ($null -ne $Partition.MbrType) { $typeName = ('MBR 0x{0:X2}' -f $Partition.MbrType) }
+        $ref = "$ref, type=$typeName"
+    }
+    return $ref
+}
+
 function Get-PartitionPlan {
     param(
         [Parameter(Mandatory)][object]$OSDisk,
@@ -1203,6 +1257,22 @@ function Get-PartitionPlan {
     }).Count -gt 0) {
         $invalidReason = 'another partition overlaps the OS partition geometry'
     }
+    # Enrich the two multi-object rejections with references to the
+    # offending partitions. The reason text keeps its stable prefix so
+    # log parsers and the docs continue to match; the parenthetical
+    # suffix is for operator diagnosis.
+    if ($invalidReason -eq 'partition inventory contains entries from another disk') {
+        $crossDisks = @($allPartitions | Where-Object { $_.DiskNumber -ne $OSDisk.Number } | ForEach-Object { $_.DiskNumber } | Select-Object -Unique)
+        $invalidReason = "$invalidReason (foreign disk number(s): $($crossDisks -join ', '))"
+    } elseif ($invalidReason -eq 'another partition overlaps the OS partition geometry') {
+        $overlapWithOS = @($allPartitions | Where-Object {
+            $_.PartitionNumber -ne $OSPartition.PartitionNumber -and
+            [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart
+        })
+        $refs = ($overlapWithOS | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
+        $invalidReason = "$invalidReason ($refs)"
+    }
+
     $typedRecovery = @($allPartitions | Where-Object {
         ($_.GptType -eq $recoveryType) -or ($_.MbrType -eq 0x27)
     })
@@ -1216,11 +1286,17 @@ function Get-PartitionPlan {
     } elseif (-not $invalidReason -and ($osStart -lt 0 -or $osSize -le 0 -or $osEnd -gt $diskSize)) {
         $invalidReason = 'OS partition geometry is inconsistent with disk size'
     } elseif (-not $invalidReason -and @($typedRecovery | Where-Object { [int64]$_.Size -gt $MaxRecoveryPartitionBytes }).Count -gt 0) {
-        $invalidReason = "recovery-typed partition exceeds the $([math]::Round($MaxRecoveryPartitionBytes/1MB)) MiB safety ceiling"
+        $oversizedRecovery = @($typedRecovery | Where-Object { [int64]$_.Size -gt $MaxRecoveryPartitionBytes })
+        $refs = ($oversizedRecovery | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
+        $invalidReason = "recovery-typed partition exceeds the $([math]::Round($MaxRecoveryPartitionBytes/1MB)) MiB safety ceiling ($refs)"
     } elseif (-not $invalidReason -and @($typedRecovery | Where-Object { [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart }).Count -gt 0) {
-        $invalidReason = 'recovery-typed partition overlaps the OS partition geometry'
+        $overlapRecovery = @($typedRecovery | Where-Object { [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart })
+        $refs = ($overlapRecovery | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
+        $invalidReason = "recovery-typed partition overlaps the OS partition geometry ($refs)"
     } elseif (-not $invalidReason -and @($typedRecovery | Where-Object { ([int64]$_.Offset + [int64]$_.Size) -le $osStart }).Count -gt 0) {
-        $invalidReason = 'recovery-typed partition precedes the OS partition; layout requires review'
+        $beforeRecovery = @($typedRecovery | Where-Object { ([int64]$_.Offset + [int64]$_.Size) -le $osStart })
+        $refs = ($beforeRecovery | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
+        $invalidReason = "recovery-typed partition precedes the OS partition; layout requires review ($refs)"
     }
 
     $reclaimable = [System.Collections.Generic.List[object]]::new()
@@ -1236,7 +1312,8 @@ function Get-PartitionPlan {
             $partitionEnd = $partitionStart + [int64]$partition.Size
             if ($partitionEnd -le $osEnd) { continue }
             if ($partitionStart -lt $cursor) {
-                $invalidReason = 'partition extents overlap or are not ordered consistently'
+                $currRef = Format-PartitionRef -Partition $partition
+                $invalidReason = "partition extents overlap or are not ordered consistently (current $currRef starts at $([math]::Round($partitionStart/1MB,1)) MiB, but the previous extent ends at $([math]::Round($cursor/1MB,1)) MiB)"
                 break
             }
 
@@ -1259,7 +1336,22 @@ function Get-PartitionPlan {
             [int64]$_.Offset -ge $cursor
         })
         if ($nonContiguousRecovery.Count -gt 0) {
-            $invalidReason = 'recovery-typed partitions are separated from C: by a non-recovery partition'
+            # Name the intervening non-recovery partition(s), and the
+            # recovery partition(s) that are separated from C: by them.
+            # This is the diagnostic the field log could not provide: a
+            # plan rejection that named only the category of the problem
+            # left the operator with no indication which partition was
+            # in the way.
+            $firstSeparated = $nonContiguousRecovery | Sort-Object Offset | Select-Object -First 1
+            $interveningParts = @($allPartitions | Where-Object {
+                $_.PartitionNumber -ne $OSPartition.PartitionNumber -and
+                [int64]$_.Offset -ge $osEnd -and
+                ([int64]$_.Offset + [int64]$_.Size) -le [int64]$firstSeparated.Offset -and
+                -not (($_.GptType -eq $recoveryType) -or ($_.MbrType -eq 0x27))
+            })
+            $interveningRefs = ($interveningParts | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
+            $separatedRefs = ($nonContiguousRecovery | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
+            $invalidReason = "recovery-typed partitions are separated from C: by a non-recovery partition (intervening: $interveningRefs; separated: $separatedRefs)"
         }
     }
 

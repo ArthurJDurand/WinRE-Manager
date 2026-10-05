@@ -250,7 +250,7 @@ The harness shows what production would see, without changing anything:
 
 ```
   ╔══════════════════════════════════════════════════════════════════╗
-  ║ WinRE Manager Test Harness (v25)                                 ║
+  ║ WinRE Manager Test Harness (v26)                                 ║
   ║ Working directory: C:\Temp\WinRETest                             ║
   ║ Detected: OS=Win11  Vendor=ASUS  MT=Syst  CPU=Intel              ║
   ╚══════════════════════════════════════════════════════════════════╝
@@ -365,7 +365,7 @@ Full matrix and orchestration policy in [`docs/exit-codes.md`](docs/exit-codes.m
 
 ## Version
 
-**Production:** `WinRE.ps1` v47 patch 3. **Harness:** `Test-WinRE.ps1` v25.
+**Production:** `WinRE.ps1` v47 patch 3. **Harness:** `Test-WinRE.ps1` v26.
 
 The v47 patch 1 `ScriptVersion` bump (46 → 47) changes the `DesiredStateId`, so every managed machine performs one full update on its next scheduled run, then returns to the fast path. The v47 release introduces the third-party driver strip stage, so the deployed WIM bytes differ from v46 whenever a rebuild happens — the version boundary converges the fleet on the strip-normalized driver set. See the migration notes in [`CHANGELOG.md`](CHANGELOG.md).
 

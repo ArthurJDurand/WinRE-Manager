@@ -48,7 +48,30 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 25
+    Version : 26
+
+    v26 changes vs v25:
+    1. Added a Plan adjacency preview section to Option 1. The section
+       mirrors the read-only subset of production's Get-PartitionPlan
+       rejection checks so an operator can see whether production would
+       reject the current layout before running production. The checks
+       evaluated are: cross-disk inventory, overlap with the OS
+       partition, recovery-typed partition exceeding the 2 GiB ceiling,
+       recovery-typed partition overlapping the OS partition,
+       recovery-typed partition preceding the OS partition, partition
+       extents overlapping or not ordered consistently, and a
+       recovery-typed partition separated from C: by a non-recovery
+       partition -- the rejection that a 2026-10-05 field log on an AMD
+       Ryzen 7 5825U machine produced without naming the intervening
+       partition. The check does not compute a bucket size or a planned
+       extent; the rejections related to planned-extent sizing are not
+       evaluated, and a clean preview is not a claim that the full plan
+       would succeed.
+    2. Added Get-HarnessPartitionRef, a partition-rendering helper that
+       produces the disk/part/size/label/type form production's new
+       Format-PartitionRef produces, so the harness names the same
+       objects the production log will name.
+    3. Menu title and startup Rule bumped 25 -> 26.
 
     v25 changes vs v24:
     1. Added Remove-WindowsDriver to the DISM cmdlet availability
@@ -942,6 +965,146 @@ function Get-RecoveryPartitions {
     return @($allParts)
 }
 
+# Render a partition as disk/part/size/label/type for diagnostic output.
+# The disk/part/size/label form mirrors production's Format-PartitionRef
+# so the harness names the same objects the production log will name.
+# The type name uses the harness's own Get-PartitionTypeName, which has
+# a slightly different style from production's inline switch, but the
+# resulting name is still informative and readable.
+function Get-HarnessPartitionRef {
+    param(
+        [Parameter(Mandatory)]$Partition,
+        [switch]$WithType
+    )
+    $ref = "disk $($Partition.DiskNumber) part $($Partition.PartitionNumber)"
+    try {
+        $sizeMiB = [math]::Round([int64]$Partition.Size / 1MB, 1)
+        $ref = "$ref, $sizeMiB MiB"
+    } catch { }
+    try {
+        $vol = Get-Volume -Partition $Partition -ErrorAction SilentlyContinue
+        if ($vol -and $vol.FileSystemLabel) {
+            $ref = "$ref, label='$($vol.FileSystemLabel)'"
+        }
+    } catch { }
+    if ($WithType) {
+        $ref = "$ref, type=$(Get-PartitionTypeName -Partition $Partition)"
+    }
+    return $ref
+}
+
+# Mirror the read-only subset of production's Get-PartitionPlan rejection
+# checks so an operator can see, from the diagnostic, whether production
+# would reject this layout before running production. The checks here are
+# purely geometric and partition-identity; they do not compute a bucket
+# size or a planned extent, so the rejections related to planned-extent
+# sizing (invalid bucket, planned size non-positive, aligned end
+# preceding OS start) are not evaluated. A clean result means the
+# checks that can be evaluated read-only passed; it is not a claim that
+# the full plan would succeed.
+function Test-PlanAdjacencyReadOnly {
+    param(
+        [Parameter(Mandatory)]$OSDisk,
+        [Parameter(Mandatory)]$OSPartition,
+        [Parameter(Mandatory)][array]$Partitions
+    )
+
+    $recoveryType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
+    $osStart = [int64]$OSPartition.Offset
+    $osSize  = [int64]$OSPartition.Size
+    $osEnd   = $osStart + $osSize
+    $allPartitions = @($Partitions | Sort-Object -Property Offset)
+    $maxRecoveryBytes = [int64](2048 * 1MB)
+
+    $reasons = @()
+
+    $crossDisks = @($allPartitions | Where-Object { $_.DiskNumber -ne $OSDisk.Number } | ForEach-Object { $_.DiskNumber } | Select-Object -Unique)
+    if ($crossDisks.Count -gt 0) {
+        $reasons += "partition inventory contains entries from another disk (foreign disk number(s): $($crossDisks -join ', '))"
+    }
+
+    $overlapWithOS = @($allPartitions | Where-Object {
+        $_.PartitionNumber -ne $OSPartition.PartitionNumber -and
+        [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart
+    })
+    if ($overlapWithOS.Count -gt 0) {
+        $refs = ($overlapWithOS | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+        $reasons += "another partition overlaps the OS partition geometry ($refs)"
+    }
+
+    $typedRecovery = @($allPartitions | Where-Object {
+        ($_.GptType -eq $recoveryType) -or ($_.MbrType -eq 0x27)
+    })
+
+    $oversizedRecovery = @($typedRecovery | Where-Object { [int64]$_.Size -gt $maxRecoveryBytes })
+    if ($oversizedRecovery.Count -gt 0) {
+        $refs = ($oversizedRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+        $reasons += "recovery-typed partition exceeds the 2048 MiB safety ceiling ($refs)"
+    }
+
+    $overlapRecovery = @($typedRecovery | Where-Object { [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart })
+    if ($overlapRecovery.Count -gt 0) {
+        $refs = ($overlapRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+        $reasons += "recovery-typed partition overlaps the OS partition geometry ($refs)"
+    }
+
+    $beforeRecovery = @($typedRecovery | Where-Object { ([int64]$_.Offset + [int64]$_.Size) -le $osStart })
+    if ($beforeRecovery.Count -gt 0) {
+        $refs = ($beforeRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+        $reasons += "recovery-typed partition precedes the OS partition; layout requires review ($refs)"
+    }
+
+    $cursor = $osEnd
+    $reclaimable = [System.Collections.Generic.List[object]]::new()
+    $blockingPartition = $null
+    $orderFailure = $null
+    foreach ($partition in $allPartitions) {
+        if ($partition.PartitionNumber -eq $OSPartition.PartitionNumber -and $partition.DiskNumber -eq $OSPartition.DiskNumber) { continue }
+        $partitionStart = [int64]$partition.Offset
+        $partitionEnd = $partitionStart + [int64]$partition.Size
+        if ($partitionEnd -le $osEnd) { continue }
+        if ($partitionStart -lt $cursor) {
+            $currRef = Get-HarnessPartitionRef -Partition $partition
+            $orderFailure = "partition extents overlap or are not ordered consistently (current $currRef starts at $([math]::Round($partitionStart/1MB,1)) MiB, but the previous extent ends at $([math]::Round($cursor/1MB,1)) MiB)"
+            break
+        }
+        $isTypedRecovery = ($partition.GptType -eq $recoveryType) -or ($partition.MbrType -eq 0x27)
+        if (-not $isTypedRecovery) {
+            $blockingPartition = $partition
+            break
+        }
+        $reclaimable.Add($partition)
+        $cursor = $partitionEnd
+    }
+    if ($orderFailure) {
+        $reasons += $orderFailure
+    }
+
+    if (-not $orderFailure -and -not $blockingPartition) {
+        $nonContiguousRecovery = @($typedRecovery | Where-Object {
+            $_.PartitionNumber -notin @($reclaimable | ForEach-Object { $_.PartitionNumber }) -and
+            [int64]$_.Offset -ge $cursor
+        })
+        if ($nonContiguousRecovery.Count -gt 0) {
+            $firstSeparated = $nonContiguousRecovery | Sort-Object Offset | Select-Object -First 1
+            $interveningParts = @($allPartitions | Where-Object {
+                $_.PartitionNumber -ne $OSPartition.PartitionNumber -and
+                [int64]$_.Offset -ge $osEnd -and
+                ([int64]$_.Offset + [int64]$_.Size) -le [int64]$firstSeparated.Offset -and
+                -not (($_.GptType -eq $recoveryType) -or ($_.MbrType -eq 0x27))
+            })
+            $interveningRefs = ($interveningParts | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+            $separatedRefs = ($nonContiguousRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+            $reasons += "recovery-typed partitions are separated from C: by a non-recovery partition (intervening: $interveningRefs; separated: $separatedRefs)"
+        }
+    }
+
+    return @{
+        Status  = if ($reasons.Count -eq 0) { 'OK' } else { 'REJECTED' }
+        Reasons = $reasons
+    }
+}
+
 # =========================== DIAGNOSTIC ===========================
 function Show-SystemDiagnostic {
     Rule "System diagnostic - read-only information gathering"
@@ -1233,6 +1396,32 @@ function Show-SystemDiagnostic {
                 ([string]$isLabel).PadRight(8),
                 ([string]$onOsDisk).PadRight(9)) $color
         }
+    }
+
+    # ---- Plan adjacency preview (read-only mirror of production plan rejections) ----
+    Write-Diag ""
+    Write-Diag "  Plan adjacency preview" "Cyan"
+    Write-Diag "  ──────────────────────" "DarkGray"
+    if ($osPart -and $osDisk) {
+        $planPartList = @(Get-Partition -DiskNumber $osDisk.Number -ErrorAction SilentlyContinue)
+        if ($planPartList.Count -gt 0) {
+            $adjResult = Test-PlanAdjacencyReadOnly -OSDisk $osDisk -OSPartition $osPart -Partitions $planPartList
+            if ($adjResult.Status -eq 'OK') {
+                Write-Diag "  Production's plan would not reject this layout on the checks that can be evaluated read-only." "Green"
+                Write-Diag "  The full plan also computes a bucket size and a planned extent;" "DarkGray"
+                Write-Diag "  those checks are not evaluated here." "DarkGray"
+            } else {
+                Write-Diag "  Production's plan would REJECT this layout. Rejection reason(s):" "Yellow"
+                foreach ($r in $adjResult.Reasons) {
+                    Write-Diag "    - $r" "Yellow"
+                }
+                Write-Diag "  The destructive sequence will defer with EXIT_WARNING until the layout is resolved." "DarkGray"
+            }
+        } else {
+            Write-Diag "  (no partitions on the OS disk - preview not evaluated)" "Yellow"
+        }
+    } else {
+        Write-Diag "  (OS partition or OS disk could not be resolved - preview not evaluated)" "Yellow"
     }
 
     # ---- OS partition supported sizes ----
@@ -2667,7 +2856,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v25)"
+    $titleContent = "WinRE Manager Test Harness (v26)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -2715,7 +2904,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v25"
+Rule "WinRE Manager test harness v26"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN
