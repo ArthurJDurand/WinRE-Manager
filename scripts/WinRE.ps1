@@ -3789,8 +3789,12 @@ function Get-DesiredStateId {
 # CPU vendor/generation. VMD presence is deliberately excluded: its
 # detection is driven by the manifest's requiredDevices patterns, so
 # it cannot be recomputed when the manifest is unavailable, which is
-# precisely the situation this hash exists for. A VMD-presence change
-# would require a motherboard change, which HW/CPU already capture.
+# precisely the situation this hash exists for. VMD is a BIOS
+# setting, not a hardware property: a VMD flip can occur without
+# any hardware change, so HW/CPU do NOT capture it. A machine whose
+# VMD state flipped while offline could take the fast path with a
+# stale DesiredStateId — a documented residual, bounded by the fact
+# that VMD detection needs the manifest the offline fallback lacks.
 #
 # Get-DesiredStateId and Get-LocalInputsId share the first three
 # components and differ in the additional ones (VMD, MANIFEST, OEMPACK,
