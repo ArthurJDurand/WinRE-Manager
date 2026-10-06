@@ -33,6 +33,10 @@ The scripts you will actually run live in the `scripts\` folder:
 - `scripts\WinRE.ps1` — the production script (invoked by the wrapper)
 - `scripts\Test-WinRE.ps1` — the read-only diagnostic harness
 
+**After unpacking a release archive:** the GitHub auto-archive extracts to a folder named `WinRE-Manager-<tag>\`. The wrapper you will actually run is at `WinRE-Manager-<tag>\scripts\WinRE-Manager.cmd` — open that folder in File Explorer and double-click the `.cmd` file.
+
+> **First launch may be blocked by SmartScreen.** Files downloaded from the internet carry the Mark-of-the-Web flag, and the built-in Windows zip extractor propagates it to the extracted `.cmd`. If double-clicking `WinRE-Manager.cmd` triggers "Windows protected your PC", click **More info** → **Run anyway**. To clear the flag permanently, right-click the `.cmd` → **Properties** → tick **Unblock** → **OK**. Extracting with 7-Zip instead of the built-in extractor avoids the flag altogether.
+
 ### Step 2 — Run the wrapper
 
 From File Explorer, open the `scripts\` folder and double-click **`WinRE-Manager.cmd`**. The wrapper opens the menu in the current console without asking for elevation. When you pick an action that needs Administrator rights, a UAC prompt appears and the selected PowerShell script runs elevated in a new window; the menu stays open behind it.
@@ -50,6 +54,12 @@ The wrapper menu appears with these options:
 The wrapper does not request elevation at startup. The menu is unelevated, and elevation is requested only for the action you pick: the selected PowerShell script runs elevated in a new window, and the menu remains open behind it.
 
 > **Why the wrapper, not a direct script invocation?** The wrapper keeps the menu open so you can run several operations in sequence without re-launching, gives you a chance to abort at any point before anything destructive happens, and elevates only the specific PowerShell script that needs it. The production script has its own fail-fast elevation guard for the case where it is invoked directly — but the wrapper is the recommended path for everyone.
+
+### Step 3 — First-run workflow
+
+On a machine that has never run WinRE Manager, take the three options in order: **1** (test harness, read-only) to confirm the current state, **2** (DryRun preview) to see what a live run would do without doing any of it, then **3** (Run for real) only after the preview looks reasonable. The wrapper warns you again before option 3 and requires typing `RUN` to confirm.
+
+After a successful run, **Option 4** shows the tail of the log.
 
 ---
 
