@@ -69,25 +69,17 @@ The test harness runs unelevated; the production script needs elevation or SYSTE
 
 ### One-liners (no local clone)
 
-Runs the script in your current session — including its final `exit` — so this form is convenient for a quick diagnostic but not for anything you need `$LASTEXITCODE` from.
-
-```powershell
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/Test-WinRE.ps1' -UseBasicParsing | Invoke-Expression
-```
-
-**`Invoke-Expression` cannot pass parameters.** For `WinRE.ps1` with `-DryRun` or any other switch, use the scriptblock form. Same current-session caveat, but the arguments work:
-
-```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/WinRE.ps1' -UseBasicParsing))) -DryRun
-```
-
-The save-and-run form is preferable for anything you care about: it isolates the script in a child process, keeps your shell open, and exposes `$LASTEXITCODE`:
+Save the script to a temp path and run it in a child process:
 
 ```powershell
 $p = "$env:TEMP\WinRE.ps1"
 Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
 powershell -ExecutionPolicy Bypass -File $p -DryRun
 ```
+
+Substitute the `Test-WinRE.ps1` URL to fetch the read-only harness, and drop `-DryRun` to run for real. The save-and-run form isolates the script in a child process, keeps your shell open, and exposes `$LASTEXITCODE` — the right shape for anything you care about.
+
+> **Do not pipe the fetched content to `Invoke-Expression`.** The script begins with a UTF-8 byte-order mark followed by a comment-based-help block. Piping the fetched text through `Invoke-Expression` does not strip the BOM before parsing, so the parser does not recognize the help block as a comment and fails on its content. The save-and-run form handles the BOM correctly because the file parser does.
 
 > **Execution policy note.** The `-ExecutionPolicy Bypass` flag applies only to the child process running the script; it does not change your machine's execution policy. If you run a downloaded script directly (`& $p` or `.\script.ps1`), your policy may block it.
 
