@@ -39,6 +39,8 @@ As of v47 patch 1, a full-update run additionally logs:
 
 The program lock is acquired first, immediately after the banner. The log records `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on success, `Another WinRE Manager instance is already running (program lock file is exclusively held). …` if a second instance is running, and `Could not set up program lock at <path> : <error> - proceeding without single-instance protection; concurrent runs may collide` if the lock could not be acquired for a non-contention reason. Under `-DryRun` the lock is skipped and the log records `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances`. See "The script exited with a rename error (concurrent instance)" below for the full discussion.
 
+As of v48 patch 1, four additional lines are logged on the full-update path; the v48 patch 2 elevation guard adds a fifth. The **elevation guard** (v48 patch 2) either logs `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.` and exits before the program lock and before hardware probes, or passes silently. On refusal it creates the log directory itself so its FATAL message has somewhere to be written. The **architecture gate** logs either `Unsupported OS architecture '<arch>': this manager supports x64 only.` and exits `EXIT_WARNING`, or `Architecture gate passed: x64` and continues. The **`LocalInputsId`** is logged as `LocalInputsId: <hash>` immediately after the architecture gate. On the intervening-anchor path, the **anchor plan** is logged as `Intervening-anchor plan: anchor is disk <n> part <m>; anchor shrink <N> MiB -> planned anchor size <M> MiB; recovery partition will be created at offset <O> MiB`. The **transactional WIM replacement** logs `Preserving existing target ... as rollback copy at <path>` when the target had a pre-existing WIM, and either `Rollback copy restored to <path>` or `rollback restore hash verification failed` depending on the outcome. See the corresponding sections below.
+
 One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. As of v44 patch 6, the destructive path no longer consults C:'s BitLocker state at all — only the OS-fallback route does, because on that route the target volume *is* C:.
 
 One further check that runs early and can defer the run is the VMD hardware presence detection. As of v44 patch 6 it is fail-closed: a PnP enumeration error is treated as indeterminate rather than as VMD hardware absent. See "VMD hardware detection was indeterminate" below.
@@ -133,11 +135,64 @@ This gives you OS-fallback WinRE — functional but not the design goal. The ded
 
 **Do NOT re-run the pre-patch-5 script on this machine.** It will fail the same way and delete the recovery partition again.
 
+## The script refused to run because it is not elevated (v48 patch 2)
+
+**Symptom.** The script exits with code 3 (`EXIT_FATAL`) in milliseconds. The FATAL message is written to `C:\ProgramData\OEM\Logs\WinRE-Manager.log`; the guard creates the log directory first so the message has somewhere to be written, even on a machine that has never run `WinRE.ps1` before.
+
+**Log signature.** On the console (and in the log if `C:\ProgramData\OEM\Logs\` already existed):
+
+```
+[ERROR] FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session. Re-run from an elevated prompt, or launch via the scheduled task's SYSTEM context. No changes have been made to WinRE, partitions, BitLocker, drive letters, the workspace, or the state file.
+```
+
+**Cause.** The v48 patch 2 elevation guard runs as the very first statement inside the outer `try` block, before the program lock, before hardware probes, before the manifest fetch, and before any state-modifying action. On refusal it creates the log directory itself so its FATAL message has somewhere to be written. It checks whether the current process has the Administrator role; if not, it refuses in milliseconds rather than proceeding through several minutes of setup work before failing at `Mount-WindowsImage` with an ambiguous FATAL.
+
+**This is expected behavior, not a bug.** The guard exists precisely to convert an expensive, ambiguous failure into a fast, clear one. Do not file a bug for this signature.
+
+**Resolution.** Relaunch from an elevated prompt or via `scripts\WinRE-Manager.cmd`. From a normal PowerShell:
+
+```powershell
+Start-Process powershell -Verb RunAs
+```
+
+Then run `.\scripts\WinRE.ps1 -DryRun` or `.\scripts\WinRE.ps1` from the elevated window. The guard also accepts the `NT AUTHORITY\SYSTEM` context used by the scheduled task, so a scheduled run under SYSTEM is not affected.
+
+**Under `-DryRun` the guard still fires.** DryRun avoids destructive operations, but it still reads partition tables, calls `reagentc /info`, and reads DISM metadata; refusing unelevated DryRun keeps the behavior unambiguous.
+
+## The script refused to run because the OS architecture is not x64 (v48 patch 1)
+
+**Symptom.** The script exits with code 2 (`EXIT_WARNING`) before the manifest fetch. The machine is unchanged: no partition touched, no WIM deployed, WinRE not disabled, no state file written.
+
+**Log signature.**
+
+```
+[WARN] Unsupported OS architecture '<arch>': this manager supports x64 only. No WinRE, partition, image, checkpoint, or recovery-state changes have been made. The machine remains as it was before this run; the previous WinRE route (if any) is untouched. ARM64 support would require a separate, tested change to the WinRE image pipeline.
+```
+
+Where `<arch>` is one of `ARM64`, `x86`, or `unknown`.
+
+**Cause.** The v48 patch 1 architecture gate refuses to run on any architecture other than `x64`. The pipeline has not been validated on ARM64 or x86, and the architecture token is not a `DesiredStateId` component, so nothing upstream would have flagged a mismatch if the pipeline had proceeded. The gate makes the refusal explicit and named rather than letting the machine reach a pipeline stage it was not built for.
+
+**This is a stable deferral, not a transient failure.** Any machine whose architecture is not `x64` will continue to exit 2 on every run until the manager adds support or the machine is replaced. Do not retry expecting a different result.
+
+**Diagnostic steps.** To confirm what the guard saw:
+
+```powershell
+[Environment]::Is64BitOperatingSystem
+$env:PROCESSOR_ARCHITECTURE
+$env:PROCESSOR_ARCHITEW6432
+Get-CimInstance Win32_OperatingSystem | Select-Object OSArchitecture, Caption, BuildNumber
+```
+
+The guard uses `PROCESSOR_ARCHITECTURE` with `PROCESSOR_ARCHITEW6432` taking precedence when present; `Win32_OperatingSystem.OSArchitecture` is consulted only as a 32-bit-OS fallback when the process architecture is unrecognized. On x64 hardware running an x64 OS, `PROCESSOR_ARCHITECTURE` reads `AMD64` and the guard passes with `Architecture gate passed: x64`. On ARM64, it reads `ARM64` and the guard refuses. If the tokens look wrong for your hardware, file a bug with all four of the values above.
+
+**Under `-DryRun` the gate still fires** and exits `EXIT_WARNING` unconditionally, because the architecture is a property of the machine and not of the run mode.
+
 ## The machine is in Audit Mode / OOBE / sysprep
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v47 patch 2) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v48 patch 2) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -334,7 +389,7 @@ or
 Followed (at the `Ensure-AdequateRecoveryPartition` site) by:
 
 ```
-[WARN] Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring C: to its captured size; no partitions have been deleted.
+[WARN] Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring OS partition (C:) to its captured size; no partitions have been deleted.
 ```
 
 Followed (at the Step 5 deployment site) by:
@@ -518,7 +573,7 @@ Followed by removal of the checkpoint file and a re-read returning Step 0.
 
 ## The destructive replacement was deferred before partition deletion (v45 patch 1; v46 patch 2 and v47 patch 1 added reasons)
 
-**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: the old recovery partition is still present, no partition was deleted, and the run did not attempt OS-fallback. The deferral is protective: the destructive sequence was about to run, the read-only plan or the pre-shrink check determined that it could not safely complete, and the script stepped back before destroying anything. In one v46 patch 2 sub-case — the pre-deletion resolver guard — WinRE is left `Disabled` because `reagentc /disable` has already run; see "The active WinRE route could not be resolved to a partition" below. In one v47 patch 1 sub-case — the pre-`/disable` race-detector abort — C: may have been pre-shrunk and is restored before the return; see "The pre-`/disable` race detector fired" above. In every other reason, WinRE stays `Enabled` and registered to the old recovery partition.
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is unchanged: the old recovery partition is still present, no partition was deleted, and the run did not attempt OS-fallback. The deferral is protective: the destructive sequence was about to run, the read-only plan or the pre-shrink check determined that it could not safely complete, and the script stepped back before destroying anything. In one v47 patch 1 sub-case — the pre-`/disable` race-detector abort — C: may have been pre-shrunk and is restored before the return; see "The pre-`/disable` race detector fired" above. In every other reason, WinRE stays `Enabled` and registered to the old recovery partition.
 
 **Log signature.** The last lines of the run before exit are:
 
@@ -531,21 +586,21 @@ The second line appears only when the deferral is retry-suppressible; the first 
 
 The most common `<Reason>` values are the following. Each has a distinct resolution. [exit-codes.md](exit-codes.md) carries the full list, including the internal failure reasons (`partition geometry unavailable`, `WinRE disable failed before deletion`, `WinRE disable verification failed before deletion`, `active WinRE location could not be resolved`, the two `recovery partition deletion failed` variants, and `registered source changed before disable`); those indicate storage-level, OS-level, or Windows-Update-driven conditions rather than operator-actionable constraints, and are diagnosable from the surrounding log lines.
 
-- **`Dedicated recovery partition plan rejected: <specific reason>. No partition or WinRE changes were made.`** — The read-only geometry plan rejected the layout. The `RetrySuppressible` flag is not set; the marker is not written. The nested `<specific reason>` is one of thirteen: the partition inventory contains entries from another disk; another partition overlaps the OS partition geometry; the OS partition's supported-size bounds are unavailable; the requested recovery bucket size is invalid; the requested recovery bucket size exceeds the 2 GiB safety ceiling; the OS partition's geometry is inconsistent with the disk size; a recovery-typed partition exceeds the 2 GiB safety ceiling; a recovery-typed partition overlaps the OS partition geometry; a recovery-typed partition precedes the OS partition; partition extents overlap or are not ordered consistently; a recovery-typed partition is separated from C: by a non-recovery partition; the planned OS partition size would be zero or negative; or the aligned managed extent end precedes the OS partition start. Since v47 patch 3, the seven partition-identity rejection reasons name the offending partition(s) directly: disk number, partition number, size, volume label where readable, and type code. This is the diagnostic that a 2026-10-05 field log on an AMD Ryzen 7 5825U machine could not provide: the log showed `recovery-typed partitions are separated from C: by a non-recovery partition` with no indication of which partition was in the way. Under v47 patch 4 the same rejection reads `recovery-typed partitions are separated from C: by a non-recovery partition (intervening: disk 0 part 4, ... ; separated: disk 0 part 5, ...)` - the log now names the objects, and an operator (or a bug report) can identify the layout without re-running the harness.
-- **`Pre-shrink free-space check could not read the C: volume (Get-Volume -DriveLetter C returned nothing). Refusing to shrink C: without verifying the 3 GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed.`** — Fail-closed C: volume-read check. `RetrySuppressible = $false`; the marker is not written; the next run retries naturally.
-- **`Pre-shrink free-space check failed: shrinking C: by <n> MiB would leave only <m> GiB free, below the 3 GiB minimum. …`** — The measured projected free space on C: after the planned shrink would fall below 3 GiB. `RetrySuppressible = $true`; the marker is written.
-- **`Pre-destructive shrink failed after all retries. Existing WinRE registration and recovery partitions remain intact; deferring without OS-fallback.`** — All three shrink attempts (immediate, sleep-10s, defrag) failed. `RetrySuppressible = $true`; the marker is written.
-- **`OS partition did not land at the planned size; preserving the old recovery route and deferring`** — The shrink returned success but the post-resize verification failed. `RetrySuppressible = $true`; the marker is written.
+- **`Dedicated recovery partition plan rejected: <specific reason>. No partition or WinRE changes were made.`** — The read-only geometry plan rejected the layout. The `RetrySuppressible` flag is not set; the marker is not written. The nested `<specific reason>` is one of thirteen: the partition inventory contains entries from another disk; another partition overlaps the OS partition geometry; the OS partition's supported-size bounds are unavailable; the requested recovery bucket size is invalid; the requested recovery bucket size exceeds the 2 GiB safety ceiling; the OS partition's geometry is inconsistent with the disk size; a recovery-typed partition exceeds the 2 GiB safety ceiling; a recovery-typed partition overlaps the OS partition geometry; a recovery-typed partition precedes the OS partition; partition extents overlap or are not ordered consistently; a recovery-typed partition is separated from C: by a non-recovery partition; the planned OS partition size would be zero or negative; or the aligned managed extent end precedes the OS partition start. Since v47 patch 3, the seven partition-identity rejection reasons name the offending partition(s) directly: disk number, partition number, size, volume label where readable, and type code. This is the diagnostic that a 2026-10-05 field log on an AMD Ryzen 7 5825U machine could not provide: the log showed `recovery-typed partitions are separated from C: by a non-recovery partition` with no indication of which partition was in the way. As of v47 patch 3 the same rejection reads `recovery-typed partitions are separated from C: by a non-recovery partition (intervening: disk 0 part 4, ... ; separated: disk 0 part 5, ...)` - the log now names the objects, and an operator (or a bug report) can identify the layout without re-running the harness.
+- **`Pre-shrink free-space check could not read the OS partition (C:) volume (Get-Volume -Partition returned nothing). Refusing to shrink without verifying the 3 GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed.`** — Fail-closed resize-target volume-read check. `RetrySuppressible = $false`; the marker is not written; the next run retries naturally.
+- **`Pre-shrink free-space check failed: shrinking OS partition (C:) by <n> MiB would leave only <m> GiB free, below the 3 GiB minimum. …`** — The measured projected free space on C: after the planned shrink would fall below 3 GiB. `RetrySuppressible = $true`; the marker is written.
+- **`Pre-destructive shrink of OS partition (C:) failed after all retries. Existing WinRE registration and recovery partitions remain intact; deferring without OS-fallback.`** — All three shrink attempts (immediate, sleep-10s, defrag) failed. `RetrySuppressible = $true`; the marker is written.
+- **`OS partition (C:) did not land at the planned size; preserving the old recovery route and deferring`** — The shrink returned success but the post-resize verification failed. `RetrySuppressible = $true`; the marker is written.
 - **`Resize rounding leaves only <n> MiB for a <m> MiB bucket; preserving the old route and deferring`** — The actual post-resize geometry leaves less space than the plan's bucket needs. `RetrySuppressible = $true`; the marker is written.
-- **`WinRE is Enabled but its registered location (<location>) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made.`** (v46 patch 2) — The active WinRE route could not be resolved to a partition. `Reason = "active WinRE location could not be resolved"`. Delete-last ordering and route restoration both depend on knowing which partition is active; without it, no partition is protected and a mid-loop failure could leave the machine with no working recovery route. The guard fires **after** `reagentc /disable` has already run, so the machine is left with WinRE `Disabled` and the old recovery partition intact. `RetrySuppressible = $false`; the marker is not written. See "The active WinRE route could not be resolved to a partition" below.
-- **`Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring C: to its captured size; no partitions have been deleted.`** (v47 patch 1) — The pre-`/disable` race detector fired at the `Ensure-AdequateRecoveryPartition` site. `Reason = "registered source changed before disable"`. The abort happens after the pre-shrink but before any partition is deleted, so C: is restored to its captured size and the old WinRE route is intact. `RetrySuppressible = $false`; the marker is not written. See "The pre-`/disable` race detector fired" above.
+- **`WinRE is Enabled but its registered location (<location>) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made.`** (v46 patch 2) — The active WinRE route could not be resolved to a partition. `Reason = "active WinRE location could not be resolved"`. Delete-last ordering and route restoration both depend on knowing which partition is active; without it, no partition is protected and a mid-loop failure could leave the machine with no working recovery route. The guard fires ahead of the pre-shrink and ahead of `reagentc /disable` (v48 patch 1 placement), so the machine is left with WinRE still `Enabled` and the old recovery partition intact. `RetrySuppressible = $false`; the marker is not written. See "The active WinRE route could not be resolved to a partition" below.
+- **`Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring OS partition (C:) to its captured size; no partitions have been deleted.`** (v47 patch 1) — The pre-`/disable` race detector fired at the `Ensure-AdequateRecoveryPartition` site. `Reason = "registered source changed before disable"`. The abort happens after the pre-shrink but before any partition is deleted, so C: is restored to its captured size and the old WinRE route is intact. `RetrySuppressible = $false`; the marker is not written. See "The pre-`/disable` race detector fired" above.
 
 **Cause.** The v45 patch 1 pipeline runs the risky operation — the shrink — in the reversible window, before `reagentc /disable` and before any partition deletion. The read-only geometry plan checks the layout before any change. Any of the conditions above stops the run before the destructive sequence begins. Except for the v46 patch 2 resolver deferral and the v47 patch 1 race-detector abort, the old recovery route is left intact.
 
 The most common causes:
 
 - **Insufficient free space on C:.** The shrink would take C: below the 3 GiB reserve. Free space on C: and re-run.
-- **Transient volume-read failure.** `Get-Volume -DriveLetter C` returned nothing. This is rare and usually transient; re-run.
+- **Transient volume-read failure.** The pre-shrink free-space check's read of the resize-target volume returned nothing. This is rare and usually transient; re-run.
 - **Blocking layout.** A non-recovery partition after C:, a non-contiguous recovery partition, or a recovery-typed partition preceding C:. The disk layout requires manual review.
 - **Oversized recovery partition.** A recovery-typed partition over 2 GiB is present, and the plan refuses to reuse or delete it. Preserve it or use the harness Option 1 to inspect it.
 - **Shrink failure.** C: cannot be shrunk by the required amount even after the sleep-and-defrag retries. Free space on C:, defragment the drive, or reduce the required bucket (which depends on the WIM size).
@@ -584,22 +639,18 @@ If both hold, the run exits `EXIT_WARNING` without repeating the same pre-shrink
 
 ### The active WinRE route could not be resolved to a partition (v46 patch 2)
 
-**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the log shows the v46 patch 2 pre-deletion resolver guard firing. The old recovery partition is intact — no partition was deleted — but the machine is left with WinRE `Disabled`, because `reagentc /disable` has already run by the time this guard fires.
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the log shows the v46 patch 2 pre-deletion resolver guard firing. The old recovery partition is intact — no partition was deleted — and, because the guard fires ahead of the pre-shrink and ahead of `reagentc /disable` (v48 patch 1 placement), the machine is left with WinRE still `Enabled`.
 
 **Log signature.**
 
 ```
-[INFO] Disabling WinRE before partition recreation
-[INFO] reagentc /disable: exit=0, output=REAGENTC.EXE: Operation Successful.
-[INFO] WinRE disable verified
-[INFO] Pre-deletion inventory:
 [ERROR] WinRE is Enabled but its registered location (<location>) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made.
 [WARN] Dedicated replacement deferred before partition deletion (active WinRE location could not be resolved). The existing WinRE route was preserved; not attempting OS-fallback.
 ```
 
-Note the ordering: the guard fires **after** the `/disable` block, not before it. The machine is left with WinRE `Disabled` and the old recovery partition intact and unregistered.
+Note the ordering: as of v48 patch 1, the guard fires **before** the pre-shrink and **before** the `/disable` block, so WinRE is still `Enabled` and the old recovery partition is intact when the deferral is returned.
 
-**Cause.** `Get-WinREState` returned `Status = Enabled` but `Resolve-WinRELocationToPartition` could not map the registered location to a partition. Delete-last ordering depends on identifying the active partition so the previous route's target survives a mid-loop failure; route restoration depends on knowing which partition to re-enable. Without either, the script refuses to begin a destructive sequence that could leave the machine with no working recovery route. The guard fires after `/disable` because the resolver is only needed once the script is about to touch partitions.
+**Cause.** `Get-WinREState` returned `Status = Enabled` but `Resolve-WinRELocationToPartition` could not map the registered location to a partition. Delete-last ordering depends on identifying the active partition so the previous route's target survives a mid-loop failure; route restoration depends on knowing which partition to re-enable. Without either, the script refuses to begin a destructive sequence that could leave the machine with no working recovery route. The guard fires ahead of the pre-shrink and ahead of `/disable` (v48 patch 1 placement): the resolver is needed to determine the resize target (the anchor in the intervening case) and to establish the delete-last ordering before any partition is touched.
 
 Causes of an unresolvable location:
 
@@ -648,7 +699,80 @@ Causes of an unresolvable location:
 
 5. **If no type-coded recovery partition exists on the OS disk**, the machine is in the state described in ["The machine has no recovery partition and WinRE is disabled"](#the-machine-has-no-recovery-partition-and-winre-is-disabled). Follow that recovery procedure.
 
-**Do not re-run the script without re-registering WinRE first.** The next run will see WinRE `Disabled` and may take the enable-only or full-update path; the enable-only path cannot succeed without a partition to register against, and the full-update path may attempt the destructive sequence again and hit the same guard.
+**Re-running the script is safe.** The guard fires with WinRE still `Enabled` and the old recovery partition intact, so the machine is in the same state it was before the run. If the resolver still cannot map the location, the same guard fires again with the same outcome.
+
+## The intervening-anchor plan rejected the layout (v48 patch 1)
+
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`). The old recovery partition is intact; no partition was touched.
+
+**Log signatures.** One of the following appears in the log, always prefixed by the plan summary line:
+
+```
+[WARN] Dedicated recovery partition plan rejected: <specific anchor failure>. No partition or WinRE changes were made.
+```
+
+or, for the surplus case:
+
+```
+[WARN] intervening anchor is N MiB smaller than the plan requires to seat the recovery partition at the disk tail; this v48 scope does not extend the anchor (BitLocker). Manual intervention: extend the anchor to close the gap, or reduce the desired recovery partition size, then re-run.
+```
+
+or, for the multi-intervening case:
+
+```
+[WARN] recovery-typed partitions exist beyond the intervening anchor's recovery cluster; this layout is not supported (intervening: ...).
+```
+
+**Cause.** The v48 patch 1 intervening-anchor path handles the `C: | D: | Recovery` layout within a deliberately narrow scope: exactly one non-recovery data partition between C: and the type-coded recovery cluster, and the anchor must validate against nine read-only conditions (on the OS disk, not C:, not a recovery-typed partition, not EFI/MSR/system/reserved, NTFS, accessible for resize, sufficiently large, shrinkable from the right with sufficient free space, no unexpected intervening geometry). The scope does not extend the anchor, does not move partitions, and does not handle multiple intervening partitions.
+
+**The anchor-validation failures are:** anchor is an EFI System Partition; anchor is a Microsoft Reserved Partition; anchor is a system/boot partition; anchor has no readable volume; anchor filesystem is not NTFS; anchor has no drive letter; anchor encryption state is indeterminate; anchor is BitLocker-locked; anchor supported-size query failed; planned anchor size is zero or negative; planned anchor size is below the anchor's supported minimum.
+
+**The surplus case** fires when the recovery partition being reclaimed is **larger** than the new bucket size. The plan cannot seat the new recovery partition at the disk tail without extending the anchor, and the v48 scope forbids extending the anchor because a BitLocker-encrypted anchor is not safely growable via `Resize-Partition` alone.
+
+**The multi-intervening case** fires when there are two or more non-recovery partitions between C: and the recovery cluster (`C: | D: | E: | Recovery`). This was already a deferral under v47; v48 keeps the deferral and enriches the reason with `Format-PartitionRef` entries.
+
+**Resolution.** Run `scripts\Test-WinRE.ps1` Option 1 to identify the exact partition the plan rejected. The log names the disk number, partition number, size, label, and type code for each candidate. Depending on the reason:
+
+- **Anchor is EFI/MSR/system/reserved:** the intervening partition is not a data partition; the layout is out of scope. Resolve manually, or file a bug if the classification seems wrong.
+- **Anchor filesystem not NTFS / no readable volume:** the anchor's filesystem is not supported by the current scope.
+- **Anchor has no drive letter:** the anchor needs a drive letter for the plan to verify BitLocker state. Assign one manually, then re-run.
+- **Anchor encryption state indeterminate or BitLocker-locked:** unlock or fully decrypt the anchor, then re-run.
+- **Anchor supported-size query failed:** a storage-level condition. Investigate and retry.
+- **Surplus case:** extend the anchor to close the gap, or reduce the desired recovery partition size (which is derived from the WIM size plus the 280 MiB overhead, rounded up to the next 100 MiB and clamped to a 1000 MiB minimum).
+- **Multi-intervening:** the v48 scope is deliberately narrow. Automating multi-intervening handling is a v49 candidate; for now the layout requires manual intervention.
+
+After resolving, delete `C:\Recovery\OEM\winre_state.json` and `C:\Recovery\OEM\winre_partition_deferred.json` to force a retry:
+
+```powershell
+Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force -ErrorAction SilentlyContinue
+```
+
+**Field status.** The intervening-anchor happy path is field-verified on the AMD Ryzen 7 5825U that motivated it. The multi-intervening and surplus rejections have not been exercised on physical hardware. If you see one of them, please capture the full log and file a bug.
+
+## The offline fallback deferred because `LocalInputsId` did not match (v48 patch 1)
+
+**Symptom.** The machine is offline (or the manifest host is unreachable). The run exits with code 2 (`EXIT_WARNING`). The machine is unchanged: no WIM deployed, no partition touched, WinRE not disabled, no state file written.
+
+**Log signature.**
+
+```
+[WARN] Offline fallback: stored LocalInputsId <stored-hash> does not match the current locally-computable inputs <current-hash>. A hardware or OS input changed while the machine was offline; the stored DesiredStateId no longer describes this machine. Deferring rather than taking the fast path on a stale DSI. Bring the machine online so a fresh manifest can be fetched and a new DesiredStateId computed.
+```
+
+**Cause.** The offline fallback trusts the state file's stored `DesiredStateId` without recomputing it, but as of v48 patch 1 it also recomputes a `LocalInputsId` hash over the three locally-observable deployment inputs (hardware identity, OS build, CPU vendor/generation) and compares it against the stored value. A mismatch means a locally-observable input changed while the machine was offline — a CPU swap, a BIOS update that flipped VMD (visible via the CPU vendor/generation component), a Windows build change, or a motherboard replacement. The stored `DesiredStateId` describes a machine that no longer exists, so the run refuses to take the fast path on it.
+
+**This is a protective deferral.** The offline fallback's original design trust boundary was "trust the state file if the local safety checks pass"; the v48 patch 1 field bounds that trust to a hash over the inputs the script can still see. The machine is unchanged and healthy; the DSI is simply stale.
+
+**Resolution.** Bring the machine online. The next scheduled run with network recomputes the `DesiredStateId` from a fresh manifest and either converges on the fast path (if no deployment input actually changed) or performs the full-update pass (if one did). No manual intervention is required. If the machine is expected to remain offline, the correct state is the current one: the machine defers with `EXIT_WARNING` until network is available.
+
+**Diagnostic steps.** To see what changed:
+
+```powershell
+Get-Content "$env:SystemDrive\Recovery\OEM\winre_state.json" | ConvertFrom-Json | Select-Object DesiredStateId, LocalInputsId, LastUpdated
+```
+
+The harness at v27 reports the computed `LocalInputsId` in Option S alongside the stored value, so a field engineer can see the mismatch without running production.
 
 ## The script exited with a rename error (concurrent instance)
 
@@ -792,7 +916,7 @@ Exit code 3. The machine is unchanged. No WIM deployed, no partition touched.
 
 **Resolution (Case 3 — restore network before the next run).** A first deployment requires the live manifest. On the next scheduled run with network, the script fetches the manifest, computes the initial `DesiredStateId`, and performs a full-update pass. If the machine is expected to be offline indefinitely, the deployment cannot complete; consider pre-staging the state file from a machine that has network by copying `C:\Recovery\OEM\winre_state.json` from a working machine of the same model — but note that the DSI is machine-specific and a copied state file may not match.
 
-**Residual risk while offline.** The offline fallback trusts the state file's stored `DesiredStateId` without verifying that the machine's local hardware still matches the inputs that produced it. On a machine whose hardware changed while offline — a CPU swap, a BIOS update that flipped VMD, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — the offline run could take the fast path with a stale DSI. The next successful manifest fetch detects the drift and forces a rebuild. A `LocalInputsId` field in the state file would close this; it is planned as its own version boundary. See [state-and-idempotency.md](state-and-idempotency.md) for the full discussion.
+**Residual risk while offline is closed as of v48 patch 1.** The offline fallback trusts the state file's stored `DesiredStateId` without recomputing it from cached inputs, but it also recomputes a `LocalInputsId` hash over the three locally-observable deployment inputs (hardware identity, OS build, CPU vendor/generation) and compares it against the stored value. A mismatch defers with `EXIT_WARNING` — the stored `DesiredStateId` describes a machine whose hardware or OS has since changed, and the run does not take the fast path on that basis. VMD presence is deliberately excluded because its detection depends on the manifest, which the offline fallback does not have. See [state-and-idempotency.md](state-and-idempotency.md) for the full discussion.
 
 **Not to be confused with the Audit Mode or OS-fallback BitLocker deferrals.** All three exit with code 2 and leave the state file unchanged, but the log signature is distinct. The Audit Mode deferral logs `Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=…)` and fires before the hardware check. The OS-fallback BitLocker deferral logs `OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=…)` and fires after the classifier runs. The offline deferral logs `Offline fallback: the machine requires a full update …` and fires before the full-update pipeline. A field engineer reading the log will see the difference immediately.
 
@@ -1414,7 +1538,7 @@ Under v47 the first run also writes the `DeployedWinREMetadata` anchor. From the
 
 If the state file is repeatedly disappearing on a machine that has already taken one full-update pass under the current version, check:
 
-1. Whether `Restore-OSPartitionSize` is failing. If it is, `$Script:GeometryRestoreFailed` is set and `Write-WinREState` deletes the state file on purpose. The log will show `Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file`. Investigate why the geometry restore is failing.
+1. Whether `Restore-OSPartitionSize` is failing. If it is, `$Script:GeometryRestoreFailed` is set and `Write-WinREState` deletes the state file on purpose. The log will show `Write-WinREState: a partition geometry could not be verified after a failed destructive attempt - deleting state file so the next run retries from a clean slate`. Investigate why the geometry restore is failing.
 2. Whether the file is being deleted by something else (antivirus, cleanup task, GPO). `C:\Recovery\OEM\` is not a location that should be cleaned by any standard tooling.
 3. Whether the loop-breaker is firing because the enable-failure counter reached 3. The state file is deliberately left in place in that case (the operator deletes it manually to reset the counter), but if a cleanup tool is configured to remove anything in `C:\Recovery\OEM\` on a schedule, it will also remove the state file for this reason.
 
@@ -1470,7 +1594,7 @@ To make an OS-fallback machine attempt the dedicated path again:
 ...
 [INFO] Confirmed deletion of partition 4 on disk 0
 ...
-[ERROR] Planned recovery extent is no longer free after deletion (offset=... size=... overlapCount=0); restoring original C: size
+[ERROR] Planned recovery extent is no longer free after deletion (offset=... size=... overlapCount=0); restoring OS partition (C:)
 ```
 
 Two features distinguish this from other post-delete failures: the `alignment reserve 344 KiB` value in the plan summary line, and `overlapCount=0` in the post-delete check. Other post-delete failures produce different messages (`New-Partition` failure, `Format-Volume` failure, and so on) and are documented under their own sections above.
@@ -1524,7 +1648,10 @@ or, if the OS-shrink could not fit:
 ```
 [INFO] No suitable existing recovery partition - attempting to create one
 …
-[ERROR] Returning null - main flow will attempt OS-partition fallback (C:\Recovery\WindowsRE).
+[WARN] ================================================================================
+[WARN] Dedicated recovery partition creation failed after all attempts.
+[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
+[WARN] ================================================================================
 ```
 
 **Cause.** The active WinRE location resolves to a partition that has the right volume label but not the right type code. Under v44 patch 7, this partition is:
@@ -1635,6 +1762,13 @@ Under DryRun the OS-fallback BitLocker gate is not reached. The full-update pipe
 
 The DryRun contract for the VMD-query-indeterminate deferral (v44 patch 6) is the same: the enumeration error is logged, and the run continues rather than exiting.
 
+Two v48 checks that run under `-DryRun` do **not** have a read-only carve-out and exit unconditionally:
+
+- **The elevation guard (v48 patch 2).** An unelevated dry run exits `EXIT_FATAL` in milliseconds with the same FATAL log line as a live run. DryRun avoids destructive operations, but it still reads partition tables, calls `reagentc /info`, and reads DISM metadata; refusing unelevated DryRun keeps the behavior unambiguous.
+- **The architecture gate (v48 patch 1).** A dry run on a non-x64 host exits `EXIT_WARNING` with the same `Unsupported OS architecture` line as a live run. The architecture is a property of the machine, not of the run mode, so the refusal is unconditional.
+
+The v48 `LocalInputsId` computation runs under `-DryRun` (the value is logged) but its comparison against the state file does not, because the offline fallback is not reachable in a dry run — the dry run always performs a live manifest fetch and never enters the offline path.
+
 The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the reasons evaluated before the DryRun choke point are surfaced exactly as in a live run, while the reasons only reachable after the choke point or gated on `-not $Script:DryRun` are not. The surfaced group is the plan-rejection reasons (all thirteen), `partition geometry unavailable`, `C: volume could not be read for free-space check`, `post-shrink free space below minimum`, and `active WinRE location could not be resolved` (seventeen of the twenty-five distinct reason strings). The unsurfaced group is the pre-shrink execution paths (`pre-shrink failed`, `pre-shrink verification failed`, `resize rounding reduced planned extent`), the two disable-failure paths, the deletion-failure path, and the registered-source-changed abort. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN]   - Disk …` lines.
 
 Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable …` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
@@ -1668,6 +1802,12 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - If the run exited with code 3 and the log ends with `Cannot rename because item at '<workspace>\winre.wim' does not exist`, check whether the log also contains `Could not set up program lock at …` earlier in the run. If it does, the lock could not be acquired for a non-contention reason (permissions, missing `Logs` directory, transient filesystem issue) and the run proceeded unprotected. The reporter should include the exact lock-failure message and any relevant permissions on `C:\ProgramData\OEM\Logs\`.
 - If the log contains `CmdletizationQuery_NotFound_DiskNumber` or `No MSFT_Partition objects found with property 'DiskNumber'`, note the disk number the error names and whether the machine has a card reader or an empty USB enclosure attached. As of v46 patch 2 (production) and v22 (harness), the guard silences the error; include the exact text and the version banner so the reporter can confirm the fix applies.
 - If the log shows `Planned recovery extent is no longer free after deletion (offset=... size=... overlapCount=0)` following the deletion of the old recovery partition, and the plan summary line shows an `alignment reserve` value, this is the v45 plan-rejection corner fixed by v46 patch 1. Include the version banner from the top of the log (v45 patch 1 or later), the `alignment reserve` value, and the state file's `DesiredStateId` at the time of the failure. See [The v45 plan-rejection corner](#the-v45-plan-rejection-corner-fixed-in-v46-patch-1).
+- If the run exited with code 3 and the log ends with `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.`, this is **expected behavior**, not a bug. The v48 patch 2 elevation guard refuses unelevated launches in milliseconds. The fix is to relaunch from an elevated prompt or via `scripts\WinRE-Manager.cmd`. No bug report is needed.
+- If the run exited with code 2 and the log shows `Unsupported OS architecture '<arch>'`, this is the v48 patch 1 architecture gate refusing to run on a non-x64 host. Include `[Environment]::Is64BitOperatingSystem`, `$env:PROCESSOR_ARCHITECTURE`, `$env:PROCESSOR_ARCHITEW6432`, and the output of `Get-CimInstance Win32_OperatingSystem | Select-Object OSArchitecture, Caption, BuildNumber`.
+- If the run exited with code 2 and the log shows `Dedicated recovery partition plan rejected: anchor is ...` or `intervening anchor is N MiB smaller than the plan requires`, this is a v48 intervening-anchor rejection. Include the anchor partition's current size, filesystem, type code, BitLocker state, and drive letter, plus the full partition inventory from `Get-Partition -DiskNumber <n>`.
+- If the run exited with code 2 and the log shows `recovery-typed partitions exist beyond the intervening anchor's recovery cluster`, this is the v48 multi-intervening rejection. Include the full partition layout from `Get-Partition -DiskNumber <n>`.
+- If the run exited with code 2 and the log shows `Offline fallback: stored LocalInputsId <hash> does not match the current locally-computable inputs <hash>`, this is the v48 offline hardware-drift guard. Include both hashes and the state file's `LastUpdated`.
+- If the run exited with code 2 and the log shows `Preserving existing target ... as rollback copy` followed by `copy failed - restoring rollback copy` or `rollback restore hash verification failed`, this is the v48 transactional WIM replacement's failure branch. Include the source path, target path, source hash, and the rollback-hash verification outcome. This branch has not been exercised in the field and the project wants field data on it.
 - The relevant slice of the log — not the whole file unless asked.
 - The output of `Test-WinRE.ps1` Option 1, which reports what the production script would see on this machine and includes the BitLocker, Windows Setup state, target-partition state, and classifier verdicts. If the report is about the fast path or the state file, also include the output of Option S.
 

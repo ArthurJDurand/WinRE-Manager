@@ -30,6 +30,17 @@ end_of_line = crlf
 [*.md]
 trim_trailing_whitespace = false
 
+# These three markdown files are CRLF per the project encoding table,
+# unlike the remaining docs/*.md files which are LF.
+[README.md]
+end_of_line = crlf
+
+[docs/architecture.md]
+end_of_line = crlf
+
+[docs/index.md]
+end_of_line = crlf
+
 [*.{yml,yaml}]
 indent_size = 2
 

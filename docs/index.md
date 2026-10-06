@@ -3,7 +3,7 @@
 **A self-healing Windows Recovery Environment manager for Windows 10 and 11.**
 
 [![Docs](https://img.shields.io/badge/docs-ArthurJDurand.github.io-4B32C3)](https://ArthurJDurand.github.io/WinRE-Manager/)
-[![Version](https://img.shields.io/badge/version-v47%20patch%203-blue)](../CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v48%20patch%202-blue)](../CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)](../README.md)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)](../README.md)
 
@@ -15,53 +15,47 @@ If you landed here searching for **"fix Windows Recovery"**, **"repair Windows R
 
 ## Quick Start
 
-Everything below runs the same production script. Pick the level of action you want.
+The recommended path is the interactive wrapper, `scripts\WinRE-Manager.cmd`. If you want to drive the PowerShell scripts directly — for scripting, CI, or a pinned version — see [Advanced usage](#advanced-usage).
 
-### 1. Open an elevated PowerShell
+### Step 1 — Get the scripts
 
-The diagnostic harness runs unelevated. The dry-run and repair commands need an **elevated** PowerShell prompt — the current user with the Administrator token.
-
-Easiest way to get one: press **Win+X**, then **A** (Windows Terminal as Administrator), or press **Win+R**, type `powershell`, then press **Ctrl+Shift+Enter**. From inside any PowerShell (or cmd.exe):
+Clone the repository:
 
 ```powershell
-Start-Process powershell -Verb RunAs
+git clone https://github.com/ArthurJDurand/WinRE-Manager.git
 ```
 
-> **Execution policy note.** The Quick Start commands invoke the downloaded scripts through `powershell -ExecutionPolicy Bypass -File`. That flag applies only to the child process running the script; it does not change your machine's execution policy. If you run a downloaded script directly (`& $p` or `.\script.ps1`), your policy may block it. See [One-liners (advanced)](#one-liners-advanced) for the direct-execution alternatives and their trade-offs.
+Or download the latest release from [github.com/ArthurJDurand/WinRE-Manager/releases/latest](https://github.com/ArthurJDurand/WinRE-Manager/releases/latest) and unpack the archive.
 
-### 2. Read-only diagnostic (no elevation required)
+The scripts you will actually run live in the `scripts\` folder:
 
-Changes nothing. Prints the current WinRE state, partition layout, driver inventory, and deployment inputs. Safe to run on a production machine at any time.
+- `scripts\WinRE-Manager.cmd` — the interactive wrapper (recommended)
+- `scripts\WinRE.ps1` — the production script (invoked by the wrapper)
+- `scripts\Test-WinRE.ps1` — the read-only diagnostic harness
 
-```powershell
-$p = "$env:TEMP\Test-WinRE.ps1"
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/Test-WinRE.ps1' -UseBasicParsing -OutFile $p
-powershell -ExecutionPolicy Bypass -File $p
-```
+### Step 2 — Run the wrapper
 
-The harness opens an interactive menu. **Option 1** is the system diagnostic.
+From File Explorer, open the `scripts\` folder and double-click **`WinRE-Manager.cmd`**. The wrapper opens the menu in the current console without asking for elevation. When you pick an action that needs Administrator rights, a UAC prompt appears and the selected PowerShell script runs elevated in a new window; the menu stays open behind it.
 
-### 3. Dry run — walk the full flow, change nothing
+The wrapper menu appears with these options:
 
-An elevated PowerShell is required. Traces every decision production would make and writes the same log lines, but touches no partition, no WIM, and no `reagentc` state.
+| Option | What it does |
+|---|---|
+| **1** Test harness | Read-only diagnostics and self-tests. Makes no changes to partitions, WinRE, BitLocker, or state. |
+| **2** Preview (DryRun) | Walks the full production flow and prints every decision it would make — without shrinking, deleting, creating, formatting, or deploying anything. |
+| **3** Run for real | The actual repair. Warns you first, requires you to type `RUN` to confirm, then does the work. |
+| **4** Show recent log | Prints the tail of the last run's log and offers to open it in Notepad. |
+| **5** Quit | Closes the wrapper. |
 
-```powershell
-$p = "$env:TEMP\WinRE.ps1"
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
-powershell -ExecutionPolicy Bypass -File $p -DryRun
-```
+The wrapper does not request elevation at startup. The menu is unelevated, and elevation is requested only for the action you pick: the selected PowerShell script runs elevated in a new window, and the menu remains open behind it.
 
-### 4. Repair
+> **Why the wrapper, not a direct script invocation?** The wrapper keeps the menu open so you can run several operations in sequence without re-launching, gives you a chance to abort at any point before anything destructive happens, and elevates only the specific PowerShell script that needs it. The production script has its own fail-fast elevation guard for the case where it is invoked directly — but the wrapper is the recommended path for everyone.
 
-Rebuilds the recovery image and re-registers WinRE if the machine needs it; otherwise takes the fast path and exits without doing any work.
+---
 
-```powershell
-$p = "$env:TEMP\WinRE.ps1"
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
-powershell -ExecutionPolicy Bypass -File $p
-```
+## Advanced usage
 
-### If you cloned the repo
+### Direct PowerShell invocation
 
 From the repository root, in an elevated PowerShell:
 
@@ -71,33 +65,43 @@ powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -DryRun       # ele
 powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1               # elevated
 ```
 
-### One-liners (advanced)
+The test harness runs unelevated; the production script needs elevation or SYSTEM.
 
-Runs the script in your current session — including its final `exit`. Useful when you want the shortest possible invocation:
+### One-liners (no local clone)
+
+Runs the script in your current session — including its final `exit` — so this form is convenient for a quick diagnostic but not for anything you need `$LASTEXITCODE` from.
 
 ```powershell
 Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/Test-WinRE.ps1' -UseBasicParsing | Invoke-Expression
 ```
 
-**`Invoke-Expression` cannot pass parameters.** For `WinRE.ps1` with `-DryRun` or any other switch, use the scriptblock form. It has the same current-session caveat, but the arguments work:
+**`Invoke-Expression` cannot pass parameters.** For `WinRE.ps1` with `-DryRun` or any other switch, use the scriptblock form. Same current-session caveat, but the arguments work:
 
 ```powershell
 & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/WinRE.ps1' -UseBasicParsing))) -DryRun
 ```
 
-The save-and-run form above is preferable for anything you care about: it isolates the script in a child process, keeps your shell open, and exposes `$LASTEXITCODE`.
-
-### Reproducible runs (pinned version)
-
-`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v47.3` for the current v47 patch 3 release:
+The save-and-run form is preferable for anything you care about: it isolates the script in a child process, keeps your shell open, and exposes `$LASTEXITCODE`:
 
 ```powershell
 $p = "$env:TEMP\WinRE.ps1"
-Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v47.3/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
+Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/main/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
 powershell -ExecutionPolicy Bypass -File $p -DryRun
 ```
 
-> Downloading a script from the internet and executing it is convenient but you should be comfortable with the source. The URLs above all point to the project's own GitHub repository at `raw.githubusercontent.com/ArthurJDurand/WinRE-Manager`, over HTTPS. If you prefer, clone the repo and run the local copy — the code is identical. Pin a release tag for anything you deploy broadly.
+> **Execution policy note.** The `-ExecutionPolicy Bypass` flag applies only to the child process running the script; it does not change your machine's execution policy. If you run a downloaded script directly (`& $p` or `.\script.ps1`), your policy may block it.
+
+> **Trust note.** Downloading a script from the internet and executing it is convenient but you should be comfortable with the source. The URLs above all point to the project's own GitHub repository at `raw.githubusercontent.com/ArthurJDurand/WinRE-Manager`, over HTTPS. If you prefer, clone the repo and run the local copy — the code is identical. Pin a release tag for anything you deploy broadly.
+
+### Reproducible runs (pinned version)
+
+`main` tracks the current release. For a fixed, reproducible version, replace `main` with a release tag — `v48.2` for the current v48 patch 2 release:
+
+```powershell
+$p = "$env:TEMP\WinRE.ps1"
+Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/ArthurJDurand/WinRE-Manager/v48.2/scripts/WinRE.ps1' -UseBasicParsing -OutFile $p
+powershell -ExecutionPolicy Bypass -File $p -DryRun
+```
 
 ### Fleet deployment
 
@@ -143,6 +147,7 @@ A recovery environment that boots but cannot be navigated is barely a recovery e
 - **A missing recovery partition.** Some OEM images ship without one. WinRE Manager plans a replacement geometry, shrinks C: by the minimum required, and creates a dedicated recovery partition on the aligned boundary.
 - **An undersized recovery partition.** If the existing partition cannot hold the serviced WIM plus Microsoft's 250 MiB servicing margin, WinRE Manager replaces it. A partition that cannot meet the margin will fail the next Windows Update — accepting it would be worse than replacing it.
 - **A recovery partition on a non-OS disk.** A stray type-coded recovery partition on a secondary disk can cause Startup Repair to point the BCD at the wrong image. WinRE Manager removes type-coded recovery partitions from non-OS disks.
+- **A recovery partition separated from C: by a data partition (v48).** A machine laid out as `C: | D: | Recovery` is now handled automatically: the manager identifies `D:` as an intervening anchor, validates it (on the OS disk, not C:, not a recovery-typed partition, NTFS, accessible for resize, sufficiently large, shrinkable from the right), shrinks it, and creates a new recovery partition adjacent to the shrunk anchor. The scope is deliberately narrow — exactly one intervening partition, no partition-moving, no extension of the anchor. Multi-intervening layouts (`C: | D: | E: | Recovery`) and the surplus case (the recovery partition being reclaimed is larger than the new bucket) still defer stably with named reasons.
 - **An OEM factory-restore volume carrying the recovery type code.** Recovery-typed partitions over 2 GiB are preserved for operator review — never deleted, never reused. Windows Setup recovery partitions are under 1.5 GiB; OEM factory volumes can be 7–20 GiB and may carry the same type code.
 
 ### Build drift and stale images — Windows Update moves, WinRE Manager tracks
@@ -231,7 +236,7 @@ flowchart LR
     C -->|"No"| D["Defer<br/>old recovery route<br/>preserved"]
     C -->|"Yes"| E["Plan geometry<br/>(read-only)"]
 
-    E --> F["Pre-shrink C:<br/>(reversible window)"]
+    E --> F["Pre-shrink resize target:<br/>C: (or intervening anchor)<br/>(reversible window)"]
     F --> G["Disable WinRE<br/>Delete + recreate partition<br/>Deploy + register"]
 
     style D fill:#a40e26,stroke:#a40e26,color:#fff
@@ -244,7 +249,7 @@ If driver download fails, or OEM pack extraction produces zero INFs, or the VMD 
 
 A machine that has ever run WinRE Manager carries *our* previously injected OEM and VMD drivers inside its registered WinRE image. v47 normalizes that away before injecting the current recipe: the mounted image is stripped to **zero third-party drivers**, proven by re-enumeration, and only then is the current driver set injected.
 
-This is what makes the deployment identity — `DesiredStateId` — a reliable fingerprint of the image contents, not just of the inputs that produced them. It also means the WIM cannot silently accumulate drivers across rebuilds. The strip stage is hard-gated: if enumeration, removal, or the final zero-driver verification fails at any point, the candidate is discarded before any partition work, `reagentc` call, or WIM deployment begins.
+This is what makes the deployed image a deterministic function of the current inputs, rather than a lineage-seeded artifact that accumulates drivers across rebuilds. The `DesiredStateId` does not encode the recipe — it fingerprints the deployment inputs (hardware, OS build, CPU, VMD, manifest version, OEM pack version, `ScriptVersion`) — so a recipe change that materially alters the deployed artifact ships under a `ScriptVersion` bump, keeping the fingerprint in step with the recipe. It also means the WIM cannot silently accumulate drivers across rebuilds. The strip stage is hard-gated: if enumeration, removal, or the final zero-driver verification fails at any point, the candidate is discarded before any partition work, `reagentc` call, or WIM deployment begins.
 
 ---
 
@@ -258,6 +263,10 @@ This is what makes the deployment identity — `DesiredStateId` — a reliable f
 - **Isolated scratch.** Image scratch uses internal fixed NTFS storage only. USB, SD/MMC, network, FireWire, Fibre Channel, unknown-bus disks, and reparse-point workspace paths are excluded.
 - **Suppress identical retries.** When a pre-shrink deferral is operator-actionable, a sidecar marker suppresses identical retries while the existing route remains verified functional. A staged optimized WIM, if present, lets the eventual successful run skip re-servicing.
 - **Single instance.** A kernel-enforced file lock prevents two runs from colliding on the same machine.
+- **Intervening-anchor scope.** When the anchor path is taken (v48), the anchor is validated against nine read-only conditions before any mutation, and the anchor itself is never extended — a BitLocker-encrypted anchor is not safely growable via `Resize-Partition` alone.
+- **Transactional WIM replacement (v48).** The existing WIM on the active route is preserved as a rollback copy in the workspace before the target is deleted. On any copy failure, the rollback copy is restored and hash-verified.
+- **Architecture gate (v48).** The manager refuses to run on any architecture other than x64. The refusal is a stable, named deferral that exits `EXIT_WARNING` before any state mutation.
+- **Elevation guard (v48 patch 2).** An unelevated launch is refused in milliseconds, before the program lock, before hardware probes, and before any network fetch. On refusal the guard creates the log directory itself so its FATAL message has somewhere to be written. The guard accepts both interactive Administrator sessions and the SYSTEM context used by the scheduled task.
 
 ---
 
@@ -265,9 +274,9 @@ This is what makes the deployment identity — `DesiredStateId` — a reliable f
 
 **Does it work on Windows 10 and Windows 11?** Yes. Windows 10 build 19041+ and Windows 11 build 22000+. Windows 11 24H2 (build 26100) and the 25H2 builds are explicitly supported.
 
-**Does it work on BitLocker-encrypted drives?** Yes. The policy is target-volume-based — WinRE is prepared on its *target* recovery partition, and that partition is decrypted in place if needed. Only the OS-fallback route requires C: to be fully decrypted, because there the target volume *is* C:. The script never modifies C:'s BitLocker state.
+**Does it work on BitLocker-encrypted drives?** Yes. The policy is target-volume-based — WinRE is prepared on its *target* recovery partition, and that partition is decrypted in place if needed. Only the OS-fallback route requires C: to be fully decrypted, because there the target volume *is* C:. The script never modifies C:'s BitLocker state. As of v48, the intervening-anchor path accepts a BitLocker-encrypted anchor partition that is currently unlocked; a locked or indeterminate anchor defers.
 
-**Does it need internet access?** For the first deployment on a fresh machine, yes — to fetch the driver manifest, the OEM WinPE pack, the VMD driver package, and (only if no local source is usable) a base WIM. On a machine that already has a state file and passes its local safety checks, a network outage does not prevent the run: the offline fallback trusts the stored `DesiredStateId` and takes the fast path. Under v47 the offline fast path additionally requires the state file's `DeployedWinREMetadata` anchor to match the currently-registered image — a v46-era state file needs one online run first to write the anchor.
+**Does it need internet access?** For the first deployment on a fresh machine, yes — to fetch the driver manifest, the OEM WinPE pack, the VMD driver package, and (only if no local source is usable) a base WIM. On a machine that already has a state file and passes its local safety checks, a network outage does not prevent the run: the offline fallback trusts the stored `DesiredStateId` and takes the fast path. Under v47 the offline fast path additionally requires the state file's `DeployedWinREMetadata` anchor to match the currently-registered image — a v46-era state file needs one online run first to write the anchor. As of v48 patch 1, the offline fallback also verifies a `LocalInputsId` hash over the locally-computable deployment inputs (hardware identity, OS build, CPU vendor/generation); a mismatch defers with `EXIT_WARNING` rather than trusting a stored `DesiredStateId` that no longer describes this machine. VMD presence is deliberately excluded from that hash because its detection depends on the manifest, which is precisely what the offline fallback does not have.
 
 **Will it break anything?** The whole design is organized around four invariants, in this order: never break WinRE, never leave a machine without a working recovery route, minimize the `reagentc /disable` window, and prepare everything before touching anything. Destructive work is read-only planned first, then carried out inside a reversible window. A machine that does not need work takes the fast path and makes no state changes. Read-only diagnostic first, dry run second, repair third.
 
@@ -281,23 +290,31 @@ This is what makes the deployment identity — `DesiredStateId` — a reliable f
 
 | Component | Version |
 |---|---|
-| `scripts/WinRE.ps1` | **v47 patch 3** |
-| `scripts/Test-WinRE.ps1` (read-only harness) | **v26** |
+| `scripts/WinRE.ps1` | **v48 patch 2** |
+| `scripts/Test-WinRE.ps1` (read-only harness) | **v27** |
+| `scripts/WinRE-Manager.cmd` | (interactive wrapper; ships with the release) |
 
-**Migration.** `ScriptVersion` remains 47; `ScriptPatchLevel` moves from 2 to 3. No fleet-wide rebuild is forced. A machine already on v47 patch 2 continues on the fast path. The v47 patch 3 changes are three correctness corrections on error paths, one DryRun fidelity fix, one wording correction, and one defensive hardening in the enable-only escalation; none of them affects the fast path or the deployed WIM recipe. Full notes are in the [changelog](../CHANGELOG.md).
+**Migration (v48 patch 1).** `ScriptVersion` moves from 47 to 48, so every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. The v48 patch 1 release bundles five changes: intervening-partition handling (the `C: | D: | Recovery` layout is now handled automatically within a deliberately narrow scope), an architecture gate (x64 only), the `LocalInputsId` state-file field (closes the offline hardware-drift residual), LKG-by-hash at any discovered recovery location (a WIM found on any type-coded recovery partition whose SHA256 matches `state.CurrentImageHash` is accepted as last-known-good), and transactional WIM replacement (a failed copy on the active route restores the previous WIM rather than leaving the target empty).
+
+**Migration (v48 patch 2).** `ScriptVersion` remains 48; `ScriptPatchLevel` moves from 1 to 2. No fleet-wide rebuild is forced. A machine that ran v48 patch 1 continues on the fast path. The v48 patch 2 changes are a fail-fast elevation guard, a source-WIM hash cache that closes a pre-existing enable-only fallthrough path, and two comment corrections; none of them affects the fast path or the deployed WIM recipe.
+
+Full notes are in the [changelog](../CHANGELOG.md).
 
 **Field-testing status.** The v45 destructive path has completed end-to-end on a disposable Hyper-V VM, and the MBR attribute path (`set id=27`) has been exercised on a Win10 MBR VM. The v46 patch 1 plan-clamp fix is field-verified on the Lenovo IdeaPad 3 15IAU7 that motivated it — the plan-rejection corner is documented in [troubleshooting](troubleshooting.md) — and the clean-path v46 destructive pipeline is on record for the Dell Latitude 3540 and two HP EliteBook G1i models.
+
+**v48 patch 1 status.** The intervening-anchor path is field-verified on the exact machine that motivated it: an AMD Ryzen 7 5825U laid out as `C: (232 GiB, at SizeMin) | Storage (720 GiB, Basic Data) | Recovery (1000 MiB, type-coded)`. Under v47 patch 3 the same layout produced the plan rejection `recovery-typed partitions are separated from C: by a non-recovery partition`; under v48 patch 1 the manager identified the storage partition as the anchor, validated it, shrunk it by 200 MiB, deleted the old recovery partition, created a 1200 MiB replacement at offset 975561 MiB, registered it, and reached `Operating mode: DEDICATED` with `reagentc /enable` exit 0. The state file was written with the v48 DSI and the metadata anchor. Four minutes of elevation-failure logs on 2026-10-05 motivated the v48 patch 2 elevation guard.
 
 The v47 non-destructive paths are field-verified on an ASUS PRIME H510M-D (i5-11400, Win11 26300). A v46 → v47 migration correctly triggered a full update via the state-file DSI mismatch branch, took the source-selection "registered" branch (no hash-validated LKG present), ran the strip stage (no-op — the image was already clean), ran ResetBase and the export, reused the existing type-coded recovery partition, and completed `reagentc /disable` → deploy → `/enable` with exit 0. Two subsequent runs took the fast path. The v23 harness passed all 16 parser self-tests.
 
 The v47 patch 2 non-destructive paths have now been exercised on four physical machines. A Dell Pro Max 16 Premium MA16250 performed a full rebuild with the Dell WinPE11 A10 OEM pack (64 drivers injected; fast path on the second run). Two ASUS Vivobooks (X1504ZA and X1504VA) ran with C: actively encrypting and completed the dedicated-partition path successfully; the newly created recovery partition was not re-claimed by the Device Encryption service. A fast-path smoke test on the ASUS PRIME H510M-D confirmed the state file, metadata anchor, and byte-drift comparison work end-to-end. All four reached `Operating mode: DEDICATED` with exit code 0. The v24 harness passes all 16 parser self-tests.
 
-**What is not yet covered by v47 field data.** The destructive partition paths — pre-shrink, partition delete, `New-Partition`, the whole-layout assertion, and the post-delete extension fallback — have not been exercised under v47 on physical hardware. Nor have the strip stage with a non-zero third-party driver set, the OEM pack or VMD driver injection paths, the metadata-triggered rebuild branch, the pre-`/disable` race-detector abort branch, or the WIM_READY checkpoint save/resume round trip. The v45 destructive-path VM test remains the recommended next step before broad rollout, followed by a canary on a machine with an OEM driver pack so the strip-and-reinject loop runs against a non-empty set.
+**What is not yet covered by v48 field data.** The v48 intervening-anchor happy path is field-verified on the AMD Ryzen 7 5825U machine; the post-deletion failure behaviour on that path has not been exercised under a deliberate failure. The v48 multi-intervening rejection and surplus rejection have not been exercised on physical hardware. The transactional WIM replacement's rollback branch (a copy failure mid-replacement) has not been exercised. The architecture gate has not been exercised on ARM64 hardware. The source-WIM hash cache fix (v48 patch 2) has not been exercised on the enable-only fallthrough path. The remaining v47 gaps also stand: the strip stage with a non-zero third-party driver set, the OEM pack or VMD driver injection paths, the metadata-triggered rebuild branch, the pre-`/disable` race-detector abort branch, and the WIM_READY checkpoint save/resume round trip. The deliberate post-deletion failure test on a disposable VM remains the recommended next step before broad rollout; see [Testing](testing.md).
 
 ---
 
 ## Repository tools
 
+- **`scripts/WinRE-Manager.cmd`** — the interactive wrapper. Menu-driven entry point with elevation, warnings, and a typed `RUN` confirmation for the destructive path. Recommended for everyone.
 - **`scripts/WinRE.ps1`** — the production script. Elevated repair and servicing on a single machine, or as a SYSTEM scheduled task on a fleet.
 - **`scripts/Test-WinRE.ps1`** — the read-only test harness. Diagnostics, parser self-tests, and package checks. Safe to run concurrently with production.
 - **`scripts/Build-DellWinPEMap.ps1`**, **`scripts/Build-HPWinPEMap.ps1`**, **`scripts/Build-LenovoWinPEMap.ps1`** — optional map-maintenance utilities for teams hosting their own OEM driver maps.

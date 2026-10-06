@@ -11,7 +11,7 @@ Thanks for considering a contribution. This project is a self-healing production
 
 ## Questions and general discussion
 
-For deployment help, "does this work on X", design discussions, and other content that isn't a bug report or a feature request, use [GitHub Discussions](https://github.com/ArthurJDurand/WinRE-Manager/discussions). Bug reports and feature requests go to Issues, using the templates. Do not post security issues publicly â€” see [SECURITY.md](SECURITY.md).
+For deployment help, "does this work on X", design discussions, and other content that isn't a bug report or a feature request, use [GitHub Discussions](https://github.com/ArthurJDurand/WinRE-Manager/discussions). Bug reports and feature requests go to Issues, using the templates. Do not post security issues publicly - see [SECURITY.md](SECURITY.md).
 
 ## Bug reports
 
@@ -32,7 +32,7 @@ Before you write code:
 
 1. **Read the invariants.** [`docs/architecture.md`](docs/architecture.md) opens with the four design invariants — the hierarchy that every decision in the script is subordinate to. Below them, its "Control-flow invariants" section lists the detailed enforcement, one entry per guarantee. The `.NOTES` block at the top of `scripts/WinRE.ps1` carries the abbreviated "Critical lessons (do not regress)" list. Every one of those exists because a real machine failed. Do not weaken any of them without a field case.
 2. **Check the exit-code semantics.** [docs/exit-codes.md](docs/exit-codes.md) documents priority and precedence. Changes that alter exit paths almost always need a changelog entry.
-3. **`ScriptVersion` discipline.** The version bumps when a change modifies the deployed WIM bytes, the partition layout that gets created, or the `DesiredStateId` inputs. A `DesiredStateId` input change (the v44 patch 1 pattern) does not change the WIM bytes on a machine whose driver set is already correct, but it forces every managed machine to rebuild once because the state file's stored ID no longer matches — that counts, and such a change must ship with a `Migration note` section in `CHANGELOG.md` describing the expected fleet behaviour and the rollback procedure. The v45 patch 1 revision is a second instance of the same rule: it changed the `SCRIPT` component of the `DesiredStateId` and shipped with its own migration note. The v46 patch 1 revision is a third: it changed the `SCRIPT` component again (45 → 46) to close a plan-rejection corner that had left affected machines stuck in OS-fallback, and shipped with its own migration note. The v47 patch 1 revision is a fourth, and the first to combine two of the three triggers at once: it changes the image production recipe (the strip stage normalizes the mounted WIM to zero third-party drivers before injection, so a rebuild produces different bytes than v46 would have on the same inputs) **and** bumps `SCRIPT` from 46 to 47, so every managed machine performs one full update on its next scheduled run. It shipped with its own migration note. Cosmetic fixes ship under the same version and the same `DesiredStateId`. If your PR would force a rebuild on healthy machines by any of those three mechanisms, say so explicitly in the PR and explain why.
+3. **`ScriptVersion` discipline.** The version bumps when a change modifies the deployed WIM bytes, the partition layout that gets created, or the `DesiredStateId` inputs. A `DesiredStateId` input change (the v44 patch 1 pattern) does not change the WIM bytes on a machine whose driver set is already correct, but it forces every managed machine to rebuild once because the state file's stored ID no longer matches — that counts, and such a change must ship with a `Migration note` section in `CHANGELOG.md` describing the expected fleet behaviour and the rollback procedure. The v45 patch 1 revision is a second instance of the same rule: it changed the `SCRIPT` component of the `DesiredStateId` and shipped with its own migration note. The v46 patch 1 revision is a third: it changed the `SCRIPT` component again (45 → 46) to close a plan-rejection corner that had left affected machines stuck in OS-fallback, and shipped with its own migration note. The v47 patch 1 revision is a fourth, and the first to combine two of the three triggers at once: it changes the image production recipe (the strip stage normalizes the mounted WIM to zero third-party drivers before injection, so a rebuild produces different bytes than v46 would have on the same inputs) **and** bumps `SCRIPT` from 46 to 47, so every managed machine performs one full update on its next scheduled run. It shipped with its own migration note. The v48 patch 1 revision is a fifth, and the largest since v43: it bundles five distinct changes (intervening-partition handling, the architecture gate, the `LocalInputsId` state-file field, LKG-by-hash at any discovered recovery location, and transactional WIM replacement) and bumps `SCRIPT` from 47 to 48. It shipped with its own migration note. Cosmetic fixes ship under the same version and the same `DesiredStateId`. If your PR would force a rebuild on healthy machines by any of those three mechanisms, say so explicitly in the PR and explain why.
 4. **Changelog.** Every functional change gets an entry in `CHANGELOG.md` with the real field case that motivated it, in the style of the existing entries. The `.NOTES` block records the current design invariants and the CRITICAL LESSONS LEARNED list; update it only when your change modifies an invariant or adds a new lesson. The two files serve different readers and both are part of the complete record.
 5. **No silent catch blocks.** Every `try/catch` either logs, sets a state flag, or both.
 6. **No unverified destructive operations.** Any code path that deletes, resizes, or formats a partition must either verify its preconditions and restore geometry on failure, or set `$Script:GeometryRestoreFailed`.
@@ -71,6 +71,8 @@ The residual corner is narrower than the v44 patch 7 residual: a `New-Partition`
 
 The gate also covers the eventual post-deletion-failure check, future refinements to the 2 GiB sanity ceiling that would touch the post-deletion segment (the ceiling itself is implemented and gates `Find-SuitableRecoveryPartition`, `Remove-StrayRecoveryPartitions`, and `Get-PartitionPlan`), and any other change that alters the destructive sequence after deletion.
 
+**The v48 intervening-anchor handling is confined to the pre-shrink segment.** The resize-target abstraction moves the pre-shrink target from C: to the anchor in the intervening case; the post-deletion sequence (`New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, drive-letter assignment) is structurally unchanged from the non-intervening case. The v48 development accepted the risk that the post-deletion segment has not been exercised under a deliberate failure on the intervening path, on the reasoning that the segment is the same code with different parameters; the 2026-10-06 field validation confirmed the happy path on the exact motivating layout. The deliberate post-deletion failure test remains the gate for future changes to the segment.
+
 Changes to the **pre-shrink segment** (plan, pre-shrink, verification, deferral) are **not** gated by this residual — but they are still subject to the four-bullet requirement above.
 
 If your PR would alter the post-deletion segment, say so explicitly and include the test result that unblocks it.
@@ -93,13 +95,16 @@ Before you submit:
 
 ```powershell
 # 1. Parser check — throws on any syntax error
-Get-Command .\scripts\WinRE.ps1 -ErrorAction Stop | Out-Null
+[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\WinRE.ps1).Path, [ref]$null, [ref]$null)
 
 # 2. Dry run on a real machine (VM preferred)
 powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -DryRun
 
 # 3. Harness
 powershell -ExecutionPolicy Bypass -File .\scripts\Test-WinRE.ps1
+
+# 4. Interactive end-to-end smoke test (optional but recommended)
+.\scripts\WinRE-Manager.cmd
 ```
 
 Use mocked geometry tests and a disposable Windows VM for partition-path changes. Physical GPT/MBR canary runs are recommended before broad fleet rollout; for changes to the post-deletion segment of the destructive path they are required — see the gating note above. Never force a shrink failure on a production client.

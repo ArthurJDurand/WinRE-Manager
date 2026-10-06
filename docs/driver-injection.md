@@ -45,7 +45,7 @@ For how to host your own manifest and OEM maps, see [self-hosting.md](self-hosti
 - **`drivers[].os`** — array of OS identifiers the driver supports. Valid values: `"Win10"`, `"Win11"`.
 - **`drivers[].match.cpuGenMin`** — minimum Intel CPU generation.
 - **`drivers[].match.cpuGenMax`** — maximum Intel CPU generation.
-- **`drivers[].match.requiredDevices`** — array of device hardware IDs. The union of all `requiredDevices` values across all manifest entries is matched against present PnP devices in a single query; if any device matches, VMD hardware is considered present. A driver entry that declares `requiredDevices` is downloaded only when that machine-wide check succeeds. If `requiredDevices` is absent or empty on an entry, the entry is downloaded regardless of hardware.
+- **`drivers[].match.requiredDevices`** — array of device hardware IDs. The union of all `requiredDevices` values across all manifest entries is matched against present PnP devices in a single query; if any device matches, VMD hardware is considered present. A driver entry that declares `requiredDevices` is downloaded only when that machine-wide check succeeds. If `requiredDevices` is absent or empty on an entry, the VMD-presence filter is bypassed for that entry; the OS match and the Intel CPU-vendor / generation range still apply.
 - **`drivers[].driverUrl`** — URL to a `.7z` archive containing one or more driver INFs.
 
 ### VMD hardware presence (fail-closed as of v44 patch 6)
@@ -195,7 +195,7 @@ Some Lenovo packages return a non-zero exit code on **success** and still popula
 7-Zip:
 
 ```
-7z.exe x <cab> -o"<path>" -y
+7z.exe x <cab> -o"<path>" -w"<path>" -y
 ```
 
 The INF count is checked. If zero, the extraction is treated as failure even on a clean 7-Zip exit.
@@ -318,7 +318,7 @@ The cross-reference also depends on the extraction directory being **fresh**. A 
 
 As of v47, immediately after capturing `$preInjectThirdParty`, the script checks whether it is greater than zero. It is expected to be zero after a successful strip. If it is not zero:
 
-- The script logs a WARN: `Strip claimed zero third-party drivers but the filtered pre-injection count is $preInjectThirdParty — the filterless and filtered DISM queries disagree on this image. Filterless is authoritative; injection delta accounting may underreport.`
+- The script logs a WARN: `Strip claimed zero third-party drivers but the filtered pre-injection count is $preInjectThirdParty - the filterless and filtered DISM queries disagree on this image. Filterless is authoritative; injection delta accounting may underreport.`
 - It sets `$Script:nonFatalWarning = $true`.
 
 This is **diagnostic only, not a gate**. The filterless `Get-WindowsDriver` form used by the strip is authoritative for the zero-driver guarantee; the filtered form used by the injection-delta accounting is the older v46 heuristic. If the two disagree, the filterless form wins. The warning surfaces the disagreement so an operator investigating a driver problem has a signal, but the run continues. The existing injection success gate (delta > 0 OR INF-basename match) handles the outcome conservatively regardless of the disagreement.

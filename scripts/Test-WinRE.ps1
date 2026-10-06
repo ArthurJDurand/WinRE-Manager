@@ -16,7 +16,9 @@
       - Get-IntelProcessorGeneration
       - Get-DesiredStateId (seven-field recipe, production ScriptVersion
         - the $ProductionScriptVersion default tracks production's
-        $ScriptVersion and must be bumped whenever production bumps)
+        $ScriptVersion and must be bumped whenever production bumps;
+        currently 48)
+      - Get-LocalInputsId (v48 three-field locally-computable hash)
       - Get-DriverManifest retry policy (2 attempts, 2s sleep, WARN log)
       - VMD detection (fail-closed on PnP enumeration error)
       - Lenovo map resolution status machine (5 states)
@@ -48,7 +50,37 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 26
+    Version : 27
+
+    v27 changes vs v26:
+    1. $ProductionScriptVersion default bumped 47 -> 48 to track
+       production's ScriptVersion. Without this bump, Option S reported
+       a false DSI MISMATCH for every state file v48 production writes.
+       Same class of drift that v21 (44 -> 45), v22 (45 -> 46), and v23
+       (46 -> 47) corrected. This is the fourth correction in the same
+       family; consider a guard that reads production's $ScriptVersion
+       directly if the two scripts ever ship in the same repo layout.
+    2. Test-PlanAdjacencyReadOnly now mirrors production v48's
+       intervening-anchor handling. Before this change the preview
+       reported the C: | D: | Recovery layout as either OK (because
+       the non-contiguous check was gated on -not $blockingPartition,
+       which is false for that layout) or as an unconditional
+       rejection (which v48 production no longer produces when the
+       anchor validates). The preview now detects the anchor, validates
+       it against the same read-only rules production uses, and reports
+       either acceptance with the anchor identity or rejection with
+       the specific anchor failure. The caller in Option 1 has been
+       updated to render the new verdict.
+    3. Added Get-LocalInputsId mirror and displayed the computed and
+       stored values in Show-StateFileParity. Production v48 writes
+       LocalInputsId to the state file and consults it on offline
+       fallback; the harness now surfaces drift before it surprises
+       an operator.
+    4. Added Architecture to Get-ThisMachineProfile and displayed it
+       in the System Diagnostic with a red banner when the value is
+       anything other than x64. Production v48 refuses to run on
+       non-x64 before any mutation; the harness now surfaces the same
+       fact before the operator runs production.
 
     v26 changes vs v25:
     1. Added a Plan adjacency preview section to Option 1. The section
@@ -782,7 +814,7 @@ function Get-IntelProcessorGeneration {
 }
 
 function Get-DesiredStateId {
-    # Mirror of production v47 patch 1's Get-DesiredStateId. The
+    # Mirror of production v48's Get-DesiredStateId. The
     # $ProductionScriptVersion default MUST track production's
     # $ScriptVersion. If it falls behind, Show-StateFileParity reports
     # a false DSI MISMATCH for every state file production has written.
@@ -793,7 +825,7 @@ function Get-DesiredStateId {
         $OEMPackage,
         [Parameter(Mandatory)][string]$ExpectedDriverSetVersion,
         [bool]$VMDPresent = $false,
-        [int]$ProductionScriptVersion = 47
+        [int]$ProductionScriptVersion = 48
     )
     $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
     $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
@@ -805,6 +837,26 @@ function Get-DesiredStateId {
         "MANIFEST=$ExpectedDriverSetVersion",
         "OEMPACK=$oemVersion",
         "SCRIPT=$ProductionScriptVersion"
+    )
+    $joined = $parts -join ';;'
+    $bytes  = [System.Text.Encoding]::UTF8.GetBytes($joined)
+    $sha    = [System.Security.Cryptography.SHA256]::Create()
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+}
+
+# v48 mirror of production's Get-LocalInputsId. Computed from the same
+# three components (HW, OS, CPU) that production uses; VMD is
+# deliberately excluded because its detection depends on the manifest,
+# which is unavailable in the offline scenario the hash exists for.
+function Get-LocalInputsId {
+    param(
+        [Parameter(Mandatory)]$Hardware
+    )
+    $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
+    $parts = @(
+        "HW=$($Hardware.Manufacturer)|$($Hardware.Model)|$($Hardware.MachineType)",
+        "OS=$($Hardware.Build)",
+        "CPU=$($Hardware.CPUVendor)|$cpuGen"
     )
     $joined = $parts -join ';;'
     $bytes  = [System.Text.Encoding]::UTF8.GetBytes($joined)
@@ -849,6 +901,20 @@ function Get-ThisMachineProfile {
     $cpuVendor = if ($cpu.Manufacturer -like "*Intel*") { "Intel" } else { "AMD" }
     $gen = Get-IntelProcessorGeneration -CPUName $cpu.Name
 
+    # v48: mirror production's architecture token. PROCESSOR_ARCHITEW6432
+    # takes precedence when present (WOW64 case); OSArchitecture is
+    # consulted only as a 32-bit fallback. See production's
+    # Get-HardwareObject for the full explanation.
+    $osArchRaw = if ($os.OSArchitecture) { [string]$os.OSArchitecture } else { "" }
+    $procArchRaw = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $procArchUp = if ($procArchRaw) { $procArchRaw.ToUpperInvariant() } else { "" }
+    $archToken = "unknown"
+    if     ($procArchUp -eq 'ARM64') { $archToken = "ARM64" }
+    elseif ($procArchUp -eq 'AMD64') { $archToken = "x64" }
+    elseif ($procArchUp -eq 'X86')   { $archToken = "x86" }
+    elseif ($osArchRaw -match '32-bit') { $archToken = "x86" }
+    elseif ($osArchRaw -match '64-bit') { $archToken = "unknown" }
+
     return [PSCustomObject]@{
         OS            = $osLabel
         IsWin11       = $isWin11
@@ -859,6 +925,7 @@ function Get-ThisMachineProfile {
         Build         = $os.BuildNumber
         CPUVendor     = $cpuVendor
         CPUGeneration = $gen
+        Architecture  = $archToken
     }
 }
 
@@ -999,9 +1066,17 @@ function Get-HarnessPartitionRef {
 # purely geometric and partition-identity; they do not compute a bucket
 # size or a planned extent, so the rejections related to planned-extent
 # sizing (invalid bucket, planned size non-positive, aligned end
-# preceding OS start) are not evaluated. A clean result means the
-# checks that can be evaluated read-only passed; it is not a claim that
-# the full plan would succeed.
+# preceding OS start, planned anchor size below supported minimum) are
+# not evaluated. A clean result means the checks that can be evaluated
+# read-only passed; it is not a claim that the full plan would succeed.
+#
+# v27: mirrors the v48 intervening-anchor handling. When the walk stops
+# at a non-recovery blocker whose end is immediately followed by a
+# recovery partition, the blocker is validated as a potential anchor.
+# If validation passes, Status is OK (the read-only subset did not reject
+# the layout) and the anchor is reported via InterveningAnchor. If
+# validation fails, the anchor rejection reason becomes the plan rejection. The separation
+# rejection is only reported when no intervening anchor was established.
 function Test-PlanAdjacencyReadOnly {
     param(
         [Parameter(Mandatory)]$OSDisk,
@@ -1016,71 +1091,157 @@ function Test-PlanAdjacencyReadOnly {
     $allPartitions = @($Partitions | Sort-Object -Property Offset)
     $maxRecoveryBytes = [int64](2048 * 1MB)
 
-    $reasons = @()
+    $invalidReason = $null
 
     $crossDisks = @($allPartitions | Where-Object { $_.DiskNumber -ne $OSDisk.Number } | ForEach-Object { $_.DiskNumber } | Select-Object -Unique)
     if ($crossDisks.Count -gt 0) {
-        $reasons += "partition inventory contains entries from another disk (foreign disk number(s): $($crossDisks -join ', '))"
+        $invalidReason = "partition inventory contains entries from another disk (foreign disk number(s): $($crossDisks -join ', '))"
     }
 
-    $overlapWithOS = @($allPartitions | Where-Object {
-        $_.PartitionNumber -ne $OSPartition.PartitionNumber -and
-        [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart
-    })
-    if ($overlapWithOS.Count -gt 0) {
-        $refs = ($overlapWithOS | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
-        $reasons += "another partition overlaps the OS partition geometry ($refs)"
+    if (-not $invalidReason) {
+        $overlapWithOS = @($allPartitions | Where-Object {
+            $_.PartitionNumber -ne $OSPartition.PartitionNumber -and
+            [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart
+        })
+        if ($overlapWithOS.Count -gt 0) {
+            $refs = ($overlapWithOS | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+            $invalidReason = "another partition overlaps the OS partition geometry ($refs)"
+        }
     }
 
     $typedRecovery = @($allPartitions | Where-Object {
         ($_.GptType -eq $recoveryType) -or ($_.MbrType -eq 0x27)
     })
 
-    $oversizedRecovery = @($typedRecovery | Where-Object { [int64]$_.Size -gt $maxRecoveryBytes })
-    if ($oversizedRecovery.Count -gt 0) {
-        $refs = ($oversizedRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
-        $reasons += "recovery-typed partition exceeds the 2048 MiB safety ceiling ($refs)"
+    if (-not $invalidReason) {
+        $oversizedRecovery = @($typedRecovery | Where-Object { [int64]$_.Size -gt $maxRecoveryBytes })
+        if ($oversizedRecovery.Count -gt 0) {
+            $refs = ($oversizedRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+            $invalidReason = "recovery-typed partition exceeds the 2048 MiB safety ceiling ($refs)"
+        }
     }
 
-    $overlapRecovery = @($typedRecovery | Where-Object { [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart })
-    if ($overlapRecovery.Count -gt 0) {
-        $refs = ($overlapRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
-        $reasons += "recovery-typed partition overlaps the OS partition geometry ($refs)"
+    if (-not $invalidReason) {
+        $overlapRecovery = @($typedRecovery | Where-Object { [int64]$_.Offset -lt $osEnd -and ([int64]$_.Offset + [int64]$_.Size) -gt $osStart })
+        if ($overlapRecovery.Count -gt 0) {
+            $refs = ($overlapRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+            $invalidReason = "recovery-typed partition overlaps the OS partition geometry ($refs)"
+        }
     }
 
-    $beforeRecovery = @($typedRecovery | Where-Object { ([int64]$_.Offset + [int64]$_.Size) -le $osStart })
-    if ($beforeRecovery.Count -gt 0) {
-        $refs = ($beforeRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
-        $reasons += "recovery-typed partition precedes the OS partition; layout requires review ($refs)"
+    if (-not $invalidReason) {
+        $beforeRecovery = @($typedRecovery | Where-Object { ([int64]$_.Offset + [int64]$_.Size) -le $osStart })
+        if ($beforeRecovery.Count -gt 0) {
+            $refs = ($beforeRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
+            $invalidReason = "recovery-typed partition precedes the OS partition; layout requires review ($refs)"
+        }
     }
 
     $cursor = $osEnd
     $reclaimable = [System.Collections.Generic.List[object]]::new()
     $blockingPartition = $null
-    $orderFailure = $null
-    foreach ($partition in $allPartitions) {
-        if ($partition.PartitionNumber -eq $OSPartition.PartitionNumber -and $partition.DiskNumber -eq $OSPartition.DiskNumber) { continue }
-        $partitionStart = [int64]$partition.Offset
-        $partitionEnd = $partitionStart + [int64]$partition.Size
-        if ($partitionEnd -le $osEnd) { continue }
-        if ($partitionStart -lt $cursor) {
-            $currRef = Get-HarnessPartitionRef -Partition $partition
-            $orderFailure = "partition extents overlap or are not ordered consistently (current $currRef starts at $([math]::Round($partitionStart/1MB,1)) MiB, but the previous extent ends at $([math]::Round($cursor/1MB,1)) MiB)"
-            break
+    if (-not $invalidReason) {
+        foreach ($partition in $allPartitions) {
+            if ($partition.PartitionNumber -eq $OSPartition.PartitionNumber -and $partition.DiskNumber -eq $OSPartition.DiskNumber) { continue }
+            $partitionStart = [int64]$partition.Offset
+            $partitionEnd = $partitionStart + [int64]$partition.Size
+            if ($partitionEnd -le $osEnd) { continue }
+            if ($partitionStart -lt $cursor) {
+                $currRef = Get-HarnessPartitionRef -Partition $partition
+                $invalidReason = "partition extents overlap or are not ordered consistently (current $currRef starts at $([math]::Round($partitionStart/1MB,1)) MiB, but the previous extent ends at $([math]::Round($cursor/1MB,1)) MiB)"
+                break
+            }
+            $isTypedRecovery = ($partition.GptType -eq $recoveryType) -or ($partition.MbrType -eq 0x27)
+            if (-not $isTypedRecovery) {
+                $blockingPartition = $partition
+                break
+            }
+            $reclaimable.Add($partition)
+            $cursor = $partitionEnd
         }
-        $isTypedRecovery = ($partition.GptType -eq $recoveryType) -or ($partition.MbrType -eq 0x27)
-        if (-not $isTypedRecovery) {
-            $blockingPartition = $partition
-            break
-        }
-        $reclaimable.Add($partition)
-        $cursor = $partitionEnd
-    }
-    if ($orderFailure) {
-        $reasons += $orderFailure
     }
 
-    if (-not $orderFailure -and -not $blockingPartition) {
+    # v48 intervening-anchor detection.
+    $interveningAnchor = $null
+    if (-not $invalidReason -and $blockingPartition -and $reclaimable.Count -eq 0) {
+        $anchorRef = Get-HarnessPartitionRef -Partition $blockingPartition -WithType
+        $anchorEnd = [int64]$blockingPartition.Offset + [int64]$blockingPartition.Size
+        $afterAnchor = @($allPartitions |
+            Where-Object { $_.PartitionNumber -ne $blockingPartition.PartitionNumber } |
+            Where-Object { [int64]$_.Offset -ge $anchorEnd } |
+            Sort-Object Offset)
+        $firstRecoveryAfter = if ($afterAnchor.Count -gt 0) {
+            $candidate = $afterAnchor[0]
+            if (($candidate.GptType -eq $recoveryType) -or ($candidate.MbrType -eq 0x27)) { $candidate } else { $null }
+        } else { $null }
+
+        if ($firstRecoveryAfter) {
+            $anchorReject = $null
+            $efiType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+            $msrType = '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
+
+            if (($blockingPartition.GptType -eq $efiType) -or ($blockingPartition.MbrType -eq 0xef)) {
+                $anchorReject = "anchor is an EFI System Partition ($anchorRef)"
+            } elseif ($blockingPartition.GptType -eq $msrType) {
+                $anchorReject = "anchor is a Microsoft Reserved Partition ($anchorRef)"
+            } elseif ($blockingPartition.IsSystem -or $blockingPartition.IsBoot) {
+                $anchorReject = "anchor is a system/boot partition ($anchorRef)"
+            }
+
+            if (-not $anchorReject) {
+                try {
+                    $anchorVol = Get-Volume -Partition $blockingPartition -ErrorAction SilentlyContinue
+                    if (-not $anchorVol) {
+                        $anchorReject = "anchor has no readable volume ($anchorRef)"
+                    } elseif ($anchorVol.FileSystem -ne 'NTFS') {
+                        $anchorReject = "anchor filesystem is '$($anchorVol.FileSystem)', not NTFS ($anchorRef)"
+                    }
+                } catch {
+                    $anchorReject = "anchor volume could not be inspected ($anchorRef)"
+                }
+            }
+
+            if (-not $anchorReject) {
+                if (-not $blockingPartition.DriveLetter) {
+                    $anchorReject = "anchor has no drive letter; cannot verify BitLocker state for resize ($anchorRef)"
+                } else {
+                    try {
+                        $mbo = & manage-bde.exe -status "$($blockingPartition.DriveLetter):" 2>&1
+                        $mboText = ($mbo | Out-String)
+                        if ($mboText -match 'could not be opened by BitLocker') { }
+                        elseif ($mboText -match 'Conversion Status:\s*Fully Decrypted') { }
+                        elseif ($mboText -match 'Lock Status:\s*Unlocked') { }
+                        elseif ($mboText -match 'Lock Status:\s*Locked') {
+                            $anchorReject = "anchor is BitLocker-locked; cannot resize ($anchorRef)"
+                        } else {
+                            $anchorReject = "anchor encryption state is indeterminate; refusing to shrink ($anchorRef)"
+                        }
+                    } catch {
+                        $anchorReject = "anchor BitLocker state could not be determined ($anchorRef)"
+                    }
+                }
+            }
+
+            if (-not $anchorReject) {
+                try {
+                    $null = Get-PartitionSupportedSize -DiskNumber $blockingPartition.DiskNumber -PartitionNumber $blockingPartition.PartitionNumber -ErrorAction Stop
+                } catch {
+                    $anchorReject = "anchor supported-size query failed ($anchorRef)"
+                }
+            }
+
+            if ($anchorReject) {
+                $invalidReason = $anchorReject
+            } else {
+                $interveningAnchor = $blockingPartition
+            }
+        }
+    }
+
+    # Non-contiguous check. Reported only when no intervening anchor was
+    # established; when an anchor was established the layout is accepted
+    # by production and this rejection does not fire.
+    if (-not $invalidReason -and -not $interveningAnchor) {
         $nonContiguousRecovery = @($typedRecovery | Where-Object {
             $_.PartitionNumber -notin @($reclaimable | ForEach-Object { $_.PartitionNumber }) -and
             [int64]$_.Offset -ge $cursor
@@ -1095,13 +1256,14 @@ function Test-PlanAdjacencyReadOnly {
             })
             $interveningRefs = ($interveningParts | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
             $separatedRefs = ($nonContiguousRecovery | ForEach-Object { Get-HarnessPartitionRef -Partition $_ -WithType }) -join '; '
-            $reasons += "recovery-typed partitions are separated from C: by a non-recovery partition (intervening: $interveningRefs; separated: $separatedRefs)"
+            $invalidReason = "recovery-typed partitions are separated from C: by a non-recovery partition (intervening: $interveningRefs; separated: $separatedRefs)"
         }
     }
 
     return @{
-        Status  = if ($reasons.Count -eq 0) { 'OK' } else { 'REJECTED' }
-        Reasons = $reasons
+        Status            = if ($invalidReason) { 'REJECTED' } else { 'OK' }
+        Reason            = $invalidReason
+        InterveningAnchor = $interveningAnchor
     }
 }
 
@@ -1139,6 +1301,13 @@ function Show-SystemDiagnostic {
     Write-KV "Detected OS"      "$($profile.OS)" "White"
     Write-KV "Detected Vendor"  "$($profile.Vendor)" "White"
     Write-KV "Detected MT"      "$($profile.MachineType)" "Gray"
+    $archColor = if ($profile.Architecture -eq 'x64') { "Green" } else { "Red" }
+    Write-KV "Architecture"     "$($profile.Architecture)" $archColor
+    if ($profile.Architecture -ne 'x64') {
+        Write-Diag ""
+        Write-Diag "  WARNING: architecture is '$($profile.Architecture)'; production v48 supports x64 only." "Red"
+        Write-Diag "           A live production run would refuse with EXIT_WARNING before any mutation." "Red"
+    }
 
     # ---- reagentc /info (raw) ----
     Write-Diag ""
@@ -1224,7 +1393,7 @@ function Show-SystemDiagnostic {
                 Write-Diag ""
                 Write-WarningBanner -Headline "LOW DISK SPACE ON OS VOLUME ($($osPart.DriveLetter):)" -BodyLines @(
                     "",
-                    "  Free:  $freeStr  of  $totalStr  ($freePct% free)"
+                    "  Free:  $freeStr  of  $totalStr  ($freePct% free)",
                     "",
                     "  Production may not be able to shrink C: enough to make",
                     "  room for a dedicated recovery partition. If the shrink",
@@ -1406,15 +1575,23 @@ function Show-SystemDiagnostic {
         $planPartList = @(Get-Partition -DiskNumber $osDisk.Number -ErrorAction SilentlyContinue)
         if ($planPartList.Count -gt 0) {
             $adjResult = Test-PlanAdjacencyReadOnly -OSDisk $osDisk -OSPartition $osPart -Partitions $planPartList
-            if ($adjResult.Status -eq 'OK') {
+            if ($adjResult.Status -eq 'OK' -and $adjResult.InterveningAnchor) {
+                $anchorRef = Get-HarnessPartitionRef -Partition $adjResult.InterveningAnchor -WithType
+                Write-Diag "  Production's plan would not reject this layout on the checks that can" "Green"
+                Write-Diag "  be evaluated read-only, and it would accept it via intervening-anchor" "Green"
+                Write-Diag "  handling. Anchor (the resize target): $anchorRef" "Green"
+                Write-Diag "  The anchor will be shrunk from the right and the recovery partition" "DarkGray"
+                Write-Diag "  will be created in the freed space immediately after it." "DarkGray"
+                Write-Diag "  The full plan performs additional checks not evaluated here (its" "DarkGray"
+                Write-Diag "  anchor-second-walk scan for stray recovery-typed partitions beyond" "DarkGray"
+                Write-Diag "  the reclaimable cluster, plus bucket-size and planned-extent sizing)." "DarkGray"
+            } elseif ($adjResult.Status -eq 'OK') {
                 Write-Diag "  Production's plan would not reject this layout on the checks that can be evaluated read-only." "Green"
                 Write-Diag "  The full plan also computes a bucket size and a planned extent;" "DarkGray"
                 Write-Diag "  those checks are not evaluated here." "DarkGray"
             } else {
-                Write-Diag "  Production's plan would REJECT this layout. Rejection reason(s):" "Yellow"
-                foreach ($r in $adjResult.Reasons) {
-                    Write-Diag "    - $r" "Yellow"
-                }
+                Write-Diag "  Production's plan would REJECT this layout. Reason:" "Yellow"
+                Write-Diag "    - $($adjResult.Reason)" "Yellow"
                 Write-Diag "  The destructive sequence will defer with EXIT_WARNING until the layout is resolved." "DarkGray"
             }
         } else {
@@ -1678,11 +1855,16 @@ function Show-SystemDiagnostic {
         Write-Host "[OK]  " -NoNewline -ForegroundColor Green
         Write-Host "reagentc location regex matched '$matched'" -ForegroundColor Gray
         Record "Parser: reagentc location" $true "matched '$matched'"
-    } else {
+    } elseif ($wreState.Status -eq 'Enabled') {
         Write-Host "  " -NoNewline
         Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
-        Write-Host " reagentc location regex did not match any line" -ForegroundColor Gray
-        Record "Parser: reagentc location" $false "no match"
+        Write-Host " reagentc location regex did not match any line (WinRE is Enabled)" -ForegroundColor Gray
+        Record "Parser: reagentc location" $false "no match while Enabled"
+    } else {
+        Write-Host "  " -NoNewline
+        Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+        Write-Host " reagentc location line not present (WinRE status=$($wreState.Status))" -ForegroundColor Gray
+        Record "Parser: reagentc location" $false -State "SKIP" -Detail "no location line (WinRE $($wreState.Status))"
     }
 
     # Check 2b (v22): reagentc Windows RE Version regex, mirrors
@@ -1861,9 +2043,9 @@ function Show-SystemDiagnostic {
         Record "Parser: Get-RecoveryPartitions" $true "$($recPartsCheck.Count) found"
     } else {
         Write-Host "  " -NoNewline
-        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
-        Write-Host " Get-RecoveryPartitions: found 0 partitions" -ForegroundColor Gray
-        Record "Parser: Get-RecoveryPartitions" $false "0 found"
+        Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+        Write-Host " Get-RecoveryPartitions: 0 partitions (legitimate on OS-fallback or Disabled-WinRE machines; not a structural failure)" -ForegroundColor Gray
+        Record "Parser: Get-RecoveryPartitions" $false -State "SKIP" -Detail "0 found (legitimate for OS-fallback / Disabled)"
     }
 
     # Check 10: Get-PartitionSupportedSize
@@ -1899,10 +2081,10 @@ function Show-SystemDiagnostic {
     # ---- v18 future-proofing checks ----
 
     # Check 11: DISM cmdlet availability. Production hard-depends on all
-    # five: mounting, dismounting, reading metadata, adding drivers, and
-    # listing drivers. A missing cmdlet means production cannot run at
-    # all on this host, and the harness's own parser coverage cannot
-    # validate the injection path.
+    # six: mounting, dismounting, reading metadata, adding drivers,
+    # listing drivers, and removing drivers. A missing cmdlet means
+    # production cannot run at all on this host, and the harness's own
+    # parser coverage cannot validate the injection path.
     $dismCmds = @(
         "Mount-WindowsImage", "Dismount-WindowsImage", "Get-WindowsImage",
         "Add-WindowsDriver", "Get-WindowsDriver", "Remove-WindowsDriver"
@@ -1923,9 +2105,10 @@ function Show-SystemDiagnostic {
         Record "Parser: DISM cmdlets" $false "missing: $($missingDismCmd -join ', ')"
     }
 
-    # Check 12: Get-Disk shape. Production reads all seven of these in
-    # Get-OSDisk, the capacity pre-check, and the partition-style branch
-    # of Ensure-AdequateRecoveryPartition.
+    # Check 12: Get-Disk shape. Production reads all eight of these in
+    # Get-OSDisk, the capacity pre-check, the partition-style branch of
+    # Ensure-AdequateRecoveryPartition, and the workspace-candidate
+    # allowlist gate in Get-WorkDirCandidates.
     try {
         $sampleDisk = Get-Disk -ErrorAction Stop | Select-Object -First 1
         if ($sampleDisk) {
@@ -2247,6 +2430,24 @@ function Show-StateFileParity {
         Write-KV "DeployedWinREMetadata" "$deployedMeta" "Green"
     }
 
+    # v48 local-inputs hash. Computed from the same three components
+    # production uses. Shown so an operator can see whether the offline
+    # fallback would defer on a hardware or OS drift since the last
+    # successful online run.
+    $computedLocalInputsId = Get-LocalInputsId -Hardware $profile
+    Write-KV "Computed LocalInputsId" "$computedLocalInputsId" "Magenta"
+    $storedLocalInputsId = $state.LocalInputsId
+    if ($storedLocalInputsId) {
+        $liMatch = ([string]$storedLocalInputsId -eq $computedLocalInputsId)
+        Write-KV "Stored LocalInputsId" "$storedLocalInputsId" $(if ($liMatch) { "Green" } else { "Yellow" })
+        if (-not $liMatch) {
+            Write-Diag "           LocalInputsId mismatch - production's offline fallback would" "Yellow"
+            Write-Diag "           defer (EXIT_WARNING) rather than trust the stored DSI." "Yellow"
+        }
+    } else {
+        Write-KV "Stored LocalInputsId" "(absent - state file predates v48)" "Yellow"
+    }
+
     Write-Diag ""
     if (-not $vmdQueryOk) {
         Write-Host "  Verdict: " -NoNewline -ForegroundColor DarkGray
@@ -2377,16 +2578,6 @@ function Get-LenovoWinPEPack {
         IsUrl          = $true
         ExpectedMD5    = $null
         ExpectedSHA256 = $winpe.sha256
-    }
-}
-
-function Get-OEMWinPEPack {
-    param($Hardware)
-    switch ($Hardware.Manufacturer) {
-        "Dell"   { return Get-DellWinPEPack   -Hardware $Hardware }
-        "HP"     { return Get-HPWinPEPack     -Hardware $Hardware }
-        "LENOVO" { return Get-LenovoWinPEPack -Hardware $Hardware }
-        default  { return $null }
     }
 }
 
@@ -2856,7 +3047,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v26)"
+    $titleContent = "WinRE Manager Test Harness (v27)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -2904,7 +3095,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v26"
+Rule "WinRE Manager test harness v27"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

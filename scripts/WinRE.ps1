@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 47 (v47 patch 3)
+    Version : 48 (v48 patch 2)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -37,12 +37,18 @@
                 which partition is wrong is a log the operator cannot act on.
             - Pre-shrink deferral preserves the old route. Its sidecar marker only
                 suppresses retries while that route and its registered WIM are valid.
-            - The destructive sequence fails closed before deletion if the active
-                WinRE route is Enabled but its registered location cannot be
-                resolved to a partition. Delete-last ordering and route
-                restoration both depend on identifying the active target;
-                without it, no partition is protected and a mid-loop failure
-                could leave the machine with no working recovery route.
+            - The destructive sequence fails closed before ANY mutation when
+                the active WinRE route is Enabled but its registered location
+                is empty or cannot be resolved to a partition. Route
+                resolution runs immediately after $stateBefore is captured,
+                before the C: pre-shrink and before reagentc /disable; the
+                fail-closed guard is the first thing the destructive path
+                does, and the log statement "No partition or WinRE changes
+                were made" is true on every deferral path that emits it.
+                Delete-last ordering and route restoration both depend on
+                identifying the active target; without it, no partition is
+                protected and a mid-loop failure could leave the machine
+                with no working recovery route.
             - The whole-layout assertion fails closed when the OS partition cannot
                 be resolved, rather than skipping the C: adjacency check. A layout
                 that cannot be verified against C: is not accepted; the assertion
@@ -60,7 +66,11 @@
                 evidence for a metadata-neutral source change), plus the
                 final deployed WIM's SHA256. Logged for evidence only; no
                 gate reads any of these values and none enters
-                DesiredStateId.
+                DesiredStateId. The DISM servicing metadata used by
+                Select-BaseWinRESource for source selection is read via a
+                separate call (Get-WimServicingMetadata); the "no gate reads
+                these values" claim applies only to the logged observability
+                values above, not to the source-selection comparison.
             - LKG migration bridge: on the first v47 run on a machine whose
                 state file was written by v46 or earlier, the DSI mismatch
                 correctly causes the state reader to return empty, which
@@ -119,9 +129,91 @@
                 logged, so the operator sees why the search is
                 exhausting candidates.
 
+            - Architecture gate (v48). Get-HardwareObject reports the
+                actual OS architecture, normalized to "x64", "ARM64",
+                "x86", or "unknown", not a hardcoded "x64". The value
+                is derived from the process-architecture environment
+                variables (PROCESSOR_ARCHITECTURE, with
+                PROCESSOR_ARCHITEW6432 taking precedence when present)
+                because Win32_OperatingSystem.OSArchitecture reports
+                only "32-bit" or "64-bit" and cannot distinguish ARM64
+                from x64. The manager refuses to run on any architecture
+                other than x64. The refusal happens before any state
+                mutation and is a stable, named deferral. ARM64 support
+                is not claimed; a future fleet requirement would be a
+                separate change.
+
+            - Intervening-partition handling (v48). Narrow scope: exactly
+                one valid intervening data partition between C: and the
+                recovery partition(s) on the OS disk, and the anchor is the
+                partition immediately preceding the first recovery partition
+                in offset order. Multiple recovery partitions immediately
+                after the anchor are still handled (all are reclaimed); the
+                scope constraint is on the number of NON-recovery
+                intervening partitions, not on the number of recovery
+                partitions. The anchor is validated strictly before any
+                mutation: on the OS disk, not C:, not a recovery-typed
+                partition, not EFI/MSR/system/reserved, NTFS, accessible
+                for resize (fully decrypted, OR BitLocker-encrypted and
+                currently unlocked; locked or indeterminate encryption
+                state defers), sufficiently large, shrinkable from the
+                right, with sufficient free space after shrink, and with
+                no unexpected partition or gap geometry between it and the
+                first recovery partition. Failure of any condition rejects
+                the plan with a named reason and defers without touching
+                the machine. Multi-intervening layouts, locked anchors, and
+                general partition-moving are out of scope. The post-deletion
+                replacement flow is unchanged from the non-intervening case;
+                only the anchor partition identity differs.
+
+            - LKG by hash at any discovered location (v48). A WIM found
+                on any recovery partition whose SHA256 exactly matches
+                state.CurrentImageHash is accepted as last-known-good.
+                Provenance is content, not pathname. The canonical
+                C:\Recovery\WindowsRE\winre.wim remains the preferred
+                LKG path, but the hash binding is what makes it
+                trusted, and the same binding lets a discovered WIM at
+                an arbitrary recovery location stand in as LKG when the
+                canonical path is missing.
+
+            - Transactional WIM replacement (v48). Replacing the WIM on
+                the currently-active recovery route preserves the old
+                WIM as a rollback copy in the already-selected
+                workspace until the new WIM is fully verified in place,
+                and restores the old one on any copy failure. The same
+                pattern covers the OS-fallback target. This closes the
+                window in which a failed copy previously left the
+                machine with WinRE disabled and no usable WIM on the
+                active route. The rollback copy is released once
+                reagentc /setreimage has succeeded and reagentc /enable
+                has been attempted: after that point the new WIM is in
+                place and reagentc is pointing at it, so restoring the
+                old bytes would not change the outcome of an enable
+                failure.
+
         Known gap:
-            - Offline fallback trusts stored DesiredStateId; LocalInputsId would
-                close the residual hardware-drift risk.
+            - The intervening-partition handling added in v48 has not been
+                exercised under a deliberate post-deletion failure on a
+                disposable VM. The narrow scope (single intervening
+                partition, strict anchor validation) and the v48
+                transactional WIM replacement reduce the exposure, but the
+                mid-flow failure window is not proven closed by test
+                evidence. This gap closes when the deliberate post-deletion
+                failure test is run and its result is recorded.
+            - Free-space deferrals are deliberately retry-suppressed:
+                when the pre-shrink free-space check rejects, the run
+                writes a deferral marker and does not retry on the next
+                scheduled run even if free space has since been freed.
+                This suppresses the full rebuild that would otherwise
+                run before reaching the same rejection point, at the
+                cost of requiring operator intervention when free space
+                changes. The operator path is to free space and then
+                delete C:\Recovery\OEM\winre_state.json and
+                C:\Recovery\OEM\winre_partition_deferred.json to force
+                a retry. A targeted re-evaluation (marker caches the
+                resize target identity and planned shrink; next run
+                re-reads free space and retries only if resolved) is a
+                v49 candidate.
 
     Critical lessons (do not regress):
       - No 7-Zip for Lenovo/HP EXE extraction; use the vendor's EXE with
@@ -159,6 +251,10 @@
         both IsSystem and IsBoot; excluding IsSystem unconditionally
         made the OS-volume fallback in Get-WorkDirPlan unreachable on
         those machines.
+      - Never delete an old WIM before the new one is staged, verified,
+        and in place. The v48 transactional replacement exists because
+        v47 could leave the machine with WinRE disabled and no usable
+        WIM on the active route.
 #>
 
 [CmdletBinding()]
@@ -175,8 +271,8 @@ $EXIT_REBOOT_REQUIRED  = 1
 $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
-$ScriptVersion    = 47
-$ScriptPatchLevel = "3"
+$ScriptVersion    = 48
+$ScriptPatchLevel = "2"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -227,8 +323,25 @@ $Script:OriginalTempPath       = $null
 $Script:OriginalTmpPath        = $null
 $Script:TempEnvironmentChanged = $false
 $Script:RegisteredSourceFingerprint = $null
-$Script:DeployedWinREMetadata = $null
-$Script:StagedWimSourceHash = $null
+$Script:DeployedWinREMetadata  = $null
+$Script:StagedWimSourceHash    = $null
+# v48: transactional WIM replacement. When a new WIM is staged over a
+# previously-deployed WIM on the active route, the old WIM is first
+# copied to this path (inside the already-selected workspace) and left
+# there until the new WIM is fully verified in place. On any failure
+# during the replacement window, the rollback copy is restored before
+# the route is re-enabled. Reset to $null once the replacement is
+# committed.
+$Script:RollbackWimPath        = $null
+# v48: locally-computable deployment inputs hash. Binds the offline
+# fast-path decision to the hardware identity, OS build, and CPU
+# vendor/generation observable on the local machine, independent of the
+# driver manifest and OEM pack map. VMD presence is deliberately
+# excluded because its detection depends on the manifest, which the
+# offline fallback does not have. Recomputed on every run; compared
+# against the stored value on offline fallback. A mismatch defers with
+# EXIT_WARNING rather than trusting a stale DesiredStateId.
+$Script:LocalInputsId          = $null
 
 # =========================== LOGGING ===========================
 function Write-Log {
@@ -755,6 +868,54 @@ function Test-VolumeEncrypted {
     }
 }
 
+# v48: anchor-specific accessibility check. The v47 anchor policy
+# required a fully decrypted partition, which rejects the common case
+# of an encrypted data partition and therefore defers the very
+# machines the intervening-partition feature was added for. The
+# correct question is not "is it decrypted" but "can Resize-Partition
+# safely operate on it":
+#
+#   - fully decrypted: yes.
+#   - BitLocker-encrypted, currently unlocked: yes. Resize-Partition
+#     resizes the partition table and the NTFS filesystem; BitLocker
+#     metadata sits at the front of the volume and is not affected by
+#     a right-edge shrink. The volume remains encrypted and unlockable
+#     after the resize. The manager never touches the anchor's
+#     BitLocker state (no -off, no -suspend, no -on).
+#   - BitLocker-encrypted, currently locked: no. The volume is not
+#     mounted and its free space cannot be probed.
+#   - indeterminate: no, fail closed.
+#
+# Returns $true (accessible), $false (not accessible), or $null
+# (indeterminate). Callers defer on $false and $null.
+function Test-VolumeAccessibleForResize {
+    param([Parameter(Mandatory)][string]$MountPoint)
+
+    $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
+    if ($blv) {
+        $vs = [string]$blv.VolumeStatus
+        if ($vs -eq 'FullyDecrypted') { return $true }
+        if ($vs -in @('FullyEncrypted','EncryptionInProgress','DecryptionInProgress','EncryptionPaused','DecryptionPaused')) {
+            $lock = [string]$blv.LockStatus
+            if ($lock -eq 'Unlocked') { return $true }
+            if ($lock -eq 'Locked')   { return $false }
+            return $null
+        }
+        return $null
+    }
+    try {
+        $mbo = & manage-bde.exe -status $MountPoint 2>&1
+        $mboJoined = ($mbo | Out-String)
+        if ($mboJoined -match 'could not be opened by BitLocker') { return $true }
+        if ($mboJoined -match 'Conversion Status:\s*Fully Decrypted') { return $true }
+        if ($mboJoined -match 'Lock Status:\s*Unlocked') { return $true }
+        if ($mboJoined -match 'Lock Status:\s*Locked')   { return $false }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
 function Test-DeferredWinRERouteFunctional {
     param(
         [Parameter(Mandatory)][hashtable]$WinREState,
@@ -901,11 +1062,11 @@ function Remove-StrayRecoveryPartitions {
         foreach ($rp in @(Get-RecoveryPartitions -DiskNumber $disk.Number)) {
             $isTyped = ($rp.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($rp.MbrType -eq 0x27)
             if (-not $isTyped) {
-                Write-Log "Step 7: skipping non-OS-disk partition $($disk.Number)/$($rp.PartitionNumber) - label matches recovery but type code does not" -Level WARN
+                Write-Log "Stray-recovery cleanup: skipping non-OS-disk partition $($disk.Number)/$($rp.PartitionNumber) - label matches recovery but type code does not" -Level WARN
                 continue
             }
             if ([int64]$rp.Size -gt [int64]($MaxManagedRecoveryPartitionMiB * 1MB)) {
-                Write-Log "Step 7: preserving oversized recovery-typed partition $($disk.Number)/$($rp.PartitionNumber) ($([math]::Round($rp.Size/1MB,1)) MiB > $MaxManagedRecoveryPartitionMiB MiB safety ceiling) for operator review" -Level WARN
+                Write-Log "Stray-recovery cleanup: preserving oversized recovery-typed partition $($disk.Number)/$($rp.PartitionNumber) ($([math]::Round($rp.Size/1MB,1)) MiB > $MaxManagedRecoveryPartitionMiB MiB safety ceiling) for operator review" -Level WARN
                 $Script:nonFatalWarning = $true
                 continue
             }
@@ -915,9 +1076,9 @@ function Remove-StrayRecoveryPartitions {
             }
             try {
                 $rp | Remove-Partition -Confirm:$false -ErrorAction Stop
-                Write-Log "Step 7: deleted stray recovery partition $($disk.Number)/$($rp.PartitionNumber)"
+                Write-Log "Stray-recovery cleanup: deleted stray recovery partition $($disk.Number)/$($rp.PartitionNumber)"
             } catch {
-                Write-Log "Step 7: failed to delete stray recovery partition $($disk.Number)/$($rp.PartitionNumber): $_" -Level WARN
+                Write-Log "Stray-recovery cleanup: failed to delete stray recovery partition $($disk.Number)/$($rp.PartitionNumber): $_" -Level WARN
                 $Script:nonFatalWarning = $true
                 $anyFailed = $true
             }
@@ -1027,12 +1188,19 @@ function Assert-PartitionSizeAfterResize {
 
 # Post-creation geometry assertion. Confirms that a newly-created
 # recovery partition landed at the planned offset (exact) and size
-# (within one alignment block), that it does not overlap the OS
-# partition, that the C:-to-recovery gap does not exceed one alignment
-# block, and that its end matches the planned aligned managed-extent
-# end within one alignment block. A trailing offset within tolerance
-# is logged; anything larger is a fatal geometry mismatch that
-# triggers orphan removal and a deferred return.
+# (within one alignment block), that it does not overlap the boundary
+# partition, that the boundary-to-recovery gap does not exceed one
+# alignment block, and that its end matches the planned aligned
+# managed-extent end within one alignment block.
+#
+# v48: the adjacency check is against -BoundaryPartition. When the
+# parameter is omitted the boundary defaults to the OS partition, so
+# the v47 call sites are unchanged. In the intervening-anchor case the
+# caller passes the anchor; without this, the C:-to-recovery gap
+# measured against the anchor layout (which includes the entire anchor
+# partition) would always exceed tolerance and the assertion would
+# reject every valid intervening plan. This was caught during
+# end-to-end review of the v48 post-delete path.
 function Assert-RecoveryPartitionLayout {
     param(
         [Parameter(Mandatory)][int]$DiskNumber,
@@ -1040,7 +1208,8 @@ function Assert-RecoveryPartitionLayout {
         [Parameter(Mandatory)][int64]$ExpectedOffsetBytes,
         [Parameter(Mandatory)][int64]$ExpectedSizeBytes,
         [int64]$ExpectedEndBytes = -1,
-        [int64]$AlignmentToleranceBytes = 1MB
+        [int64]$AlignmentToleranceBytes = 1MB,
+        [object]$BoundaryPartition = $null
     )
     try {
         $part = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
@@ -1061,27 +1230,32 @@ function Assert-RecoveryPartitionLayout {
             Write-Log "Assert-RecoveryPartitionLayout: recovery size $([math]::Round($part.Size/1MB,2)) MiB, expected $([math]::Round($ExpectedSizeBytes/1MB,2)) MiB, delta $([math]::Round($sizeDelta/1MB,2)) MiB exceeds $([math]::Round($AlignmentToleranceBytes/1MB,2)) MiB tolerance" -Level ERROR
             return $false
         }
-        $osPart = Get-OSPartition
-        if (-not $osPart) {
-            # The OS partition could not be resolved. Fail closed rather
-            # than skip the C: adjacency check: a layout that cannot be
-            # verified against C: must not be accepted.
-            Write-Log "Assert-RecoveryPartitionLayout: could not resolve the OS partition; refusing to accept the layout without the C: adjacency check" -Level ERROR
+
+        # Resolve the boundary partition. Default is the OS partition
+        # (v47 behavior). Intervening-anchor callers pass the anchor.
+        $boundary = if ($BoundaryPartition) { $BoundaryPartition } else { Get-OSPartition }
+        if (-not $boundary) {
+            # Neither the caller-supplied boundary nor the OS partition
+            # could be resolved. Fail closed rather than skip the
+            # adjacency check: a layout that cannot be verified against
+            # a boundary must not be accepted.
+            Write-Log "Assert-RecoveryPartitionLayout: could not resolve the boundary partition; refusing to accept the layout without the adjacency check" -Level ERROR
             return $false
         }
-        if ($osPart.DiskNumber -eq $DiskNumber) {
-            $osEnd = [int64]$osPart.Offset + [int64]$osPart.Size
-            if ($osEnd -gt [int64]$part.Offset) {
-                Write-Log "Assert-RecoveryPartitionLayout: OS partition end $([math]::Round($osEnd/1MB,2)) MiB overlaps recovery start $([math]::Round($part.Offset/1MB,2)) MiB" -Level ERROR
+        $boundaryRef = "disk $($boundary.DiskNumber) part $($boundary.PartitionNumber)"
+        if ($boundary.DiskNumber -eq $DiskNumber) {
+            $boundaryEnd = [int64]$boundary.Offset + [int64]$boundary.Size
+            if ($boundaryEnd -gt [int64]$part.Offset) {
+                Write-Log "Assert-RecoveryPartitionLayout: boundary partition ($boundaryRef) end $([math]::Round($boundaryEnd/1MB,2)) MiB overlaps recovery start $([math]::Round($part.Offset/1MB,2)) MiB" -Level ERROR
                 return $false
             }
-            $gapBytes = [int64]$part.Offset - $osEnd
+            $gapBytes = [int64]$part.Offset - $boundaryEnd
             if ($gapBytes -gt $AlignmentToleranceBytes) {
-                Write-Log "Assert-RecoveryPartitionLayout: gap between OS end $([math]::Round($osEnd/1MB,2)) MiB and recovery start $([math]::Round($part.Offset/1MB,2)) MiB is $([math]::Round($gapBytes/1MB,2)) MiB, exceeds $([math]::Round($AlignmentToleranceBytes/1MB,2)) MiB alignment tolerance" -Level ERROR
+                Write-Log "Assert-RecoveryPartitionLayout: gap between boundary partition ($boundaryRef) end $([math]::Round($boundaryEnd/1MB,2)) MiB and recovery start $([math]::Round($part.Offset/1MB,2)) MiB is $([math]::Round($gapBytes/1MB,2)) MiB, exceeds $([math]::Round($AlignmentToleranceBytes/1MB,2)) MiB alignment tolerance" -Level ERROR
                 return $false
             }
             if ($gapBytes -gt 0) {
-                Write-Log "Assert-RecoveryPartitionLayout: C:-to-recovery alignment gap $([math]::Round($gapBytes/1KB,1)) KiB (within tolerance)"
+                Write-Log "Assert-RecoveryPartitionLayout: boundary-to-recovery alignment gap $([math]::Round($gapBytes/1KB,1)) KiB (within tolerance)"
             }
         }
         if ($ExpectedEndBytes -gt 0) {
@@ -1101,95 +1275,6 @@ function Assert-RecoveryPartitionLayout {
         Write-Log "Assert-RecoveryPartitionLayout: query failed for $DiskNumber/$PartitionNumber - $_" -Level ERROR
         return $false
     }
-}
-
-# =========================== RECOVERY PARTITION CREATION ===========================
-# Restore C: to a requested target size (typically the pre-attempt size
-# captured before a shrink). When -TargetSizeBytes is omitted, falls
-# back to the partition's supported maximum. Any failure sets
-# nonFatalWarning and GeometryRestoreFailed, which causes
-# Write-WinREState to delete the state file and forces a clean retry.
-function Restore-OSPartitionSize {
-    param(
-        [Parameter(Mandatory)][string]$Reason,
-        [object]$TargetSizeBytes = $null
-    )
-
-    if ($Script:DryRun) {
-        if ($null -ne $TargetSizeBytes) { Write-Log "[DRY RUN] Would restore OS partition to $([math]::Round([int64]$TargetSizeBytes/1MB,1)) MiB ($Reason)" }
-        else { Write-Log "[DRY RUN] Would re-extend OS partition to SizeMax ($Reason)" }
-        return $true
-    }
-
-    $osPart = Get-OSPartition
-    if (-not $osPart) {
-        Write-Log "Restore-OSPartitionSize: OS partition not found ($Reason)" -Level WARN
-        $Script:nonFatalWarning = $true
-        $Script:GeometryRestoreFailed = $true
-        return $false
-    }
-    try {
-        $targetSize = if ($null -ne $TargetSizeBytes) {
-            [int64]$TargetSizeBytes
-        } else {
-            [int64](Get-PartitionSupportedSize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber -ErrorAction Stop).SizeMax
-        }
-        if ($targetSize -eq $osPart.Size) {
-            Write-Log "OS partition already at requested size $([math]::Round($targetSize/1MB,1)) MiB ($Reason)"
-            return $true
-        }
-        Write-Log "Restoring OS partition from $([math]::Round($osPart.Size/1MB,1)) MiB to $([math]::Round($targetSize/1MB,1)) MiB ($Reason)"
-        $osPart | Resize-Partition -Size $targetSize -ErrorAction Stop
-        Start-Sleep 3
-        if (-not (Assert-PartitionSizeAfterResize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber -ExpectedSizeBytes $targetSize)) {
-            Write-Log "Restore-OSPartitionSize: verification failed ($Reason)" -Level WARN
-            $Script:nonFatalWarning = $true
-            $Script:GeometryRestoreFailed = $true
-            return $false
-        }
-        return $true
-    } catch {
-        Write-Log "Restore-OSPartitionSize failed ($Reason): $_" -Level WARN
-        $Script:nonFatalWarning = $true
-        $Script:GeometryRestoreFailed = $true
-        return $false
-    }
-}
-
-# Delete a partition we created but could not complete. Uses delete-first
-# / diskpart-override-second. On survival, sets the geometry-failure
-# flags so the state file is invalidated.
-function Remove-OrphanPartition {
-    param(
-        [Parameter(Mandatory)][int]$DiskNumber,
-        [Parameter(Mandatory)][int]$PartitionNumber,
-        [Parameter(Mandatory)][string]$Reason,
-        [object]$TargetOSPartitionSizeBytes = $null
-    )
-
-    if ($Script:DryRun) { Write-Log "[DRY RUN] Would remove orphan partition $DiskNumber/$PartitionNumber ($Reason)"; return $true }
-
-    try {
-        $p = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
-        $p | Remove-Partition -Confirm:$false -ErrorAction Stop
-    } catch {
-        try {
-            $dp = "select disk $DiskNumber`nselect partition $PartitionNumber`ndelete partition override"
-            $dp | diskpart | Out-Null
-        } catch { }
-    }
-    Start-Sleep 2
-    $stillThere = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
-    if ($stillThere) {
-        Write-Log "Orphan partition $DiskNumber/$PartitionNumber could not be removed after $Reason - manual cleanup may be required" -Level WARN
-        $Script:nonFatalWarning = $true
-        $Script:GeometryRestoreFailed = $true
-        return $false
-    }
-    Write-Log "Removed orphan partition $DiskNumber/$PartitionNumber after $Reason"
-
-    Restore-OSPartitionSize -Reason "after orphan removal" -TargetSizeBytes $TargetOSPartitionSizeBytes | Out-Null
-    return $true
 }
 
 # Build a short, log-friendly identifier for a partition. Used in
@@ -1232,6 +1317,178 @@ function Format-PartitionRef {
     return $ref
 }
 
+# Restore a partition to a requested target size (typically the size
+# captured before a shrink attempt). Used by the C: shrink path and,
+# in v48, by the intervening-anchor shrink path.
+#
+# v48 generalization: the function now accepts optional -DiskNumber
+# and -PartitionNumber. When omitted, or when the supplied identity
+# resolves to the OS partition, the behavior and log wording are
+# identical to v47. When supplied with a non-OS partition, the
+# function operates on that partition, and the log label reflects the
+# actual target. This is how the intervening-anchor path restores its
+# anchor after a failed shrink; the OS-partition call sites are
+# unchanged.
+#
+# When -TargetSizeBytes is omitted, the function falls back to the
+# partition's supported maximum (SizeMax). Only C: call sites use
+# that fallback today; anchor call sites always pass an explicit
+# target size.
+#
+# Any failure sets nonFatalWarning and GeometryRestoreFailed, which
+# causes Write-WinREState to delete the state file and forces a clean
+# retry. The flag is set for anchor failures as well as OS-partition
+# failures: if the anchor is left shrunken after a failed rollback,
+# the state file must not remain valid or the next run may take the
+# fast path over an unexpectedly-shrunken anchor.
+function Restore-OSPartitionSize {
+    param(
+        [Parameter(Mandatory)][string]$Reason,
+        [object]$TargetSizeBytes = $null,
+        [int]$DiskNumber = -1,
+        [int]$PartitionNumber = -1
+    )
+
+    # Resolve target partition. Both DiskNumber/PartitionNumber must be
+    # supplied together or neither; partial supply is an internal error.
+    $targetPart = $null
+    $targetIsOS = $false
+    if ($DiskNumber -ge 0 -or $PartitionNumber -ge 0) {
+        if ($DiskNumber -lt 0 -or $PartitionNumber -lt 0) {
+            Write-Log "Restore-OSPartitionSize: DiskNumber and PartitionNumber must both be specified (got $DiskNumber/$PartitionNumber)" -Level WARN
+            $Script:nonFatalWarning = $true
+            return $false
+        }
+        $targetPart = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
+        $osPartCheck = Get-OSPartition
+        if ($targetPart -and $osPartCheck -and
+            $targetPart.DiskNumber -eq $osPartCheck.DiskNumber -and
+            $targetPart.PartitionNumber -eq $osPartCheck.PartitionNumber) {
+            $targetIsOS = $true
+        }
+    } else {
+        $targetPart = Get-OSPartition
+        $targetIsOS = $true
+    }
+
+    $partLabel = if ($targetIsOS) { "OS partition" }
+                 elseif ($targetPart) { "partition disk $($targetPart.DiskNumber) part $($targetPart.PartitionNumber)" }
+                 elseif ($DiskNumber -ge 0) { "partition disk $DiskNumber part $PartitionNumber" }
+                 else { "partition" }
+
+    if ($Script:DryRun) {
+        if ($null -ne $TargetSizeBytes) { Write-Log "[DRY RUN] Would restore $partLabel to $([math]::Round([int64]$TargetSizeBytes/1MB,1)) MiB ($Reason)" }
+        else { Write-Log "[DRY RUN] Would re-extend $partLabel to SizeMax ($Reason)" }
+        return $true
+    }
+
+    if (-not $targetPart) {
+        Write-Log "Restore-OSPartitionSize: $partLabel not found ($Reason)" -Level WARN
+        $Script:nonFatalWarning = $true
+        $Script:GeometryRestoreFailed = $true
+        return $false
+    }
+    try {
+        $targetSize = if ($null -ne $TargetSizeBytes) {
+            [int64]$TargetSizeBytes
+        } else {
+            [int64](Get-PartitionSupportedSize -DiskNumber $targetPart.DiskNumber -PartitionNumber $targetPart.PartitionNumber -ErrorAction Stop).SizeMax
+        }
+        if ($targetSize -eq $targetPart.Size) {
+            Write-Log "$partLabel already at requested size $([math]::Round($targetSize/1MB,1)) MiB ($Reason)"
+            return $true
+        }
+        Write-Log "Restoring $partLabel from $([math]::Round($targetPart.Size/1MB,1)) MiB to $([math]::Round($targetSize/1MB,1)) MiB ($Reason)"
+        $targetPart | Resize-Partition -Size $targetSize -ErrorAction Stop
+        Start-Sleep 3
+        if (-not (Assert-PartitionSizeAfterResize -DiskNumber $targetPart.DiskNumber -PartitionNumber $targetPart.PartitionNumber -ExpectedSizeBytes $targetSize)) {
+            Write-Log "Restore-OSPartitionSize: verification failed ($Reason)" -Level WARN
+            $Script:nonFatalWarning = $true
+            $Script:GeometryRestoreFailed = $true
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Log "Restore-OSPartitionSize failed ($Reason): $_" -Level WARN
+        $Script:nonFatalWarning = $true
+        $Script:GeometryRestoreFailed = $true
+        return $false
+    }
+}
+
+# Delete a partition we created but could not complete. Uses delete-first
+# / diskpart-override-second. On survival, sets the geometry-failure
+# flags so the state file is invalidated.
+#
+# v48: the function now also restores the anchor partition (not just C:)
+# after orphan removal. -AnchorDiskNumber/-AnchorPartitionNumber default
+# to the OS partition, so v47-style call sites are unchanged. When the
+# orphan was created after an intervening anchor was shrunk, the caller
+# passes the anchor's identity so the correct partition is restored.
+#
+# -TargetOSPartitionSizeBytes is the size to restore the anchor to.
+# The parameter name is kept for continuity with the v47 call sites;
+# in the intervening case the "anchor" is not C:.
+function Remove-OrphanPartition {
+    param(
+        [Parameter(Mandatory)][int]$DiskNumber,
+        [Parameter(Mandatory)][int]$PartitionNumber,
+        [Parameter(Mandatory)][string]$Reason,
+        [object]$TargetOSPartitionSizeBytes = $null,
+        [int]$AnchorDiskNumber = -1,
+        [int]$AnchorPartitionNumber = -1
+    )
+
+    if ($Script:DryRun) { Write-Log "[DRY RUN] Would remove orphan partition $DiskNumber/$PartitionNumber ($Reason)"; return $true }
+
+    try {
+        $p = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
+        $p | Remove-Partition -Confirm:$false -ErrorAction Stop
+    } catch {
+        try {
+            $dp = "select disk $DiskNumber`nselect partition $PartitionNumber`ndelete partition override"
+            $dp | diskpart | Out-Null
+        } catch { }
+    }
+    Start-Sleep 2
+    $stillThere = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
+    if ($stillThere) {
+        Write-Log "Orphan partition $DiskNumber/$PartitionNumber could not be removed after $Reason - manual cleanup may be required" -Level WARN
+        $Script:nonFatalWarning = $true
+        $Script:GeometryRestoreFailed = $true
+        return $false
+    }
+    Write-Log "Removed orphan partition $DiskNumber/$PartitionNumber after $Reason"
+
+    Restore-OSPartitionSize -Reason "after orphan removal" -TargetSizeBytes $TargetOSPartitionSizeBytes `
+        -DiskNumber $AnchorDiskNumber -PartitionNumber $AnchorPartitionNumber | Out-Null
+    return $true
+}
+
+# Read-only partition plan. Computes where a new recovery partition
+# would go and how much the resize target (C: in the non-intervening
+# case, or the intervening anchor in the v48 intervening case) would
+# need to shrink or extend to make room.
+#
+# v48 additions:
+#   - Intervening-anchor detection. When the v47 walk stops at a
+#     non-recovery partition (the blocker) and no recovery partition
+#     preceded it, check whether the blocker is the immediate
+#     predecessor of the first recovery partition after C:. If so,
+#     validate the anchor against the rules in the header. On success,
+#     the anchor is recorded and a second walk collects the recovery
+#     cluster after the anchor. On failure, reject with a named reason
+#     that includes a Format-PartitionRef of the anchor.
+#   - New plan fields: InterveningAnchor (partition or $null),
+#     PlannedAnchorPartitionSize, AnchorShrinkBytes, AnchorExtendBytes.
+#     In the non-intervening case these are $null/0/0 and the caller
+#     sees exactly the v47 plan shape.
+#   - The plan does not extend the anchor. When the anchor's current
+#     end is farther from the disk tail than the plan needs, the plan
+#     rejects with the named surplus reason rather than creating a
+#     needlessly large replacement. Extending a BitLocker-encrypted
+#     anchor is not safe via Resize-Partition alone, and the v48 scope
+#     forbids additional manage-bde work on the anchor.
 function Get-PartitionPlan {
     param(
         [Parameter(Mandatory)][object]$OSDisk,
@@ -1330,18 +1587,138 @@ function Get-PartitionPlan {
         }
     }
 
-    if (-not $invalidReason) {
+    # v48: intervening-anchor detection. See header for scope. Only
+    # attempted when the walk stopped at a non-recovery partition and
+    # nothing was reclaimed before it (i.e., the blocker is adjacent
+    # to C:, possibly with an alignment gap). If a recovery partition
+    # preceded the blocker, the layout is out of scope for v48 and the
+    # v47 non-contiguous rejection applies.
+    $interveningAnchor = $null
+    $interveningAnchorReason = $null
+    $anchorSupportedSizeMin = $null
+
+    if (-not $invalidReason -and $blockingPartition -and $reclaimable.Count -eq 0) {
+        $anchorRef = Format-PartitionRef -Partition $blockingPartition -WithType
+        $anchorEnd = [int64]$blockingPartition.Offset + [int64]$blockingPartition.Size
+
+        $afterAnchor = @($allPartitions |
+            Where-Object { $_.PartitionNumber -ne $blockingPartition.PartitionNumber } |
+            Where-Object { [int64]$_.Offset -ge $anchorEnd } |
+            Sort-Object Offset)
+
+        $firstRecoveryAfter = if ($afterAnchor.Count -gt 0) {
+            $candidate = $afterAnchor[0]
+            if (($candidate.GptType -eq $recoveryType) -or ($candidate.MbrType -eq 0x27)) { $candidate } else { $null }
+        } else { $null }
+
+        if ($firstRecoveryAfter) {
+            $anchorReject = $null
+            $efiType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+            $msrType = '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
+
+            if (($blockingPartition.GptType -eq $efiType) -or ($blockingPartition.MbrType -eq 0xef)) {
+                $anchorReject = "anchor is an EFI System Partition ($anchorRef)"
+            } elseif ($blockingPartition.GptType -eq $msrType) {
+                $anchorReject = "anchor is a Microsoft Reserved Partition ($anchorRef)"
+            } elseif ($blockingPartition.IsSystem -or $blockingPartition.IsBoot) {
+                $anchorReject = "anchor is a system/boot partition ($anchorRef)"
+            }
+
+            if (-not $anchorReject) {
+                try {
+                    $anchorVol = Get-Volume -Partition $blockingPartition -ErrorAction SilentlyContinue
+                    if (-not $anchorVol) {
+                        $anchorReject = "anchor has no readable volume ($anchorRef)"
+                    } elseif ($anchorVol.FileSystem -ne 'NTFS') {
+                        $anchorReject = "anchor filesystem is '$($anchorVol.FileSystem)', not NTFS ($anchorRef)"
+                    }
+                } catch {
+                    $anchorReject = "anchor volume could not be inspected: $_ ($anchorRef)"
+                }
+            }
+
+            if (-not $anchorReject) {
+                if (-not $blockingPartition.DriveLetter) {
+                    $anchorReject = "anchor has no drive letter; cannot verify BitLocker state for resize ($anchorRef)"
+                } else {
+                    $anchorMount = "$($blockingPartition.DriveLetter):"
+                    $accessible = Test-VolumeAccessibleForResize -MountPoint $anchorMount
+                    if ($null -eq $accessible) {
+                        $anchorReject = "anchor encryption state is indeterminate; refusing to shrink ($anchorRef)"
+                    } elseif (-not $accessible) {
+                        $anchorReject = "anchor is BitLocker-locked; cannot resize ($anchorRef)"
+                    }
+                }
+            }
+
+            if (-not $anchorReject) {
+                try {
+                    $anchorSupported = Get-PartitionSupportedSize -DiskNumber $blockingPartition.DiskNumber -PartitionNumber $blockingPartition.PartitionNumber -ErrorAction Stop
+                    $anchorSupportedSizeMin = [int64]$anchorSupported.SizeMin
+                } catch {
+                    $anchorReject = "anchor supported-size query failed: $_ ($anchorRef)"
+                }
+            }
+
+            if ($anchorReject) {
+                $interveningAnchorReason = $anchorReject
+            } else {
+                $interveningAnchor = $blockingPartition
+            }
+        }
+    }
+
+    # If an anchor was found, re-walk from the anchor end. This
+    # collects the recovery cluster adjacent to the anchor and finds
+    # the next non-recovery blocker (if any) beyond that cluster.
+    if (-not $invalidReason -and $interveningAnchor) {
+        $anchorEnd = [int64]$interveningAnchor.Offset + [int64]$interveningAnchor.Size
+        $cursor = $anchorEnd
+        $blockingPartition = $null
+
+        foreach ($partition in $allPartitions) {
+            if ($partition.PartitionNumber -eq $interveningAnchor.PartitionNumber -and
+                $partition.DiskNumber -eq $interveningAnchor.DiskNumber) { continue }
+            $partitionStart = [int64]$partition.Offset
+            $partitionEnd = $partitionStart + [int64]$partition.Size
+            if ($partitionEnd -le $anchorEnd) { continue }
+            if ($partitionStart -lt $cursor) {
+                $currRef = Format-PartitionRef -Partition $partition
+                $invalidReason = "partition extents overlap or are not ordered consistently (current $currRef starts at $([math]::Round($partitionStart/1MB,1)) MiB, but the previous extent ends at $([math]::Round($cursor/1MB,1)) MiB)"
+                break
+            }
+
+            $unallocatedBytes += ($partitionStart - $cursor)
+            $isTypedRecovery = ($partition.GptType -eq $recoveryType) -or ($partition.MbrType -eq 0x27)
+            if (-not $isTypedRecovery) {
+                $blockingPartition = $partition
+                break
+            }
+
+            $reclaimable.Add($partition)
+            $recoveryBytes += [int64]$partition.Size
+            $cursor = $partitionEnd
+        }
+    }
+
+    # Propagate the anchor-specific rejection. This takes priority over
+    # the v47 non-contiguous-recovery reason below because it names the
+    # specific validation that failed on the anchor.
+    if (-not $invalidReason -and $interveningAnchorReason) {
+        $invalidReason = $interveningAnchorReason
+    }
+
+    # Non-contiguous check. In the non-intervening path this is the v47
+    # rejection for layouts like C: | D: | Recovery. In the intervening
+    # path it catches stray typed-recovery partitions that were not
+    # collected by either walk (pathological layouts like
+    # C: | D: | Recovery | E: | Recovery2).
+    if (-not $invalidReason -and -not $interveningAnchor) {
         $nonContiguousRecovery = @($typedRecovery | Where-Object {
             $_.PartitionNumber -notin @($reclaimable | ForEach-Object { $_.PartitionNumber }) -and
             [int64]$_.Offset -ge $cursor
         })
         if ($nonContiguousRecovery.Count -gt 0) {
-            # Name the intervening non-recovery partition(s), and the
-            # recovery partition(s) that are separated from C: by them.
-            # This is the diagnostic the field log could not provide: a
-            # plan rejection that named only the category of the problem
-            # left the operator with no indication which partition was
-            # in the way.
             $firstSeparated = $nonContiguousRecovery | Sort-Object Offset | Select-Object -First 1
             $interveningParts = @($allPartitions | Where-Object {
                 $_.PartitionNumber -ne $OSPartition.PartitionNumber -and
@@ -1352,6 +1729,14 @@ function Get-PartitionPlan {
             $interveningRefs = ($interveningParts | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
             $separatedRefs = ($nonContiguousRecovery | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
             $invalidReason = "recovery-typed partitions are separated from C: by a non-recovery partition (intervening: $interveningRefs; separated: $separatedRefs)"
+        }
+    } elseif (-not $invalidReason -and $interveningAnchor) {
+        $strayRecovery = @($typedRecovery | Where-Object {
+            $_.PartitionNumber -notin @($reclaimable | ForEach-Object { $_.PartitionNumber })
+        })
+        if ($strayRecovery.Count -gt 0) {
+            $refs = ($strayRecovery | ForEach-Object { Format-PartitionRef -Partition $_ -WithType }) -join '; '
+            $invalidReason = "recovery-typed partitions exist beyond the intervening anchor's recovery cluster; this layout is not supported ($refs)"
         }
     }
 
@@ -1368,25 +1753,63 @@ function Get-PartitionPlan {
 
     # Single-boundary geometry model. The recovery partition occupies
     # the last BucketSizeBytes of the usable extent, ending at the
-    # 1 MiB-aligned usable end; C: ends exactly where the recovery
-    # partition begins. Bytes between the raw extent end and the
-    # aligned end are the explicit disk-end / alignment reserve and are
-    # logged, not treated as a defect. This replaces the earlier
-    # "shrink deficit plus alignment slack" model, which could leave an
-    # unaccounted trailing gap.
+    # 1 MiB-aligned usable end. In the non-intervening case, C: ends
+    # exactly where the recovery partition begins. In the v48
+    # intervening case, the anchor ends where the recovery partition
+    # begins.
     $alignedManagedExtentEnd = [int64]([Math]::Floor($tailEnd / 1MB) * 1MB)
     $plannedPartitionStart   = [int64]($alignedManagedExtentEnd - $BucketSizeBytes)
-    $plannedOSSize           = [int64]($plannedPartitionStart - $osStart)
-    $plannedOSEnd            = [int64]$plannedPartitionStart
-    $shrinkBytes             = [int64][Math]::Max(0, ($osSize - $plannedOSSize))
-    $extendBytes             = [int64][Math]::Max(0, ($plannedOSSize - $osSize))
-    $plannedAvailableBytes   = [int64]$BucketSizeBytes
-    $alignmentReserveBytes   = [int64]($tailEnd - $alignedManagedExtentEnd)
-    $requiresConsolidation   = ($plannedOSSize -lt $SizeMinBytes)
-    if (-not $invalidReason -and $plannedOSSize -le 0) {
+
+    $plannedAnchorPartitionSize = $null
+    $anchorShrinkBytes = [int64]0
+    $anchorExtendBytes = [int64]0
+    if ($interveningAnchor) {
+        $anchorCurSize = [int64]$interveningAnchor.Size
+        $plannedAnchorPartitionSize = [int64]($plannedPartitionStart - [int64]$interveningAnchor.Offset)
+        if ($plannedAnchorPartitionSize -gt $anchorCurSize) {
+            # Surplus case: the anchor's current end is farther from
+            # the disk tail than the plan needs, so seating the
+            # recovery partition at the plan's tail position would
+            # leave a gap between the anchor end and the recovery
+            # start that exceeds the alignment tolerance. The v48
+            # scope does not extend the anchor (BitLocker: a right-edge
+            # grow of an encrypted anchor is not a simple resize, and
+            # the invariants forbid additional manage-bde work on the
+            # anchor). Both workarounds - leaving the gap unallocated,
+            # or absorbing the surplus into a recovery partition that
+            # may exceed the managed ceiling - are worse than a clean
+            # deferral before any mutation. Reject with a named reason
+            # and let the operator resolve it.
+            $gapMiB = [math]::Round(($plannedAnchorPartitionSize - $anchorCurSize) / 1MB, 1)
+            if (-not $invalidReason) {
+                $invalidReason = "intervening anchor is $gapMiB MiB smaller than the plan requires to seat the recovery partition at the disk tail; this v48 scope does not extend the anchor (BitLocker). Manual intervention: extend the anchor to close the gap, or reduce the desired recovery partition size, then re-run."
+            }
+            # Cap for the returned plan's diagnostic fields; the plan
+            # is rejected above and the caller will not use them.
+            $plannedAnchorPartitionSize = $anchorCurSize
+        } elseif ($plannedAnchorPartitionSize -lt $anchorCurSize) {
+            $anchorShrinkBytes = [int64]($anchorCurSize - $plannedAnchorPartitionSize)
+        }
+    }
+
+    $plannedOSSize = if ($interveningAnchor) { $osSize } else { [int64]($plannedPartitionStart - $osStart) }
+    $plannedOSEnd = if ($interveningAnchor) { $osEnd } else { $plannedPartitionStart }
+    $shrinkBytes = if ($interveningAnchor) { [int64]0 } else { [int64][Math]::Max(0, ($osSize - $plannedOSSize)) }
+    $extendBytes = if ($interveningAnchor) { [int64]0 } else { [int64][Math]::Max(0, ($plannedOSSize - $osSize)) }
+    $plannedAvailableBytes = [int64]$BucketSizeBytes
+    $alignmentReserveBytes = [int64]($tailEnd - $alignedManagedExtentEnd)
+    $requiresConsolidation = if ($interveningAnchor) { $false } else { ($plannedOSSize -lt $SizeMinBytes) }
+
+    if (-not $invalidReason -and -not $interveningAnchor -and $plannedOSSize -le 0) {
         $invalidReason = 'planned OS partition size would be zero or negative'
-    } elseif (-not $invalidReason -and $alignedManagedExtentEnd -le $osStart) {
+    } elseif (-not $invalidReason -and -not $interveningAnchor -and $alignedManagedExtentEnd -le $osStart) {
         $invalidReason = 'aligned managed extent end precedes the OS partition start'
+    } elseif (-not $invalidReason -and $interveningAnchor) {
+        if ($null -eq $plannedAnchorPartitionSize -or $plannedAnchorPartitionSize -le 0) {
+            $invalidReason = 'planned anchor size is zero or negative'
+        } elseif ($null -ne $anchorSupportedSizeMin -and $plannedAnchorPartitionSize -lt $anchorSupportedSizeMin) {
+            $invalidReason = "planned anchor size $([math]::Round($plannedAnchorPartitionSize/1MB,1)) MiB is below the anchor's supported minimum $([math]::Round($anchorSupportedSizeMin/1MB,1)) MiB"
+        }
     }
 
     return @{
@@ -1408,26 +1831,54 @@ function Get-PartitionPlan {
         AlignmentReserveBytes       = $alignmentReserveBytes
         DeletableRecoveryPartitions = @($reclaimable.ToArray())
         BlockingPartition           = $blockingPartition
+        InterveningAnchor           = $interveningAnchor
+        PlannedAnchorPartitionSize  = $plannedAnchorPartitionSize
+        AnchorShrinkBytes           = $anchorShrinkBytes
+        AnchorExtendBytes           = $anchorExtendBytes
     }
 }
 
+# Shrink a partition to make room for the new recovery partition. Used
+# for C: in the non-intervening case and, in v48, for the intervening
+# anchor in the intervening case.
+#
+# v48 generalization: the function accepts an optional -DefragTarget.
+# When empty it defaults to $env:SystemDrive, preserving the v47
+# behavior for the C: call site. When the caller passes a non-C: drive
+# letter (typically the anchor's), that drive is used for the defrag.exe
+# consolidation step on attempt 3, and the free-space log line
+# references the target partition instead of C:.
+#
+# The function name retains "OS" for continuity with v47 and to keep
+# the function searchable; the caller is responsible for confirming
+# that the partition identity it passes is the one that should be
+# shrunk (C: or a validated intervening anchor).
+#
+# Retry policy (unchanged from v47): 3 attempts with a 10-second sleep
+# before attempt 2 and a defrag.exe <target> /x pass before attempt 3.
+# Verification after each attempt via Assert-PartitionSizeAfterResize.
 function Invoke-OSPartitionShrink {
     param(
         [Parameter(Mandatory)][int]$DiskNumber,
         [Parameter(Mandatory)][int]$PartitionNumber,
         [Parameter(Mandatory)][int64]$InitialSizeBytes,
-        [Parameter(Mandatory)][int64]$TargetSizeBytes
+        [Parameter(Mandatory)][int64]$TargetSizeBytes,
+        [string]$DefragTarget = ""
     )
 
+    if (-not $DefragTarget) { $DefragTarget = $env:SystemDrive }
+
     if ($Script:DryRun) {
-        Write-Log "[DRY RUN] Would shrink OS partition $DiskNumber/$PartitionNumber from $([math]::Round($InitialSizeBytes/1MB,1)) MiB to $([math]::Round($TargetSizeBytes/1MB,1)) MiB before disabling WinRE or deleting partitions"
+        Write-Log "[DRY RUN] Would shrink partition $DiskNumber/$PartitionNumber from $([math]::Round($InitialSizeBytes/1MB,1)) MiB to $([math]::Round($TargetSizeBytes/1MB,1)) MiB before disabling WinRE or deleting partitions"
         return @{ Success = $true; Changed = $false; CurrentSizeBytes = $InitialSizeBytes }
     }
 
     $sizeMinBefore = [int64](Get-PartitionSupportedSize -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop).SizeMin
-    $cVolForLog = Get-Volume -DriveLetter $env:SystemDrive.TrimEnd(':') -ErrorAction SilentlyContinue
-    $cFreeForLog = if ($cVolForLog) { [math]::Round([int64]$cVolForLog.SizeRemaining/1GB, 2) } else { "unknown" }
-    Write-Log "Pre-destructive shrink target $([math]::Round($TargetSizeBytes/1MB,1)) MiB; SizeMin $([math]::Round($sizeMinBefore/1MB,1)) MiB; C: free at start of shrink $cFreeForLog GiB"
+    $targetPartForLog = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
+    $targetVolForLog = if ($targetPartForLog) { Get-Volume -Partition $targetPartForLog -ErrorAction SilentlyContinue } else { $null }
+    $targetLabel = if ($targetPartForLog -and $targetPartForLog.DriveLetter) { "$($targetPartForLog.DriveLetter):" } else { "disk $DiskNumber part $PartitionNumber" }
+    $targetFreeForLog = if ($targetVolForLog) { [math]::Round([int64]$targetVolForLog.SizeRemaining/1GB, 2) } else { "unknown" }
+    Write-Log "Pre-destructive shrink target $([math]::Round($TargetSizeBytes/1MB,1)) MiB; SizeMin $([math]::Round($sizeMinBefore/1MB,1)) MiB; $targetLabel free at start of shrink $targetFreeForLog GiB"
     $success = $false
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
@@ -1437,10 +1888,10 @@ function Invoke-OSPartitionShrink {
             $sizeMinAfterSleep = [int64](Get-PartitionSupportedSize -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop).SizeMin
             Write-Log "After 10s sleep: SizeMin $([math]::Round($sizeMinAfterSleep/1MB,1)) MiB (delta $([math]::Round(($sizeMinBefore-$sizeMinAfterSleep)/1MB,1)) MiB)"
         } elseif ($attempt -eq 3) {
-            Write-Log "Consolidating free space with defrag.exe C: /x before pre-destructive shrink attempt 3" -Level WARN
+            Write-Log "Consolidating free space with defrag.exe ${DefragTarget} /x before pre-destructive shrink attempt 3" -Level WARN
             try {
-                $defragOutput = & defrag.exe $env:SystemDrive /x 2>&1
-                Write-Log "defrag $env:SystemDrive /x exit $LASTEXITCODE"
+                $defragOutput = & defrag.exe $DefragTarget /x 2>&1
+                Write-Log "defrag $DefragTarget /x exit $LASTEXITCODE"
                 if ($defragOutput) { $defragOutput | Select-Object -First 10 | ForEach-Object { Write-Log "  defrag: $_" } }
             } catch {
                 Write-Log "defrag invocation failed: $_" -Level WARN
@@ -1479,6 +1930,12 @@ function Invoke-OSPartitionShrink {
 # single-boundary geometry model; the pre-shrink path handles the shrink
 # case. Uses 3 attempts with 5-second spacing between them; on failure
 # the caller decides between the safe fallback and OS-fallback.
+#
+# v48: unchanged. The intervening-anchor design does not extend the
+# anchor (Get-PartitionPlan caps the planned anchor size at its current
+# size), and the OS partition is the only partition this function is
+# called on. Kept verbatim so the post-deletion behavior for C: is
+# identical to v47.
 function Invoke-OSPartitionExtend {
     param(
         [Parameter(Mandatory)][int]$DiskNumber,
@@ -1524,7 +1981,20 @@ function Invoke-OSPartitionExtend {
 }
 
 function Ensure-AdequateRecoveryPartition {
-    param([int]$RequiredWimSizeMB)
+    param(
+        [int]$RequiredWimSizeMB,
+        # Optional. When supplied, the function refuses to proceed
+        # with the destructive recovery-partition sequence if the
+        # source file resolves to a partition in the plan's
+        # deletion set. This closes a source-lifetime hole on the
+        # enable-only /setreimage-failure fall-through path, where
+        # the deployment source WIM may live on the very recovery
+        # partition the destructive sequence is about to delete.
+        # Failure to resolve the path is treated as fail-closed:
+        # the function defers rather than proceeding without the
+        # source-lifetime guarantee.
+        [AllowNull()][string]$ProtectedSourcePath = $null
+    )
 
     # Dynamic sizing: WIM + 250 MiB free-space + 30 MiB filesystem, rounded
     # UP to the next 100 MiB boundary, minimum 1000 MiB.
@@ -1556,13 +2026,94 @@ function Ensure-AdequateRecoveryPartition {
         return @{ Status = "Deferred"; Reason = $plan.Reason }
     }
 
+    # Source-lifetime guard. When the caller identifies the file the
+    # subsequent deployment will consume, verify that file's partition
+    # is not in the plan's deletion set. Fail-closed on resolution
+    # failure: deferring is the correct response when the source
+    # lifetime cannot be proven safe before mutation begins.
+    if ($ProtectedSourcePath -and $plan.Valid) {
+        $sourcePart = $null
+        try {
+            $sourceVol = Get-Volume -FilePath $ProtectedSourcePath -ErrorAction SilentlyContinue
+            if ($sourceVol) {
+                $sourcePart = Get-Partition -Volume $sourceVol -ErrorAction SilentlyContinue
+            }
+        } catch { }
+
+        if (-not $sourcePart) {
+            Write-Log "Cannot resolve deployment source WIM '$ProtectedSourcePath' to a storage partition. Deferring before any recovery-partition mutation. No partition or WinRE changes were made." -Level WARN
+            return @{ Status = "Deferred"; Reason = "unable to resolve deployment source partition" }
+        }
+
+        $sourceInDeletionSet = @($plan.DeletableRecoveryPartitions | Where-Object {
+            $_.DiskNumber -eq $sourcePart.DiskNumber -and
+            $_.PartitionNumber -eq $sourcePart.PartitionNumber
+        }).Count -gt 0
+
+        if ($sourceInDeletionSet) {
+            $sourceRef = Format-PartitionRef -Partition $sourcePart
+            Write-Log "Refusing to proceed: the deployment source WIM is on $sourceRef, which the destruction plan intends to delete. Deferring before any mutation. No partition or WinRE changes were made." -Level WARN
+            return @{ Status = "Deferred"; Reason = "deployment source partition is in the destruction set" }
+        }
+    }
+
     $deletableParts = @($plan.DeletableRecoveryPartitions)
     Write-Log "Partition plan: recovery reclaim $([math]::Round($plan.RecoveryBytes/1MB,1)) MiB, contiguous free $([math]::Round($plan.UnallocatedBytes/1MB,1)) MiB, shrink $([math]::Round($plan.ShrinkBytes/1MB,1)) MiB, extend $([math]::Round($plan.ExtendBytes/1MB,1)) MiB, bucket $bucketSizeMiB MiB, planned offset $([math]::Round($plan.PlannedPartitionStart/1MB,1)) MiB, alignment reserve $([math]::Round($plan.AlignmentReserveBytes/1KB,1)) KiB"
+    # v48: intervening-anchor logging. The general partition-plan line
+    # shows C:-centric numbers, which are 0 in the intervening case
+    # (C: is untouched). This line names the anchor and its numbers so
+    # the operator sees what is actually about to be shrunk.
+    if ($plan.InterveningAnchor) {
+        Write-Log "Intervening-anchor plan: anchor is disk $($plan.InterveningAnchor.DiskNumber) part $($plan.InterveningAnchor.PartitionNumber); anchor shrink $([math]::Round($plan.AnchorShrinkBytes/1MB,1)) MiB -> planned anchor size $([math]::Round($plan.PlannedAnchorPartitionSize/1MB,1)) MiB; recovery partition will be created at offset $([math]::Round($plan.PlannedPartitionStart/1MB,1)) MiB"
+    }
     if ($plan.RequiresConsolidation) {
         Write-Log "Current SizeMin $([math]::Round($plan.SizeMinBytes/1MB,1)) MiB exceeds planned C: target $([math]::Round($plan.PlannedOSPartitionSize/1MB,1)) MiB; running the existing pre-destructive sleep and defrag retries before deciding whether to defer" -Level WARN
     }
 
+    # v48 patch 1: capture WinRE state and resolve the active
+    # route BEFORE any partition mutation. In v47 this resolution ran
+    # after the pre-shrink and after reagentc /disable, so the
+    # fail-closed guard could fire only after the machine had already
+    # been changed - and the log statement below ("No partition or
+    # WinRE changes were made") was false on that path. The resolution
+    # now runs immediately after capture, and the later duplicate block
+    # is removed. $activePartForInventory is consumed by the
+    # pre-deletion inventory and the delete-last ordering further down.
+    #
+    # v48 patch 1 extension: when WinRE is Enabled but reagentc
+    # reports no registered location at all, that is also a fail-closed
+    # case. The delete-last ordering cannot protect an unidentified
+    # partition, and route restoration cannot be attempted if a later
+    # deletion fails. v47 silently fell through in this case.
     $stateBefore = Get-WinREState
+    $activePartForInventory = $null
+    if ($stateBefore.Location) {
+        $activePartForInventory = Resolve-WinRELocationToPartition -Location $stateBefore.Location
+    }
+    if ($stateBefore.Status -eq "Enabled") {
+        if (-not $stateBefore.Location) {
+            Write-Log "WinRE is Enabled but reagentc reports no registered location. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made." -Level ERROR
+            return @{ Status = "Deferred"; Reason = "active WinRE location is empty" }
+        }
+        if (-not $activePartForInventory) {
+            Write-Log "WinRE is Enabled but its registered location ($($stateBefore.Location)) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made." -Level ERROR
+            return @{ Status = "Deferred"; Reason = "active WinRE location could not be resolved" }
+        }
+    }
+
+    # v48: resize-target abstraction. In the non-intervening case the
+    # resize target is C:; in the intervening case it is the anchor.
+    # Every subsequent operation - shrink, restore, verify, orphan
+    # removal - uses these variables instead of referring to C: or to
+    # $osPart directly. In the non-intervening case the values collapse
+    # to their v47 equivalents, so the code path is unchanged for that
+    # case.
+    $resizeTarget = if ($plan.InterveningAnchor) { $plan.InterveningAnchor } else { $osPart }
+    $resizeTargetInitialSize = if ($plan.InterveningAnchor) { [int64]$plan.InterveningAnchor.Size } else { $initialOSSize }
+    $resizeTargetPlannedSize = if ($plan.InterveningAnchor) { [int64]$plan.PlannedAnchorPartitionSize } else { [int64]$plan.PlannedOSPartitionSize }
+    $resizeBytes = if ($plan.InterveningAnchor) { [int64]$plan.AnchorShrinkBytes } else { [int64]$plan.ShrinkBytes }
+    $resizeTargetDefrag = if ($plan.InterveningAnchor -and $plan.InterveningAnchor.DriveLetter) { "$($plan.InterveningAnchor.DriveLetter):" } else { $env:SystemDrive }
+    $resizeTargetLabel = if ($plan.InterveningAnchor) { "anchor partition (disk $($plan.InterveningAnchor.DiskNumber) part $($plan.InterveningAnchor.PartitionNumber))" } else { "OS partition (C:)" }
 
     # v44 patch 6: C: encryption is diagnostic, not a veto, for the
     # dedicated-target path. reagentc's BitLocker check is on the target,
@@ -1581,76 +2132,82 @@ function Ensure-AdequateRecoveryPartition {
         }
     }
 
-    if ($plan.ShrinkBytes -gt 0) {
+    if ($resizeBytes -gt 0) {
         # Pre-shrink free-space verification (v45 patch 1). The shrink
-        # reduces C:'s capacity. We refuse to shrink when the projected
-        # post-shrink free space on C: would fall below $MinFreeSpaceGB,
-        # because a machine at that threshold may not be able to complete
-        # the deployment or function normally afterwards. This check runs
-        # before any partition or WinRE change.
-        $cVolumeLetter = $env:SystemDrive.TrimEnd(':')
-        $cVolumeForCheck = Get-Volume -DriveLetter $cVolumeLetter -ErrorAction SilentlyContinue
-        if (-not $cVolumeForCheck) {
-            Write-Log "Pre-shrink free-space check could not read the C: volume (Get-Volume -DriveLetter $cVolumeLetter returned nothing). Refusing to shrink C: without verifying the $MinFreeSpaceGB GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed." -Level WARN
-            return @{ Status = "Deferred"; Reason = "C: volume could not be read for free-space check"; RetrySuppressible = $false }
+        # reduces the resize target's capacity. We refuse to shrink when
+        # the projected post-shrink free space on the target would fall
+        # below $MinFreeSpaceGB, because a machine at that threshold may
+        # not be able to complete the deployment or function normally
+        # afterwards. This check runs before any partition or WinRE
+        # change.
+        #
+        # v48: applied to the resize target's volume (C: or the anchor).
+        $resizeTargetVolume = Get-Volume -Partition $resizeTarget -ErrorAction SilentlyContinue
+        if (-not $resizeTargetVolume) {
+            Write-Log "Pre-shrink free-space check could not read the $resizeTargetLabel volume (Get-Volume -Partition returned nothing). Refusing to shrink without verifying the $MinFreeSpaceGB GiB reserve is preserved. No partition or WinRE changes were made. The read failure may be transient, so this deferral is not retry-suppressed." -Level WARN
+            return @{ Status = "Deferred"; Reason = "$resizeTargetLabel volume could not be read for free-space check"; RetrySuppressible = $false }
         }
-        $currentFreeBytes = [int64]$cVolumeForCheck.SizeRemaining
-        $projectedFreeBytes = $currentFreeBytes - [int64]$plan.ShrinkBytes
+        $currentFreeBytes = [int64]$resizeTargetVolume.SizeRemaining
+        $projectedFreeBytes = $currentFreeBytes - [int64]$resizeBytes
         $minFreeBytes = [int64]($MinFreeSpaceGB * 1GB)
-        Write-Log "Pre-shrink free-space check: C: currently has $([math]::Round($currentFreeBytes/1GB,2)) GiB free; planned shrink is $([math]::Round($plan.ShrinkBytes/1MB,1)) MiB; projected free after shrink is $([math]::Round($projectedFreeBytes/1GB,2)) GiB; minimum required is $MinFreeSpaceGB GiB"
+        Write-Log "Pre-shrink free-space check: $resizeTargetLabel currently has $([math]::Round($currentFreeBytes/1GB,2)) GiB free; planned shrink is $([math]::Round($resizeBytes/1MB,1)) MiB; projected free after shrink is $([math]::Round($projectedFreeBytes/1GB,2)) GiB; minimum required is $MinFreeSpaceGB GiB"
         if ($projectedFreeBytes -lt $minFreeBytes) {
-            Write-Log "Pre-shrink free-space check failed: shrinking C: by $([math]::Round($plan.ShrinkBytes/1MB,1)) MiB would leave only $([math]::Round($projectedFreeBytes/1GB,2)) GiB free, below the $MinFreeSpaceGB GiB minimum. Free space on C: and re-run. No partition or WinRE changes were made." -Level WARN
-            return @{ Status = "Deferred"; Reason = "post-shrink free space below minimum"; RetrySuppressible = $true }
+            Write-Log "Pre-shrink free-space check failed: shrinking $resizeTargetLabel by $([math]::Round($resizeBytes/1MB,1)) MiB would leave only $([math]::Round($projectedFreeBytes/1GB,2)) GiB free, below the $MinFreeSpaceGB GiB minimum. Free space on the resize target and re-run. No partition or WinRE changes were made." -Level WARN
+            return @{ Status = "Deferred"; Reason = "post-shrink free space below minimum on $resizeTargetLabel"; RetrySuppressible = $true }
         }
 
         $shrinkResult = $null
         try {
-            $shrinkResult = Invoke-OSPartitionShrink -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber `
-                                                      -InitialSizeBytes $initialOSSize -TargetSizeBytes $plan.PlannedOSPartitionSize
+            $shrinkResult = Invoke-OSPartitionShrink -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber `
+                                                      -InitialSizeBytes $resizeTargetInitialSize -TargetSizeBytes $resizeTargetPlannedSize `
+                                                      -DefragTarget $resizeTargetDefrag
         } catch {
-            Write-Log "Pre-destructive OS shrink could not be completed: $_" -Level WARN
+            Write-Log "Pre-destructive shrink of $resizeTargetLabel could not be completed: $_" -Level WARN
         }
 
         if (-not $shrinkResult -or -not $shrinkResult.Success) {
-            $currentOSPart = Get-OSPartition
-            if (-not $currentOSPart -or [int64]$currentOSPart.Size -ne $initialOSSize) {
-                $restoreOk = Restore-OSPartitionSize -Reason "pre-destructive shrink failure" -TargetSizeBytes $initialOSSize
+            $currentResizeTarget = Get-Partition -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber -ErrorAction SilentlyContinue
+            if (-not $currentResizeTarget -or [int64]$currentResizeTarget.Size -ne $resizeTargetInitialSize) {
+                $restoreOk = Restore-OSPartitionSize -Reason "pre-destructive shrink failure" -TargetSizeBytes $resizeTargetInitialSize `
+                    -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber
                 if (-not $restoreOk) {
-                    Write-Log "C: could not be verified at its original size after pre-destructive shrink failure" -Level ERROR
+                    Write-Log "$resizeTargetLabel could not be verified at its original size after pre-destructive shrink failure" -Level ERROR
                 }
             }
-            Write-Log "Pre-destructive shrink failed after all retries. Existing WinRE registration and recovery partitions remain intact; deferring without OS-fallback." -Level WARN
+            Write-Log "Pre-destructive shrink of $resizeTargetLabel failed after all retries. Existing WinRE registration and recovery partitions remain intact; deferring without OS-fallback." -Level WARN
             return @{ Status = "Deferred"; Reason = "pre-shrink failed"; RetrySuppressible = $true }
         }
 
         if (-not $Script:DryRun) {
-            $osPart = Get-OSPartition
+            $resizeTargetFresh = Get-Partition -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber -ErrorAction SilentlyContinue
             # The shrink already verified the resize internally
             # (Invoke-OSPartitionShrink calls Assert-PartitionSizeAfterResize
             # after each attempt). This re-check confirms the same thing on
-            # a fresh Get-OSPartition read; keep the check as a defensive
-            # confirmation but suppress its success log line so the run
-            # log has exactly one "Verified partition" line per shrink.
-            if (-not $osPart -or -not (Assert-PartitionSizeAfterResize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber -ExpectedSizeBytes $plan.PlannedOSPartitionSize -SuppressSuccessLog)) {
-                Restore-OSPartitionSize -Reason "pre-destructive shrink verification failure" -TargetSizeBytes $initialOSSize | Out-Null
-                Write-Log "OS partition did not land at the planned size; preserving the old recovery route and deferring" -Level ERROR
+            # a fresh read; keep the check as defensive confirmation but
+            # suppress its success log line so the run log has exactly one
+            # "Verified partition" line per shrink.
+            if (-not $resizeTargetFresh -or -not (Assert-PartitionSizeAfterResize -DiskNumber $resizeTargetFresh.DiskNumber -PartitionNumber $resizeTargetFresh.PartitionNumber -ExpectedSizeBytes $resizeTargetPlannedSize -SuppressSuccessLog)) {
+                Restore-OSPartitionSize -Reason "pre-destructive shrink verification failure" -TargetSizeBytes $resizeTargetInitialSize `
+                    -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
+                Write-Log "$resizeTargetLabel did not land at the planned size; preserving the old recovery route and deferring" -Level ERROR
                 return @{ Status = "Deferred"; Reason = "pre-shrink verification failed"; RetrySuppressible = $true }
             }
-            # Single-boundary model: align the post-resize C: end up to
-            # the next 1 MiB, and let the recovery partition fill the
+            # Single-boundary model: align the post-resize resize-target end up
+            # to the next 1 MiB, and let the recovery partition fill the
             # remaining space to the aligned managed-extent end. If the
             # resize landed exactly, actualPartitionStart equals the
             # planned start and the recovery partition is exactly
             # PlannedPartitionSize bytes with no trailing gap. If the
             # resize rounded, the recovery size is adjusted to fill the
             # remaining space exactly, so no trailing gap remains.
-            $actualOSStart = [int64]$osPart.Offset
-            $actualOSEnd = $actualOSStart + [int64]$osPart.Size
-            $actualPartitionStart = [int64]([Math]::Ceiling($actualOSEnd / 1MB) * 1MB)
+            $actualResizeTargetStart = [int64]$resizeTargetFresh.Offset
+            $actualResizeTargetEnd = $actualResizeTargetStart + [int64]$resizeTargetFresh.Size
+            $actualPartitionStart = [int64]([Math]::Ceiling($actualResizeTargetEnd / 1MB) * 1MB)
             $actualPartitionEnd = [int64]$plan.AlignedManagedExtentEnd
             $actualPartitionSize = [int64]($actualPartitionEnd - $actualPartitionStart)
             if ($actualPartitionSize -lt $plan.PlannedPartitionSize) {
-                Restore-OSPartitionSize -Reason "resize rounding left insufficient planned extent" -TargetSizeBytes $initialOSSize | Out-Null
+                Restore-OSPartitionSize -Reason "resize rounding left insufficient planned extent" -TargetSizeBytes $resizeTargetInitialSize `
+                    -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
                 Write-Log "Resize rounding leaves only $([math]::Round($actualPartitionSize/1MB,1)) MiB for a $([math]::Round($plan.PlannedPartitionSize/1MB,1)) MiB bucket; preserving the old route and deferring" -Level WARN
                 return @{ Status = "Deferred"; Reason = "resize rounding reduced planned extent"; RetrySuppressible = $true }
             }
@@ -1669,7 +2226,7 @@ function Ensure-AdequateRecoveryPartition {
     } elseif ($plan.ExtendBytes -gt 0) {
         Write-Log "Partition plan requires extending C: by $([math]::Round($plan.ExtendBytes/1MB,1)) MiB to consume surplus space after the old recovery partitions are deleted; no pre-destructive action required"
     } else {
-        Write-Log "Partition plan requires no OS resize; existing C: geometry will be preserved"
+        Write-Log "Partition plan requires no resize; existing partition geometry will be preserved"
     }
 
     if ($stateBefore.Status -eq "Enabled") {
@@ -1678,16 +2235,17 @@ function Ensure-AdequateRecoveryPartition {
         } else {
             # v47: race-detector recheck immediately before the first
             # possible /disable of this execution. This site runs after
-            # the pre-destructive C: shrink, so an abort must restore
-            # C: to its captured size before returning Deferred. No
-            # partitions have been deleted yet at this point; the old
-            # WinRE route is still intact and no route restoration is
-            # needed.
+            # the pre-destructive resize, so an abort must restore the
+            # resize target to its captured size before returning
+            # Deferred. No partitions have been deleted yet at this
+            # point; the old WinRE route is still intact and no route
+            # restoration is needed.
             if (-not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'Ensure-AdequateRecoveryPartition')) {
-                Write-Log "Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring C: to its captured size; no partitions have been deleted." -Level WARN
-                $restoreOk = Restore-OSPartitionSize -Reason "registered source drifted before /disable" -TargetSizeBytes $initialOSSize
+                Write-Log "Registered WinRE source changed during candidate preparation - aborting before /disable. Restoring $resizeTargetLabel to its captured size; no partitions have been deleted." -Level WARN
+                $restoreOk = Restore-OSPartitionSize -Reason "registered source drifted before /disable" -TargetSizeBytes $resizeTargetInitialSize `
+                    -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber
                 if (-not $restoreOk) {
-                    Write-Log "C: could not be verified at its original size after drift abort; deleting state file so the next run retries from a clean slate" -Level ERROR
+                    Write-Log "$resizeTargetLabel could not be verified at its original size after drift abort; deleting state file so the next run retries from a clean slate" -Level ERROR
                     $statePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
                     Remove-ItemIfExist $statePath
                 }
@@ -1704,7 +2262,8 @@ function Ensure-AdequateRecoveryPartition {
             Write-Log "reagentc /disable: exit=$disableExit, output=$disableOutput"
             if ($disableExit -ne 0) {
                 Write-Log "reagentc /disable failed (exit $disableExit): $disableOutput" -Level ERROR
-                Restore-OSPartitionSize -Reason "reagentc /disable failure before deletion" -TargetSizeBytes $initialOSSize | Out-Null
+                Restore-OSPartitionSize -Reason "reagentc /disable failure before deletion" -TargetSizeBytes $resizeTargetInitialSize `
+                    -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
                 if (Restore-PreviousWinRERoute -PreviousState $stateBefore) {
                     return @{ Status = "Deferred"; Reason = "WinRE disable failed before deletion" }
                 }
@@ -1714,7 +2273,8 @@ function Ensure-AdequateRecoveryPartition {
             $verifyDisabled = Get-WinREState
             if ($verifyDisabled.Status -ne "Disabled") {
                 Write-Log "WinRE is still reported as $($verifyDisabled.Status) after reagentc /disable - aborting before partition deletion" -Level ERROR
-                Restore-OSPartitionSize -Reason "WinRE disable verification failure before deletion" -TargetSizeBytes $initialOSSize | Out-Null
+                Restore-OSPartitionSize -Reason "WinRE disable verification failure before deletion" -TargetSizeBytes $resizeTargetInitialSize `
+                    -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
                 if (Restore-PreviousWinRERoute -PreviousState $stateBefore) {
                     return @{ Status = "Deferred"; Reason = "WinRE disable verification failed before deletion" }
                 }
@@ -1725,22 +2285,10 @@ function Ensure-AdequateRecoveryPartition {
     }
 
     Write-Log "Pre-deletion inventory:"
-    $activePartForInventory = $null
-    if ($stateBefore.Location) {
-        $activePartForInventory = Resolve-WinRELocationToPartition -Location $stateBefore.Location
-        if (-not $activePartForInventory -and $stateBefore.Status -eq "Enabled") {
-            # The active WinRE route is Enabled, but its registered location
-            # could not be resolved to a partition. Delete-last ordering
-            # depends on knowing which partition is active so the previous
-            # route's target survives a mid-loop failure; without it, no
-            # partition is protected, and Restore-PreviousWinRERoute has no
-            # target to re-enable if a later deletion fails. Defer before
-            # any destructive change rather than proceeding without that
-            # protection.
-            Write-Log "WinRE is Enabled but its registered location ($($stateBefore.Location)) could not be resolved to a partition. The delete-last ordering cannot protect the active partition, and route restoration cannot be attempted if a later deletion fails. Refusing to begin the destructive sequence. No partition or WinRE changes were made." -Level ERROR
-            return @{ Status = "Deferred"; Reason = "active WinRE location could not be resolved" }
-        }
-    }
+    # v48: $activePartForInventory was resolved at the top of this
+    # function, before any mutation. The v47 code resolved it here,
+    # after the pre-shrink and after /disable, and used the fail-closed
+    # guard on this site; that guard has been moved up (see above).
     foreach ($rp in $deletableParts) {
         $rpLabel = "(no label)"
         $rpUsedMiB = -1
@@ -1762,10 +2310,7 @@ function Ensure-AdequateRecoveryPartition {
 
     # Delete the currently-active recovery partition last. If a later
     # deletion fails, the previous WinRE route's target still exists
-    # and can be restored by Restore-PreviousWinRERoute. The script
-    # only knows the active partition from $stateBefore.Location at
-    # this point; anything it cannot identify as active is a candidate
-    # for early deletion.
+    # and can be restored by Restore-PreviousWinRERoute.
     $orderedDeletable = [System.Collections.Generic.List[object]]::new()
     $activeDeletablePartition = $null
     foreach ($rp in $deletableParts) {
@@ -1785,12 +2330,14 @@ function Ensure-AdequateRecoveryPartition {
     # DryRun stops here: single structural choke point before any
     # state-modifying action.
     if ($Script:DryRun) {
-        $resizeSummary = if ($plan.ShrinkBytes -gt 0) {
+        $resizeSummary = if ($plan.InterveningAnchor) {
+            "shrink $resizeTargetLabel by $([math]::Round($plan.AnchorShrinkBytes/1MB,1)) MiB before disabling WinRE"
+        } elseif ($plan.ShrinkBytes -gt 0) {
             "shrink C: by $([math]::Round($plan.ShrinkBytes/1MB,1)) MiB before disabling WinRE"
         } elseif ($plan.ExtendBytes -gt 0) {
             "extend C: by $([math]::Round($plan.ExtendBytes/1MB,1)) MiB after deleting the old recovery partitions"
         } else {
-            "leave C: geometry unchanged"
+            "leave partition geometry unchanged"
         }
         Write-Log "[DRY RUN] Plan is valid: $resizeSummary, then delete $($deletableParts.Count) adjacent recovery partition(s) and create exactly $bucketSizeMiB MiB at offset $([math]::Round($plan.PlannedPartitionStart/1MB,1)) MiB"
         foreach ($rp in $orderedDeletable) {
@@ -1812,7 +2359,8 @@ function Ensure-AdequateRecoveryPartition {
         $stillThere = Get-Partition -DiskNumber $rp.DiskNumber -PartitionNumber $rp.PartitionNumber -ErrorAction SilentlyContinue
         if ($stillThere) {
             Write-Log "FATAL: recovery partition $($rp.DiskNumber)/$($rp.PartitionNumber) could not be deleted" -Level ERROR
-            $sizeRestoreOk = Restore-OSPartitionSize -Reason "recovery partition deletion failure" -TargetSizeBytes $initialOSSize
+            $sizeRestoreOk = Restore-OSPartitionSize -Reason "recovery partition deletion failure" -TargetSizeBytes $resizeTargetInitialSize `
+                -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber
             # WinRE was disabled earlier in this routine. The active
             # partition (deleted last) is still present, so the previous
             # route may be restorable. Attempt it before returning.
@@ -1821,8 +2369,8 @@ function Ensure-AdequateRecoveryPartition {
                 return @{ Status = "Deferred"; Reason = "recovery partition deletion failed; previous route restored" }
             }
             if ($routeRestoreOk -and -not $sizeRestoreOk) {
-                Write-Log "Recovery partition deletion failed and the previous WinRE route was restored, but C: could not be verified at its original size. The geometry-restore flag is set; the state file will be invalidated so the next run retries from clean. Report this as a partial rollback." -Level ERROR
-                return @{ Status = "Deferred"; Reason = "recovery partition deletion failed; previous route restored but C: geometry restore unverified" }
+                Write-Log "Recovery partition deletion failed and the previous WinRE route was restored, but $resizeTargetLabel could not be verified at its original size. The geometry-restore flag is set; the state file will be invalidated so the next run retries from clean. Report this as a partial rollback." -Level ERROR
+                return @{ Status = "Deferred"; Reason = "recovery partition deletion failed; previous route restored but $resizeTargetLabel geometry restore unverified" }
             }
             Write-Log "Previous WinRE route could not be restored after deletion failure; WinRE will remain disabled until the next run or manual intervention" -Level ERROR
             return $null
@@ -1837,6 +2385,12 @@ function Ensure-AdequateRecoveryPartition {
     # recovery partition at the current (un-extended) C: end so WinRE
     # remains deployable, and log the residual trailing extent. Exact
     # geometry is a goal, not a reason to leave WinRE disabled.
+    #
+    # v48: this block fires only when ExtendBytes > 0, which the plan
+    # guarantees is 0 in the intervening case. The intervening case
+    # never extends the anchor; Get-PartitionPlan caps the planned
+    # anchor size at its current size and leaves any surplus as
+    # unallocated disk space.
     if ($plan.ExtendBytes -gt 0) {
         if ($Script:DryRun) {
             Write-Log "[DRY RUN] Would extend C: to $([math]::Round($plan.PlannedOSPartitionSize/1MB,1)) MiB after recovery deletion"
@@ -1879,6 +2433,13 @@ function Ensure-AdequateRecoveryPartition {
                         $plan.FallbackTrailingExtentBytes = $fallbackTrailingExtent
                         $Script:nonFatalWarning = $true
                         $fallbackUsable = $true
+                        # v48 patch 2: keep $resizeTargetPlannedSize in sync
+                        # with the mutated $plan.PlannedOSPartitionSize;
+                        # otherwise the post-delete verification below
+                        # compares against the pre-fallback planned size and
+                        # fails on any surplus > 1 MiB, aborting before
+                        # New-Partition runs.
+                        $resizeTargetPlannedSize = [int64]$plan.PlannedOSPartitionSize
                     } else {
                         Write-Log "Extension-failure fallback unavailable: only $([math]::Round($fallbackSize/1MB,1)) MiB free after the current C: end, less than the $([math]::Round($plan.PlannedPartitionSize/1MB,1)) MiB bucket. Falling through to the caller's OS-fallback decision." -Level ERROR
                     }
@@ -1893,10 +2454,19 @@ function Ensure-AdequateRecoveryPartition {
         }
     }
 
-    $osPart = Get-OSPartition
-    if (-not $osPart -or -not (Assert-PartitionSizeAfterResize -DiskNumber $osPart.DiskNumber -PartitionNumber $osPart.PartitionNumber -ExpectedSizeBytes $plan.PlannedOSPartitionSize)) {
-        Write-Log "OS partition does not match the planned size after recovery deletion" -Level ERROR
-        Restore-OSPartitionSize -Reason "post-delete geometry verification failure" -TargetSizeBytes $initialOSSize | Out-Null
+    # v48: verify the resize target's size after all resize operations.
+    # Non-intervening: verifies C: at PlannedOSPartitionSize (unchanged
+    # from v47). Intervening: verifies the anchor at
+    # PlannedAnchorPartitionSize.
+    $verifyTarget = if ($plan.InterveningAnchor) {
+        Get-Partition -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber -ErrorAction SilentlyContinue
+    } else {
+        Get-OSPartition
+    }
+    if (-not $verifyTarget -or -not (Assert-PartitionSizeAfterResize -DiskNumber $verifyTarget.DiskNumber -PartitionNumber $verifyTarget.PartitionNumber -ExpectedSizeBytes $resizeTargetPlannedSize)) {
+        Write-Log "$resizeTargetLabel does not match the planned size after recovery deletion" -Level ERROR
+        Restore-OSPartitionSize -Reason "post-delete geometry verification failure" -TargetSizeBytes $resizeTargetInitialSize `
+            -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
         return $null
     }
 
@@ -1909,8 +2479,9 @@ function Ensure-AdequateRecoveryPartition {
     })
     $diskSizeNow = [int64](Get-Disk -Number $osDisk.Number -ErrorAction Stop).Size
     if ($overlap.Count -gt 0 -or $plannedEnd -gt ($diskSizeNow - 1MB)) {
-        Write-Log "Planned recovery extent is no longer free after deletion (offset=$newOffset size=$newSize overlapCount=$($overlap.Count)); restoring original C: size" -Level ERROR
-        Restore-OSPartitionSize -Reason "planned recovery extent unavailable" -TargetSizeBytes $initialOSSize | Out-Null
+        Write-Log "Planned recovery extent is no longer free after deletion (offset=$newOffset size=$newSize overlapCount=$($overlap.Count)); restoring $resizeTargetLabel" -Level ERROR
+        Restore-OSPartitionSize -Reason "planned recovery extent unavailable" -TargetSizeBytes $resizeTargetInitialSize `
+            -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
         return $null
     }
 
@@ -1943,19 +2514,33 @@ function Ensure-AdequateRecoveryPartition {
     }
     if (-not $newPart) {
         Write-Log "New-Partition failed after 3 attempts" -Level ERROR
-        Restore-OSPartitionSize -Reason "New-Partition failed after 3 attempts" -TargetSizeBytes $initialOSSize | Out-Null
+        Restore-OSPartitionSize -Reason "New-Partition failed after 3 attempts" -TargetSizeBytes $resizeTargetInitialSize `
+            -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
         return $null
     }
 
     # Whole-layout assertion (item 5). New-Partition returning success
     # does not by itself prove the partition landed at the planned
-    # offset and size, or that the OS partition ends where the plan
-    # expected. Re-query and verify; on failure, remove the orphan and
-    # return $null so the caller falls back as it does for Format-Volume
-    # failure.
-    if (-not (Assert-RecoveryPartitionLayout -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -ExpectedOffsetBytes $newOffset -ExpectedSizeBytes $newSize -ExpectedEndBytes $plannedEnd)) {
+    # offset and size, or that the boundary partition ends where the
+    # plan expected. Re-query and verify; on failure, remove the orphan
+    # and return $null so the caller falls back as it does for
+    # Format-Volume failure.
+    #
+    # v48: the boundary is the anchor in the intervening case, or the
+    # OS partition (default) otherwise. Re-query the anchor so its
+    # .Size reflects the shrunk value, not the stale plan-time value.
+    $boundaryForAssert = if ($plan.InterveningAnchor) {
+        Get-Partition -DiskNumber $plan.InterveningAnchor.DiskNumber -PartitionNumber $plan.InterveningAnchor.PartitionNumber -ErrorAction SilentlyContinue
+    } else {
+        $null
+    }
+    if (-not (Assert-RecoveryPartitionLayout -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber `
+                                              -ExpectedOffsetBytes $newOffset -ExpectedSizeBytes $newSize -ExpectedEndBytes $plannedEnd `
+                                              -BoundaryPartition $boundaryForAssert)) {
         Write-Log "Recovery partition did not land at the planned geometry - removing it and deferring" -Level ERROR
-        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "post-creation geometry assertion failed" -TargetOSPartitionSizeBytes $initialOSSize | Out-Null
+        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "post-creation geometry assertion failed" `
+            -TargetOSPartitionSizeBytes $resizeTargetInitialSize `
+            -AnchorDiskNumber $resizeTarget.DiskNumber -AnchorPartitionNumber $resizeTarget.PartitionNumber | Out-Null
         return $null
     }
 
@@ -1963,7 +2548,9 @@ function Ensure-AdequateRecoveryPartition {
         Format-Volume -Partition $newPart -FileSystem NTFS -NewFileSystemLabel 'Recovery' -Confirm:$false -Force | Out-Null
     } catch {
         Write-Log "Format-Volume failed: $_" -Level ERROR
-        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "Format-Volume failure (main path)" -TargetOSPartitionSizeBytes $initialOSSize | Out-Null
+        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "Format-Volume failure (main path)" `
+            -TargetOSPartitionSizeBytes $resizeTargetInitialSize `
+            -AnchorDiskNumber $resizeTarget.DiskNumber -AnchorPartitionNumber $resizeTarget.PartitionNumber | Out-Null
         return $null
     }
     Start-Sleep 3
@@ -1987,13 +2574,17 @@ function Ensure-AdequateRecoveryPartition {
     if (-not $preferredLetter) { $preferredLetter = Get-AvailableDriveLetter }
     if (-not $preferredLetter) {
         Write-Log "No drive letter available" -Level ERROR
-        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "no drive letter available" -TargetOSPartitionSizeBytes $initialOSSize | Out-Null
+        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "no drive letter available" `
+            -TargetOSPartitionSizeBytes $resizeTargetInitialSize `
+            -AnchorDiskNumber $resizeTarget.DiskNumber -AnchorPartitionNumber $resizeTarget.PartitionNumber | Out-Null
         return $null
     }
     $assignedLetter = Invoke-DriveLetterAssignment -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -PreferredLetter $preferredLetter
     if (-not $assignedLetter) {
         Write-Log "Could not assign ANY drive letter to new recovery partition" -Level ERROR
-        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "drive-letter assignment failed" -TargetOSPartitionSizeBytes $initialOSSize | Out-Null
+        Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "drive-letter assignment failed" `
+            -TargetOSPartitionSizeBytes $resizeTargetInitialSize `
+            -AnchorDiskNumber $resizeTarget.DiskNumber -AnchorPartitionNumber $resizeTarget.PartitionNumber | Out-Null
         return $null
     }
     $Script:tempDriveLetters.Add($assignedLetter)
@@ -2009,7 +2600,9 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "Newly created recovery partition is BitLocker-managed - decrypting in place" -Level WARN
         if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber)) {
             Write-Log "Could not make newly created recovery partition unencrypted - aborting recovery partition creation" -Level ERROR
-            Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "in-place decryption failed" -TargetOSPartitionSizeBytes $initialOSSize | Out-Null
+            Remove-OrphanPartition -DiskNumber $osPart.DiskNumber -PartitionNumber $newPart.PartitionNumber -Reason "in-place decryption failed" `
+                -TargetOSPartitionSizeBytes $resizeTargetInitialSize `
+                -AnchorDiskNumber $resizeTarget.DiskNumber -AnchorPartitionNumber $resizeTarget.PartitionNumber | Out-Null
             return $null
         }
         Write-Log "Newly created recovery partition decrypted in place"
@@ -2084,7 +2677,164 @@ function Find-SuitableRecoveryPartition {
     return $null
 }
 
-# =========================== DEPLOY WIM TO PARTITION ===========================
+# =========================== TRANSACTIONAL WIM DEPLOY ===========================
+# Copy a WIM to a target path without a window in which a failure leaves
+# the target with no usable WIM. Used by Deploy-WimToPartition (recovery
+# partition target) and by the OS-fallback branch in Main (target is
+# C:\Recovery\WindowsRE\winre.wim).
+#
+# Sequence, in order:
+#   1. Hash the source WIM. Abort if it is unreadable.
+#   2. If the target exists:
+#        a. Copy the target to a rollback path in the workspace.
+#        b. Hash-verify the rollback copy against the target. If the
+#           copy does not match, abort WITHOUT deleting the target --
+#           an untrusted rollback is not a rollback.
+#   3. Delete the target.
+#   4. Copy the source WIM to the target.
+#   5. Hash-verify the target. On mismatch, restore the rollback copy
+#      over the target and hash-verify the restore.
+#   6. Apply hidden+system attributes to the target.
+#
+# The rollback copy is left at $Script:RollbackWimPath after a
+# successful deploy. The caller releases it after reagentc /setreimage
+# has succeeded and reagentc /enable has been attempted (regardless of
+# /enable's return value): once the new WIM is in place and reagentc
+# is pointing at it, restoring the old bytes would not change the
+# outcome of an enable failure. If the run aborts earlier, the file
+# stays in the workspace and is removed by the normal
+# workspace-cleanup path on the next run.
+#
+# The one residual window is a process crash between steps 3 and 5.
+# No filesystem primitive gives an atomic swap on a single file, so
+# this window cannot be fully eliminated. The v48 improvement over
+# v47 is that a non-crash failure mid-sequence restores the previous
+# WIM rather than leaving the target empty.
+function Deploy-WimTransactional {
+    param(
+        [Parameter(Mandatory)][string]$SourceWim,
+        [Parameter(Mandatory)][string]$TargetPath,
+        [Parameter(Mandatory)][string]$TargetDescription
+    )
+
+    # Reset script-scope rollback pointer so a stale value from a
+    # previous invocation in the same process cannot leak into this
+    # call's failure path.
+    $Script:RollbackWimPath = $null
+
+    $srcHash = $null
+    $srcSize = 0
+    try {
+        $srcHash = (Get-FileHash -LiteralPath $SourceWim -Algorithm SHA256).Hash
+        $srcSize = (Get-Item -LiteralPath $SourceWim -Force).Length
+    } catch {
+        Write-Log "Deploy-WimTransactional ($TargetDescription): source WIM is unreadable: $_" -Level ERROR
+        return $false
+    }
+    if (-not $srcHash) {
+        Write-Log "Deploy-WimTransactional ($TargetDescription): could not hash source WIM $SourceWim" -Level ERROR
+        return $false
+    }
+
+    $hadExistingTarget = Test-Path -LiteralPath $TargetPath -PathType Leaf
+    if ($hadExistingTarget) {
+        if (-not $WorkDir) {
+            Write-Log "Deploy-WimTransactional ($TargetDescription): workspace path is not set; cannot place a rollback copy. Refusing to delete the existing target." -Level ERROR
+            return $false
+        }
+        $rollbackPath = Join-Path $WorkDir "winre_rollback.wim"
+        try {
+            if (Test-Path -LiteralPath $rollbackPath) {
+                try { & attrib $rollbackPath -h -s -r 2>&1 | Out-Null } catch { }
+                Remove-Item -LiteralPath $rollbackPath -Force -ErrorAction Stop
+            }
+            $existingSize = Get-FileSizeMB -Path $TargetPath
+            Write-Log "Preserving existing target ($TargetDescription) $TargetPath ($existingSize MiB) as rollback copy at $rollbackPath"
+            Copy-Item -LiteralPath $TargetPath -Destination $rollbackPath -Force -ErrorAction Stop
+            $rollbackHash = (Get-FileHash -LiteralPath $rollbackPath -Algorithm SHA256).Hash
+            $targetHash = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash
+            if (-not $rollbackHash -or -not $targetHash -or $rollbackHash -ne $targetHash) {
+                Write-Log "Deploy-WimTransactional ($TargetDescription): rollback copy hash verification failed (rollback=$rollbackHash, target=$targetHash). Refusing to delete the existing target; the deploy is aborted and the old route is left intact." -Level ERROR
+                try { Remove-Item -LiteralPath $rollbackPath -Force -ErrorAction SilentlyContinue } catch { }
+                return $false
+            }
+            Write-Log "Rollback copy verified (SHA256=$rollbackHash)"
+            $Script:RollbackWimPath = $rollbackPath
+        } catch {
+            Write-Log "Deploy-WimTransactional ($TargetDescription): could not preserve existing target as rollback copy: $_" -Level ERROR
+            if ($rollbackPath) { try { Remove-Item -LiteralPath $rollbackPath -Force -ErrorAction SilentlyContinue } catch { } }
+            return $false
+        }
+    }
+
+    # Delete the existing target, if any. If this fails, the old WIM is
+    # still in place and the route is intact; abort without touching
+    # anything further.
+    if ($hadExistingTarget) {
+        try {
+            try { & attrib $TargetPath -h -s -r 2>&1 | Out-Null } catch { }
+            Remove-Item -LiteralPath $TargetPath -Force -ErrorAction Stop
+            Start-Sleep 1
+        } catch {
+            Write-Log "Deploy-WimTransactional ($TargetDescription): could not delete existing target $TargetPath : $_" -Level ERROR
+            return $false
+        }
+    }
+
+    # Copy the new source in and verify.
+    $copyOk = $false
+    try {
+        Write-Log "Copying $([math]::Round($srcSize/1MB,1)) MiB to $TargetPath"
+        Copy-Item -LiteralPath $SourceWim -Destination $TargetPath -Force -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+            Write-Log "Deploy-WimTransactional ($TargetDescription): copy reported success but destination is missing" -Level ERROR
+        } else {
+            $dstHash = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash
+            if ($srcHash -ne $dstHash) {
+                Write-Log "Deploy-WimTransactional ($TargetDescription): copy hash mismatch (source=$srcHash, target=$dstHash)" -Level ERROR
+            } else {
+                Write-Log "Copy verified (SHA256=$dstHash)"
+                $copyOk = $true
+            }
+        }
+    } catch {
+        Write-Log "Deploy-WimTransactional ($TargetDescription): copy failed: $_" -Level ERROR
+    }
+
+    if (-not $copyOk) {
+        if (-not $hadExistingTarget -or -not $Script:RollbackWimPath) {
+            Write-Log "Deploy-WimTransactional ($TargetDescription): copy failed and no rollback copy is available (target had no previous WIM)" -Level ERROR
+            return $false
+        }
+        Write-Log "Deploy-WimTransactional ($TargetDescription): copy failed - restoring rollback copy from $Script:RollbackWimPath" -Level WARN
+        try {
+            if (Test-Path -LiteralPath $TargetPath) {
+                try { & attrib $TargetPath -h -s -r 2>&1 | Out-Null } catch { }
+                Remove-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+            }
+            Copy-Item -LiteralPath $Script:RollbackWimPath -Destination $TargetPath -Force -ErrorAction Stop
+            $restoredHash = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash
+            $rollbackHash = (Get-FileHash -LiteralPath $Script:RollbackWimPath -Algorithm SHA256).Hash
+            if ($restoredHash -and $rollbackHash -and $restoredHash -eq $rollbackHash) {
+                try { attrib $TargetPath +h +s } catch { }
+                Write-Log "Rollback copy restored to $TargetPath (SHA256=$restoredHash) - the previous WinRE WIM is in place ($TargetDescription)" -Level WARN
+            } else {
+                Write-Log "Deploy-WimTransactional ($TargetDescription): rollback restore hash verification failed (restored=$restoredHash, rollback=$rollbackHash). The target may be incomplete." -Level ERROR
+            }
+        } catch {
+            Write-Log "Deploy-WimTransactional ($TargetDescription): rollback restore failed: $_" -Level ERROR
+        }
+        return $false
+    }
+
+    try { attrib $TargetPath +h +s } catch { }
+    return $true
+}
+
+# Thin wrapper preserving the v47 signature and semantics. Computes the
+# target path from the partition (Recovery\WindowsRE\winre.wim on the
+# partition's drive letter), guards self-copy, ensures the target
+# directory exists, and delegates the copy to Deploy-WimTransactional.
 function Deploy-WimToPartition {
     param(
         [Parameter(Mandatory)][hashtable]$Partition,
@@ -2107,27 +2857,8 @@ function Deploy-WimToPartition {
 
     New-DirectoryIfNotExists $targetDir
 
-    try {
-        if (Test-Path $target) {
-            $existingSize = Get-FileSizeMB -Path $target
-            Write-Log "Deleting existing $target ($existingSize MiB) to free space"
-            Remove-Item $target -Force -ErrorAction SilentlyContinue
-            Start-Sleep 1
-        }
-        $srcHash = (Get-FileHash $SourceWim -Algorithm SHA256).Hash
-        $srcSize = (Get-Item $SourceWim -Force).Length
-        Write-Log "Copying $([math]::Round($srcSize/1MB,1)) MiB to $target"
-        Copy-Item $SourceWim -Destination $target -Force
-        if (-not (Test-Path $target)) { Write-Log "Copy failed: destination missing" -Level ERROR; return $false }
-        $dstHash = (Get-FileHash $target -Algorithm SHA256).Hash
-        if ($srcHash -ne $dstHash) { Write-Log "Copy hash mismatch" -Level ERROR; return $false }
-        Write-Log "Copy verified (SHA256=$dstHash)"
-        attrib $target +h +s
-        return $true
-    } catch {
-        Write-Log "Deploy-WimToPartition failed: $_" -Level ERROR
-        return $false
-    }
+    $desc = "recovery partition disk $($Partition.DiskNumber) part $($Partition.PartitionNumber)"
+    return (Deploy-WimTransactional -SourceWim $SourceWim -TargetPath $target -TargetDescription $desc)
 }
 
 # =========================== ENABLE WINRE ===========================
@@ -2411,13 +3142,45 @@ function Get-HardwareObject {
         if ($version -and $version.Length -ge 4) { $machineType = $version.Substring(0,4) }
     }
 
+    # v48: normalized OS architecture. Win32_OperatingSystem.OSArchitecture
+    # distinguishes only "32-bit" from "64-bit" - it does NOT distinguish
+    # ARM64 from x64. The process-architecture environment variables do:
+    # PROCESSOR_ARCHITECTURE is "AMD64", "ARM64", or "x86" on a native
+    # process; PROCESSOR_ARCHITEW6432 carries the underlying 64-bit
+    # architecture when the current process is WOW64. Precedence: W6432
+    # first, then PROCESSOR_ARCHITECTURE; OSArchitecture is consulted
+    # only as a 32-bit-OS fallback when the process architecture is
+    # unrecognized. On a 64-bit OS with an unrecognized process
+    # architecture the token is "unknown" (fail closed; we do not
+    # guess between x64 and ARM64).
+    #
+    # The v48 architecture gate in Main reads this token and refuses to
+    # run on any value other than "x64". The gate fires immediately
+    # after this function is called, before any state mutation.
+    $osArchRaw = if ($os.OSArchitecture) { [string]$os.OSArchitecture } else { "" }
+    $procArchRaw = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $procArchUp = if ($procArchRaw) { $procArchRaw.ToUpperInvariant() } else { "" }
+    $archToken = "unknown"
+    if ($procArchUp -eq 'ARM64') {
+        $archToken = "ARM64"
+    } elseif ($procArchUp -eq 'AMD64') {
+        $archToken = "x64"
+    } elseif ($procArchUp -eq 'X86') {
+        $archToken = "x86"
+    } elseif ($osArchRaw -match '32-bit') {
+        $archToken = "x86"
+    } elseif ($osArchRaw -match '64-bit') {
+        $archToken = "unknown"
+    }
+    Write-Log "OS architecture: OSArchitecture='$osArchRaw', PROCESSOR_ARCHITECTURE='$procArchRaw', normalized='$archToken'"
+
     $Script:CachedHardware = [PSCustomObject]@{
         Manufacturer  = $Manufacturer
         Model         = $model
         MachineType   = $machineType
         CPUVendor     = if ($cpu.Manufacturer -like "*Intel*") { "Intel" } else { "AMD" }
         CPUGeneration = $gen
-        Architecture  = "x64"
+        Architecture  = $archToken
         OS            = $os.Caption
         IsWin10       = $os.Caption -like "*Windows 10*"
         IsWin11       = $os.Caption -like "*Windows 11*"
@@ -2532,6 +3295,23 @@ function Compare-WimServicingMetadata {
 # breaks the equality, so a partial or stale file cannot be silently
 # promoted. No new persistence field is needed.
 #
+# v48: LKG-by-hash at any discovered recovery location. If the
+# canonical C:\Recovery\WindowsRE\winre.wim does not exist OR its hash
+# does not match state.CurrentImageHash, scan every type-coded recovery
+# partition on the OS disk (excluding the OS partition itself) for a
+# winre.wim whose SHA256 matches. Provenance is content, not pathname.
+# The canonical path remains preferred when its hash is valid; the
+# discovery scan runs only when it is not.
+#
+# Discovery may assign temporary drive letters to recovery partitions
+# via Ensure-RecoveryPartitionAccess. Those letters are added to
+# $Script:tempDriveLetters and cleaned up at end of run under the
+# existing temp-drive-letter cleanup. The function has a side effect
+# in the discovery path; that is accepted because the alternative
+# (threading a pre-computed candidate list through every caller) would
+# duplicate the discovery logic and weaken the single-source-selection
+# invariant established in v47 patch 2.
+#
 # Returns a hashtable @{ Path = <string>; Hash = <string> } when the
 # LKG is valid, $null otherwise. Callers that need only the path read
 # .Path; callers that need the content hash for source-binding or
@@ -2540,17 +3320,50 @@ function Get-LKGWinREImagePath {
     param([string]$StoredHash)
     if (-not $StoredHash) { return $null }
     $candidate = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
-    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { return $null }
-    $hash = Get-LiveWimHash -WimPath $candidate
-    if (-not $hash) {
-        Write-Log "Get-LKGWinREImagePath: LKG candidate exists but is unreadable: $candidate" -Level WARN
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+        $hash = Get-LiveWimHash -WimPath $candidate
+        if (-not $hash) {
+            Write-Log "Get-LKGWinREImagePath: LKG candidate exists but is unreadable: $candidate" -Level WARN
+        } elseif ($hash -eq $StoredHash) {
+            return @{ Path = $candidate; Hash = $hash }
+        } else {
+            Write-Log "Get-LKGWinREImagePath: canonical LKG candidate hash $hash does not match state.CurrentImageHash $StoredHash - searching discovered recovery locations"
+        }
+    } else {
+        Write-Log "Get-LKGWinREImagePath: canonical LKG candidate not present at $candidate - searching discovered recovery locations"
+    }
+
+    # v48: scan discovered type-coded recovery partitions on the OS disk
+    # for a WIM whose SHA256 matches state.CurrentImageHash.
+    $osDisk = Get-OSDisk
+    if (-not $osDisk) {
+        Write-Log "Get-LKGWinREImagePath: cannot enumerate discovered recovery locations - OS disk not resolvable"
         return $null
     }
-    if ($hash -ne $StoredHash) {
-        Write-Log "Get-LKGWinREImagePath: LKG candidate hash $hash does not match state.CurrentImageHash $StoredHash - not treated as LKG"
-        return $null
+    $osPart = Get-OSPartition
+    $scanned = 0
+    foreach ($rp in @(Get-RecoveryPartitions -DiskNumber $osDisk.Number)) {
+        if ($osPart -and $rp.DiskNumber -eq $osPart.DiskNumber -and $rp.PartitionNumber -eq $osPart.PartitionNumber) { continue }
+        $isTyped = ($rp.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($rp.MbrType -eq 0x27)
+        if (-not $isTyped) { continue }
+        $accessPath = @(Ensure-RecoveryPartitionAccess -TargetDir "\\?\GLOBALROOT\device\harddisk$($rp.DiskNumber)\partition$($rp.PartitionNumber)")[0]
+        if (-not $accessPath) { continue }
+        foreach ($cand in @((Join-Path $accessPath "Recovery\WindowsRE\winre.wim"), (Join-Path $accessPath "winre.wim"))) {
+            if (-not (Test-Path -LiteralPath $cand -PathType Leaf)) { continue }
+            $scanned++
+            $hash = Get-LiveWimHash -WimPath $cand
+            if ($hash -and $hash -eq $StoredHash) {
+                Write-Log "Get-LKGWinREImagePath: LKG by hash found at discovered recovery location $cand (SHA256=$hash matches state.CurrentImageHash)"
+                return @{ Path = $cand; Hash = $hash }
+            }
+        }
     }
-    return @{ Path = $candidate; Hash = $hash }
+    if ($scanned -gt 0) {
+        Write-Log "Get-LKGWinREImagePath: scanned $scanned discovered recovery WIM(s); none matched state.CurrentImageHash $StoredHash"
+    } else {
+        Write-Log "Get-LKGWinREImagePath: no discovered recovery WIM found; LKG is not available"
+    }
+    return $null
 }
 
 # v47 patch 2: canonical source-selection helper. Called from Step 2
@@ -2558,6 +3371,10 @@ function Get-LKGWinREImagePath {
 # prove a staged candidate was built from the source the current
 # selection rules would choose). Sharing the implementation makes
 # drift between the two call sites structurally impossible.
+#
+# v48: no signature change. The LKG-anywhere behavior is provided
+# transparently by Get-LKGWinREImagePath, so both call sites inherit
+# it without further modification.
 #
 # Returns a hashtable with non-null SourcePath, SourceHash, Reason,
 # and Branch when a local source is usable. Returns $null when
@@ -2568,7 +3385,7 @@ function Get-LKGWinREImagePath {
 # WinRE route can have a valid registered WIM; the source decision
 # depends on whether the registered location yielded a readable WIM
 # ($ActiveLocationWimPresent), the LKG's hash validity, and the
-# metadata comparison — not on whether WinRE happens to be Enabled
+# metadata comparison -- not on whether WinRE happens to be Enabled
 # or Disabled at the moment the decision is made.
 function Select-BaseWinRESource {
     param(
@@ -2650,6 +3467,10 @@ function Select-BaseWinRESource {
 # the final re-read and /disable completing cannot be eliminated without
 # moving work into the disable->enable window and violating invariant 3.
 # The detector narrows the exposure to that residual interval.
+#
+# v48: no change. The v48 transactional WIM replacement does not alter
+# the fingerprint logic; the detector still reads the currently
+# registered WIM hash and compares against the captured value.
 #
 # Get-RegisteredWinREFingerprint returns a hashtable with a Status
 # field:
@@ -2962,6 +3783,36 @@ function Get-DesiredStateId {
     return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
 }
 
+# v48: locally-computable deployment inputs hash. Binds the offline
+# fast-path decision to the inputs that are observable on the local
+# machine without any network fetch: hardware identity, OS build, and
+# CPU vendor/generation. VMD presence is deliberately excluded: its
+# detection is driven by the manifest's requiredDevices patterns, so
+# it cannot be recomputed when the manifest is unavailable, which is
+# precisely the situation this hash exists for. A VMD-presence change
+# would require a motherboard change, which HW/CPU already capture.
+#
+# Get-DesiredStateId and Get-LocalInputsId share the first three
+# components and differ in the additional ones (VMD, MANIFEST, OEMPACK,
+# SCRIPT). On offline fallback, comparing LocalInputsId catches drift
+# in exactly the locally-knowable inputs, which is the residual known
+# gap described before v48.
+function Get-LocalInputsId {
+    param(
+        [Parameter(Mandatory)]$Hardware
+    )
+    $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
+    $parts = @(
+        "HW=$($Hardware.Manufacturer)|$($Hardware.Model)|$($Hardware.MachineType)",
+        "OS=$($Hardware.Build)",
+        "CPU=$($Hardware.CPUVendor)|$cpuGen"
+    )
+    $joined = $parts -join ';;'
+    $bytes  = [System.Text.Encoding]::UTF8.GetBytes($joined)
+    $sha    = [System.Security.Cryptography.SHA256]::Create()
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+}
+
 # =========================== STATE FILE ===========================
 # v47: narrow read of a stale state file's CurrentImageHash, used only
 # for LKG validation during the v46 -> v47 migration.
@@ -3009,6 +3860,9 @@ function Read-WinREState {
         LastEnableResult         = "ok"
         EnableFailureAttempts    = 0
         DeployedWinREMetadata    = $null
+        # v48: locally-computable deployment-inputs hash, stored by the
+        # v48 full-update path and consulted on offline fallback.
+        LocalInputsId            = $null
     }
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
     if (-not (Test-Path $path)) { return $empty }
@@ -3028,6 +3882,7 @@ function Read-WinREState {
                 LastEnableResult         = if ($state.LastEnableResult) { [string]$state.LastEnableResult } else { "ok" }
                 EnableFailureAttempts    = if ($state.EnableFailureAttempts) { [int]$state.EnableFailureAttempts } else { 0 }
                 DeployedWinREMetadata    = if ($state.DeployedWinREMetadata) { [string]$state.DeployedWinREMetadata } else { $null }
+                LocalInputsId            = if ($state.LocalInputsId) { [string]$state.LocalInputsId } else { $null }
             }
         }
         Write-Log "State file DesiredStateId mismatch - stale" -Level WARN
@@ -3050,12 +3905,24 @@ function Write-WinREState {
         [int]$RepairAttempts = 0,
         [string]$LastEnableResult = "ok",
         [int]$EnableFailureAttempts = 0,
-        [string]$DeployedWinREMetadata = $null
+        [string]$DeployedWinREMetadata = $null,
+        # v48: locally-computable deployment-inputs hash. Defaults to the
+        # script-scoped value (set at startup after hardware/VMD
+        # detection). Callers do not need to pass it explicitly in
+        # practice; it is exposed as a parameter only for symmetry with
+        # the other state fields and to allow future callers to override
+        # it if that becomes necessary.
+        [string]$LocalInputsId = $null
     )
     # v47: DeployedWinREMetadata defaults to the script-scoped carry-forward
     # value. Only the full-update deployment path overrides it explicitly.
     if (-not $PSBoundParameters.ContainsKey('DeployedWinREMetadata')) {
         $DeployedWinREMetadata = $Script:DeployedWinREMetadata
+    }
+    # v48: LocalInputsId defaults to the script-scoped value in the same
+    # manner.
+    if (-not $PSBoundParameters.ContainsKey('LocalInputsId')) {
+        $LocalInputsId = $Script:LocalInputsId
     }
     $state = @{
         DesiredStateId           = $DesiredStateId
@@ -3071,16 +3938,20 @@ function Write-WinREState {
     if ($null -ne $DeployedDiskNumber -and [int]$DeployedDiskNumber -ge 0) { $state.DeployedDiskNumber = [int]$DeployedDiskNumber }
     if ($null -ne $DeployedPartitionNumber -and [int]$DeployedPartitionNumber -ge 0) { $state.DeployedPartitionNumber = [int]$DeployedPartitionNumber }
     if ($DeployedWinREMetadata) { $state.DeployedWinREMetadata = [string]$DeployedWinREMetadata }
+    if ($LocalInputsId) { $state.LocalInputsId = [string]$LocalInputsId }
     $stateJson = $state | ConvertTo-Json -Depth 3
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
 
     if ($Script:DryRun) { Write-Log "[DRY RUN] Would write state file"; return }
 
-    # GeometryRestoreFailed means C: is still shrunken after a failed
+    # GeometryRestoreFailed means a partition (C: or, in v48, the
+    # intervening anchor) is still at its shrunken size after a failed
     # destructive attempt. Delete the state file so the next run treats
-    # the state as absent and retries from clean.
+    # the state as absent and retries from clean. The message is
+    # deliberately partition-agnostic in v48: the same flag now covers
+    # both the OS-partition case and the anchor case.
     if ($Script:GeometryRestoreFailed) {
-        Write-Log "Write-WinREState: OS partition geometry could not be verified after a failed destructive attempt - deleting state file so the next run retries from a clean slate" -Level WARN
+        Write-Log "Write-WinREState: a partition geometry could not be verified after a failed destructive attempt - deleting state file so the next run retries from a clean slate" -Level WARN
         if (Test-Path $path) {
             try {
                 & cmd /c "attrib -h -s -r `"$path`" 2>&1" | Out-Null
@@ -3530,6 +4401,38 @@ function Get-GitHubBaseWinRE {
 
 # =========================== MAIN ===========================
 try {
+    # ---- v48 patch 2: fail-fast elevation guard ----
+    # Runs before the program lock, before hardware probes, network
+    # fetches, workspace allocation, and any servicing work. On
+    # refusal the guard creates the log directory itself, solely so
+    # its FATAL message has somewhere to be written; the success
+    # path continues to the normal log-directory creation that
+    # follows. An unelevated launch (direct
+    # .\WinRE.ps1 from a non-admin prompt) would otherwise proceed
+    # through hardware detection, manifest fetch, VMD detection, and
+    # the multi-minute base-WIM download before failing at
+    # Mount-WindowsImage with "The requested operation requires
+    # elevation." That failure mode burned ~4 minutes on 2026-10-05
+    # and surfaced as an ambiguous FATAL in the log. This guard
+    # refuses in milliseconds with a clear message.
+    #
+    # The check accepts both interactive Administrator sessions and
+    # the SYSTEM context used by the scheduled task. SYSTEM's token
+    # is a member of the Administrators role for this check, so the
+    # scheduled-task path continues to work.
+    #
+    # DryRun is not exempted. DryRun avoids destructive operations
+    # but still reads partition tables, calls reagentc /info, and
+    # reads DISM metadata; refusing unelevated DryRun keeps the
+    # behavior unambiguous and matches production's prerequisites.
+    $currentPrincipal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $elevMsg = "FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session. Re-run from an elevated prompt, or launch via the scheduled task's SYSTEM context. No changes have been made to WinRE, partitions, BitLocker, drive letters, the workspace, or the state file."
+        try { New-DirectoryIfNotExists $LogDir } catch { }
+        Write-Log $elevMsg -Level ERROR
+        exit $EXIT_FATAL
+    }
+
     New-DirectoryIfNotExists $LogDir
     Write-Log "========== WinRE Manager Started (v$ScriptVersion patch $ScriptPatchLevel) =========="
     if ($Script:DryRun) { Write-Log "*** DRY RUN MODE ***" }
@@ -3579,11 +4482,39 @@ try {
     $Hardware = Get-HardwareObject
     Write-Log "System: $($Hardware.Manufacturer) $($Hardware.Model), MT=$($Hardware.MachineType), OS=$($Hardware.WinPE) (build $($Hardware.Build))"
 
+    # ---- v48: Architecture gate ----
+    # Get-HardwareObject reports the actual OS architecture from the
+    # process-architecture environment variables. This manager supports
+    # x64 only. Any other architecture (ARM64, x86, unknown) refuses to
+    # run before any state mutation. The refusal is a stable, named
+    # deferral, not a fatal error: the machine is left untouched and
+    # EXIT_WARNING is returned.
+    if ($Hardware.Architecture -ne 'x64') {
+        Write-Log "Unsupported OS architecture '$($Hardware.Architecture)': this manager supports x64 only. No WinRE, partition, image, checkpoint, or recovery-state changes have been made. The machine remains as it was before this run; the previous WinRE route (if any) is untouched. ARM64 support would require a separate, tested change to the WinRE image pipeline." -Level WARN
+        exit $EXIT_WARNING
+    }
+    Write-Log "Architecture gate passed: x64"
+
+    # ---- v48: LocalInputsId ----
+    # Locally-computable deployment-inputs hash. Computed once here, in
+    # script scope, from the hardware identity, OS build, and CPU
+    # vendor/generation. Stored by every Write-WinREState call and
+    # compared on offline fallback (below) to detect hardware/OS drift
+    # between the last online run and a subsequent offline run.
+    $Script:LocalInputsId = Get-LocalInputsId -Hardware $Hardware
+    Write-Log "LocalInputsId: $($Script:LocalInputsId)"
+
     # ---- Driver manifest fetch (v44 patch 5) ----
     # Offline fallback: on fetch failure, trust the state file's stored
     # DesiredStateId directly (does NOT recompute from cached inputs,
     # which would need the OEM map on the same unavailable network).
     # Local safety checks in the fast path still enforced.
+    #
+    # v48: on offline fallback the state file's LocalInputsId is also
+    # compared against the current locally-computable inputs. A
+    # mismatch means a hardware or OS input changed while the machine
+    # was offline; the stored DesiredStateId describes a machine that
+    # no longer exists, and the run defers rather than trusting it.
     $manifest = $null
     for ($retry = 1; $retry -le 2; $retry++) {
         try { $manifest = Invoke-RestMethod -Uri $DriverManifestUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop; break }
@@ -3614,6 +4545,21 @@ try {
             Write-Log "Driver manifest unavailable and the state file does not record a DesiredStateId." -Level ERROR
             throw "Driver manifest unavailable and state file lacks the required fields."
         }
+
+        # v48: offline-fallback hardware-drift guard.
+        if ($cachedManifestState.LocalInputsId) {
+            $storedLocalInputsId = [string]$cachedManifestState.LocalInputsId
+            $currentLocalInputsId = $Script:LocalInputsId
+            if ($storedLocalInputsId -ne $currentLocalInputsId) {
+                Write-Log "Offline fallback: stored LocalInputsId $storedLocalInputsId does not match the current locally-computable inputs $currentLocalInputsId. A hardware or OS input changed while the machine was offline; the stored DesiredStateId no longer describes this machine. Deferring rather than taking the fast path on a stale DSI. Bring the machine online so a fresh manifest can be fetched and a new DesiredStateId computed." -Level WARN
+                $Script:nonFatalWarning = $true
+                exit $EXIT_WARNING
+            }
+            Write-Log "Offline fallback: stored LocalInputsId matches current locally-computable inputs ($currentLocalInputsId)"
+        } else {
+            Write-Log "Offline fallback: state file has no LocalInputsId (pre-v48 state file); proceeding as v47 did. The next successful online run will populate the field and enable drift detection." -Level WARN
+        }
+
         $ExpectedDriverSetVersion = $cachedManifestState.InjectedDriverSetVersion
         $DesiredStateId           = $cachedManifestState.DesiredStateId
         $Script:offlineFallback   = $true
@@ -3766,7 +4712,7 @@ try {
     if (-not $lkgStoredHash) {
         $lkgStoredHash = Get-StaleWinREStateImageHash
         if ($lkgStoredHash) {
-            Write-Log "LKG validation: using historical CurrentImageHash from stale state file ($lkgStoredHash) for the v46 -> v47 migration"
+            Write-Log "LKG validation: using historical CurrentImageHash from stale state file ($lkgStoredHash) so the last-known-good copy is recognized across a version boundary"
         }
     }
 
@@ -4200,6 +5146,13 @@ try {
     # path, re-verify C: is still confirmed FullyDecrypted. The machine
     # remains functional either way, but a state that has drifted is
     # surfaced as EXIT_WARNING so an operator sees it.
+    #
+    # v48: no change. The fast path is agnostic to the intervening-anchor
+    # layout; it fires when the currently-registered route is valid and
+    # current. A machine with C: | D: | Recovery that needs no rebuild
+    # exits here cleanly. The intervening-anchor path is exercised only
+    # when a rebuild is required AND the existing recovery partition is
+    # not suitable.
     $nothingToDo = $false
     if (-not $needInject -and $WinREState.Status -eq "Enabled") {
         if ($existingRecoveryParts.Count -ne 1) {
@@ -4447,7 +5400,7 @@ try {
             } else {
                 Write-Log "Checkpoint step $($cp.Step) source identity $storedSourceHash matches the currently-selected source"
                 # v47 patch 2: restore the staged source hash so a
-                # resumed Step 3 → Step 4 execution writes the correct
+                # resumed Step 3 -> Step 4 execution writes the correct
                 # checkpoint at Step 4.
                 $Script:StagedWimSourceHash = $storedSourceHash
             }
@@ -4566,7 +5519,7 @@ try {
                 Write-Log "Captured registered-source fingerprint: location=$($Script:RegisteredSourceFingerprint.Location), version=$($Script:RegisteredSourceFingerprint.Version), hash=$($Script:RegisteredSourceFingerprint.Hash)"
             }
             'unreadable' {
-                Write-Log "Registered-source fingerprint unavailable: WinRE is Enabled at $($Script:RegisteredSourceFingerprint.Location) but its WIM could not be read. The pre-/disable race-detector recheck will defer." -Level WARN
+                Write-Log "Registered-source fingerprint unavailable: WinRE is Enabled at $($Script:RegisteredSourceFingerprint.Location) but its WIM could not be read. The pre-/disable race-detector recheck will defer only if the registered location, version, or WIM readability changes." -Level WARN
             }
             default {
                 Write-Log "No registered source to fingerprint (WinRE status=$($WinREState.Status))"
@@ -4584,7 +5537,7 @@ try {
             if ($ActiveLocationImage -or $FallbackImage) {
                 Write-Log "[DRY RUN]   Step 2: Select base WIM source (registered vs hash-validated LKG by Version/SPBuild/SPLevel; GitHub cold-start if neither usable) and copy to WorkDir\base.wim"
                 Write-Log "[DRY RUN]     Registered candidate: $(if ($ActiveLocationImage) { $ActiveLocationImage } else { '(unavailable)' })"
-                Write-Log "[DRY RUN]     LKG candidate: $env:SystemDrive\Recovery\WindowsRE\winre.wim (used only when SHA256 matches state.CurrentImageHash)"
+                Write-Log "[DRY RUN]     LKG candidate: $env:SystemDrive\Recovery\WindowsRE\winre.wim (used only when SHA256 matches state.CurrentImageHash; discovered recovery locations are also scanned)"
             } else {
                 Write-Log "[DRY RUN]   Step 2: Download base WIM from GitHub and extract to WorkDir\base.wim"
             }
@@ -4610,7 +5563,7 @@ try {
             $sz = Get-FileSizeMB -Path $imageToCheck
             if ($sz -gt 0) { $sz } else { 750 }
         } else { 750 }
-        Write-Log "[DRY RUN]   Step 5: Find or create dedicated recovery partition, deploy WIM (est. $estMB MiB), reagentc /setreimage, reagentc /enable"
+        Write-Log "[DRY RUN]   Step 5: Find or create dedicated recovery partition, deploy WIM transactionally (est. $estMB MiB), reagentc /setreimage, reagentc /enable"
         Write-Log "[DRY RUN]   Step 6: Clean WorkDir and checkpoint file"
         Write-Log "[DRY RUN]   Step 7: Remove stray type-coded recovery partitions on non-OS disks"
 
@@ -4623,8 +5576,8 @@ try {
         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 1 -DesiredStateId $DesiredStateId
     }
     if ($step -le 2) {
-        Write-Log "Step 2: Obtaining base WIM"
         if ($needInject) {
+            Write-Log "Step 2: Obtaining base WIM"
             if (-not $ActiveLocationImage -and -not $FallbackImage) {
                 if (-not (Get-GitHubBaseWinRE -WorkDir $WorkDir -Hardware $Hardware)) {
                     Write-Log "GitHub base WIM retrieval failed" -Level FATAL
@@ -4633,7 +5586,7 @@ try {
             } else {
                 # v47 patch 2: source selection via the shared helper, so
                 # the checkpoint validator uses exactly the same decision
-                # rules. The helper handles the registered → LKG → GitHub
+                # rules. The helper handles the registered -> LKG -> GitHub
                 # preference order and does not consult WinRE status.
                 $selection = Select-BaseWinRESource `
                     -ActiveLocationImage $ActiveLocationImage `
@@ -5013,11 +5966,26 @@ try {
     if ($finalSizeMB -le 0) { Write-Log "Could not determine WIM size" -Level FATAL; exit $EXIT_FATAL }
     Write-Log "Source WIM: $SourceWim ($finalSizeMB MiB)"
 
+    # v48 patch 2: cache source-derived values before any operation that
+    # could make $SourceWim inaccessible. On the enable-only path's
+    # /setreimage failure -> full-update fallthrough (with
+    # $needInject = $false), $SourceWim points at the registered WIM on
+    # a recovery partition accessed via a temporary drive letter. That
+    # letter is removed later (before reagentc /enable), after which
+    # the path becomes unreadable. Caching the hash, build, and
+    # servicing metadata here keeps the state-write correct regardless
+    # of when the letter is removed. Without this cache, $finalHash
+    # would be $null on that path and the state file would not be
+    # written, forcing the next run to repeat the full-update pass.
+    $cachedSourceHash = Get-LiveWimHash $SourceWim
+    $cachedSourceBuild = Get-WimBuild -WimPath $SourceWim
+    $cachedSourceMetadata = Get-WimServicingMetadata -WimPath $SourceWim
+
     $recoveryPartition = Find-SuitableRecoveryPartition -RequiredWimSizeMB $finalSizeMB
 
     if (-not $recoveryPartition) {
         Write-Log "No suitable existing recovery partition - attempting to create one"
-        $created = Ensure-AdequateRecoveryPartition -RequiredWimSizeMB $finalSizeMB
+        $created = Ensure-AdequateRecoveryPartition -RequiredWimSizeMB $finalSizeMB -ProtectedSourcePath $SourceWim
         if ($created -and $created.Status -eq "Deferred") {
             Write-Log "Dedicated replacement deferred before partition deletion ($($created.Reason)). The existing WinRE route was preserved; not attempting OS-fallback." -Level WARN
             if ($created.RetrySuppressible) {
@@ -5121,30 +6089,21 @@ try {
     if ($recoveryPartition) {
         $deployOk = Deploy-WimToPartition -Partition $recoveryPartition -SourceWim $SourceWim
     } else {
+        # v48: transactional WIM replacement. The v47 remove-then-copy
+        # is replaced by Deploy-WimTransactional, which preserves the
+        # existing WIM as a rollback copy, stages the new WIM, verifies
+        # it in place, and restores the old WIM on any failure before
+        # the machine is left with no usable WIM on the OS-fallback
+        # route. Self-copy guard remains: when the source IS the
+        # fallback target, there is nothing to copy.
         $srcFull = $null; try { $srcFull = [System.IO.Path]::GetFullPath($SourceWim) } catch { }
         $dstFull = $null; try { $dstFull = [System.IO.Path]::GetFullPath($FinalWim) } catch { }
         if ($srcFull -and $dstFull -and $srcFull -eq $dstFull) {
             Write-Log "OS-fallback: source and target are the same file - nothing to copy"
             $deployOk = $true
         } else {
-            try {
-                New-DirectoryIfNotExists $TargetDir
-                if (Test-Path $FinalWim) {
-                    try { & attrib $FinalWim -h -s -r 2>&1 | Out-Null } catch { }
-                    try { Remove-Item $FinalWim -Force -ErrorAction SilentlyContinue } catch { }
-                }
-                $srcHash = (Get-FileHash $SourceWim -Algorithm SHA256).Hash
-                Copy-Item $SourceWim -Destination $FinalWim -Force -ErrorAction Stop
-                if (-not (Test-Path $FinalWim)) { throw "destination missing" }
-                $dstHash = (Get-FileHash $FinalWim -Algorithm SHA256).Hash
-                if ($srcHash -ne $dstHash) { throw "copy hash mismatch" }
-                attrib $FinalWim +h +s
-                Write-Log "OS-fallback copy verified (SHA256=$dstHash)"
-                $deployOk = $true
-            } catch {
-                Write-Log "OS-fallback deployment failed: $_" -Level ERROR
-                $deployOk = $false
-            }
+            New-DirectoryIfNotExists $TargetDir
+            $deployOk = Deploy-WimTransactional -SourceWim $SourceWim -TargetPath $FinalWim -TargetDescription "OS-fallback target"
         }
     }
 
@@ -5193,6 +6152,20 @@ try {
         }
     }
 
+    # v48: the transactional replacement has committed once /setreimage
+    # has succeeded and /enable has been attempted against the new WIM.
+    # The rollback copy is released here regardless of /enable's return
+    # value: the new WIM is in place and reagentc is pointing at it, so
+    # restoring the old bytes would not change the outcome of an enable
+    # failure. Left in place on any earlier exit path (fatal, warning,
+    # or crash); the workspace cleanup on the next run removes it.
+    if ($Script:RollbackWimPath) {
+        if (Test-Path -LiteralPath $Script:RollbackWimPath -PathType Leaf) {
+            Remove-ItemIfExist $Script:RollbackWimPath
+        }
+        $Script:RollbackWimPath = $null
+    }
+
     # Update the OS-fallback WIM at C:\Recovery\WindowsRE\winre.wim.
     # In v47 this file serves two roles: the OS-fallback deployment target
     # when WinRE runs from the OS partition, and the last-known-good (LKG)
@@ -5237,16 +6210,26 @@ try {
         }
         if (-not $copyOk) {
             Write-Log "Fallback copy to $fallbackTarget denied (likely ACL). Non-fatal." -Level WARN
+            # v48 patch 1: mark the failed fallback copy as a
+            # non-fatal warning so the run exits EXIT_WARNING instead of
+            # EXIT_SUCCESS. Without this, a dedicated deployment can
+            # succeed, the LKG copy can fail, and the run still reports
+            # success - inconsistent with the exit-code discipline and
+            # hiding a degraded LKG from the operator.
+            $Script:nonFatalWarning = $true
         }
     }
 
     # ---- State write ----
-    $finalHash = Get-LiveWimHash $SourceWim
+    # v48 patch 2: use cached source-derived values captured before any
+    # drive-letter removal. See the cache-site comment for the reachable
+    # path that motivated this.
+    $finalHash = $cachedSourceHash
     # v46 patch 2: log the build of the WIM that was actually deployed.
     # Compare against the pre-touch "WinRE ... Version:" startup line to
     # see whether this run replaced a newer registered build with an
     # older one. Informational only.
-    $deployedWimBuild = Get-WimBuild -WimPath $SourceWim
+    $deployedWimBuild = $cachedSourceBuild
     Write-Log "Post-deploy WIM build: $(if ($deployedWimBuild) { $deployedWimBuild } else { 'unknown' }) (source: $SourceWim)"
     # v47: log the final deployed WIM's SHA256. This is the value that
     # will be written to the state file as CurrentImageHash and will be
@@ -5259,7 +6242,7 @@ try {
     # drift detection has an anchor. If the metadata cannot be read, store
     # $null; the next run will then treat the state as missing metadata
     # and force a rebuild.
-    $deployedMetaNow = Get-WimServicingMetadata -WimPath $SourceWim
+    $deployedMetaNow = $cachedSourceMetadata
     if ($deployedMetaNow) {
         $Script:DeployedWinREMetadata = "$($deployedMetaNow.Version)|$($deployedMetaNow.SPBuild)"
         Write-Log "Deployed WinRE metadata: $($Script:DeployedWinREMetadata)"

@@ -3,8 +3,12 @@
     Build HPWinPEMap.json from the HP Client Windows PE Driver Packs page.
 .DESCRIPTION
     Parses the WinPEDriverPacks table on ftp.ext.hp.com and emits a map
-    keyed by WinPE family (WinPE10_11, WinPE5, WinPE4, WinPE3).
-    The newest entry per family wins.
+    keyed by the source family string with spaces and slashes stripped:
+    "WinPE 10/11" -> WinPE1011, "WinPE 10" -> WinPE10, "WinPE 5" ->
+    WinPE5, "WinPE 4" -> WinPE4, "WinPE 3" -> WinPE3. The newest entry
+    per family wins. When WinPE1011 is present, its entry is also
+    aliased under the key "Current"; WinRE.ps1 reads Packs.WinPE1011
+    directly, so the alias exists for operator convenience only.
 #>
 
 $ErrorActionPreference = "Continue"
@@ -62,11 +66,11 @@ Write-T "Page fetched: $($html.Length) chars" -L SUCCESS
 $tableMatch = [regex]::Match($html, '(?is)<table id="WinPEDriverPacks">(.*?)</table>')
 if (-not $tableMatch.Success) { Write-T "WinPEDriverPacks table not found" -L ERROR; return }
 
-$rows = [regex]::Matches($tableMatch.Groups[1].Value, '(?is)<tr>\s*(.*?)\s*</tr>')
+$rows = [regex]::Matches($tableMatch.Groups[1].Value, '(?is)<tr[^>]*>\s*(.*?)\s*</tr>')
 
 $entries = @()
 foreach ($row in $rows) {
-    $cells = [regex]::Matches($row.Groups[1].Value, '(?is)<td>(.*?)</td>')
+    $cells = [regex]::Matches($row.Groups[1].Value, '(?is)<td[^>]*>(.*?)</td>')
     if ($cells.Count -lt 5) { continue }
 
     $winpeVer = ($cells[0].Groups[1].Value -replace '<[^>]+>','').Trim()

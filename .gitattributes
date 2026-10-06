@@ -9,6 +9,10 @@
 *.bat  text eol=crlf
 
 *.md   text eol=lf
+# These three markdown files are CRLF per the project encoding table.
+/README.md              text eol=crlf
+/docs/architecture.md   text eol=crlf
+/docs/index.md          text eol=crlf
 *.yml  text eol=lf
 *.yaml text eol=lf
 *.json text eol=lf
