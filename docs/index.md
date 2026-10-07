@@ -7,7 +7,7 @@ description: "Repair and rebuild the Windows Recovery Environment (WinRE) on Win
 
 **Repair and rebuild the Windows Recovery Environment (WinRE) on Windows 10 and 11.**
 
-WinRE Manager services `winre.wim`, injects the OEM and Intel VMD drivers the recovery environment needs, verifies the registered recovery route, and keeps the recovery partition correctly sized. Safe to re-run: a machine that needs no work takes an idempotent fast path that mounts no WIM, touches no partition, and does not disable, re-register, or enable WinRE. Runs on one machine, or as a scheduled SYSTEM task across a managed fleet.
+WinRE Manager services `winre.wim`, injects the OEM and Intel VMD drivers the recovery environment needs, verifies the registered recovery route, and keeps the recovery partition correctly sized. Safe to re-run: a machine that needs no work takes an idempotent fast path that mounts no WIM, does not modify the OS-disk partition layout, and does not disable, re-register, or enable WinRE. Runs on one machine, or as a scheduled SYSTEM task across a managed fleet.
 
 ---
 
@@ -66,7 +66,7 @@ flowchart TD
     RunHost --> Flow
 
     Flow --> Fast{"What does it find?"}
-    Fast -->|"Nothing to fix"| FP["Tier 1 · fast path<br/>no changes"]
+    Fast -->|"Nothing to fix"| FP["Tier 1 · fast path<br/>no OS-disk changes"]
     Fast -->|"WinRE registered, disabled"| EO["Tier 2 · enable-only<br/>prepare volume · re-register"]
     Fast -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
 
@@ -105,7 +105,7 @@ Rules 1–3 are **invariants**: no code change may weaken them. Rule 4 is the **
 
 The destructive path is surrounded by protections implemented in the code rather than relying on operator assumptions. Each of the following is enforced by the software, not left to operator discretion.
 
-- **Idempotent fast path.** A healthy machine exits without mounting a WIM, touching a partition, or issuing a `reagentc` mutation.
+- **Idempotent fast path.** A healthy machine exits without mounting a WIM, without modifying the OS-disk partition layout, and without issuing a `reagentc` mutation.
 - **Plan before change.** A read-only geometry plan runs before WinRE is disabled or any partition is deleted, and refuses layouts it cannot prove safe.
 - **Reversible failure window.** The C: pre-shrink runs before `reagentc /disable` and before any deletion. A failed pre-shrink leaves the old route intact.
 - **Fail closed on the destructive sequence.** If the active WinRE route or the OS partition cannot be resolved, the sequence stops before touching the disk.
@@ -124,7 +124,7 @@ Full safety model: **[Architecture](architecture.md)** and **[Recovery partition
 
 | Tier | When | What happens |
 |---|---|---|
-| **Tier 1 — fast path** | The machine is healthy. | No WIM is mounted, no partition is touched, no `reagentc` mutation is issued. Runtime is dominated by Windows' own CIM and PnP enumeration. |
+| **Tier 1 — fast path** | The machine is healthy. | No WIM is mounted, the OS-disk partition layout is not modified, no `reagentc` mutation is issued. Runtime is dominated by Windows' own CIM and PnP enumeration. |
 | **Tier 2 — enable-only** | The image is current, but WinRE is disabled. | The target recovery partition is prepared, the image is re-registered, and `reagentc /enable` is called. No partition geometry change, no image rebuild, no C: shrink. |
 | **Tier 3 — full update** | The image is missing, stale, or the recovery partition is wrong-sized. | The only path that may perform destructive partition changes. Every preparation — OEM pack, VMD package, base WIM, strip stage, injection, export — completes **before** the first byte of the recovery partition is touched. If any preparation fails, the script stops and the old recovery route is preserved. |
 
@@ -189,7 +189,7 @@ Detailed write-ups:
 - Windows 10 (build 19041+) or Windows 11 (build 22000+). Windows 11 24H2 and 25H2 explicitly supported.
 - PowerShell 5.1 or 7.x.
 - x64 OS architecture. ARM64 support is not claimed.
-- Elevation or SYSTEM for production. The read-only harness runs unelevated.
+- Elevation or SYSTEM for production. The read-only harness runs unelevated when invoked directly; the recommended wrapper (`WinRE-Manager.cmd`) launches it elevated for complete query results.
 - 7-Zip at `C:\Program Files\7-Zip\7z.exe` (installed via `winget` if missing).
 - Internet access on first deployment. Offline after the first successful run on a machine whose state file is present and whose local safety checks pass.
 

@@ -173,10 +173,10 @@ Five new parser self-test checks (see "The parser self-test" below):
 Cosmetic fixes:
 
 12. **`Write-KV` overflow handling.** A key at or past `$KeyWidth` now gets a separating space before its value. Previously, `Manifest VMD device IDs` (23 chars, one over the 22-char key column) rendered flush against the value.
-13. **Changelog "Four" → "Five"** for the count of future-proofing checks (the v18 changelog miscounted).
-14. **Changelog "in the detail" → "in the log line"** for the `Test-VmdDrivers` SKIP path (the raw CPU string is logged via `Say`, not recorded in `Record -Detail`).
+13. **Harness `.NOTES` block count "Four" → "Five"** for the count of future-proofing checks (the v18 harness `.NOTES` block miscounted).
+14. **Harness `.NOTES` block wording "in the detail" → "in the log line"** for the `Test-VmdDrivers` SKIP path (the raw CPU string is logged via `Say`, not recorded in `Record -Detail`).
 
-The output format is unchanged from v16 in every respect except the new colour tagging for the v18 checks and the new `INDETERMINATE` verdict colouring in Option S.
+The output format is unchanged from v16 in every respect except the new colour tagging for the v18 checks, the five new parser self-test lines, and the new `INDETERMINATE` verdict colouring in Option S.
 
 ## Running it
 
@@ -575,7 +575,7 @@ The v45 destructive-path VM test documented below remains the recommended next s
 
 ### v48 patch 1 destructive-path coverage
 
-The v48 patch 1 release adds four changes; three of them are testable independently of the destructive sequence.
+The v48 patch 1 release introduces five changes: intervening-partition handling, the architecture gate, `LocalInputsId`, LKG-by-hash at any discovered recovery location, and transactional WIM replacement. Four are covered below; the fifth (LKG-by-hash) is a source-selection change and is not covered here.
 
 - **Architecture gate.** Unexercised on ARM64 hardware. A live run on any non-x64 host should exit `EXIT_WARNING` before any state mutation; a live run on an x64 host should log `Architecture gate passed: x64` and continue unchanged. The gate has no DryRun carve-out: a dry run on a non-x64 host also exits `EXIT_WARNING` unconditionally.
 - **`LocalInputsId` offline-drift guard.** Unexercised on the offline path. The test shape: a machine whose stored `LocalInputsId` was written by a prior run, taken offline, and whose hardware or OS build is changed while offline (VM snapshot manipulation or an in-place build change), then run with the manifest unreachable. The run should exit `EXIT_WARNING` with the `Offline fallback: stored LocalInputsId ... does not match` line rather than take the fast path.
@@ -584,7 +584,7 @@ The v48 patch 1 release adds four changes; three of them are testable independen
 
 ### v46 patch 2 hardenings (inside the post-deletion gate)
 
-The v46 patch 2 cycle added four post-review hardenings of `Ensure-AdequateRecoveryPartition`. Per [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-remaining-gated-scope), they sit **inside** the post-deletion gate — no future change to the post-deletion segment of the destructive sequence should ship until the post-deletion failure test below runs and its result is recorded. The four hardenings:
+The v46 patch 2 cycle added four post-review hardenings of `Ensure-AdequateRecoveryPartition`. Per [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-remaining-gated-scope), they are treated as inside the post-deletion gate — no future change to the post-deletion segment of the destructive sequence should ship until the post-deletion failure test below runs and its result is recorded. The four hardenings:
 
 - **Pre-deletion resolver guard.** Refuses the destructive sequence when WinRE was `Enabled` and its registered location cannot be resolved to a partition. As of v48 patch 1, fires ahead of the pre-shrink and ahead of `reagentc /disable`, so the machine is left with WinRE still `Enabled` and the old recovery partition intact.
 - **Extension-fallback bucket cap.** Caps the extension-failure fallback at the plan's bucket size, not the full remaining extent, preserving the 2 GiB managed-recovery ceiling.

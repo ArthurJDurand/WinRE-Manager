@@ -18,7 +18,7 @@ labels: ['enhancement', 'needs-triage']
 
 ## Impact on existing deployments
 
-- Would this change the `ScriptVersion`? If so, why does the deployed WIM need to change?
+- Would this change the `ScriptVersion`? If so, which of the three triggers applies — the deployed WIM bytes, the partition layout that gets created, or a `DesiredStateId` input?
 - Would this change the `DesiredStateId` inputs? Adding a new hardware property or deployment input to the ID forces every managed machine to rebuild once on the next run. If so, describe the `Migration Note` the change would need.
 - Would this force a rebuild on healthy machines?
 - Would this alter any exit-code semantics?

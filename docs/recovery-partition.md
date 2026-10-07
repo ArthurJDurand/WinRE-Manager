@@ -47,7 +47,7 @@ Once the base WIM is obtained, the pipeline mounts it, strips every third-party 
 
 The strip stage does not change the sizing arithmetic: `wimSizeMiB` is measured on the exported WIM after the strip and after ResetBase, and both thresholds below use that value directly.
 
-On the enable-only path no WIM is rebuilt — the existing deployed WIM's size is used directly.
+On the enable-only path the sizing policy below is not consulted: no partition is created or resized, so neither threshold applies. The enable-only path operates against the currently registered recovery partition and assumes its size is adequate; if it is not, the operator resolves it by way of the full-update path on a later run.
 
 ### Two thresholds
 
@@ -205,38 +205,38 @@ The plan is the contract for the rest of the sequence. Every subsequent step com
 
 ### 2. Pre-shrink in the reversible window
 
-If `ShrinkBytes > 0`, the script performs the C: shrink now — **before** `reagentc /disable`, before any partition is deleted, and before any other state-modifying action. This is the v45 patch 1 reorder.
+If the plan requires a resize — C: on the non-intervening path (`ShrinkBytes > 0`), the anchor on the intervening-anchor path (`AnchorShrinkBytes > 0`) — the script performs the resize now, before `reagentc /disable`, before any partition is deleted, and before any other state-modifying action. This is the v45 patch 1 reorder; v48 patch 1 extended it to the intervening-anchor path.
 
 Two pre-shrink gates run first:
 
-**Fail-closed free-space check.** The script reads C:'s current free space and computes the projected free space after the planned shrink. Two deferral cases:
+**Fail-closed free-space check.** The script reads the resize target's current free space and computes the projected free space after the planned shrink. Two deferral cases:
 
-- If C:'s volume cannot be read (`Get-Volume -DriveLetter C` returns nothing), the script defers with `Reason = "C: volume could not be read for free-space check"` and `RetrySuppressible = $false`. The read failure may be transient, so the deferral is not retry-suppressed — the next run tries the read again.
-- If the projected free space after the shrink would fall below the 3 GiB reserve (`$MinFreeSpaceGB`), the script defers with `Reason = "post-shrink free space below minimum"` and `RetrySuppressible = $true`. Free space on C: and re-run.
+- If the resize target's volume cannot be read (`Get-Volume -Partition $resizeTarget` returns nothing), the script defers with `Reason = "<resize-target label> volume could not be read for free-space check"` and `RetrySuppressible = $false`. The read failure may be transient, so the deferral is not retry-suppressed — the next run tries the read again. The label is `OS partition (C:)` on the non-intervening path and `anchor partition (disk X part Y)` on the intervening-anchor path.
+- If the projected free space after the shrink would fall below the 3 GiB reserve (`$MinFreeSpaceGB`), the script defers with `Reason = "post-shrink free space below minimum on <resize-target label>"` and `RetrySuppressible = $true`. Free space on the resize target and re-run.
 
 **Shrink execution.** `Invoke-OSPartitionShrink` runs with three attempts:
 
 - Attempt 1 — immediate `Resize-Partition` to the planned OS partition size.
 - Attempt 2 — after a 10-second sleep, re-query `SizeMin`, log the delta, retry.
-- Attempt 3 — after `defrag C: /x` with no timeout, sleep 5 seconds, re-query `SizeMin`, log the delta, retry. As of v48 patch 1, the `defrag` target is parameterized via `-DefragTarget`; on the intervening-anchor path it is the anchor's drive letter instead of `C:`. When the parameter is omitted, the function defaults to `$env:SystemDrive`, preserving the v47 behavior for the OS-partition call site.
+- Attempt 3 — after `defrag <target> /x` with no timeout, sleep 5 seconds, re-query `SizeMin`, log the delta, retry. As of v48 patch 1, the `defrag` target is parameterized via `-DefragTarget`; on the intervening-anchor path it is the anchor's drive letter instead of `C:`. When the parameter is omitted, the function defaults to `$env:SystemDrive`, preserving the v47 behavior for the OS-partition call site.
 
 Every attempt logs the pre-shrink size and target size. Every attempt is followed by `Assert-PartitionSizeAfterResize`, which confirms the partition landed at the target size within 1 MiB.
 
-If all three attempts fail, the script calls `Restore-OSPartitionSize -TargetSizeBytes $initialOSSize` to restore C: to its pre-attempt size, and returns `Deferred` with `Reason = "pre-shrink failed"` and `RetrySuppressible = $true`. **The old recovery route is intact** — no partition was deleted and WinRE was never disabled. The machine is left exactly as it was found.
+If all three attempts fail, the script calls `Restore-OSPartitionSize -TargetSizeBytes $resizeTargetInitialSize -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber` to restore the resize target to its pre-attempt size, and returns `Deferred` with `Reason = "pre-shrink failed"` and `RetrySuppressible = $true`. **The old recovery route is intact** — no partition was deleted and WinRE was never disabled. The machine is left exactly as it was found.
 
 If the shrink succeeds but the post-resize verification fails, the same restoration runs and the script returns `Deferred` with `Reason = "pre-shrink verification failed"` and `RetrySuppressible = $true`.
 
-If the shrink succeeds and verification passes, the script re-reads C:'s actual end and recomputes the aligned partition start and size as described under "The single-boundary geometry model" above. If the actual geometry leaves less than the plan's bucket size, the script restores C: and returns `Deferred` with `Reason = "resize rounding reduced planned extent"` and `RetrySuppressible = $true`.
+If the shrink succeeds and verification passes, the script re-reads the resize target's actual end and recomputes the aligned partition start and size as described under "The single-boundary geometry model" above. If the actual geometry leaves less than the plan's bucket size, the script restores the resize target and returns `Deferred` with `Reason = "resize rounding reduced planned extent"` and `RetrySuppressible = $true`.
 
 ### 3. Disable WinRE
 
 If WinRE is currently `Enabled`, `reagentc /disable` runs. The script then verifies via `Get-WinREState` that the status is `Disabled`.
 
-This step runs **after** the pre-shrink, in the reversible window's tail. If the disable fails, the script restores C: to its original size and calls `Restore-PreviousWinRERoute -PreviousState $stateBefore`. If the previous route is confirmed restored, the function returns `Deferred` with `Reason = "WinRE disable failed before deletion"` or `Reason = "WinRE disable verification failed before deletion"`. Otherwise it returns `$null` and the main flow falls through to OS-fallback. Neither deferral is retry-suppressed — the failure indicates a storage-level or OS-level condition, not a transient constraint.
+This step runs **after** the pre-shrink, in the reversible window's tail. If the disable fails, the script restores the resize target to its original size and calls `Restore-PreviousWinRERoute -PreviousState $stateBefore`. If the previous route is confirmed restored, the function returns `Deferred` with `Reason = "WinRE disable failed before deletion"` or `Reason = "WinRE disable verification failed before deletion"`. Otherwise it returns `$null` and the main flow falls through to OS-fallback. Neither deferral is retry-suppressed — the failure indicates a storage-level or OS-level condition, not a transient constraint.
 
 **Pre-`/disable` race detector (v47 patch 1).** Immediately before this `/disable` call — and before whichever other `/disable` site the execution reaches first — the race detector re-reads the registered WinRE's `Location`, `Version`, and WIM SHA256, and compares them against values captured at the start of the rebuild (`Get-RegisteredWinREFingerprint`). Any change — location, version, or hash — aborts before the disable.
 
-At this site the abort must first restore C: to its captured size, because the pre-shrink has already run. No partitions have been deleted yet and the old WinRE route is still intact, so no route restoration is needed. After the size restore, the script resets the checkpoint to Step 2, removes `base.wim` and any stale `winre_optimized.wim`, and returns `Deferred` with `Reason = "registered source changed before disable"`. The deferral is not retry-suppressed — the drift is a Windows-Update-driven transient, and the next run re-evaluates source selection.
+At this site the abort must first restore the resize target to its captured size, because the pre-shrink has already run. No partitions have been deleted yet and the old WinRE route is still intact, so no route restoration is needed. After the size restore, the script resets the checkpoint to Step 2, removes `base.wim` and any stale `winre_optimized.wim`, and returns `Deferred` with `Reason = "registered source changed before disable"`. The deferral is not retry-suppressed — the drift is a Windows-Update-driven transient, and the next run re-evaluates source selection.
 
 This is a **race detector, not a lock**. Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update, so the microseconds between the re-read and the disable returning cannot be eliminated without moving work into the disable→enable window (which would violate invariant 3). The detector narrows the window from minutes to that residual. See [architecture.md](architecture.md) for the full rationale and [state-and-idempotency.md](state-and-idempotency.md) for the two capture states and their handling.
 
@@ -248,7 +248,7 @@ The guard exists because both the delete-last ordering (step 4) and `Restore-Pre
 
 The guard fires ahead of the pre-shrink and ahead of `reagentc /disable`, so a machine that reaches this deferral is left with WinRE still `Enabled` and the old recovery partition intact. This is the same class of deferral as the other pre-shrink deferrals: the old route is preserved and no partition was touched. A subsequent run re-evaluates the layout from the top. See [troubleshooting.md](troubleshooting.md) for the re-registration recovery procedure.
 
-`RetrySuppressible` is not set for this deferral — the condition requires operator action to resolve, and retrying would produce the same rejection. Since v47 patch 3, the seven partition-identity rejection reasons (cross-disk inventory, overlap with C:, oversized recovery-typed partition, recovery-typed overlap with C:, recovery-typed precedes C:, extent overlap / ordering, and separated-from-C:) name the offending partition(s) - disk number, partition number, size, volume label, and type code - so the log identifies the layout the operator needs to resolve without requiring a separate harness run.
+`RetrySuppressible` is not set for this deferral — the condition requires operator action to resolve, and retrying would produce the same rejection.
 
 **Field status.** This guard is a v46 patch 2 code-review hardening. It has not been exercised in the field.
 
@@ -260,10 +260,10 @@ For each type-coded recovery partition the plan marked as deletable — GPT GUID
 
 A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is **not** in this loop. The type-code gate is applied before the loop and again inside it, as a redundant check. A label-only match is logged with the message "Skipping label-only recovery match on disk N partition M: recovery label alone does not authorize deletion." and the loop continues.
 
-If a deletion fails, the script calls `Restore-OSPartitionSize -TargetSizeBytes $initialOSSize` and then `Restore-PreviousWinRERoute -PreviousState $stateBefore`, capturing both results separately (v46 patch 2). Three return shapes are possible:
+If a deletion fails, the script calls `Restore-OSPartitionSize -TargetSizeBytes $resizeTargetInitialSize -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber` and then `Restore-PreviousWinRERoute -PreviousState $stateBefore`, capturing both results separately (v46 patch 2). Three return shapes are possible:
 
 - **Both restores succeed** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored"`.
-- **Route restored, C: geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but C: geometry restore unverified"`, and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. This is a partial rollback and is reported honestly rather than being flattened into the success case.
+- **Route restored, resize-target geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but <resize-target label> geometry restore unverified"` (the label is `OS partition (C:)` on the non-intervening path and `anchor partition (disk X part Y)` on the intervening-anchor path; v48 patch 1), and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. This is a partial rollback and is reported honestly rather than being flattened into the success case.
 - **Route not restored** — `$null`, and the main flow falls through to OS-fallback. This is the post-deletion residual corner.
 
 None of the deletion-failure deferrals is retry-suppressed.
@@ -305,11 +305,11 @@ The new partition is created at `Plan.PlannedPartitionStart` with size `Plan.Pla
 - **Identity** — disk number and partition number match the values `New-Partition` returned.
 - **Exact offset** — the partition's `Offset` equals `Plan.PlannedPartitionStart` to the byte.
 - **Size within tolerance** — the partition's `Size` is within one alignment block (1 MiB) of `Plan.PlannedPartitionSize`.
-- **No overlap with C:** — C:'s end is at or before the partition's start.
-- **C:-to-recovery gap within tolerance** — the gap between C:'s end and the partition's start is within one alignment block. A gap within tolerance is logged; a gap beyond tolerance is a fatal geometry mismatch.
+- **No overlap with the boundary partition** — the boundary partition's end is at or before the new partition's start.
+- **Boundary-to-recovery gap within tolerance** — the gap between the boundary partition's end and the new partition's start is within one alignment block. A gap within tolerance is logged; a gap beyond tolerance is a fatal geometry mismatch.
 - **End at `AlignedManagedExtentEnd`** — the partition's end is within one alignment block of the aligned managed extent end. The same log-or-fail policy applies.
 
-**Fail-closed on an unresolvable OS partition (v46 patch 2).** Before the C:-adjacency checks, the assertion re-resolves the OS partition via `Get-OSPartition`. If that returns nothing, the assertion returns `$false` rather than skipping the adjacency check. The layout cannot be verified against C:, so it is not accepted. This is the last check before `Format-Volume`; failing closed here prevents a partition that cannot be validated against C: from being formatted and registered.
+**Fail-closed on an unresolvable boundary partition (v46 patch 2; generalized for the intervening anchor in v48 patch 1).** Before the adjacency checks, the assertion resolves the boundary partition — the caller-supplied `-BoundaryPartition` when present, otherwise the OS partition via `Get-OSPartition`. If neither resolves, the assertion returns `$false` rather than skipping the adjacency check. The layout cannot be verified against a boundary, so it is not accepted. This is the last check before `Format-Volume`; failing closed here prevents a partition that cannot be validated against a boundary from being formatted and registered.
 
 **Boundary-partition parameter (v48 patch 1).** The assertion accepts an optional `-BoundaryPartition`. When omitted, the boundary defaults to the OS partition, preserving the v47 behavior; the v47 call sites are unchanged. On the intervening-anchor path the caller passes the shrunk anchor, so the overlap and gap checks measure against the anchor rather than C:. Without the parameter the >700 GiB C:-to-recovery gap on the motivating layout would exceed the 1 MiB alignment tolerance and the assertion would reject every valid intervening plan. The v48 field run on the AMD Ryzen 7 5825U confirmed the parameter fires correctly on the exact layout that motivated the feature.
 
@@ -319,7 +319,7 @@ On success, the script logs:
 Verified recovery partition layout: disk N partition M, offset O MiB, size S MiB
 ```
 
-On failure, the script calls `Remove-OrphanPartition` to clean up the partition it just created, then restores C: and returns `$null`. The main flow falls through to OS-fallback. This matches the existing `Format-Volume`-failure recovery shape.
+On failure, the script calls `Remove-OrphanPartition` to clean up the partition it just created, then restores the resize target and returns `$null`. The main flow falls through to OS-fallback. This matches the existing `Format-Volume`-failure recovery shape.
 
 ### 8. Format and attribute
 
@@ -382,9 +382,9 @@ The main flow adds the assigned drive letter to `$Script:tempDriveLetters` so it
 
 When the pre-shrink sequence (or the pre-flight geometry plan) returns `Deferred` with `RetrySuppressible = $true`, the main flow writes a marker at `C:\Recovery\OEM\winre_partition_deferred.json`. The marker contains the current `DesiredStateId` and a `Since` timestamp.
 
-The marker's purpose is to suppress identical retries. A machine whose destructive replacement deferred because C: has insufficient free space will defer again the next run if the constraint has not been resolved. The marker records that fact so the next run can skip the same retries and exit cleanly with `EXIT_WARNING` rather than spending a full-update pass on a plan that will fail the same way.
+The marker's purpose is to suppress identical retries. A machine whose destructive replacement deferred because the resize target has insufficient free space will defer again the next run if the constraint has not been resolved. The marker records that fact so the next run can skip the same retries and exit cleanly with `EXIT_WARNING` rather than spending a full-update pass on a plan that will fail the same way.
 
-The marker is written only for `RetrySuppressible = $true` deferrals. The v46 patch 2 pre-deletion resolver deferral (`active WinRE location could not be resolved`) is not retry-suppressed: the condition requires operator action to resolve, and the machine is in a state (WinRE `Disabled` with the old partition intact) where the next run must re-evaluate the registration rather than skip. The same applies to the `WinRE disable failed before deletion` and `recovery partition deletion failed` deferrals, and to the v47 patch 1 pre-`/disable` race-detector abort (`registered source changed before disable`) — the drift is a Windows-Update-driven transient that the next run re-evaluates, not a stable operator-actionable condition.
+The marker is written only for `RetrySuppressible = $true` deferrals. The v46 patch 2 pre-deletion resolver deferral (`active WinRE location could not be resolved`) is not retry-suppressed: the condition requires operator action to resolve, and the machine is in a state where the next run must re-evaluate the registration rather than skip. The same applies to the `WinRE disable failed before deletion` and `recovery partition deletion failed` deferrals, and to the v47 patch 1 pre-`/disable` race-detector abort (`registered source changed before disable`) — the drift is a Windows-Update-driven transient that the next run re-evaluates, not a stable operator-actionable condition.
 
 On each subsequent run, the marker is honored only when both of the following hold:
 
@@ -428,8 +428,8 @@ When a recovery partition deletion fails after WinRE has already been disabled, 
 
 The deletion-failure branch captures the size-restore result and the route-restore result separately (v46 patch 2). The three return shapes are:
 
-- **Both restores succeed** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored"`. The machine is left in a functional state — WinRE is `Enabled` on the same partition it was registered to before the run started, and C: is at its original size.
-- **Route restored, C: geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but C: geometry restore unverified"`, and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. The partial rollback is reported as such; the previous code could report "previous route restored" while C: remained shrunken.
+- **Both restores succeed** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored"`. The machine is left in a functional state — WinRE is `Enabled` on the same partition it was registered to before the run started, and the resize target is at its original size.
+- **Route restored, resize-target geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but <resize-target label> geometry restore unverified"`, and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. The partial rollback is reported as such; the previous code could report "previous route restored" while the resize target remained shrunken.
 - **Route not restored** — `$null` with an ERROR log stating that the route could not be restored. The machine ends without a working recovery route, and manual intervention is required.
 
 **`Test-WinRELocationMatches`.** reagentc may report the same volume in either the GLOBALROOT form (`\\?\GLOBALROOT\device\harddiskN\partitionM\`) or the Volume-GUID form (`\\?\Volume{guid}\`), and the form can change across a disable/enable cycle. The function compares the two locations by:
@@ -461,24 +461,26 @@ See [architecture.md](architecture.md) for the full policy and [deployment.md](d
 
 ## `Restore-OSPartitionSize`
 
-The helper that restores C: when a post-shrink step fails. As of v45 patch 1 it accepts a `-TargetSizeBytes` parameter:
+The helper that restores a partition when a post-shrink step fails. As of v45 patch 1 it accepts a `-TargetSizeBytes` parameter:
 
 ```
 Restore-OSPartitionSize -Reason "<description>" -TargetSizeBytes <bytes>
 ```
 
-When `-TargetSizeBytes` is provided, the helper resizes C: to exactly that size. The recovery path always passes `-TargetSizeBytes $initialOSSize` — the pre-attempt size captured at the top of `Ensure-AdequateRecoveryPartition` — so a failed destructive attempt restores C: to the geometry it had before the run started. The parameterless call falls back to `SizeMax` and is retained only for legacy call sites. As of v48 patch 1, the helper also accepts optional `-DiskNumber` and `-PartitionNumber` parameters. Both must be supplied together or neither; a partial supply logs an internal-error WARN and returns `$false`. When supplied, the helper operates on the identified partition instead of C:, and the log label reflects the actual target. The intervening-anchor path uses these parameters to restore the shrunk anchor after a failed shrink or a failed destructive attempt; the OS-partition call sites are unchanged and continue to omit them. Any failure sets `nonFatalWarning` and `GeometryRestoreFailed` on the anchor path as well as the C: path, so the state file is invalidated and the next run retries from clean rather than taking the fast path over an unexpectedly-shrunken anchor.
+When `-TargetSizeBytes` is provided, the helper resizes the target partition to exactly that size. The recovery path always passes `-TargetSizeBytes $resizeTargetInitialSize` — the pre-attempt size captured at the top of `Ensure-AdequateRecoveryPartition` — so a failed destructive attempt restores the resize target to the geometry it had before the run started. The parameterless call falls back to `SizeMax` and is retained only for legacy call sites.
 
-The helper checks the current size first. If C: is already at the target size, it returns `$true` without resizing. Otherwise it resizes, sleeps 3 seconds, and verifies via `Assert-PartitionSizeAfterResize`.
+As of v48 patch 1, the helper also accepts optional `-DiskNumber` and `-PartitionNumber` parameters. Both must be supplied together or neither; a partial supply logs an internal-error WARN and returns `$false`. When supplied, the helper operates on the identified partition instead of C:, and the log label reflects the actual target. The intervening-anchor path uses these parameters to restore the shrunk anchor after a failed shrink or a failed destructive attempt; the OS-partition call sites are unchanged and continue to omit them. Any failure sets `nonFatalWarning` and `GeometryRestoreFailed` on the anchor path as well as the C: path, so the state file is invalidated and the next run retries from clean rather than taking the fast path over an unexpectedly-shrunken anchor.
+
+The helper checks the current size first. If the target is already at the target size, it returns `$true` without resizing. Otherwise it resizes, sleeps 3 seconds, and verifies via `Assert-PartitionSizeAfterResize`.
 
 Every failure path sets:
 
 - `$Script:nonFatalWarning = $true` (so the exit code becomes 2).
 - `$Script:GeometryRestoreFailed = $true` (so the state file is deleted).
 
-The four failure paths are: OS partition not found, resize threw an exception, post-resize verification failed, and (for the parameterless legacy call) `Get-PartitionSupportedSize` failed.
+The four failure paths are: target partition not found, resize threw an exception, post-resize verification failed, and (for the parameterless legacy call) `Get-PartitionSupportedSize` failed.
 
-The v46 patch 2 deletion-failure branch captures the helper's return value explicitly and propagates it into the deferral reason when the restore did not verify. A failed C: geometry restore after a deletion failure no longer reports as "previous route restored" while leaving C: shrunken; the state file is invalidated and the next run retries from clean.
+The v46 patch 2 deletion-failure branch captures the helper's return value explicitly and propagates it into the deferral reason when the restore did not verify. A failed resize-target geometry restore after a deletion failure no longer reports as "previous route restored" while leaving the resize target shrunken; the state file is invalidated and the next run retries from clean.
 
 ## `Remove-OrphanPartition`
 
@@ -496,9 +498,9 @@ If the partition survives, the function:
 - Sets `$Script:nonFatalWarning = $true`.
 - Sets `$Script:GeometryRestoreFailed = $true`.
 
-The `GeometryRestoreFailed` flag is important: an orphan partition between the OS partition and the disk end prevents the freed space from being reabsorbed, and without the flag the state file would record the resulting layout as valid. With the flag, the state file is deleted and the next run retries.
+The `GeometryRestoreFailed` flag is important: an orphan partition between the resize target and the disk end prevents the freed space from being reabsorbed, and without the flag the state file would record the resulting layout as valid. With the flag, the state file is deleted and the next run retries.
 
-If the partition is removed successfully, the function calls `Restore-OSPartitionSize -Reason "after orphan removal" -TargetSizeBytes $TargetOSPartitionSizeBytes` to restore C: to its pre-attempt size.
+If the partition is removed successfully, the function calls `Restore-OSPartitionSize -Reason "after orphan removal" -TargetSizeBytes $TargetOSPartitionSizeBytes` to restore the resize target to its pre-attempt size.
 
 As of v48 patch 1, the function also accepts `-AnchorDiskNumber` and `-AnchorPartitionNumber`. Both default to the OS partition, so the v47 call sites are unchanged. On the intervening-anchor path the caller passes the anchor's identity, and the post-orphan `Restore-OSPartitionSize` call restores the shrunk anchor instead of C:. Any failure sets the geometry-failure flags, exactly as on the C: path — if the anchor is left shrunken after a failed rollback, the state file must not remain valid or the next run may take the fast path over an unexpectedly-shrunken anchor.
 
@@ -551,7 +553,7 @@ The v46 patch 2 pre-deletion resolver guard and the extension-fallback bucket ca
 **v47 patch 1 coverage.** The v47 patch 1 non-destructive paths are field-verified on an ASUS PRIME H510M-D (2026-10-03). The v47-specific destructive-adjacent paths that remain unexercised on any storage are:
 
 - **The destructive partition paths under v47.** Pre-shrink, partition delete, `New-Partition`, the whole-layout assertion, and the post-delete extension fallback were not reached — the existing recovery partition was reusable.
-- **The v47 pre-`/disable` race-detector abort at the `Ensure-AdequateRecoveryPartition` site.** No drift occurred during candidate preparation, so the abort branch — with its C: size restoration — has not fired in the field.
+- **The v47 pre-`/disable` race-detector abort at the `Ensure-AdequateRecoveryPartition` site.** No drift occurred during candidate preparation, so the abort branch — with its resize-target size restoration — has not fired in the field.
 - **The strip stage against a non-empty third-party driver set.** The ASUS run's strip was a no-op. The strip-and-reinject loop has not run against a non-empty set inside a v47 production run.
 - **The three-source selection via the LKG or GitHub branches.** The ASUS run took the "registered" branch through its "no hash-validated LKG present" sub-path.
 

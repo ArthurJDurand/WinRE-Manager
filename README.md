@@ -10,7 +10,7 @@
 
 📖 **[Full documentation →](https://ArthurJDurand.github.io/WinRE-Manager/)**
 
-WinRE Manager repairs, rebuilds, and maintains the **Windows Recovery Environment** — the built-in environment Windows uses for **Advanced startup**, **Reset this PC**, and **Startup Repair**. It services `winre.wim`, injects the OEM and Intel VMD drivers the recovery environment actually needs — including the touchpad and input drivers that let a technician navigate WinRE without a keyboard — verifies the registered recovery route, and keeps the recovery partition correctly sized. It runs on one machine, or as a scheduled SYSTEM task across a managed fleet. Safe to re-run: a machine that needs no work takes an idempotent fast path that mounts no WIM, touches no partition, and does not disable, re-register, or enable WinRE.
+WinRE Manager repairs, rebuilds, and maintains the **Windows Recovery Environment** — the built-in environment Windows uses for **Advanced startup**, **Reset this PC**, and **Startup Repair**. It services `winre.wim`, injects the OEM and Intel VMD drivers the recovery environment actually needs — including the touchpad and input drivers that let a technician navigate WinRE without a keyboard — verifies the registered recovery route, and keeps the recovery partition correctly sized. It runs on one machine, or as a scheduled SYSTEM task across a managed fleet. Safe to re-run: a machine that needs no work takes an idempotent fast path that mounts no WIM, does not modify the OS-disk partition layout, and does not disable, re-register, or enable WinRE.
 
 **Having this problem?** If you're seeing **"Windows could not find the recovery environment,"** **"The Windows RE image was not found,"** **"Unable to reset, no recovery image,"** a failed `reagentc /enable`, a **recovery partition too small after a Windows Update** (`0x80070643`), or **"Startup Repair cannot repair this computer automatically,"** you're in the right place. Every one of those is a real WinRE failure mode where the fix is a correctly serviced recovery image on a correctly sized recovery partition — not a Windows reinstall. See [What WinRE Manager fixes](#what-winre-manager-fixes) for the full list.
 
@@ -28,9 +28,9 @@ The wrapper opens a menu:
 
 | Option | What it does |
 |---|---|
-| **1 — Check my PC** | Read-only diagnostics and self-tests. Changes nothing. |
-| **2 — Preview the repair** | Walks the full production flow and prints every decision it would make — without shrinking, deleting, creating, formatting, or deploying anything. |
-| **3 — Repair Windows Recovery** | Performs the repair. Warns you first, requires you to type `RUN` to confirm, then does the work. |
+| **1 — Test harness** | Read-only diagnostics and self-tests. Changes nothing. |
+| **2 — Preview (DryRun)** | Walks the full production flow and prints every decision it would make — without shrinking, deleting, creating, formatting, or deploying anything. |
+| **3 — Run for real** | Performs the repair. Warns you first, requires you to type `RUN` to confirm, then does the work. |
 | **4 — Show recent log** | Prints the tail of the last run's log and offers to open it in Notepad. |
 | **5 — Quit** | Closes the wrapper. |
 
@@ -75,7 +75,7 @@ flowchart TD
     RunHost --> Flow
 
     Flow --> Fast{"What does it find?"}
-    Fast -->|"Nothing to fix"| FP["Tier 1 · fast path<br/>no changes"]
+    Fast -->|"Nothing to fix"| FP["Tier 1 · fast path<br/>no OS-disk changes"]
     Fast -->|"WinRE registered, disabled"| EO["Tier 2 · enable-only<br/>prepare volume · re-register"]
     Fast -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
 
@@ -88,7 +88,7 @@ flowchart TD
     style Hosted fill:#8957e5,stroke:#8957e5,color:#fff
 ```
 
-> **Elevated** means an administrator PowerShell prompt — the current user with the Administrator token. **As SYSTEM** means running under the built-in `NT AUTHORITY\SYSTEM` account, which is how a scheduled task is configured. Production needs one or the other. The read-only test harness needs neither.
+> **Elevated** means an administrator PowerShell prompt — the current user with the Administrator token. **As SYSTEM** means running under the built-in `NT AUTHORITY\SYSTEM` account, which is how a scheduled task is configured. Production needs one or the other. The read-only test harness runs unelevated when invoked directly, but the recommended wrapper (`WinRE-Manager.cmd`) launches it elevated so BitLocker, partition, and DISM queries return complete data.
 
 ---
 
@@ -131,6 +131,8 @@ A recovery environment that boots but cannot be navigated is barely a recovery e
 - **A recovery partition on a non-OS disk.** A stray type-coded recovery partition on a secondary disk can cause Startup Repair to point the BCD at the wrong image. WinRE Manager removes type-coded recovery partitions from non-OS disks.
 - **An OEM factory-restore volume carrying the recovery type code.** Recovery-typed partitions over 2 GiB are preserved for operator review — never deleted, never reused. Windows Setup recovery partitions are under 1.5 GiB; OEM factory volumes can be 7–20 GiB and may carry the same type code.
 
+Because the plan rejects the entire layout when it detects an oversized recovery-typed partition on the OS disk, any run that requires a rebuild defers with `EXIT_WARNING` until the operator resolves the partition. The script will not silently accept a layout it cannot prove safe, and it does not write a retry-suppressing deferral marker for this condition.
+
 ### Build drift and stale images
 
 - **Windows Update leaves the registered WinRE newer than the deployed one.** WinRE Manager compares the registered image's DISM servicing metadata against the last-deployed metadata recorded in the state file. Drift forces a rebuild; stability stays on the fast path.
@@ -146,7 +148,7 @@ Three tiers of work. A healthy machine takes Tier 1; a machine with an enable-on
 ```mermaid
 flowchart LR
     Start["Run WinRE Manager"] --> Check{"What does it find?"}
-    Check -->|"Nothing to fix"| Fast["Tier 1 — fast path<br/>no WIM · no partition · no reagentc mutation"]
+    Check -->|"Nothing to fix"| Fast["Tier 1 — fast path<br/>no WIM · no OS-disk partition · no reagentc mutation"]
     Check -->|"WinRE registered, disabled"| Enable["Tier 2 — enable-only<br/>prepare volume · re-register"]
     Check -->|"WinRE missing or broken"| Full["Tier 3 — full update<br/>prepare · plan · shrink · rebuild · deploy"]
     Fast --> End["DEDICATED WinRE<br/>on a dedicated recovery partition"]
@@ -157,7 +159,7 @@ flowchart LR
     style End fill:#238636,stroke:#238636,color:#fff
 ```
 
-- **Tier 1 — fast path.** Health checks pass, the state file matches the current inputs, the image is current, the partition is correct. The run completes without mounting the WIM, touching a partition, or issuing a `reagentc` mutation. Runtime is dominated by Windows' own CIM and PnP enumeration.
+- **Tier 1 — fast path.** Health checks pass, the state file matches the current inputs, the image is current, the partition is correct. The run completes without mounting the WIM, modifying the OS-disk partition layout, or issuing a `reagentc` mutation. Runtime is dominated by Windows' own CIM and PnP enumeration.
 - **Tier 2 — enable-only.** The image is current, but WinRE is disabled. The script prepares the target recovery partition, re-registers the image, and calls `reagentc /enable`. No partition geometry change, no image rebuild, no C: shrink.
 - **Tier 3 — full update.** The image is missing, stale, or the recovery partition is wrong-sized. This is the only path that may perform destructive partition changes — and even here, every preparation completes before the first byte of the recovery partition is touched. If driver download fails, or OEM pack extraction produces zero INFs, or the base WIM cannot be verified, or the strip stage cannot prove zero third-party drivers remain, **the script stops before it touches the recovery partition** and the old recovery route stays intact.
 
@@ -180,7 +182,7 @@ Full hierarchy, enforcement tables, and reasoning: **[Architecture](docs/archite
 
 WinRE Manager's safety measures are implemented in the code rather than relying on operator assumptions. Each of the protections below is enforced by the script — not left to operator discretion.
 
-- **Idempotent fast path.** A healthy machine exits without mounting a WIM, touching a partition, or issuing a `reagentc` mutation. Runtime is dominated by Windows' own CIM and PnP enumeration.
+- **Idempotent fast path.** A healthy machine exits without mounting a WIM, modifying the OS-disk partition layout, or issuing a `reagentc` mutation. Runtime is dominated by Windows' own CIM and PnP enumeration.
 - **Plan before change.** A read-only geometry plan runs before WinRE is disabled or any partition is deleted. The plan refuses layouts it cannot prove safe, and names the offending partition when it does.
 - **Reversible failure window.** The C: pre-shrink runs **before** `reagentc /disable` and **before** any deletion. A failed pre-shrink leaves the old recovery route intact.
 - **Fail closed on the destructive sequence.** If the active WinRE route cannot be resolved, or the OS partition cannot be resolved for the layout assertion, the sequence stops before touching the disk.
@@ -199,7 +201,7 @@ Full safety model — workspace selection, the pre-shrink window, the transactio
 - **Windows 10** (build 19041+) or **Windows 11** (build 22000+). Windows 11 24H2 and the 25H2 builds are explicitly supported.
 - **PowerShell 5.1** or **PowerShell 7.x**.
 - **x64 OS architecture.** The manager refuses to run on ARM64, x86, or any architecture whose token cannot be resolved. ARM64 support is not claimed.
-- **Elevation or SYSTEM** for production. The read-only test harness runs unelevated. An unelevated launch of `WinRE.ps1` is refused in milliseconds with a clear `FATAL` message, rather than failing several minutes later at `Mount-WindowsImage`.
+- **Elevation or SYSTEM** for production. The read-only test harness runs unelevated when invoked directly; the recommended wrapper (`WinRE-Manager.cmd`) launches it elevated for complete query results. An unelevated launch of `WinRE.ps1` is refused in milliseconds with a clear `FATAL` message, rather than failing several minutes later at `Mount-WindowsImage`.
 - **7-Zip** at `C:\Program Files\7-Zip\7z.exe`. The script attempts installation via `winget` if missing.
 - **Internet access** to `gist.github.com`, `api.github.com`, `downloads.dell.com`, `ftp.ext.hp.com`, and `download.lenovo.com` for the first deployment on a fresh machine. On a machine whose state file is present and whose local safety checks pass, an outage does not prevent the run. All five external artifacts can be self-hosted; see **[Self-hosting](docs/self-hosting.md)**.
 - **Windows is in a normal-running state.** The script defers on OOBE and Audit Mode.
@@ -222,7 +224,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -DryRun       # ele
 powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1               # elevated
 ```
 
-The examples above use Windows PowerShell 5.1 (`powershell.exe`). If you are running PowerShell 7, substitute `pwsh` for `powershell` — the script works with either, and the harness runs unelevated in both. The test harness runs unelevated; the production script needs elevation or SYSTEM.
+The examples above use Windows PowerShell 5.1 (`powershell.exe`). If you are running PowerShell 7, substitute `pwsh` for `powershell` — the script works with either, and the harness runs unelevated in both when invoked directly. The production script needs elevation or SYSTEM. (The recommended wrapper, `WinRE-Manager.cmd`, launches the harness elevated for complete query results — see the wrapper's menu description above.)
 
 ### One-liners (no local clone)
 

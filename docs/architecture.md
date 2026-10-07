@@ -27,7 +27,7 @@ Everything below is designed around those two requirements.
 
 The production script runs one of four control-flow paths. Three of them are short-circuits; the full-update path is the long one.
 
-Before any of those paths is chosen, eight things happen in order: the elevation guard runs, the log directory is created, the program lock is acquired, the Audit Mode guard runs, the hardware identity and architecture are resolved, the architecture gate runs, the `LocalInputsId` is computed, and the drive-letter cleanup runs. The elevation guard, the Audit Mode guard, and the architecture gate are read-only gates that can terminate the run early; the log-directory creation, the `LocalInputsId` computation, and the drive-letter cleanup are normalisations that do not defer.
+Before any of those paths is chosen, the following run in order: the elevation guard, the log-directory creation, the program lock, the Audit Mode guard, the hardware identity and architecture resolution, the architecture gate, the `LocalInputsId` computation, the driver-manifest fetch, VMD detection, the required-VMD-driver-set resolution, and the recovery-volume drive-letter cleanup. The elevation guard, the Audit Mode guard, and the architecture gate are read-only gates that can terminate the run early; the log-directory creation, the `LocalInputsId` computation, and the drive-letter cleanup are normalisations that do not defer. The manifest fetch, VMD detection, and required-driver resolution are described in their own sections below; they run between the `LocalInputsId` computation and the drive-letter cleanup.
 
 The **elevation guard** (v48 patch 2) is the first thing that runs, inside the outer `try` block, before the program lock, before hardware probes, and before any network fetch. On refusal it creates the log directory itself, solely so its FATAL message has somewhere to be written. It checks whether the current process has the Administrator role via `[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)`. If not, it writes a single FATAL log line and exits `EXIT_FATAL` in milliseconds. The guard exists because an unelevated launch would otherwise proceed through hardware detection, manifest fetch, VMD detection, and the multi-minute GitHub base-WIM download before failing at `Mount-WindowsImage` with "The requested operation requires elevation" — a failure mode that burned roughly four minutes per run across the 2026-10-05 field logs. The check accepts both interactive Administrator sessions and the SYSTEM context used by the scheduled task. Under `-DryRun` the guard still fires: DryRun avoids destructive operations but still reads partition tables, calls `reagentc /info`, and reads DISM metadata, all of which require elevation on some machines, and refusing unelevated DryRun keeps the behavior unambiguous.
 
@@ -49,7 +49,7 @@ BitLocker state is not consulted at startup. The v43 patch 5 (further revision 5
 
 Entered when: WinRE is enabled, the state file matches, the currently-registered recovery partition is **type-coded and** on the OS disk, exactly one **type-coded** recovery partition exists on the OS disk, and the currently-registered WinRE image's servicing metadata matches the `DeployedWinREMetadata` anchor recorded in the state file (v47).
 
-Effect: `Remove-StrayRecoveryPartitions` enforces the "no recovery partition on non-OS disks" invariant, any stale `PendingReboot` / `RepairAttempts` / `EnableFailureAttempts` counters and a stale `LastEnableResult` are cleared by a single state-file rewrite, and the script exits. This is a read-only scan plus, if needed, one small state-file write on a healthy machine.
+Effect: `Remove-StrayRecoveryPartitions` enforces the "no recovery partition on non-OS disks" invariant, any stale `PendingReboot` / `RepairAttempts` / `EnableFailureAttempts` counters and a stale `LastEnableResult` are cleared by a single state-file rewrite, and the script exits. This is a read-only scan of the OS disk plus, if needed, a state-file rewrite and a stray-partition cleanup on any non-OS disk. On a machine with no stray recovery partitions, the run makes no state changes at all.
 
 If the manifest fetch failed and the state file's local safety checks pass, the fast path can also fire under the **offline fallback** (v44 patch 5). The script trusts the state file's stored `DesiredStateId` directly, skips the OEM pack resolution and VMD detection (both require the manifest), and exits `EXIT_WARNING` because `$Script:offlineFallback = $true`. Under v47 the offline fast path additionally requires a state file whose `DeployedWinREMetadata` anchor matches the currently-registered image's metadata; a state file written by v46 or earlier has no anchor and forces a rebuild on the first v47 run regardless of network state. From the second v47 run onward the offline check is metadata-based. As of v48 patch 1, the offline fast path additionally requires the state file's stored `LocalInputsId` to match the current locally-computable inputs; a mismatch defers with `EXIT_WARNING` rather than taking the fast path with a stale `DesiredStateId`. The machine is unchanged; the exit code signals that the fast path was taken without a live manifest fetch. See the "Control-flow invariants" section and [state-and-idempotency.md](state-and-idempotency.md) for the residual risk.
 
@@ -108,7 +108,7 @@ Under `-DryRun` the check logs the enumeration error and continues; the exit is 
 
 The full-update path.
 
-**Scope note (v48).** The step numbers below are the narrative shape of the pipeline; the script's own `Write-Log` labels are a slightly different subset. The code emits `Step 1` through `Step 4` for the WIM-preparation stages, then `Step 5: Deploying WIM to ...`, `Step 6: Cleanup`, and `Step 7: Removing stray recovery partitions on non-OS disks`. The intervening "Ensure a suitable recovery partition" work (the doc's Step 5) has no log label; the code performs it silently between the code's Step 4 and Step 5. The doc's Step 5 through Step 8 therefore diverge from the code's Step 5 through Step 7 labels.
+**Scope note (v48).** The step numbers below are the narrative shape of the pipeline; the script's own `Write-Log` labels are a slightly different subset. The code emits `Step 2` through `Step 4` for the WIM-preparation stages, then `Step 5: Deploying WIM to ...`, `Step 6: Cleanup`, and `Step 7: Removing stray recovery partitions on non-OS disks`. There is no `Step 1` log line: Step 1 is a checkpoint write only, and the wipe itself is silent. The intervening "Ensure a suitable recovery partition" work (the doc's Step 5) has no log label; the code performs it silently between the code's Step 4 and Step 5. The doc's Step 5 through Step 8 therefore diverge from the code's Step 5 through Step 7 labels.
 
 **Step 1 — Wipe WorkDir.**
 Delete `<WorkDir>\mount` and `<WorkDir>\base.wim` under the workspace selected in this run. Checkpoint as `Step=1`.
@@ -191,7 +191,7 @@ Re-read WinRE state. Classify the registered location: `DEDICATED` (recovery par
 | **Log file** | `C:\ProgramData\OEM\Logs\WinRE-Manager.log` | Append-only event log. | Rotated by the operator, not by the script. |
 | **Program lock file** | `C:\ProgramData\OEM\Logs\WinREManager.lock` | Exclusive-handle target for the single-instance guarantee (v44 patch 4). | Persists across runs; the file's existence is not the lock, the open handle is. |
 | **Partition deferral marker** | `C:\Recovery\OEM\winre_partition_deferred.json` | Suppresses identical retries of the pre-shrink deferral while the old route remains verified functional (v45 patch 1). | Persists across runs until cleared; cleared on DSI mismatch, on the route becoming non-functional, or when the fast path would fire. |
-| **WorkDir** | Selected at run time from an eligible fixed NTFS volume on an allowlisted internal/virtual bus; recorded in the checkpoint. | Scratch space for mounts, downloads, and intermediate WIMs. | Deleted at Step 6. |
+| **WorkDir** | Selected at run time from an eligible fixed NTFS volume on an allowlisted internal/virtual bus; recorded in the checkpoint. | Scratch space for mounts, downloads, and intermediate WIMs. | Deleted after deployment, before the stray-partition cleanup. |
 
 See [state-and-idempotency.md](state-and-idempotency.md) for the schemas and the crash-consistency model.
 
@@ -307,11 +307,13 @@ For the duration of that window, WinRE is not registered: `reagentc /info` reads
 - Image mount, third-party driver strip, current-recipe injection, ResetBase, export, `WIM_READY` checkpoint, `base.wim` cleanup.
 - Registered-source fingerprint capture.
 - Read-only geometry plan, free-space check, pre-shrink (with its sleep and defrag retries), post-shrink verification and actual-geometry recomputation.
-- Pre-deletion inventory, pre-deletion resolver guard.
+- Pre-deletion resolver guard (v46 patch 2; placement moved ahead of the pre-shrink by v48 patch 1).
 
 **Inside the window:**
 
 - (Nothing before this line runs after the pre-shrink but before the `/disable`; the fingerprint recheck is the first operation inside the window's entry, immediately before the `/disable` call itself.)
+- `reagentc /disable` and verify disabled.
+- Pre-deletion inventory (the diagnostic block that names each deletable partition, its size, label, used bytes, and `isWinRELocation` flag).
 - Partition delete.
 - Post-delete C: extension.
 - `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, drive-letter assignment.
@@ -332,7 +334,7 @@ This is the working rule. It is subordinate to 1–3 in that any conflict resolv
 
 **"Do no work unless needed"** — three tiers:
 
-- **Tier 1 (fast path).** State file matches, image is current, partition is correct. No WIM mounted, no partition touched, no `reagentc` call. Runtime is dominated by Windows' own CIM and PnP enumeration.
+- **Tier 1 (fast path).** State file matches, image is current, partition is correct. No WIM mounted, no OS-disk partition touched, no `reagentc` call. Runtime is dominated by Windows' own CIM and PnP enumeration.
 - **Tier 2 (enable-only).** Image current, WinRE disabled. Prepare the target partition and call `reagentc /enable`. No partition geometry change, no rebuild, no C: shrink.
 - **Tier 3 (full update).** The image is missing, stale, or the partition is wrong-sized. This is the only tier that does destructive work.
 

@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Current status
 
-**Production:** `WinRE.ps1` **v48 patch 2** (`ScriptVersion = 48`, `ScriptPatchLevel = "2"`).
+**Production:** `WinRE.ps1` **v48 patch 2** (`ScriptVersion = 48`, `ScriptPatchLevel = "2"`). Field-verified on Windows 11 24H2 (26100) and 25H2 (26200, 26300), and on Windows 10 22H2 (19045).
 **Harness:** `Test-WinRE.ps1` **v27**.
 
 The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker. Production and harness are deliberately decoupled: a harness move never forces a managed-machine rebuild.
@@ -433,7 +433,7 @@ Two conditional rebuild triggers apply:
 
 1. **A machine with a v47 patch 1 Step 3 checkpoint on disk** at the moment of the upgrade will have that checkpoint invalidated on its first v47 patch 2 run — legacy Step 3 checkpoints carry no source hash, and the new validator requires one. The run rebuilds from Step 2 against the current source. This is the correct convergence for a machine whose checkpoint lineage cannot be proven under the new rules; the alternative (accepting the checkpoint as-is) would leave the exact lineage ambiguity this patch exists to close.
 
-2. **A machine whose `Win32_ComputerSystemProduct.Version` field is padded** with trailing whitespace (observed: ASUS) and whose padded value is exactly four characters long sees a one-time `DesiredStateId` change from the Version-trim fix. The `HW` component changes from `<vendor>|<model>|1.0 ` (trailing space) to `<vendor>|<model>|UNKN` (the trimmed value is three characters, below the four-character machine-type length threshold). Those machines rebuild once on the next scheduled run. All other machines continue on the fast path.
+2. **A machine whose `Win32_ComputerSystemProduct.Version` field is padded** with trailing whitespace (observed: ASUS) and whose padded value is at least four characters long while its trimmed value is shorter than four sees a one-time `DesiredStateId` change from the Version-trim fix. The `HW` component changes from the four-character prefix of the padded value to `<vendor>|<model>|UNKN`, because the trimmed value falls below the four-character machine-type length threshold. Those machines rebuild once on the next scheduled run. All other machines continue on the fast path.
 
 ### Field verification
 
@@ -453,7 +453,7 @@ All four machines: `Operating mode: DEDICATED` at exit, exit code 0.
 
 ### Unchanged
 
-The deployed WIM production recipe is unchanged. The strip stage, the source-selection preference order, the metadata-based drift detector, the pre-`/disable` race detector, the three-source selection chain, and the `DeployedWinREMetadata` anchor are all unchanged. The state file schema is unchanged. The checkpoint file format is unchanged — the source hash was already an optional fifth field, present on `WIM_READY` checkpoints and now also present on Step 3 checkpoints. No `ScriptVersion` change. The successful-path partition geometry is unchanged; the extension-failure fallback path (see the corresponding bullets under `### Fixed`) creates a larger recovery partition when the fallback fires. The only DSI-affecting change is the Version-trim fix documented above, which affects only machines whose padded `Version` field is exactly four characters. The disabled-route race-detector residual (the fingerprint capture in `Get-RegisteredWinREFingerprint` is designed around the pre-`/disable` sequence, which a disabled-route run never reaches) remains a documented residual and is not changed by this patch.
+The deployed WIM production recipe is unchanged. The strip stage, the source-selection preference order, the metadata-based drift detector, the pre-`/disable` race detector, the three-source selection chain, and the `DeployedWinREMetadata` anchor are all unchanged. The state file schema is unchanged. The checkpoint file format is unchanged — the source hash was already an optional fifth field, present on `WIM_READY` checkpoints and now also present on Step 3 checkpoints. No `ScriptVersion` change. The successful-path partition geometry is unchanged; the extension-failure fallback path (see the corresponding bullets under `### Fixed`) creates a larger recovery partition when the fallback fires. The only DSI-affecting change is the Version-trim fix documented above, which affects only machines whose padded `Version` field is at least four characters long while its trimmed value is shorter than four. The disabled-route race-detector residual (the fingerprint capture in `Get-RegisteredWinREFingerprint` is designed around the pre-`/disable` sequence, which a disabled-route run never reaches) remains a documented residual and is not changed by this patch.
 
 ---
 
@@ -870,7 +870,7 @@ The harness's extraction cleanup, user-supplied `TestDir` protection, VMD-indete
 
 ## [v44 patch 6] — 2026-09-30
 
-> **Correction.** The claim in this entry that "the safety property — never leave a machine with no working recovery route — is preserved end-to-end without the guard" was found to be inaccurate on review. Removing the guard narrowed the safety envelope in a specific corner: C: encrypted, destructive replacement needed, destructive attempt fails after deletion, no successful retry. The correct response was eventually a reorder of the destructive sequence, not a reinstatement of the guard; that reorder shipped in [v45 patch 1](#v45-patch-1--2026-10-01). See [v44 patch 7](#v44-patch-7--2026-10-01) for the corrected statement, the field evidence, and the residual failure mode as it then stood.
+> **Correction.** This entry argues that removing the guard preserves the safety property end-to-end. That argument was found to be incomplete on review. Removing the guard narrowed the safety envelope in a specific corner: C: encrypted, destructive replacement needed, destructive attempt fails after deletion, no successful retry. The correct response was eventually a reorder of the destructive sequence, not a reinstatement of the guard; that reorder shipped in [v45 patch 1](#v45-patch-1--2026-10-01). See [v44 patch 7](#v44-patch-7--2026-10-01) for the corrected statement, the field evidence, and the residual failure mode as it then stood.
 
 Removes the v44 patch 3 destructive-path C: guard, makes Lenovo OEM-pack resolution distinguish five states, makes VMD hardware detection fail-closed, closes a Step 2 wedge left by interrupted runs, corrects the OS-fallback remediation wording, and mirrors the production changes into the harness as v18.
 
@@ -1338,4 +1338,4 @@ Two further Dell machines (a Pro Slim QCS1250 and a Vostro 16 5640) ran against 
 
 ## Earlier versions
 
-v27 through v40 introduced: the download exception-on-success fix, vendor-native extraction (Lenovo Inno Setup, HP SoftPaq), the Add-WindowsDriver return-shape workaround, recovery-partition attributes before drive-letter assignment, the 250 MiB free-space policy, `defrag /x` retry on shrink failure, and the tri-state BitLocker contract. Full engineering changelog is in the `.NOTES` block at the top of `scripts/WinRE.ps1`.
+v27 through v40 introduced: the download exception-on-success fix, vendor-native extraction (Lenovo Inno Setup, HP SoftPaq), the Add-WindowsDriver return-shape workaround, recovery-partition attributes before drive-letter assignment, the 250 MiB free-space policy, `defrag /x` retry on shrink failure, and the tri-state BitLocker contract. Per-release entries for v27 through v40 are not preserved in this file; the design invariants and Critical lessons (do not regress) list at the top of `scripts/WinRE.ps1` carry the reasoning behind the current design.

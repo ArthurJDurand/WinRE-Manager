@@ -41,7 +41,7 @@ The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPar
 - [ ] I have named **which of the four design invariants this PR strengthens**.
 - [ ] I confirm this PR **does not weaken any of rules 1–3**.
 - [ ] I have included the **test result that demonstrates the change behaves as claimed** — or, if the required test is the post-deletion failure test described in [`docs/testing.md`](docs/testing.md), I have said so explicitly and noted that this PR is **blocked until that test runs and its result is recorded**.
-- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings sit inside this gate.
+- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate.
 
 ## Invariants
 

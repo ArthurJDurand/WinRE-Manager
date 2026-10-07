@@ -21,8 +21,8 @@ labels: ['bug', 'needs-triage']
   - **Protection Status:** <!-- Protection On / Protection Off -->
   - **Conversion Status:** <!-- Fully Decrypted / Fully Encrypted / Encryption In Progress / Decryption In Progress / Encryption Paused / Decryption Paused -->
   <!-- C:'s state matters only on the OS-fallback route. On the enable-only and dedicated-partition routes, production targets the recovery partition directly and does not depend on C:'s state. -->
-- **Free space on C:** <!-- current free, in GiB, and total size of C: in GiB -->
-  <!-- Required if the run exited with a pre-shrink deferral (log line contains "Dedicated replacement deferred before partition deletion"). The free-space check refuses to shrink C: below a 3 GiB reserve, and the deferral reason names the projected post-shrink free space. -->
+- **Free space on the resize target:** <!-- current free, in GiB, and total size of the resize target in GiB -->
+  <!-- Required if the run exited with a pre-shrink deferral (log line contains "Dedicated replacement deferred before partition deletion"). The free-space check refuses to shrink the resize target below a 3 GiB reserve, and the deferral reason names the projected post-shrink free space. The resize target is C: on the ordinary path, or the intervening anchor partition (typically D:) on the v48 `C: | D: | Recovery` path. The deferral reason in the log names which: "OS partition (C:)" or "anchor partition (disk X part Y)". Report the free space and total size of the target the deferral reason names. -->
 - **Target recovery partition state:** <!-- run: .\scripts\Test-WinRE.ps1 and choose Option 1. Copy the "Target recovery partition state" block. -->
   <!-- This is the partition reagentc is registered to. It is what production prepares via Set-RecoveryPartitionReadyForWinRE. If the block says "BitLocker-managed", production will run manage-bde -off against it before calling reagentc /enable. -->
 - **VMD hardware present:** <!-- output of the harness Option 1 "VMD hardware presence" block, or "yes/no" from BIOS if the harness cannot be run. VMD presence is one of the DesiredStateId inputs. -->
@@ -30,7 +30,7 @@ labels: ['bug', 'needs-triage']
 - **State file fields:** <!-- if C:\Recovery\OEM\winre_state.json exists, paste: DesiredStateId, LastUpdated, LastEnableResult, and EnableFailureAttempts -->
   <!-- LastEnableResult and EnableFailureAttempts are optional in the JSON and default to "ok" / 0 if absent. LastUpdated distinguishes a run that reached the state-write point (timestamp newer than run start) from a deferral (timestamp unchanged). DesiredStateId is required for the maintainer to check whether the state file would be accepted on this machine. -->
   <!-- If you can run the harness, Option S "State file parity check" reports whether the on-disk state file matches the ID production would compute right now. As of v48 it also reports the stored and computed `LocalInputsId` so an offline-fallback mismatch can be diagnosed without running production. -->
-- **Checkpoint file (if present):** <!-- copy `C:\ProgramData\OEM\Logs\winre_checkpoint.txt` verbatim. It carries the staged step, the recorded `DesiredStateId`, the workspace path, the `WIM_READY` flag, and (v47 patch 1+) the recorded source-content hash. Relevant for v47 checkpoint-invalidation bugs (`Checkpoint step N source identity ... does not match the currently-selected source`) and stale-workspace resume issues. -->
+- **Checkpoint file (if present):** <!-- copy `C:\ProgramData\OEM\Logs\winre_checkpoint.txt` verbatim. It carries the staged step, the recorded `DesiredStateId`, the workspace path, the `WIM_READY` flag, and the recorded source-content hash. The fifth field (source hash) was introduced on `WIM_READY` checkpoints in v47 patch 1 and extended to Step 3 checkpoints in v47 patch 2. Relevant for v47 checkpoint-invalidation bugs (`Checkpoint step N source identity ... does not match the currently-selected source`) and stale-workspace resume issues. -->
 - **Partition deferral marker:** <!-- if C:\Recovery\OEM\winre_partition_deferred.json exists, paste its contents (the DesiredStateId and Since fields). If it does not exist, say so. -->
   <!-- The marker is written when a pre-shrink deferral suppresses identical retries across runs. Its presence explains why a subsequent run exited EXIT_WARNING without re-attempting the pre-shrink. -->
 - **Elevation:** <!-- Running as SYSTEM, as admin, unelevated -->
@@ -65,7 +65,7 @@ labels: ['bug', 'needs-triage']
 - `Deferring WinRE Manager: Windows is not in a normal-running state` — Audit Mode / OOBE / sysprep deferral.
 - `VMD hardware detection was indeterminate; deferring` — fail-closed VMD check. Include the enumeration error from the line above.
 - `OS-fallback deferred: C: could not be confirmed fully decrypted` — OS-fallback route refused. Include C:'s `Test-VolumeEncrypted` value.
-- `Dedicated replacement deferred before partition deletion (<Reason>)` — pre-shrink deferral. Include the exact `<Reason>` string, C:'s free space, and the total size of C:.
+- `Dedicated replacement deferred before partition deletion (<Reason>)` — pre-shrink deferral. Include the exact `<Reason>` string, the free space on the resize target named in that reason, and the total size of that target.
 - `Image injection did not complete. Stopping before Step 4` — Step 3 → Step 4 pipeline gate. Include the injection failure reason (OEM download, extraction, INF validation, or VMD driver download).
 - `Enable-only /enable failed (attempt N of 3)` or `Enable-only /enable refused with the BitLocker error` — enable-failure counter. Include the state file's `LastEnableResult` and `EnableFailureAttempts`.
 - `Offline fallback: the machine requires a full update` or `Offline fallback: using state file's stored DesiredStateId` — offline fallback. Include whether the machine was actually offline and the state file's `LastUpdated`.
@@ -112,7 +112,7 @@ paste here
 <summary>Test-WinRE.ps1 output</summary>
 
 ```
-paste here
+paste the interactive output here. Options 1 (System diagnostic) and S (State file parity check) are the most useful.
 ```
 
 </details>
