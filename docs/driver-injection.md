@@ -1,3 +1,8 @@
+---
+title: "Driver injection — WinRE Manager"
+description: "How WinRE Manager injects OEM WinPE driver packs and Intel VMD storage drivers into the recovery image, and the strip stage that normalizes the base."
+---
+
 # Driver injection
 
 WinRE Manager injects two kinds of drivers into the base WIM:

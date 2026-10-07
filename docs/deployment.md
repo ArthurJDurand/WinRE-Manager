@@ -1,3 +1,8 @@
+---
+title: "Deployment — WinRE Manager"
+description: "Deploy WinRE Manager on a single machine or a managed fleet: scheduled task XML, Intune, RMM, exit-code handling, and operator guidance."
+---
+
 # Deployment
 
 How to run WinRE Manager on a single machine or across a managed fleet.

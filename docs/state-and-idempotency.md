@@ -1,3 +1,8 @@
+---
+title: "State and idempotency — WinRE Manager"
+description: "WinRE Manager's DesiredStateId, state file, checkpoint, deferral marker, and the offline-fallback LocalInputsId field."
+---
+
 # State and idempotency
 
 WinRE Manager is idempotent via a single hash called `DesiredStateId`. Everything else — the state file, the checkpoint file, the deferral marker, the fast path — exists to make that hash work.

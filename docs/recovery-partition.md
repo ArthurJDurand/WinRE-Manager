@@ -1,3 +1,8 @@
+---
+title: "Recovery partition lifecycle — WinRE Manager"
+description: "Recovery partition sizing, the single-boundary geometry model, the shrink-first destructive pipeline, and every deferral reason in WinRE Manager."
+---
+
 # Recovery partition lifecycle
 
 This document covers how WinRE Manager decides what size a recovery partition should be, how it replaces one that is inadequate, and how it recovers if the destructive operations fail. The current design is the v45 patch 1 shrink-first pipeline, with the v46 patch 1 disk-end clamp applied to the geometry plan, the v46 patch 2 pre-deletion resolver guard and extension-fallback bucket cap applied to the destructive sequence, the v47 patch 1 three-source base-WIM selection and third-party driver strip stage applied to the image preparation that precedes the destructive work, and the v48 patch 1 intervening-anchor handling and transactional WIM replacement applied to the destructive sequence and the deploy step respectively.

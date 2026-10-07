@@ -1,3 +1,8 @@
+---
+title: "Exit codes — WinRE Manager"
+description: "WinRE Manager's four exit codes — EXIT_SUCCESS, EXIT_REBOOT_REQUIRED, EXIT_WARNING, EXIT_FATAL — with the sixteen exit-code-2 cases and orchestration policy."
+---
+
 # Exit codes
 
 WinRE Manager returns one of four exit codes. Orchestration should treat them as distinct outcomes, not as success/failure booleans.

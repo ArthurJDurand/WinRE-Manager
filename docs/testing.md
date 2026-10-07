@@ -1,3 +1,8 @@
+---
+title: "Testing — WinRE Manager"
+description: "Test-WinRE.ps1, the read-only harness for WinRE Manager: menu options, parser self-test, and the destructive-path regression tests."
+---
+
 # Testing
 
 `Test-WinRE.ps1` is WinRE Manager's read-only test harness. It shows you what the production script would see on a machine, without changing anything, so you can confirm the machine is in a state production can work with before you deploy. This document explains how to run it, what each menu option does, and what the results mean.

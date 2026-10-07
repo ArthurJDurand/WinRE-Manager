@@ -1,3 +1,8 @@
+---
+title: "Self-hosting — WinRE Manager"
+description: "Replace WinRE Manager's manifest, OEM maps, and base WIM repository with your own hosting. Trust model and air-gapped deployment procedure."
+---
+
 # Self-hosting the external dependencies
 
 WinRE Manager depends on five external artifacts that are hosted on GitHub by the project maintainer. All five can be replaced with self-hosted equivalents. This document explains the trust model, walks through each artifact, and gives the exact edit needed to point the scripts at your own hosting.

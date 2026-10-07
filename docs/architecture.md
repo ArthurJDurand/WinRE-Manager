@@ -1,3 +1,8 @@
+---
+title: "Architecture — WinRE Manager"
+description: "WinRE Manager's design: the four design invariants, the four control-flow paths, the eight-step pipeline, and the state-carrying artifacts."
+---
+
 # Architecture
 
 WinRE Manager is a single-file production script, an interactive command-line wrapper that launches it, a read-only test harness, and three map builders. This document explains the design — why the script makes the choices it does, what invariants it maintains, and what state it carries between runs. The wrapper (`scripts/WinRE-Manager.cmd`) is a launcher, not a fifth control-flow path: it runs the production script or the harness in response to a menu selection and does not itself participate in the pipeline described here.

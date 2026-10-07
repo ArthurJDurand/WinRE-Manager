@@ -1,3 +1,8 @@
+---
+title: "Troubleshooting — WinRE Manager"
+description: "Per-symptom playbook for WinRE Manager: log signatures, causes, and recovery steps for every failure mode the script produces."
+---
+
 # Troubleshooting
 
 Per-symptom playbook for WinRE Manager. Each section names the symptom, the log lines to look for, the likely causes, and the resolution.
