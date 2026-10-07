@@ -86,11 +86,10 @@ flowchart TD
 | 💻 **A single-machine user**, repairing your own laptop | [Quick start](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/README.md#just-want-to-fix-winre-on-your-pc) — download, extract, double-click `WinRE-Manager.cmd` |
 | 🏢 **An IT admin or sysadmin**, deploying to a managed fleet | [Deployment](deployment.md) — run as `SYSTEM` under a scheduled task |
 | 🔧 **An MSP or sysadmin hosting your own inputs** | [Self-hosting](self-hosting.md) — own manifest, OEM maps, and base WIM repository |
-| 🔎 **Curious what the script will do** before running it live | [Architecture](architecture.md), then a `-DryRun` pass |
 
 ---
 
-## The four design principles
+## The four design invariants
 
 Every decision in the codebase follows these four rules, in this order:
 
@@ -105,20 +104,9 @@ Rules 1–3 are **invariants**: no code change may weaken them. Rule 4 is the **
 
 ## Safety by design
 
-The destructive path is surrounded by protections implemented in the code rather than relying on operator assumptions. Each of the following is enforced by the software, not left to operator discretion.
+The destructive path is surrounded by protections implemented in the code rather than relying on operator assumptions. Every preparation — planning the partition layout, resolving and verifying the driver artifacts, building and normalizing the candidate image — completes before WinRE is disabled or any partition is deleted. A failure before destruction leaves the old recovery route intact; a failure during the destructive sequence restores the previous state where the design can, and names the one residual corner it cannot close. The manager also refuses to run unelevated, on a non-x64 architecture, or concurrently with another instance, and it never modifies the OS volume's BitLocker state.
 
-- **Idempotent fast path.** A healthy machine exits without mounting a WIM, without modifying the OS-disk partition layout, and without issuing a `reagentc` mutation.
-- **Plan before change.** A read-only geometry plan runs before WinRE is disabled or any partition is deleted, and refuses layouts it cannot prove safe.
-- **Reversible failure window.** The C: pre-shrink runs before `reagentc /disable` and before any deletion. A failed pre-shrink leaves the old route intact.
-- **Fail closed on the destructive sequence.** If the active WinRE route or the OS partition cannot be resolved, the sequence stops before touching the disk.
-- **Transactional WIM replacement (v48).** The active route's WIM is preserved as a rollback copy before the new one is staged. On a copy failure, the previous WIM is restored from the rollback copy and hash-verified; a rollback-restore failure is reported separately.
-- **Targeted.** WinRE is prepared on its *target* volume. C:'s BitLocker state is never modified.
-- **Isolated workspace.** Scratch uses internal fixed NTFS volumes only; USB, SD/MMC, network, and unknown-bus disks are excluded.
-- **Single instance.** A kernel-enforced file lock prevents two runs from colliding.
-- **Architecture gate (v48).** The manager refuses to run on any architecture other than x64, before any state mutation.
-- **Elevation guard (v48 patch 2).** An unelevated launch is refused in milliseconds with a clear message.
-
-Full safety model: **[Architecture](architecture.md)** and **[Recovery partition](recovery-partition.md)**.
+The full model — every protection, the code path that enforces it, and the residual corner the deliberate post-deletion failure test is intended to close — is documented in **[README — Safety by design](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/README.md#safety-by-design)**, **[Architecture](architecture.md)**, and **[Recovery partition](recovery-partition.md)**.
 
 ---
 

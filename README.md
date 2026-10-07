@@ -169,7 +169,7 @@ flowchart LR
 
 Full pipeline, checkpoints, and the state model: **[Architecture](docs/architecture.md)** and **[State and idempotency](docs/state-and-idempotency.md)**.
 
-## Design principles
+## Design invariants
 
 The whole design is organized around four rules, in this order:
 
