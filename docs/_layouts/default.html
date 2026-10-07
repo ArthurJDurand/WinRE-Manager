@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="{{ page.lang | default: site.lang | default: 'en' }}">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% if page.title %}{{ page.title }} | {% endif %}{{ site.title | default: 'WinRE Manager' }}</title>
+    {% if page.description %}<meta name="description" content="{{ page.description }}">{% endif %}
+    <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+</head>
+<body>
+    <div class="container-lg px-3 my-5 markdown-body">
+        {{ content }}
+    </div>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: false });
+        function renderMermaid() {
+            document.querySelectorAll('div.language-mermaid').forEach(function (block) {
+                var code = block.querySelector('code');
+                if (!code) { return; }
+                var div = document.createElement('div');
+                div.className = 'mermaid';
+                div.textContent = code.textContent;
+                block.replaceWith(div);
+            });
+            mermaid.run({ querySelector: '.mermaid' });
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', renderMermaid);
+        } else {
+            renderMermaid();
+        }
+    </script>
+</body>
+</html>
