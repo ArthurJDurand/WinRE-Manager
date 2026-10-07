@@ -50,9 +50,9 @@ WinRE Manager is designed to fail closed and refuses layouts it cannot prove saf
 
 | You are | Start here |
 |---|---|
-| **A single-machine user**, repairing your own laptop | [Just want to fix WinRE?](#just-want-to-fix-winre-on-your-pc) above — download, extract, double-click `WinRE-Manager.cmd`. No PowerShell required. |
-| **An IT admin or sysadmin**, deploying to a managed fleet | [Deployment](docs/deployment.md) — scheduled task XML, Intune, RMM, MDM. |
-| **An MSP or sysadmin hosting your own inputs** | [Self-hosting](docs/self-hosting.md) — your own manifest, OEM driver maps, and base WIM repository. |
+| 💻 **A single-machine user**, repairing your own laptop | [Just want to fix WinRE?](#just-want-to-fix-winre-on-your-pc) above — download, extract, double-click `WinRE-Manager.cmd`. No PowerShell required. |
+| 🏢 **An IT admin or sysadmin**, deploying to a managed fleet | [Deployment](docs/deployment.md) — scheduled task XML, Intune, RMM, MDM. |
+| 🔧 **An MSP or sysadmin hosting your own inputs** | [Self-hosting](docs/self-hosting.md) — your own manifest, OEM driver maps, and base WIM repository. |
 
 All three drive the same control flow on every machine.
 

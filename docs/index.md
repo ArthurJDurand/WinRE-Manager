@@ -81,10 +81,10 @@ flowchart TD
 
 | You are | You should read |
 |---|---|
-| **A single-machine user**, repairing your own laptop | [Quick start](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/README.md#just-want-to-fix-winre-on-your-pc) — download, extract, double-click `WinRE-Manager.cmd` |
-| **An IT admin or sysadmin**, deploying to a managed fleet | [Deployment](deployment.md) — run as `SYSTEM` under a scheduled task |
-| **An MSP or sysadmin hosting your own inputs** | [Self-hosting](self-hosting.md) — own manifest, OEM maps, and base WIM repository |
-| **Curious what the script will do** before running it live | [Architecture](architecture.md), then a `-DryRun` pass |
+| 💻 **A single-machine user**, repairing your own laptop | [Quick start](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/README.md#just-want-to-fix-winre-on-your-pc) — download, extract, double-click `WinRE-Manager.cmd` |
+| 🏢 **An IT admin or sysadmin**, deploying to a managed fleet | [Deployment](deployment.md) — run as `SYSTEM` under a scheduled task |
+| 🔧 **An MSP or sysadmin hosting your own inputs** | [Self-hosting](self-hosting.md) — own manifest, OEM maps, and base WIM repository |
+| 🔎 **Curious what the script will do** before running it live | [Architecture](architecture.md), then a `-DryRun` pass |
 
 ---
 

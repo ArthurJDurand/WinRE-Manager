@@ -1,11 +1,39 @@
 <script type="module">
-  const log = (...a) => console.log('[mermaid-init]', ...a);
+  /* ===================================================================
+     WinRE Manager — GitHub Pages client-side enhancements.
+
+     Two features are provided here, both independent of one another:
+
+       1. Mermaid diagram rendering.  Jekyll renders ```mermaid blocks
+          as <div class="language-mermaid"> wrappers around a
+          syntax-highlighted <pre><code> block.  mermaid.js looks for
+          <div class="mermaid"> elements, so we convert the Jekyll
+          output to the shape mermaid expects before initializing.
+          GitHub's own repository viewer includes mermaid.js and renders
+          the same file correctly; GitHub Pages does not, so this file
+          supplies it.
+
+       2. Copy buttons on every code block.  A small button is injected
+          into the top-right corner of each <pre> that contains a
+          <code> element.  Mermaid blocks are skipped: they are either
+          converted to SVG (nothing left to copy) or, if mermaid fails
+          to load, the raw text is visible for manual selection.
+
+     Both features run independently.  A failure in one does not block
+     the other.  Console logs are prefixed [mermaid-init] or [copy-init]
+     so they are easy to filter in the browser devtools.
+     =================================================================== */
+
+  /* -------------------------------------------------------------------
+     Feature 1: Mermaid diagrams
+     ------------------------------------------------------------------- */
+  const mermaidLog = (...a) => console.log('[mermaid-init]', ...a);
 
   (async () => {
     try {
-      log('loading mermaid from jsDelivr');
+      mermaidLog('loading mermaid from jsDelivr');
       const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
-      log('mermaid loaded', mermaid.version || '(no version property)');
+      mermaidLog('mermaid loaded', mermaid.version || '(no version property)');
       mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
 
       const convert = () => {
@@ -13,35 +41,30 @@
         // regardless of whether it is wrapped in <div class="language-mermaid">
         // (rouge output) or sits directly inside <pre> (plain output).
         const codes = document.querySelectorAll('code.language-mermaid');
-        log('candidate code blocks:', codes.length);
+        mermaidLog('candidate code blocks:', codes.length);
 
         codes.forEach((code, i) => {
           const text = code.textContent;
           const target = code.closest('pre') || code.closest('div.language-mermaid') || code.parentElement;
           if (!target || !text || !text.trim()) {
-            log('skipping block', i, 'no target or empty text');
+            mermaidLog('skipping block', i, 'no target or empty text');
             return;
           }
           const div = document.createElement('div');
           div.className = 'mermaid';
           div.textContent = text;
           target.replaceWith(div);
-          log('converted block', i, 'replaced', target.tagName);
+          mermaidLog('converted block', i, 'replaced', target.tagName);
         });
 
         const remaining = document.querySelectorAll('div.mermaid');
-        log('mermaid divs after conversion:', remaining.length);
+        mermaidLog('mermaid divs after conversion:', remaining.length);
         if (remaining.length === 0) {
-          log('nothing to render; dumping page state for diagnosis');
-          document.querySelectorAll('pre, code, [class*="language-"]').forEach(el => {
-            if ((el.className || '').includes('mermaid') || el.textContent.includes('flowchart')) {
-              log('  suspicious element:', el.tagName, el.className);
-            }
-          });
+          mermaidLog('nothing to render');
           return;
         }
         mermaid.run({ querySelector: 'div.mermaid' });
-        log('mermaid.run() called');
+        mermaidLog('mermaid.run() called');
       };
 
       if (document.readyState === 'loading') {
@@ -50,7 +73,160 @@
         convert();
       }
     } catch (e) {
-      log('failed:', e && e.message ? e.message : e);
+      mermaidLog('failed:', e && e.message ? e.message : e);
     }
   })();
+
+  /* -------------------------------------------------------------------
+     Feature 2: Copy buttons on code blocks
+     ------------------------------------------------------------------- */
+  const copyLog = (...a) => console.log('[copy-init]', ...a);
+
+  function injectCopyButtonStyles() {
+    // Style injection via JS keeps <style> out of <body>.  The layout's
+    // own <style> block lives in <head>; this appends a sibling there.
+    if (document.getElementById('copy-code-button-style')) { return; }
+    const style = document.createElement('style');
+    style.id = 'copy-code-button-style';
+    style.textContent = `
+      pre.has-copy-button {
+        position: relative;
+        padding-right: 4.5rem;
+      }
+      .copy-code-button {
+        position: absolute;
+        top: 0.5rem;
+        right: 0.5rem;
+        padding: 3px 8px;
+        font-family: inherit;
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1;
+        color: #24292f;
+        background: rgba(255, 255, 255, 0.85);
+        border: 1px solid rgba(27, 31, 36, 0.15);
+        border-radius: 6px;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.15s ease-in-out, background 0.15s ease-in-out, border-color 0.15s ease-in-out;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      pre.has-copy-button:hover .copy-code-button,
+      .copy-code-button:focus {
+        opacity: 1;
+      }
+      .copy-code-button:hover {
+        background: #f3f4f6;
+        border-color: rgba(27, 31, 36, 0.25);
+      }
+      .copy-code-button.copied {
+        background: #dafbe1;
+        border-color: rgba(35, 134, 54, 0.4);
+        color: #1a7f37;
+        opacity: 1;
+      }
+      .copy-code-button.failed {
+        background: #ffebe9;
+        border-color: rgba(207, 34, 46, 0.4);
+        color: #cf222e;
+        opacity: 1;
+      }
+      @media (hover: none) {
+        /* Touch devices have no hover; always show the button. */
+        pre.has-copy-button .copy-code-button {
+          opacity: 1;
+        }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  async function copyTextToClipboard(text) {
+    // Modern API first.  isSecureContext guards against a stale
+    // navigator.clipboard object in non-secure contexts (e.g. opening
+    // a downloaded HTML file directly).
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    // Fallback for everything else.  execCommand is deprecated but
+    // universally supported and works in the contexts where the async
+    // clipboard API is unavailable.
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    try {
+      document.execCommand('copy');
+    } finally {
+      document.body.removeChild(ta);
+    }
+  }
+
+  function addCopyButtons() {
+    injectCopyButtonStyles();
+
+    // Every <pre> that is not already processed and not inside a mermaid
+    // wrapper.  Inline <code> inside <p> is never matched because the
+    // selector requires the code to be inside a <pre>.
+    const preBlocks = document.querySelectorAll('pre:not(.has-copy-button)');
+    let added = 0;
+    preBlocks.forEach(pre => {
+      const code = pre.querySelector('code');
+      if (!code) { return; }
+
+      // Skip mermaid blocks whether converted (they are no longer <pre>)
+      // or not (still wrapped in .language-mermaid by kramdown/rouge).
+      if (code.closest('.language-mermaid')) { return; }
+      if (code.closest('.mermaid')) { return; }
+
+      pre.classList.add('has-copy-button');
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'copy-code-button';
+      button.textContent = 'Copy';
+      button.setAttribute('aria-label', 'Copy code to clipboard');
+
+      let resetTimer = null;
+      button.addEventListener('click', async () => {
+        const text = code.textContent;
+        try {
+          await copyTextToClipboard(text);
+          button.textContent = 'Copied!';
+          button.classList.remove('failed');
+          button.classList.add('copied');
+        } catch (e) {
+          copyLog('copy failed:', e && e.message ? e.message : e);
+          button.textContent = 'Failed';
+          button.classList.remove('copied');
+          button.classList.add('failed');
+        }
+        if (resetTimer) { clearTimeout(resetTimer); }
+        resetTimer = setTimeout(() => {
+          button.textContent = 'Copy';
+          button.classList.remove('copied', 'failed');
+          resetTimer = null;
+        }, 1500);
+      });
+
+      pre.appendChild(button);
+      added++;
+    });
+
+    copyLog('copy buttons added:', added);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', addCopyButtons);
+  } else {
+    addCopyButtons();
+  }
 </script>
