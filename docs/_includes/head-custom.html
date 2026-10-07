@@ -1,30 +1,56 @@
-<!-- Mermaid diagram support for GitHub Pages.
-     Jekyll renders ```mermaid fenced blocks as <div class="language-mermaid">
-     wrappers around a syntax-highlighted <pre><code> block. mermaid.js
-     looks for <div class="mermaid"> elements, so we convert the Jekyll
-     output to the shape mermaid expects before initializing.
-     GitHub's own repository viewer includes mermaid.js and renders the
-     same file correctly; GitHub Pages does not, so this file supplies it. -->
 <script type="module">
-    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  const log = (...a) => console.log('[mermaid-init]', ...a);
 
-    mermaid.initialize({ startOnLoad: false });
+  (async () => {
+    try {
+      log('loading mermaid from jsDelivr');
+      const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
+      log('mermaid loaded', mermaid.version || '(no version property)');
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
 
-    function renderMermaid() {
-        document.querySelectorAll('div.language-mermaid').forEach(function (block) {
-            var code = block.querySelector('code');
-            if (!code) { return; }
-            var div = document.createElement('div');
-            div.className = 'mermaid';
-            div.textContent = code.textContent;
-            block.replaceWith(div);
+      const convert = () => {
+        // Find every code element kramdown tagged with language-mermaid,
+        // regardless of whether it is wrapped in <div class="language-mermaid">
+        // (rouge output) or sits directly inside <pre> (plain output).
+        const codes = document.querySelectorAll('code.language-mermaid');
+        log('candidate code blocks:', codes.length);
+
+        codes.forEach((code, i) => {
+          const text = code.textContent;
+          const target = code.closest('pre') || code.closest('div.language-mermaid') || code.parentElement;
+          if (!target || !text || !text.trim()) {
+            log('skipping block', i, 'no target or empty text');
+            return;
+          }
+          const div = document.createElement('div');
+          div.className = 'mermaid';
+          div.textContent = text;
+          target.replaceWith(div);
+          log('converted block', i, 'replaced', target.tagName);
         });
-        mermaid.run({ querySelector: '.mermaid' });
-    }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', renderMermaid);
-    } else {
-        renderMermaid();
+        const remaining = document.querySelectorAll('div.mermaid');
+        log('mermaid divs after conversion:', remaining.length);
+        if (remaining.length === 0) {
+          log('nothing to render; dumping page state for diagnosis');
+          document.querySelectorAll('pre, code, [class*="language-"]').forEach(el => {
+            if ((el.className || '').includes('mermaid') || el.textContent.includes('flowchart')) {
+              log('  suspicious element:', el.tagName, el.className);
+            }
+          });
+          return;
+        }
+        mermaid.run({ querySelector: 'div.mermaid' });
+        log('mermaid.run() called');
+      };
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', convert);
+      } else {
+        convert();
+      }
+    } catch (e) {
+      log('failed:', e && e.message ? e.message : e);
     }
+  })();
 </script>
