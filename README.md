@@ -28,9 +28,9 @@ The wrapper opens a menu:
 
 | Option | What it does |
 |---|---|
-| **1 — Test harness** | Read-only diagnostics and self-tests. Changes nothing. |
-| **2 — Preview (DryRun)** | Walks the full production flow and prints every decision it would make — without shrinking, deleting, creating, formatting, or deploying anything. |
-| **3 — Run for real** | Performs the repair. Warns you first, requires you to type `RUN` to confirm, then does the work. |
+| **1 — Test harness** | Read-only checks of your Windows recovery setup. It does not modify WinRE, partitions, BitLocker, or Windows configuration. |
+| **2 — Preview (DryRun)** | Shows what the repair would do without making partition or WinRE changes. |
+| **3 — Run for real** | Performs the repair after showing a warning and requiring you to type `RUN`. |
 | **4 — Show recent log** | Prints the tail of the last run's log and offers to open it in Notepad. |
 | **5 — Quit** | Closes the wrapper. |
 
@@ -79,12 +79,14 @@ flowchart TD
     Fast -->|"WinRE registered, disabled"| EO["Tier 2 · enable-only<br/>prepare volume · re-register"]
     Fast -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
 
-    FP --> End["DEDICATED WinRE<br/>on a dedicated recovery partition"]
-    EO --> End
-    FU --> End
+    FP --> Dedicated["DEDICATED WinRE<br/>on a dedicated recovery partition"]
+    EO --> Dedicated
+    FU --> Dedicated
+    FU --> Fallback["OS-FALLBACK WinRE<br/>on C: · degraded but functional"]
 
     style Start fill:#1f6feb,stroke:#1f6feb,color:#fff
-    style End fill:#238636,stroke:#238636,color:#fff
+    style Dedicated fill:#238636,stroke:#238636,color:#fff
+    style Fallback fill:#9e6a03,stroke:#9e6a03,color:#fff
     style Hosted fill:#8957e5,stroke:#8957e5,color:#fff
 ```
 
@@ -127,7 +129,7 @@ A recovery environment that boots but cannot be navigated is barely a recovery e
 
 - **A missing recovery partition.** Some OEM images ship without one. WinRE Manager plans a replacement geometry, shrinks C: by the minimum required, and creates a dedicated recovery partition on the aligned boundary.
 - **An undersized recovery partition.** If the existing partition cannot hold the serviced WIM plus Microsoft's 250 MiB servicing margin, WinRE Manager replaces it. A partition that cannot meet the margin will fail the next Windows Update — accepting it would be worse than replacing it.
-- **A recovery partition separated from C: by a data partition (v48).** A machine laid out as `C: | D: | Recovery` is now handled automatically: the manager identifies `D:` as an *intervening anchor*, validates it against a strict set of read-only safety conditions, shrinks it from the right, and creates a new recovery partition adjacent to the shrunk anchor. The scope is deliberately narrow — exactly one intervening partition, no partition-moving, no anchor extension. Multi-intervening layouts (`C: | D: | E: | Recovery`) still defer stably with a named reason.
+- **A recovery partition separated from C: by a data partition (v48).** A machine laid out as `C: | D: | Recovery` is now handled automatically: the manager identifies `D:` as an *intervening anchor*, validates it against a strict set of read-only safety conditions, shrinks it from the right, and creates a new recovery partition adjacent to the shrunk anchor. The scope is deliberately narrow — exactly one non-recovery partition between C: and the recovery partition cluster, no partition-moving, no anchor extension. Multi-intervening layouts (`C: | D: | E: | Recovery`) still defer stably with a named reason.
 - **A recovery partition on a non-OS disk.** A stray type-coded recovery partition on a secondary disk can cause Startup Repair to point the BCD at the wrong image. WinRE Manager removes type-coded recovery partitions from non-OS disks.
 - **An OEM factory-restore volume carrying the recovery type code.** Recovery-typed partitions over 2 GiB are preserved for operator review — never deleted, never reused. Windows Setup recovery partitions are under 1.5 GiB; OEM factory volumes can be 7–20 GiB and may carry the same type code.
 
@@ -151,17 +153,19 @@ flowchart LR
     Check -->|"Nothing to fix"| Fast["Tier 1 — fast path<br/>no WIM · no OS-disk partition · no reagentc mutation"]
     Check -->|"WinRE registered, disabled"| Enable["Tier 2 — enable-only<br/>prepare volume · re-register"]
     Check -->|"WinRE missing or broken"| Full["Tier 3 — full update<br/>prepare · plan · shrink · rebuild · deploy"]
-    Fast --> End["DEDICATED WinRE<br/>on a dedicated recovery partition"]
-    Enable --> End
-    Full --> End
+    Fast --> Dedicated["DEDICATED WinRE<br/>on a dedicated recovery partition"]
+    Enable --> Dedicated
+    Full --> Dedicated
+    Full --> Fallback["OS-FALLBACK WinRE<br/>on C: · degraded but functional"]
 
     style Fast fill:#238636,stroke:#238636,color:#fff
-    style End fill:#238636,stroke:#238636,color:#fff
+    style Dedicated fill:#238636,stroke:#238636,color:#fff
+    style Fallback fill:#9e6a03,stroke:#9e6a03,color:#fff
 ```
 
 - **Tier 1 — fast path.** Health checks pass, the state file matches the current inputs, the image is current, the partition is correct. The run completes without mounting the WIM, modifying the OS-disk partition layout, or issuing a `reagentc` mutation. Runtime is dominated by Windows' own CIM and PnP enumeration.
 - **Tier 2 — enable-only.** The image is current, but WinRE is disabled. The script prepares the target recovery partition, re-registers the image, and calls `reagentc /enable`. No partition geometry change, no image rebuild, no C: shrink.
-- **Tier 3 — full update.** The image is missing, stale, or the recovery partition is wrong-sized. This is the only path that may perform destructive partition changes — and even here, every preparation completes before the first byte of the recovery partition is touched. If driver download fails, or OEM pack extraction produces zero INFs, or the base WIM cannot be verified, or the strip stage cannot prove zero third-party drivers remain, **the script stops before it touches the recovery partition** and the old recovery route stays intact.
+- **Tier 3 — full update.** The image is missing, stale, or the recovery partition is wrong-sized. This is the only path that may perform destructive partition changes — and even here, every preparation completes before the first byte of the recovery partition is touched. If driver download fails, or OEM pack extraction produces zero INFs, or the base WIM cannot be verified, or the strip stage cannot prove zero third-party drivers remain, **the script stops before it touches the recovery partition** and the old recovery route stays intact. If the destructive attempt runs but cannot create a dedicated partition, the machine ends in **OS-fallback** instead: WinRE is functional on `C:\Recovery\WindowsRE`, the run exits `EXIT_WARNING` (code 2), and the state file records `UsedOSFallback = true` so subsequent runs preserve that outcome rather than re-attempting the same destructive sequence.
 
 Full pipeline, checkpoints, and the state model: **[Architecture](docs/architecture.md)** and **[State and idempotency](docs/state-and-idempotency.md)**.
 
@@ -186,7 +190,7 @@ WinRE Manager's safety measures are implemented in the code rather than relying 
 - **Plan before change.** A read-only geometry plan runs before WinRE is disabled or any partition is deleted. The plan refuses layouts it cannot prove safe, and names the offending partition when it does.
 - **Reversible failure window.** The C: pre-shrink runs **before** `reagentc /disable` and **before** any deletion. A failed pre-shrink leaves the old recovery route intact.
 - **Fail closed on the destructive sequence.** If the active WinRE route cannot be resolved, or the OS partition cannot be resolved for the layout assertion, the sequence stops before touching the disk.
-- **Transactional WIM replacement (v48).** The active route's WIM is preserved as a rollback copy before the new one is staged; on any copy failure the previous WIM is restored and hash-verified.
+- **Transactional WIM replacement (v48).** The active route's WIM is preserved as a rollback copy before the new one is staged. On a copy failure, the previous WIM is restored from the rollback copy and hash-verified; a rollback-restore failure is reported separately.
 - **Targeted.** WinRE is prepared on its *target* volume. C:'s BitLocker state is never modified by the script.
 - **Isolated workspace.** Scratch uses internal fixed NTFS volumes only. USB, SD/MMC, network, FireWire, Fibre Channel, and unknown-bus disks are excluded.
 - **Single instance.** A kernel-enforced file lock prevents two runs from colliding on the same machine.

@@ -36,7 +36,7 @@
       mermaidLog('mermaid loaded', mermaid.version || '(no version property)');
       mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
 
-      const convert = () => {
+      const convert = async () => {
         // Find every code element kramdown tagged with language-mermaid,
         // regardless of whether it is wrapped in <div class="language-mermaid">
         // (rouge output) or sits directly inside <pre> (plain output).
@@ -63,14 +63,17 @@
           mermaidLog('nothing to render');
           return;
         }
-        mermaid.run({ querySelector: 'div.mermaid' });
-        mermaidLog('mermaid.run() called');
+        // Await the render call so the enclosing try/catch observes any
+        // mermaid parsing or rendering failure.  Without the await, the
+        // log line below would claim success even when rendering threw.
+        await mermaid.run({ querySelector: 'div.mermaid' });
+        mermaidLog('mermaid.run() completed');
       };
 
       if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', convert);
       } else {
-        convert();
+        await convert();
       }
     } catch (e) {
       mermaidLog('failed:', e && e.message ? e.message : e);

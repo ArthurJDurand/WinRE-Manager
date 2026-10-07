@@ -70,12 +70,14 @@ flowchart TD
     Fast -->|"WinRE registered, disabled"| EO["Tier 2 · enable-only<br/>prepare volume · re-register"]
     Fast -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
 
-    FP --> End["DEDICATED WinRE<br/>on a dedicated recovery partition"]
-    EO --> End
-    FU --> End
+    FP --> Dedicated["DEDICATED WinRE<br/>on a dedicated recovery partition"]
+    EO --> Dedicated
+    FU --> Dedicated
+    FU --> Fallback["OS-FALLBACK WinRE<br/>on C: · degraded but functional"]
 
     style Start fill:#1f6feb,stroke:#1f6feb,color:#fff
-    style End fill:#238636,stroke:#238636,color:#fff
+    style Dedicated fill:#238636,stroke:#238636,color:#fff
+    style Fallback fill:#9e6a03,stroke:#9e6a03,color:#fff
     style Hosted fill:#8957e5,stroke:#8957e5,color:#fff
 ```
 
@@ -109,7 +111,7 @@ The destructive path is surrounded by protections implemented in the code rather
 - **Plan before change.** A read-only geometry plan runs before WinRE is disabled or any partition is deleted, and refuses layouts it cannot prove safe.
 - **Reversible failure window.** The C: pre-shrink runs before `reagentc /disable` and before any deletion. A failed pre-shrink leaves the old route intact.
 - **Fail closed on the destructive sequence.** If the active WinRE route or the OS partition cannot be resolved, the sequence stops before touching the disk.
-- **Transactional WIM replacement (v48).** The active route's WIM is preserved as a rollback copy before the new one is staged; on any copy failure the previous WIM is restored and hash-verified.
+- **Transactional WIM replacement (v48).** The active route's WIM is preserved as a rollback copy before the new one is staged. On a copy failure, the previous WIM is restored from the rollback copy and hash-verified; a rollback-restore failure is reported separately.
 - **Targeted.** WinRE is prepared on its *target* volume. C:'s BitLocker state is never modified.
 - **Isolated workspace.** Scratch uses internal fixed NTFS volumes only; USB, SD/MMC, network, and unknown-bus disks are excluded.
 - **Single instance.** A kernel-enforced file lock prevents two runs from colliding.
@@ -126,7 +128,7 @@ Full safety model: **[Architecture](architecture.md)** and **[Recovery partition
 |---|---|---|
 | **Tier 1 — fast path** | The machine is healthy. | No WIM is mounted, the OS-disk partition layout is not modified, no `reagentc` mutation is issued. Runtime is dominated by Windows' own CIM and PnP enumeration. |
 | **Tier 2 — enable-only** | The image is current, but WinRE is disabled. | The target recovery partition is prepared, the image is re-registered, and `reagentc /enable` is called. No partition geometry change, no image rebuild, no C: shrink. |
-| **Tier 3 — full update** | The image is missing, stale, or the recovery partition is wrong-sized. | The only path that may perform destructive partition changes. Every preparation — OEM pack, VMD package, base WIM, strip stage, injection, export — completes **before** the first byte of the recovery partition is touched. If any preparation fails, the script stops and the old recovery route is preserved. |
+| **Tier 3 — full update** | The image is missing, stale, or the recovery partition is wrong-sized. | The only path that may perform destructive partition changes. Every preparation — OEM pack, VMD package, base WIM, strip stage, injection, export — completes **before** the first byte of the recovery partition is touched. If any preparation fails, the script stops and the old recovery route is preserved. If the destructive attempt runs but cannot create a dedicated partition, the machine ends in **OS-fallback** (WinRE on `C:\Recovery\WindowsRE`, exit code 2, degraded but functional). |
 
 Full pipeline, checkpoints, and the state model: **[Architecture](architecture.md)** and **[State and idempotency](state-and-idempotency.md)**.
 
