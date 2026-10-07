@@ -1,0 +1,30 @@
+<!-- Mermaid diagram support for GitHub Pages.
+     Jekyll renders ```mermaid fenced blocks as <div class="language-mermaid">
+     wrappers around a syntax-highlighted <pre><code> block. mermaid.js
+     looks for <div class="mermaid"> elements, so we convert the Jekyll
+     output to the shape mermaid expects before initializing.
+     GitHub's own repository viewer includes mermaid.js and renders the
+     same file correctly; GitHub Pages does not, so this file supplies it. -->
+<script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+    mermaid.initialize({ startOnLoad: false });
+
+    function renderMermaid() {
+        document.querySelectorAll('div.language-mermaid').forEach(function (block) {
+            var code = block.querySelector('code');
+            if (!code) { return; }
+            var div = document.createElement('div');
+            div.className = 'mermaid';
+            div.textContent = code.textContent;
+            block.replaceWith(div);
+        });
+        mermaid.run({ querySelector: '.mermaid' });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', renderMermaid);
+    } else {
+        renderMermaid();
+    }
+</script>
