@@ -188,16 +188,16 @@ For any of those details, read the log. See [troubleshooting.md](troubleshooting
 
 The pending-reboot path has its own exit logic. In order:
 
-1. Resolve the deployed target from the state file (`DeployedDiskNumber` / `DeployedPartitionNumber`, or `C:\Recovery\WindowsRE` for OS-fallback).
-2. Prepare the target:
+1. Check the repair-attempt count first. The state file's `RepairAttempts` is incremented before any other work. If the incremented value exceeds 3 (equivalently, the state file already records `RepairAttempts >= 3`), the run exits `EXIT_FATAL` immediately without attempting repair. This guard is a precondition on the whole pending-reboot path, not a post-condition on its outcome.
+2. Resolve the deployed target from the state file (`DeployedDiskNumber` / `DeployedPartitionNumber`, or `C:\Recovery\WindowsRE` for OS-fallback).
+3. Prepare the target:
    - **Dedicated partition:** call `Set-RecoveryPartitionReadyForWinRE` on the recorded partition. If it returns `$false` — the target could not be made unencrypted within the timeout — defer with `EXIT_WARNING` immediately.
    - **OS-fallback:** check C: via `Test-VolumeEncrypted`. If it does not return exactly `$false`, defer with `EXIT_WARNING` immediately. The deferral logs `Pending-reboot OS-fallback: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=…) - deferring without changing C: BitLocker state`. The script never modifies C:'s BitLocker state.
-3. Re-run `reagentc /enable` against the recorded path. If the retry succeeded and WinRE reports `Enabled`:
+4. Re-run `reagentc /enable` against the recorded path. If the retry succeeded and WinRE reports `Enabled`:
    - If `UsedOSFallback` was carried over from the state file → `EXIT_WARNING`.
    - Else if `nonFatalWarning` was set → `EXIT_WARNING`.
    - Else → `EXIT_SUCCESS`.
-4. If the retry still reports reboot-required → `EXIT_REBOOT_REQUIRED`.
-5. If the incremented repair-attempt count exceeds 3 (equivalently, the state file records `RepairAttempts >= 3`) → `EXIT_FATAL`.
+5. If the retry still reports reboot-required → `EXIT_REBOOT_REQUIRED`.
 
 Note that `PendingReboot` and `RepairAttempts` are recorded in the state file before the exit, so a machine that exits with code 3 due to too many repair attempts still has a state file reflecting the current repair count.
 
