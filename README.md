@@ -4,13 +4,13 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207.x-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
-[![Version](https://img.shields.io/badge/version-v49.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v49%20patch%201-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ArthurJDurand)
 
 📖 **[Full documentation →](https://ArthurJDurand.github.io/WinRE-Manager/)**
 
-WinRE Manager repairs, rebuilds, and maintains the **Windows Recovery Environment** — the built-in environment Windows uses for **Advanced startup**, **Reset this PC**, and **Startup Repair**. It services `winre.wim`, injects the OEM and Intel VMD drivers the recovery environment actually needs — including the touchpad and input drivers that let a technician navigate WinRE without a keyboard — verifies the registered recovery route, and keeps the recovery partition correctly sized. It runs on one machine, or as a scheduled SYSTEM task across a managed fleet. Safe to re-run: a machine that needs no work takes an idempotent fast path that mounts no WIM, does not modify the OS-disk partition layout, and does not disable, re-register, or enable WinRE.
+WinRE Manager repairs, rebuilds, and maintains the **Windows Recovery Environment** — the built-in environment Windows uses for **Advanced startup**, **Reset this PC**, and **Startup Repair**. When a rebuild is required and the source image passes the applicable safety checks, it services `winre.wim`, applies the OEM and Intel VMD drivers the recovery environment needs — including the touchpad and input drivers that let a technician navigate WinRE without a keyboard — verifies the registered recovery route, and keeps the recovery partition correctly sized. It runs on one machine, or as a scheduled SYSTEM task across a managed fleet. Safe to re-run: a machine that needs no work takes an idempotent fast path that mounts no WIM, does not modify the OS-disk partition layout, and does not disable, re-register, or enable WinRE.
 
 **Having this problem?** If you're seeing **"Windows could not find the recovery environment,"** **"The Windows RE image was not found,"** **"Unable to reset, no recovery image,"** a failed `reagentc /enable`, a **recovery partition too small after a Windows Update** (`0x80070643`), or **"Startup Repair cannot repair this computer automatically,"** you're in the right place. Every one of those is a real WinRE failure mode where the fix is a correctly serviced recovery image on a correctly sized recovery partition — not a Windows reinstall. See [What WinRE Manager fixes](#what-winre-manager-fixes) for the full list.
 
@@ -86,6 +86,7 @@ flowchart TD
     Fast -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
 
     FP --> Dedicated["DEDICATED WinRE<br/>on a dedicated recovery partition"]
+    FP --> Fallback
     EO --> Dedicated
     FU --> Dedicated
     FU --> Fallback["OS-FALLBACK WinRE<br/>on C: · degraded but functional"]
@@ -251,8 +252,12 @@ The examples above use Windows PowerShell 5.1 (`powershell.exe`). If you are run
 ### Backup and restore actions
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Backup  -BackupPath "D:\WinRE-Backups"
-powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Restore -BackupPath "D:\WinRE-Backups"
+# Backup — writes to a timestamped subdirectory of the supplied destination.
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Backup -BackupPath "D:\WinRE-Backups"
+# Restore — point at the specific timestamped directory produced by Backup,
+# not the backup root. Substitute the directory reported by the backup run
+# (e.g. D:\WinRE-Backups\2026-10-09_143000).
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Restore -BackupPath "D:\WinRE-Backups\<timestamp>"
 ```
 
 Backup captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar `backup.json` recording the source hash, size, and DISM servicing metadata. Restore validates the backup, resolves the current route, and writes the WIM back transactionally — it does not create a new partition or invent a replacement route. A usable current WinRE route must already exist.
@@ -277,7 +282,7 @@ Substitute the `Test-WinRE.ps1` URL to fetch the read-only harness, and drop `-D
 
 ### Fleet deployment
 
-Run `WinRE.ps1` as `NT AUTHORITY\SYSTEM` on a scheduled task triggered at boot and weekly. Ready-to-paste task XML and MDM guidance are in **[Deployment](docs/deployment.md)**. The wrapper's install option (`WinRE-Manager.cmd`, option **5**) does the same thing interactively and pins the task to a stable installed copy of the script, so the task survives deletion or relocation of the operator's local clone.
+Run `WinRE.ps1` as `NT AUTHORITY\SYSTEM` on a scheduled task. The deployment doc's XML template uses a boot trigger and a weekly trigger; the wrapper's install option (`WinRE-Manager.cmd`, option **5**) uses startup with a five-minute delay and a 30-day recurring trigger at 03:00, and pins the task to a stable installed copy of the script so the task survives deletion or relocation of the operator's local clone. Ready-to-paste task XML and MDM guidance are in **[Deployment](docs/deployment.md)**.
 
 ## Exit codes
 

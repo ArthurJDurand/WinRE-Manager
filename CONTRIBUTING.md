@@ -9,6 +9,8 @@ Thanks for considering a contribution. This project is a self-healing production
 3. Capture the log at `C:\ProgramData\OEM\Logs\WinRE-Manager.log`.
 4. Check [docs/troubleshooting.md](docs/troubleshooting.md).
 
+Before posting diagnostic output publicly, review it for sensitive information and redact personal identifiers, serial numbers, usernames, sensitive local paths, credentials, and any other data that should not be public. Never include a BitLocker recovery key, password, access token, or other secret in an issue or discussion.
+
 ## Questions and general discussion
 
 For deployment help, "does this work on X", design discussions, and other content that isn't a bug report or a feature request, use [GitHub Discussions](https://github.com/ArthurJDurand/WinRE-Manager/discussions). Bug reports and feature requests go to Issues, using the templates. Do not post security issues publicly - see [SECURITY.md](SECURITY.md).

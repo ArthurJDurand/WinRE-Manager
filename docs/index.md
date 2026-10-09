@@ -18,7 +18,7 @@ WinRE Manager services `winre.wim`, injects the OEM and Intel VMD drivers the re
 | **Fix WinRE on my own PC** | [Quick start (README)](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/README.md#just-want-to-fix-winre-on-your-pc) — download, extract, double-click `WinRE-Manager.cmd`. No PowerShell knowledge required. |
 | **Check my PC without changing anything** | [Testing](testing.md) — the read-only harness. |
 | **See what the repair would do before running it** | Run `WinRE-Manager.cmd` and pick **Option 3 — Preview plan (DryRun)**. |
-| **Back up WinRE before a repair** | Run `WinRE-Manager.cmd` and pick **Option 1 — Back up current WinRE**. Restores from the same wrapper via **Option 8 — Restore WinRE from backup** (visible when a valid backup exists). |
+| **Back up WinRE before a repair** | Run `WinRE-Manager.cmd` and pick **Option 1 — Back up current WinRE**. Restores from the same wrapper via **Option 8 — Restore WinRE from backup**, which is always present; the recovery row shows whether a default backup is available. |
 | **Run WinRE Manager on a schedule** | Run `WinRE-Manager.cmd` and pick **Option 5 — Install automatic maintenance**, which registers a SYSTEM scheduled task pinned to a stable installed copy of the script. Remove via **Option 6**. |
 | **Deploy to a managed fleet** | [Deployment](deployment.md) — scheduled task XML, Intune, RMM. |
 | **Host my own manifest, maps, or base WIM** | [Self-hosting](self-hosting.md). |
@@ -74,6 +74,7 @@ flowchart TD
     Fast -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
 
     FP --> Dedicated["DEDICATED WinRE<br/>on a dedicated recovery partition"]
+    FP --> Fallback
     EO --> Dedicated
     FU --> Dedicated
     FU --> Fallback["OS-FALLBACK WinRE<br/>on C: · degraded but functional"]
@@ -137,7 +138,7 @@ WinRE Manager exists because "reinstall Windows" is not a repair. The full error
 - **Recovery partition too small.** The partition cannot hold the serviced SafeOS image plus Microsoft's 250 MiB servicing margin. Frequently surfaced by Windows Update as `0x80070643` — the well-known example is the Windows 10 update KB5034441; the underlying failure is not KB-specific.
 - **"Startup Repair cannot repair this computer automatically."** The deployed WinRE lacks the storage-controller driver the machine needs.
 - **Missing or mis-sized recovery partition geometry.** Missing partition, undersized partition, recovery partition on a non-OS disk, recovery partition separated from C: by a data partition (v48 intervening-anchor path).
-- **A damaged or corrupted current WinRE.** The wrapper exposes a byte-for-byte **backup** (`WinRE-Manager.cmd` option **1**) and a transactional **restore** (option **8**, visible when a valid backup exists), so a failed repair can be rolled back to the captured state.
+- **A damaged or corrupted current WinRE.** The wrapper exposes a byte-for-byte **backup** (`WinRE-Manager.cmd` option **1**) and a transactional **restore** (option **8**, always present; the recovery row shows whether a default backup is available), so a failed repair can be rolled back to the captured state.
 
 Detailed write-ups:
 
@@ -172,7 +173,7 @@ Detailed write-ups:
 
 | Component | Version |
 |---|---|
-| `scripts/WinRE.ps1` | **v49** |
+| `scripts/WinRE.ps1` | **v49 patch 1** |
 | `scripts/Test-WinRE.ps1` (read-only harness) | **v28** |
 | `scripts/WinRE-Manager.cmd` | (interactive wrapper; ships with the release) |
 
@@ -208,7 +209,7 @@ Selected results. Full per-machine evidence: [Changelog](https://github.com/Arth
 | Lenovo | IdeaPad 3 15IAU7 (MT 82RK) | Win11 26200 | v46 patch 1 — the machine that motivated the plan-clamp fix |
 | (VM) | Hyper-V Win11 / Win10 MBR | Win11 26300 / Win10 19045 | v45 patch 1 — destructive path and MBR partition-attribute path verified end-to-end |
 
-The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines. **v49-specific field verification is pending** — the outstanding items are documented in the [v49 entry](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CHANGELOG.md#v49--2026-10-08): provenance-marker survival across a real Windows Update servicing event; two-version `iastorvd.inf` coexistence; the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour across the three flag-setting cases (outer catch, Ctrl+C, and the two `Invoke-RestoreAction` mid-transformation failure paths) and the two `finally`-never-runs interruption classes (hard kill, reboot), plus its clean-completion removal — Ctrl+C is the load-bearing case; the wrapper's backup and restore options with paths containing spaces; and the wrapper's install / reinstall of the permanent maintenance task. The remaining coverage gaps — post-deletion failure on the intervening-anchor path, the v48 multi-intervening and surplus rejections, the transactional-WIM rollback branch, and the architecture gate on ARM64 — are documented in [Testing](testing.md).
+The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines. **v49-specific field verification is pending** — the outstanding items are documented in the [v49 patch 1 entry](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CHANGELOG.md#v49-patch-1--2026-10-08): provenance-marker survival across a real Windows Update servicing event; two-version `iastorvd.inf` coexistence; the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour across the three flag-setting cases (outer catch, Ctrl+C, and the two `Invoke-RestoreAction` mid-transformation failure paths) and the two `finally`-never-runs interruption classes (hard kill, reboot), plus its clean-completion removal — Ctrl+C is the load-bearing case; the wrapper's backup and restore options with paths containing spaces; and the wrapper's install / reinstall of the permanent maintenance task. The remaining coverage gaps — post-deletion failure on the intervening-anchor path, the v48 multi-intervening and surplus rejections, the transactional-WIM rollback branch, and the architecture gate on ARM64 — are documented in [Testing](testing.md).
 
 ---
 

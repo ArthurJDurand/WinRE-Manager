@@ -36,9 +36,9 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behaviour may be reported to the community leaders responsible for enforcement by opening a private report at <https://github.com/ArthurJDurand/WinRE-Manager/security/advisories/new>.
+Instances of abusive, harassing, or otherwise unacceptable behaviour may be reported to the community leaders responsible for enforcement by emailing <ArthurJDurand@users.noreply.github.com>.
 
-Reports may also be sent by direct message to the repository owner on GitHub: <https://github.com/ArthurJDurand>.
+If you cannot use email, open an issue at <https://github.com/ArthurJDurand/WinRE-Manager/issues/new> requesting a private contact channel; a maintainer will reply and move the conversation to a private medium before any details are discussed.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

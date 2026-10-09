@@ -189,7 +189,7 @@ Under the v43 patch 5 (further revision 5) policy there is **no startup BitLocke
 
 The consequence for this document is that the resize sequence below is only entered on machines whose `ImageState` is `IMAGE_STATE_COMPLETE` (or absent) and whose OS volume is not a native-boot VHDX.
 
-**As of v44 patch 6, the destructive partition path does not consult C:'s BitLocker state.** No C: check runs before the destructive sequence begins. If the destructive sequence fails at any point and the run falls through to OS-fallback, the OS-fallback gate checks C: at that point and defers as designed.
+**As of v44 patch 6, the destructive partition path does not *gate* on C:'s BitLocker state.** When the destructive sequence will remove the current WinRE route (WinRE `Enabled` or a non-empty deletable set), the script calls `Test-VolumeEncrypted -MountPoint "C:"` and logs the result — the log line names C:'s measured state and explicitly records that C: encryption is not a veto for the dedicated-target path. No gate refuses the destructive sequence on C: encryption. If the destructive sequence fails at any point and the run falls through to OS-fallback, the OS-fallback gate checks C: at that point and defers as designed.
 
 ### 1. Read-only geometry plan
 
@@ -278,7 +278,7 @@ For each type-coded recovery partition the plan marked as deletable — GPT GUID
 
 **Delete-active-last ordering.** The currently active recovery partition — the one `$stateBefore.Location` resolves to — is moved to the end of the deletion list. If a mid-loop failure occurs, the active partition is still present and `Restore-PreviousWinRERoute` can try to re-enable it. This ordering depends on the pre-deletion resolver guard (step 3a) having successfully identified the active partition; the guard exists precisely to ensure that ordering is meaningful.
 
-A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is **not** in this loop. The type-code gate is applied before the loop and again inside it, as a redundant check. A label-only match is logged with the message "Skipping label-only recovery match on disk N partition M: recovery label alone does not authorize deletion." and the loop continues.
+A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is **not** in this loop. The type-code gate is applied in `Get-PartitionPlan`, which builds the `$reclaimable` list from type-coded partitions only; `Ensure-AdequateRecoveryPartition` iterates over `$plan.DeletableRecoveryPartitions`, so a label-only match is filtered out before the deletion list is built and never reaches the loop. The equivalent log line exists on the non-OS-disk path — `Remove-StrayRecoveryPartitions` logs `Stray-recovery cleanup: skipping non-OS-disk partition <disk>/<part> - label matches recovery but type code does not` — but the OS-disk destructive path has no equivalent because the type-code gate has already filtered label-only matches out.
 
 If a deletion fails, the script calls `Restore-OSPartitionSize -TargetSizeBytes $resizeTargetInitialSize -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber` and then `Restore-PreviousWinRERoute -PreviousState $stateBefore`, capturing both results separately (v46 patch 2). Three return shapes are possible:
 
@@ -370,13 +370,13 @@ Candidates in use are skipped, unless the letter is already owned by the target 
 
 **Each assignment method is verified against the target partition.** After `Set-Partition`, `Add-PartitionAccessPath`, or `diskpart assign letter=X`, the function re-queries the specific disk and partition and requires its `DriveLetter` to equal the letter just assigned. A bare `Test-Path "X:\"` is not sufficient: a mapped network drive at X: would resolve to the share and read as a successful assignment even though the target partition never received a letter.
 
-**Bail-outs.** At the top of each candidate iteration, the function aborts with a single ERROR if the target partition no longer exists, or if its disk is offline or not `Online`. Both cases would fail identically for all 26 candidates and produce 26 WARN lines; the bail-out returns `$null` immediately, and the caller handles it the same way as a genuine exhaustion.
+**Bail-outs.** At the top of each candidate iteration, the function aborts with a single ERROR if the target partition no longer exists, or if its disk is offline or not `Online`. Both cases would fail identically for all 23 candidates and produce 23 WARN lines; the bail-out returns `$null` immediately, and the caller handles it the same way as a genuine exhaustion.
 
 **Per-method error capture.** When all three methods fail for a given letter, the function logs the error from the last method: the exception message from the cmdlet, or a "returned but the letter did not resolve" note if the API succeeded without effect, or diskpart's stdout. The final log line reads `All three methods failed for <letter>: - <diagnostic>`, so an operator sees why the search is exhausting candidates rather than a bare "failed".
 
 **Preferred letter reuse.** If the current run has already held a drive letter on a recovery partition earlier in this run (tracked in `$Script:tempDriveLetters`), the helper prefers that letter over a fresh one from `Get-AvailableDriveLetter`. Windows caches letter-to-volume mappings in `MountedDevices`; reusing a letter the script held earlier is more likely to succeed cleanly than picking a fresh one, and it avoids the assign-remove-reassign churn that can leave stale entries. The fallback chain is unchanged: if the preferred letter fails, the helper moves on.
 
-If no drive letter can be assigned — all 26 candidates fail, or the function bailed out early — the script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
+If no drive letter can be assigned — all 23 candidates fail, or the function bailed out early — the script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
 
 ### 10. Verify encryption state (early check)
 

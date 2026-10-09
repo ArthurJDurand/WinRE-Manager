@@ -103,9 +103,13 @@ Path: `C:\Recovery\OEM\winre_state.json`.
     "LastEnableResult":         "ok",
     "EnableFailureAttempts":    0,
     "DeployedWinREMetadata":    "10.0.26100.9545|9545",
-    "LocalInputsId":            "<64-char hex>"
+    "LocalInputsId":            "<64-char hex>",
+    "ForeignSourceAcceptedHash":"<SHA256 hex>",
+    "LineageId":                "<identifier>"
 }
 ```
+
+`ForeignSourceAcceptedHash` and `LineageId` are the v49 additions. Both are optional. `ForeignSourceAcceptedHash` is written only when the source-ownership classification preserved a `Foreign-With-Drivers` source: it records the preserved source's hash so the next run recognizes the accepted foreign source and takes the fast path. `LineageId` is a persistent identifier generated on the first v49 deploy and embedded in the provenance marker written into the deployed image; it is carried forward across runs on every subsequent state write. Both fields default to `$null` when absent, so a state file written by v48 or earlier is accepted without triggering a rebuild.
 
 `DeployedDiskNumber` and `DeployedPartitionNumber` are present only when the deployment reached a dedicated recovery partition. They are used by the pending-reboot path to re-point `reagentc /setreimage` at the correct location after a reboot. They are absent from an OS-fallback state file, because the fallback target is `C:\Recovery\WindowsRE` — a path, not a partition by number.
 
@@ -117,7 +121,7 @@ The field is absent on v46-and-earlier state files. Its absence forces a rebuild
 
 `LocalInputsId` (v48 patch 1) records a hash over the three deployment inputs observable on the local machine without a network fetch: hardware identity (`Manufacturer|Model|MachineType`), OS build, and CPU vendor/generation. VMD presence is deliberately excluded because its detection depends on the manifest's `requiredDevices` patterns, which the offline fallback does not have. The field is written by every `Write-WinREState` call and read only on the offline fallback path. On that path, the run recomputes the hash from the current machine and compares it against the stored value; a mismatch defers with `EXIT_WARNING` rather than taking the fast path with a `DesiredStateId` that describes a machine whose hardware or OS has since changed. The field defaults to `$null` when absent, so a state file written by a v47 or earlier script is accepted without forcing a rebuild — the next successful online run populates it.
 
-The v46 patch 2 hardenings do not change the schema. The v47 patch 1 release adds two new fields: the state file's `DeployedWinREMetadata` field (described above) and the checkpoint file's optional fifth `SourceHash` field (described under "The v47 source-hash binding"). The v48 patch 1 release adds a third: the state file's `LocalInputsId` field (described above). **v49 does not change the schema.** None of the new deferral reasons introduced by these patches writes a new field; the reasons flow through the existing `Deferred` return path and, where applicable, through the existing `GeometryRestoreFailed` flag and state-file-invalidation mechanism.
+The v46 patch 2 hardenings do not change the schema. The v47 patch 1 release adds two new fields: the state file's `DeployedWinREMetadata` field (described above) and the checkpoint file's optional fifth `SourceHash` field (described under "The v47 source-hash binding"). The v48 patch 1 release adds a third: the state file's `LocalInputsId` field (described above). The v49 release adds two more optional state-file fields: `ForeignSourceAcceptedHash` (written only when a `Foreign-With-Drivers` source is preserved) and `LineageId` (the persistent lineage identifier embedded in the provenance marker). None of the new deferral reasons introduced by these patches writes a new field; the reasons flow through the existing `Deferred` return path and, where applicable, through the existing `GeometryRestoreFailed` flag and state-file-invalidation mechanism.
 
 ### Read semantics
 
@@ -205,7 +209,7 @@ If all offline conditions pass, the fast path fires and the run exits `EXIT_WARN
 
 The analogous transition applies for v49: a state file written under v48 has `SCRIPT=48`, so the offline fast path fails the DSI-match condition (`DesiredStateId` differs by the `SCRIPT` component) and the run exits `EXIT_WARNING` without further work. The first successful online v49 run writes the new DSI and subsequent offline runs can take the fast path.
 
-**The residual risk is closed by `LocalInputsId` as of v48 patch 1.** A machine whose local hardware changed while offline — a CPU swap, a BIOS update that flipped VMD, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — could under v44-v47 take the fast path with a stale `DesiredStateId`. The v48 patch 1 `LocalInputsId` field closes this: the offline path recomputes a hash over the three locally-observable deployment inputs (hardware identity, OS build, CPU vendor/generation) and defers with `EXIT_WARNING` when the stored and current values disagree. VMD presence is deliberately excluded because its detection depends on the manifest's `requiredDevices` patterns, which is precisely the input the offline fallback does not have. See [CHANGELOG.md](../CHANGELOG.md) under v48 patch 1 for the shipped field, and [architecture.md](architecture.md) "LocalInputsId (v48 patch 1)" for the full mechanism.
+**The residual risk is substantially closed by `LocalInputsId` as of v48 patch 1.** A machine whose local hardware changed while offline — a CPU swap, or a motherboard replacement that changed `Manufacturer` / `Model` / `MachineType` — could under v44-v47 take the fast path with a stale `DesiredStateId`. The v48 patch 1 `LocalInputsId` field closes that: the offline path recomputes a hash over the three locally-observable deployment inputs (hardware identity, OS build, CPU vendor/generation) and defers with `EXIT_WARNING` when the stored and current values disagree. VMD presence is deliberately excluded because its detection depends on the manifest's `requiredDevices` patterns, which is precisely the input the offline fallback does not have; a VMD flip that occurs while the machine is offline therefore remains a documented residual of the offline fallback, not a case this field catches. See [CHANGELOG.md](../CHANGELOG.md) under v48 patch 1 for the shipped field, and [architecture.md](architecture.md) "LocalInputsId (v48 patch 1)" for the full mechanism.
 
 ### VMD-query-indeterminate deferral does not write state (v44 patch 6)
 

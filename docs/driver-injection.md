@@ -53,7 +53,7 @@ For how to host your own manifest and OEM maps, see [self-hosting.md](self-hosti
 - **`drivers[].match.requiredDevices`** — array of device hardware IDs. The union of all `requiredDevices` values across all manifest entries is matched against present PnP devices in a single query; if any device matches, VMD hardware is considered present. A driver entry that declares `requiredDevices` is downloaded only when that machine-wide check succeeds. If `requiredDevices` is absent or empty on an entry, the VMD-presence filter is bypassed for that entry; the OS match and the Intel CPU-vendor / generation range still apply.
 - **`drivers[].driverUrl`** — URL to a `.7z` archive containing one or more driver INFs.
 
-**v49 note.** The `requiredDevices` patterns are one of the inputs the pre-deployment storage-applicability gate reads. A manifest that omits a controller present on your fleet will cause the gate to refuse the candidate on machines with that controller. Keep the patterns complete for the hardware you deploy to; a trimmed manifest is the most likely way a self-hoster triggers the applicability gate. See "The pre-deployment storage-applicability gate (v49)" below.
+**v49 note.** The `requiredDevices` patterns do not directly gate the candidate — the pre-deployment storage-applicability gate reads the candidate image's INFs and the machine's present SCSIAdapter-class devices — but the patterns influence the candidate's contents: a manifest that omits a controller present on your fleet will cause the VMD-detection step to classify the machine as having no VMD hardware, the VMD package will not be selected for injection, and the applicability gate will then refuse the resulting candidate on machines with that controller. Keep the patterns complete for the hardware you deploy to; a trimmed manifest is the most likely way a self-hoster triggers the applicability gate. See "The pre-deployment storage-applicability gate (v49)" below.
 
 ### VMD hardware presence (fail-closed as of v44 patch 6)
 
@@ -67,7 +67,7 @@ An indeterminate result means the correct driver set cannot be determined. The r
 
 Why fail-closed and not "assume absent": on a machine that genuinely has VMD hardware, guessing "absent" would select a driver set that omits the VMD package. The deployed WinRE would not be able to see the OS disk. That is the exact failure mode the v44 patch 1 `DesiredStateId` change was designed to prevent, and an empty device list from an errored enumeration is not evidence of absence. The cost of a deferral is one pipeline run; the cost of guessing wrong is a machine with a non-functional recovery environment. See [troubleshooting.md](troubleshooting.md) for the resolution.
 
-The harness's Option 1 diagnostic (v28) surfaces the machine's storage-controller enumeration alongside the manifest's VMD patterns, which is what the v49 applicability gate reads. See [testing.md](testing.md).
+The harness's Option 1 diagnostic (v28) surfaces the machine's storage-controller enumeration alongside the manifest's VMD patterns — the latter is what drives VMD detection and, indirectly, which drivers are injected into the candidate; the applicability gate then reads the candidate image's INFs and the machine's present SCSIAdapter-class devices. See [testing.md](testing.md).
 
 ## The OEM pack source
 
@@ -103,7 +103,7 @@ Selection: `$key = if ($Hardware.IsWin11) { "WinPE11" } else { "WinPE10" }`. The
 ```json
 {
     "Generated": "...",
-    "Count": 1,
+    "Count": 2,
     "Packs": {
         "WinPE1011": {
             "winpeVersion": "WinPE 10/11",
@@ -228,8 +228,8 @@ The Step 3 block runs in this order. The v49 additions are **bolded**:
 7. **Never-downgrade storage-driver check (v49).** Compare each storage-class driver in the final image against the pre-strip inventory, by INF basename. If any post-injection driver would be older, the candidate is discarded — dismounted with `-Discard`, the source preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`.
 8. Verify the injection success gate (`$Script:ImageInjectionComplete`).
 9. **Pre-deployment storage-applicability gate (v49).** The candidate must contain an INF matching one of the machine's present SCSIAdapter-class devices. A candidate that does not match is refused, dismounted with `-Discard`, and deferred.
-10. **Provenance marker write (v49).** If the `LineageId` is not yet set, generate one; write the marker into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. Non-load-bearing in v49: no gate reads it; a write failure is logged and the pipeline continues.
-11. ResetBase (only if injection succeeded).
+10. ResetBase (only if injection succeeded).
+11. **Provenance marker write (v49).** If the `LineageId` is not yet set, generate one; write the marker into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. The marker is not load-bearing in v49 — no gate in the current run reads it, and a write failure is logged and the pipeline continues — but it is read on subsequent runs by the source-ownership classifier.
 12. Dismount with `-Save`.
 
 If step 2 classifies the source as `Foreign-With-Drivers`, the pipeline exits immediately after the classification: the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, `ForeignSourceAcceptedHash` is recorded in the state file, and the run exits `EXIT_WARNING`. Steps 3–12 do not run. If step 3 fails, steps 4–12 never run — the candidate is discarded and the machine is unchanged. If step 7 detects a downgrade, the candidate is discarded; steps 8–12 do not run. If step 9 refuses, the candidate is dismounted with `-Discard` and the run defers; steps 10–12 do not run.
@@ -288,7 +288,7 @@ As of v47, Step 3 runs a strip stage between the mount and the injection, subjec
 Before any removal, the initial enumeration is logged as one line per package, with the published INF name, provider, version, and original filename. This is diagnostic:
 
 - It records what the source image contained before the strip. Under v47 the source is chosen by the source-selection logic in Step 2 (see [`architecture.md`](architecture.md) — "The v47 rebuild pipeline" — "Source selection"), so the inventory is a record of what that source contained.
-- Under v49, when the source classifies as `Foreign-With-Drivers`, the pre-strip inventory is not logged — the strip is skipped and the mounted image is preserved as-is. The classification decision itself is logged instead.
+- Under v49, when the source classifies as `Foreign-With-Drivers`, the strip's per-package pre-strip inventory is not logged — the strip is skipped and the mounted image is preserved as-is. The `Source-ownership decision: pre-strip third-party inventory: N package(s)` count line that the classifier itself produces is still emitted; the classification decision follows it.
 - Over time, the fleet logs answer whether Microsoft's WU servicing ever delivers a WinRE image with third-party driver packages already present. This is the empirical evidence that closed the original design's WU-migration concern; the strip is predicated on the observation that such packages are not currently delivered, and the inventory is how that observation would be falsified if it ever stopped being true.
 
 ### The hard gate
@@ -321,8 +321,8 @@ The strip runs **before** injection, in the same Step 3 block, when the source-o
 7. Run the never-downgrade storage-driver check.
 8. Verify the injection success gate.
 9. Run the pre-deployment storage-applicability gate.
-10. Write the provenance marker.
-11. ResetBase (only if injection succeeded).
+10. ResetBase (only if injection succeeded).
+11. **Provenance marker write (v49).** If the `LineageId` is not yet set, generate one; write the marker into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. The marker is not load-bearing in v49 — no gate in the current run reads it, and a write failure is logged and the pipeline continues — but it is read on subsequent runs by the source-ownership classifier.
 12. Dismount with `-Save`.
 
 If step 3 fails, steps 4–12 never run. The candidate is discarded; the machine is unchanged. If step 3 succeeds but step 8 fails, the injection failure gate fires — same exit code, same checkpoint rollback, same disk-state outcome, but the failure is attributed to the injection rather than to the strip. If step 7 detects a downgrade, the candidate is discarded before the success gate is evaluated. If step 9 refuses, the candidate is dismounted with `-Discard` and the run defers.
@@ -543,7 +543,7 @@ The machine is left exactly as it was before the run — WinRE is still in whate
 
 **Related to the v49 pre-deployment storage-applicability gate.** The gate runs on every candidate the pipeline is prepared to deploy. A candidate that does not contain an INF matching one of the machine's present SCSIAdapter-class devices is refused and discarded. The gate has never fired in the field; a field log of the refusal is high-signal. See "The pre-deployment storage-applicability gate (v49)" above.
 
-**Related to the v49 provenance marker write.** After the applicability gate passes and after ResetBase, the pipeline writes the provenance marker (if the `LineageId` is not yet set, it generates one) into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. The marker is not load-bearing in v49 — no gate reads it, and a write failure is logged and the pipeline continues. Its only current consumer is `Read-ProvenanceMarker`, which is called by the source-ownership classifier on a subsequent run.
+**Related to the v49 provenance marker write.** After the applicability gate passes and after ResetBase, the pipeline writes the provenance marker (if the `LineageId` is not yet set, it generates one) into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. The marker is not load-bearing in v49 — no gate in the current run reads it, and a write failure is logged and the pipeline continues — but it is read on subsequent runs by the source-ownership classifier via `Read-ProvenanceMarker`, which classifies a source carrying a matching marker as `Manager-Lineage`.
 
 **Before v44 patch 1** the pipeline continued to Step 4 and beyond even when injection failed, and relied on the state-write gate to prevent the state file from recording the run. That was not sufficient for the reasons above. The v44 patch 1 gate is the correction. The `base.wim` cleanup on the abort branch is the v44 patch 3 follow-up, and the Step 2 stale-file cleanup on the normal path is the v44 patch 6 follow-up. The v47 strip stage adds a parallel abort path that fires before injection is attempted. The v49 source-ownership classification narrows the strip to sources that are not foreign-with-drivers; the v49 never-downgrade check runs after injection and discards the whole candidate on a downgrade; the v49 applicability gate is the last refusal before the dismount commits the candidate.
 
