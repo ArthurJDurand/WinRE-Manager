@@ -1953,8 +1953,8 @@ Use it to:
 - Verify that the resolved OEM pack and VMD drivers are what you expect.
 - Verify that the classifier verdict matches what you believe the machine's state to be.
 - Verify that the Audit Mode guard would not defer a live run.
-- Verify that the v45 pre-shrink deferral would not fire on the next live run, by checking whether `Ensure-AdequateRecoveryPartition`'s dry-run plan line appears and what plan it reports.
-- Verify the v47 source-selection chain: the dry-run Step 2 block reports which source the run would prefer and names the LKG fallback.
+- **Not** verify from a dry run whether the v45 pre-shrink deferral would fire on the next live run. The pre-shrink sequence runs inside Step 5; the full-update path's DryRun choke point exits before Step 1. To see the plan's decision, run the script without `-DryRun` on a disposable VM.
+- **Not** verify the v47 source-selection chain from a dry run. The source selection runs inside Step 2; the full-update path's DryRun choke point exits before Step 1. The dry-run plan lists the source-selection step but does not execute it.
 
 The dry run does not write to the state file, the checkpoint file, or the deferral marker. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step:
 
@@ -1976,7 +1976,7 @@ Under DryRun the OS-fallback BitLocker gate is not reached. The full-update pipe
 
 The DryRun contract for the VMD-query-indeterminate deferral (v44 patch 6) is the same: the enumeration error is logged, and the run continues rather than exiting.
 
-Two v48 checks that run under `-DryRun` do **not** have a read-only carve-out and exit unconditionally:
+Three startup gates that run under `-DryRun` do **not** have a read-only carve-out and exit unconditionally:
 
 - **The elevation guard (v48 patch 2).** An unelevated dry run exits `EXIT_FATAL` in milliseconds with the same FATAL log line as a live run. DryRun avoids destructive operations, but it still reads partition tables, calls `reagentc /info`, and reads DISM metadata; refusing unelevated DryRun keeps the behavior unambiguous.
 - **The architecture gate (v48 patch 1).** A dry run on a non-x64 host exits `EXIT_WARNING` with the same `Unsupported OS architecture` line as a live run. The architecture is a property of the machine, not of the run mode, so the refusal is unconditional.
@@ -1984,7 +1984,7 @@ Two v48 checks that run under `-DryRun` do **not** have a read-only carve-out an
 
 The v48 `LocalInputsId` computation runs under `-DryRun` (the value is logged) but its comparison against the state file does not, because the offline fallback is not reachable in a dry run — the dry run always performs a live manifest fetch and never enters the offline path.
 
-The v49 source-ownership classification runs under `-DryRun` (the class is logged) but the strip stage does not, so a dry run reports which class the source would receive without performing the strip or preservation. The v49 never-downgrade storage-driver check and pre-deployment storage-applicability gate likewise compute their decisions under `-DryRun` and log the decision, but the injection and the deployment are not performed.
+None of the v49 pipeline refinements — the source-ownership classification, the never-downgrade storage-driver check, or the pre-deployment storage-applicability gate — run under `-DryRun`. They all sit inside Step 3, and the full-update path's DryRun choke point exits before Step 1. The dry-run plan's Step 3 line names them as planned steps but does not execute any of them. To see what a live run would decide on any of them, run the script without `-DryRun` on a disposable VM.
 
 The `-Action Backup` and `-Action Restore` actions do not have a DryRun mode. They are standalone actions invoked by the wrapper's SAFETY options, not pipeline stages; the DryRun contract applies to the Repair path (the default action). Running `-Action Backup` without a `-DryRun` flag is the correct invocation; adding `-DryRun` to a backup action is undefined. If a wrapper menu path is unclear, check the wrapper's screen — the backup and restore options state what they will do.
 

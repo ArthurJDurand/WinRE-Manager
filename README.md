@@ -72,7 +72,7 @@ flowchart TD
     Who -->|"IT admin / sysadmin"| Fleet["Scheduled deployment<br/>across a managed fleet"]
     Who -->|"MSP / advanced"| Hosted["Hosting your own<br/>manifest, maps, and base WIM"]
 
-    Single --> RunOne["Run WinRE-Manager.cmd<br/>Check · Preview · Repair"]
+    Single --> RunOne["Run WinRE-Manager.cmd<br/>Backup · Check · Preview · Repair"]
     Fleet --> RunFleet["Deploy WinRE.ps1 as SYSTEM<br/>via Scheduled Task / Intune / RMM"]
     Hosted --> RunHost["Configure your own<br/>self-hosted sources"]
 

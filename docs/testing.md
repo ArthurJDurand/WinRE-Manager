@@ -60,14 +60,14 @@ The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the m
 
 ### v28 changes
 
-Four changes, all downstream of the v49 cycle.
+Five changes, all downstream of the v49 cycle.
 
 - **`$ProductionScriptVersion` default bumped 48 -> 49.** The harness's `Get-DesiredStateId` mirror carries this default to track production's `$ScriptVersion`. Left at 48 it would report a false `DSI MISMATCH` for every state file v49 production writes, the same class of drift the earlier bumps corrected. This is the fifth correction in the same family (v21, v22, v23, v27, v28).
 - **`Get-StorageControllerDevices` mirror added.** Enumerates present SCSIAdapter-class devices and extracts the union of `HardwareID`, `CompatibleID`, and the `InstanceId` prefix up to the last backslash. Software and virtual controllers (`InstanceId` starting with `{GUID}\` or `SWD\`) are skipped, mirroring production's software-device filter. The mirror is used by the Option 1 VMD diagnostic and verified by the new parser self-test (Check 17).
 - **New VMD diagnostic section added to Option 1.** The section enumerates the machine's controllers (friendly name, InstanceId, and the union of IDs), then the manifest's VMD patterns, then the match verdict, then an advisory when VMD presence is false but SCSIAdapter-class devices are present. The advisory names the exact ASUS-incident shape: a controller that exists on the machine and does not match any manifest VMD pattern.
-- **New parser self-test check (Check 17) for the `Get-StorageControllerDevices` shape.** Verifies that the enumeration returns either NULL (an indeterminate result the caller must handle) or an array of objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. SKIP when zero devices are present — legitimate on some VMs.
+- **New parser self-test check (Check 17) for the `Get-StorageControllerDevices` shape.** The three possible outcomes are handled distinctly: a NULL return (an indeterminate PnP enumeration) records FAIL, an empty array records SKIP (legitimate on some VMs), and a populated array is verified to have objects each carrying `FriendlyName`, `InstanceId`, and `Ids`.
 
-Additionally, stale "v48" references in the architecture warning and the `Get-DesiredStateId` header comment were rewritten version-agnostically (they now say "production" rather than "production v48"), and the over-indented `try {` in the `Compare-WimServicingMetadata` self-test was fixed.
+Additionally, stale "v48" references in the architecture warning and the `Get-DesiredStateId` header comment were rewritten version-agnostically (they now say "production" rather than "production v48"); the over-indented `try {` in the `Compare-WimServicingMetadata` self-test was fixed; and the menu title and startup `Rule` were bumped to v28.
 
 The parser self-test count moves from seventeen checks to eighteen with the `Get-StorageControllerDevices` check.
 
@@ -489,7 +489,7 @@ Eighteen checks as of v28 (seventeen as of v25, sixteen as of v22, fifteen as of
 | 14 | CPU generation parser | Fourteen regression cases: 11th/12th/13th Gen, Core, Core Ultra, and negative cases for AMD/Celeron/Pentium/Xeon/Atom return the expected values. | v18 |
 | 15 | DesiredStateId | 64-hex, deterministic across repeat calls, VMD-sensitive, ScriptVersion-sensitive. | v18 |
 | 16 | Compare-WimServicingMetadata | Eight regression cases covering the DISM servicing-metadata comparison rules. | v25 |
-| 17 | Get-StorageControllerDevices shape | The enumeration returns either NULL (indeterminate) or an array of objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. SKIP when zero devices are present. | v28 |
+| 17 | Get-StorageControllerDevices shape | Handles the enumeration's three outcomes: a NULL return (indeterminate PnP enumeration) records FAIL, an empty array records SKIP, and a populated array is verified to have objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. | v28 |
 
 ### What a FAIL means
 
@@ -505,7 +505,7 @@ The most likely FAILs and their implications:
 - **Check 12 or 13 (Get-Disk / Get-Volume shape).** A property production reads has been removed or renamed. Production may misclassify a disk or a volume.
 - **Check 14 (CPU generation parser).** A CPU string no longer parses to the expected generation. `DesiredStateId` will contain a different `CPU=` value than intended, which will force a rebuild on machines whose state file was written under the previous parse. Investigate the raw CPU string (the diagnostic's Hardware section reports it) and extend the parser.
 - **Check 15 (DesiredStateId).** The DSI recipe has changed silently — a field dropped from the hash, or the output is no longer deterministic. This is a production correctness bug; do not deploy production to a fleet until the recipe is fixed.
-- **Check 17 (Get-StorageControllerDevices shape).** The `Get-PnpDevice` result shape has changed, or the software-device filter (`{GUID}\` and `SWD\` prefixes) has stopped matching. Production v49's storage-applicability gate uses this enumeration to decide whether the candidate image contains an INF matching the machine's controller; a shape change that removed or renamed `FriendlyName`, `InstanceId`, or `Ids` would silently degrade the harness's diagnostic output, and a change to the filter would change which devices count as the machine's storage controllers. Investigate the raw `Get-PnpDevice -Class 'SCSIAdapter' -PresentOnly` output.
+- **Check 17 (Get-StorageControllerDevices shape).** One of: the enumeration returned NULL (a transient PnP failure — re-run or investigate PnP service state); the `Get-PnpDevice` result shape has changed; the software-device filter (`{GUID}\` and `SWD\` prefixes) has stopped matching; or an unexpected exception was thrown during the enumeration. Production v49's storage-applicability gate uses this enumeration to decide whether the candidate image contains an INF matching the machine's controller; a shape change that removed or renamed `FriendlyName`, `InstanceId`, or `Ids` would silently degrade the harness's diagnostic output, and a change to the filter would change which devices count as the machine's storage controllers. Investigate the raw `Get-PnpDevice -Class 'SCSIAdapter' -PresentOnly` output.
 
 ### What a SKIP means
 

@@ -134,7 +134,7 @@ The release was driven by two converging lines of work. First, the ASUS-incident
 
   - **VMD diagnostic section added to Option 1.** Enumerates the machine's controllers before the manifest's VMD patterns, then the match verdict, then an advisory when VMD presence is false but SCSIAdapter-class devices are present — the exact ASUS-incident shape.
 
-  - **New parser self-test (Check 17).** `Parser: Get-StorageControllerDevices shape` verifies that the enumeration returns either NULL or an array of objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. SKIP when zero devices are present.
+  - **New parser self-test (Check 17).** `Parser: Get-StorageControllerDevices shape` handles the enumeration's three outcomes distinctly: a NULL return (indeterminate PnP enumeration) records FAIL, an empty array records SKIP, and a populated array is verified to have objects each carrying `FriendlyName`, `InstanceId`, and `Ids`.
 
   - **Stale "v48" references rewritten version-agnostically.** The architecture warning and the `Get-DesiredStateId` header comment no longer name a specific past version. Over-indented `try {` in the `Compare-WimServicingMetadata` self-test fixed.
 

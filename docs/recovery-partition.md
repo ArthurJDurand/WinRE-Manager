@@ -461,7 +461,7 @@ A machine whose WinRE is `Enabled` but registered to a different location is not
 
 ## Where the target partition is prepared for reagentc
 
-The destructive sequence above is only one of the paths that reaches `reagentc /enable`. The full-update path with an existing recovery partition, the enable-only path, and the pending-reboot repair path also call reagentc. Under the v43 patch 5 (further revision 5) policy, all of them prepare the target partition through the same helper: `Set-RecoveryPartitionReadyForWinRE`.
+The destructive sequence above is only one of the paths that reaches `reagentc /enable`. The full-update path with an existing recovery partition, the enable-only path, the pending-reboot repair path, and the v49 `-Action Restore` path also call reagentc. Under the v43 patch 5 (further revision 5) policy, all of them prepare the target partition through the same helper: `Set-RecoveryPartitionReadyForWinRE`.
 
 The helper is called at these sites:
 
@@ -470,6 +470,7 @@ The helper is called at these sites:
 - The pending-reboot repair path, on the partition recorded in the state file's `DeployedDiskNumber` / `DeployedPartitionNumber`.
 - Inside `Ensure-AdequateRecoveryPartition`, as a defensive early check described in step 10 above.
 - Inside `Restore-PreviousWinRERoute`, on the previous route's target partition, before the function re-registers and re-enables the route.
+- The v49 `-Action Restore` path, on the target recovery partition resolved from the current registered location, before the WIM is replaced. (Not applicable on the OS-fallback branch, where the target is C: and the OS-fallback gate applies instead.)
 
 Each call is the same: if the target is unencrypted, return immediately; otherwise run `manage-bde -off` against the target and poll for completion, up to 300 seconds.
 
@@ -581,7 +582,7 @@ The v45 destructive-path VM test remains the recommended next step before broad 
 
 **v48 patch 1 coverage.** The intervening-anchor happy path is field-verified on the AMD Ryzen 7 5825U machine that motivated it (2026-10-06), on the exact `C: | D: | Recovery` layout. The anchor shrank by 200 MiB, the recovery partition was recreated at the planned offset, and the whole-layout assertion passed against the shrunk anchor. The v48-specific destructive-adjacent paths that remain unexercised on any storage are: the intervening-anchor post-deletion failure behaviour (the same class of residual documented for the non-intervening path); the v48 multi-intervening rejection; the v48 surplus rejection; the transactional WIM replacement's rollback branch; and the architecture gate on ARM64 hardware. The remaining v47 gaps also stand, per the list above.
 
-**v49 coverage.** The v49 release adds a new startup refusal and a new pre-strip gate, but does not change the destructive resize sequence itself. Neither of the v49 additions has been exercised on physical hardware.
+**v49 coverage.** The v49 release adds four pipeline refinements — a startup refusal and three pre-deployment gates — but does not change the destructive resize sequence itself. None of the v49 additions has been exercised on physical hardware.
 
 - **The native-boot VHDX fail-closed gate.** Unexercised on VHDX-boot hardware. The gate is a startup refusal that fires before any partition or WinRE change. A live run on a VHDX-boot host should exit `EXIT_WARNING` with the topology-named refusal; a live run on a physical or pass-through volume should proceed unchanged. The gate has no `-DryRun` carve-out.
 - **The source-ownership classification.** Unexercised in the field. The classification runs before the strip stage; its decision determines whether the strip-and-reinject pipeline runs at all. The test shape is documented in [testing.md](testing.md): prepare four VMs, one for each ownership class, and confirm the classification decision matches the expected class. A `Foreign-With-Drivers` source is preserved as-is: the mounted image is dismounted with `-Discard`, no WIM is exported or deployed, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`.
