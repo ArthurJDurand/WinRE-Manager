@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 48 (v48 patch 2)
+    Version : 49.1 (v49 patch 1)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -191,6 +191,110 @@
                 old bytes would not change the outcome of an enable
                 failure.
 
+            - Native-boot VHDX fail-closed (v49). When the OS disk's
+                bus type is 'File Backed Virtual' AND at least one
+                other disk is on a non-virtual bus, the running OS is
+                natively booted from a VHD/VHDX stored on a physical
+                host disk. The cleanup and classification logic
+                assumes 'one OS disk; other disks are foreign' and
+                would treat the host's recovery partition as a stray
+                candidate. That assumption is invalid in this
+                topology. Every destructive partition operation is
+                refused before any state mutation. Detection runs in
+                Main immediately after the architecture gate; refusal
+                is a stable, named deferral (EXIT_WARNING). Do not
+                rely on user-configured SAN policy as the safety
+                mechanism; the application fails closed on its own.
+
+            - Source ownership gates destructive normalization (v49).
+                Strip and injection run only when the source WIM is
+                positively classified into one of: Manager-Owned
+                (staged source hash matches state.CurrentImageHash),
+                Manager-Lineage (valid provenance marker present),
+                or Foreign-No-Drivers (no positive ownership evidence,
+                but the source contains zero third-party drivers to
+                strip). A source classified Foreign-With-Drivers (no
+                positive ownership evidence and third-party drivers
+                present) is preserved: no strip, no injection, no
+                deployment; the state file records
+                ForeignSourceAcceptedHash so subsequent runs
+                recognize the accepted foreign source and exit
+                cleanly. This closes the ASUS class of failure, in
+                which unconditional strip removed an OEM-injected
+                storage driver the manifest did not reinject.
+
+            - Never downgrade a storage driver (v49). If the source
+                image contains a storage-class driver whose version
+                is equal to or newer than the candidate the manifest
+                would inject for the same hardware, injection of that
+                candidate is refused. The conservative response in
+                v49 is to preserve the entire image and exit
+                EXIT_WARNING rather than attempt a partial normalize;
+                finer-grained coexistence handling awaits the
+                two-version experiment described in the known gaps.
+
+            - Storage-driver applicability is a pre-deployment gate
+                (v49). Before deploying a candidate WIM, every
+                SCSIAdapter-class device on the machine is enumerated
+                and its hardware and compatible IDs are matched
+                against every INF in the mounted image's Windows\INF
+                directory (deep parse: [Manufacturer] -> per-arch
+                section -> HWID model entries). If any controller has
+                no matching driver, the candidate is rejected and
+                the run defers. The check is a necessary condition,
+                not a complete proof of storage visibility, but it
+                catches the ASUS-class failure before deployment.
+                The check fails closed: false negatives (a viable
+                candidate rejected) are preferred over false
+                positives (an unviable candidate accepted).
+
+            - Temporary resume task (v49 patch 1). A scheduled task
+                named "WinRE Manager - Resume" is registered once per
+                Repair or Restore run, after the Audit Mode guard and
+                before any work begins. It fires at boot + 1 minute and at a
+                one-shot T+1 hour trigger, and is deleted in the
+                finally block on any clean terminal exit from the
+                pipeline (SUCCESS, WARNING, REBOOT_REQUIRED, or a
+                FATAL exit taken inside Main). It is left registered
+                only when the run is interrupted: an unhandled
+                exception (the outer catch sets a persist flag),
+                Ctrl+C (a CancelKeyPress handler sets the same flag,
+                because PowerShell runs finally blocks but bypasses
+                catch blocks on Ctrl+C), a hard kill such as
+                taskkill /F (the finally block never runs), a
+                reboot mid-run (the OS terminates PowerShell), or a
+                Restore that returned cleanly but left the machine
+                mid-transformation (Invoke-RestoreAction sets the
+                flag directly when /setreimage fails after the WIM
+                has been replaced, or when /enable returns
+                failed/bitlocker after the WIM is in place; both
+                paths delete the state file, checkpoint, and
+                deferral marker so the retry starts from a clean
+                slate). The Ctrl+C distinction is load-bearing:
+                without the
+                CancelKeyPress handler, the finally block would
+                delete the task on exactly the interruption it
+                exists for. Network availability is deliberately not
+                required, so the offline fallback path can fire on
+                the resume attempt. The task's purpose is self-healing
+                an interrupted run that was killed after assigning a
+                drive letter, disabling WinRE, or deleting the old
+                recovery partition but before completing deployment
+                and re-enable. It is a crash-recovery hook, not a
+                retry-until-success mechanism: a clean exit deletes
+                the task and leaves the state file to govern the
+                next scheduled run, except for the two Restore
+                mid-transformation paths noted above.
+                Registration failure
+                is a non-fatal warning in the log and a
+                ChangesNotMade line in the run summary; it does not
+                set the exit code, because the resume task is a
+                per-run safety net, not a machine-state condition.
+                A leftover task with this name found at the next
+                run's registration step is logged as evidence that
+                the previous run was interrupted; the registration
+                step then overwrites it via -Force.
+
         Known gap:
             - The intervening-partition handling added in v48 has not been
                 exercised under a deliberate post-deletion failure on a
@@ -213,7 +317,32 @@
                 a retry. A targeted re-evaluation (marker caches the
                 resize target identity and planned shrink; next run
                 re-reads free space and retries only if resolved) is a
-                v49 candidate.
+                future candidate.
+            - v49 provenance marker survival is not yet proven. The
+                marker is written into the mounted image under
+                Sources\Recovery\WinRE-Manager\provenance.json during
+                Step 3 and is read back on a later run by the
+                source-ownership classifier. Microsoft documents
+                Sources\Recovery customizations as migrated into a
+                replacement WinRE during servicing, but no field test
+                has yet confirmed that this specific marker survives a
+                real WU WinRE servicing event. If the marker does not
+                survive, the effect is conservative: the source falls
+                through to the content-based classes, and a serviced
+                source that should have been normalized is preserved
+                rather than stripped. Exact-hash ownership
+                (Manager-Owned via state.CurrentImageHash) is the
+                strongest and only content-independent ownership gate;
+                the marker is a weaker additional signal (Manager-
+                Lineage). The provenance-marker survival test is what
+                closes this gap.
+            - Two-version storage-driver coexistence behavior is not
+                yet characterized. The v49 never-downgrade invariant
+                is the conservative constraint; it does not attempt to
+                enforce 'one driver per class' and does not attempt
+                fine-grained package removal. A controlled experiment
+                on two versions of iastorvd.inf is required before any
+                such rule is coded.
 
     Critical lessons (do not regress):
       - No 7-Zip for Lenovo/HP EXE extraction; use the vendor's EXE with
@@ -255,11 +384,41 @@
         and in place. The v48 transactional replacement exists because
         v47 could leave the machine with WinRE disabled and no usable
         WIM on the active route.
+      - Strip is only safe when ownership is proven. The ASUS incident:
+        a manifest-coverage gap combined with an unconditional strip
+        removed the machine's only working storage driver (iastorvd
+        20.2.8.1028, an Intel VMD package the manifest's requiredDevices
+        patterns did not recognize) and produced a WinRE that could not
+        see its own OS disk. Expanding the manifest would have fixed
+        that controller but not the class. The correct response is the
+        v49 source-ownership gate.
+      - Disk relationships must be proven before destructive operations,
+        not assumed. The native-boot VHDX incident: a cleanup function
+        designed for a 'one OS disk, other disks are foreign' model
+        deleted the host physical disk's recovery partition when the
+        running OS was natively booted from a VHDX. The correct
+        response is the v49 native-VHDX fail-closed gate.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # v49: action selector. 'Repair' (default) runs the existing
+    # repair pipeline. 'Backup' captures a byte-for-byte copy of the
+    # currently-registered WIM plus sidecar metadata. 'Restore'
+    # writes a backed-up WIM back to the currently-registered route.
+    # Backup and Restore are dispatched in Main immediately after the
+    # program lock and before any other pipeline work; they do not
+    # run the repair pipeline.
+    [ValidateSet('Repair','Backup','Restore')]
+    [string]$Action = 'Repair',
+
+    # v49: destination for -Action Backup, source for -Action Restore.
+    # Optional for Backup (defaults to $BackupDefaultPath below). For
+    # Restore, a value is required; the dispatcher refuses Restore
+    # with no path rather than guessing.
+    [AllowNull()][AllowEmptyString()][string]$BackupPath = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -271,8 +430,8 @@ $EXIT_REBOOT_REQUIRED  = 1
 $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
-$ScriptVersion    = 48
-$ScriptPatchLevel = "2"
+$ScriptVersion    = 49
+$ScriptPatchLevel = "1"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -301,6 +460,23 @@ $MaxManagedRecoveryPartitionMiB = 2048
 $LenovoWinPEMapUrl         = "https://gist.github.com/52250179/8211b75a38444caa68b8cebd7529376c/raw"
 $HPWinPEMapUrl             = "https://gist.github.com/52250179/07f9c3db08e5ef27daca1e7ff700af35/raw"
 $DellWinPEMapUrl           = "https://gist.github.com/52250179/52058dde0701c749be627c9601c5c925/raw"
+
+# v49: default destination for the -Action Backup mode. The wrapper
+# prompts and can pass an override; a scheduled task that invokes
+# -Action Backup without -BackupPath uses this default. The operator
+# is advised (in the wrapper prompt and in docs) to prefer an
+# external or secondary disk; the default is deliberately simple so
+# that an unattended invocation has a predictable destination.
+$BackupDefaultPath         = "C:\Backup\WindowsRE"
+
+# v49: WIM-relative path where the provenance marker is written
+# during Step 3 injection. Microsoft documents that Sources\Recovery
+# customizations are migrated into a replacement WinRE during
+# servicing, so this subtree is the strongest candidate for a
+# persistent lineage signal. It is written in v49 but no gate reads
+# it yet: exact-hash ownership (state.CurrentImageHash) is the
+# load-bearing control until the marker-survival experiment succeeds.
+$ProvenanceMarkerRelativePath = "Sources\Recovery\WinRE-Manager\provenance.json"
 
 $GitHubHeaders = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' }
 
@@ -343,6 +519,58 @@ $Script:RollbackWimPath        = $null
 # EXIT_WARNING rather than trusting a stale DesiredStateId.
 $Script:LocalInputsId          = $null
 
+# v49: run-summary accumulator. Populated by Initialize-RunSummary at
+# the top of Main, filled in by Set-RunSummaryField / Add-RunSummaryLine
+# as the run progresses, and rendered by Write-RunSummary from the
+# finally block. If the process exits before Initialize-RunSummary
+# (which cannot currently happen but is defended against), Write-
+# RunSummary is a no-op.
+$Script:RunSummary             = $null
+
+# v49: was this run a foreign-source acceptance (source preserved
+# rather than normalized)? Set by the ownership decision. The run
+# summary and the exit-code selection read this; no partition or
+# image gate reads it.
+$Script:ForeignSourceAccepted  = $false
+
+# v49: hash of a foreign source that was accepted (preserved, not
+# normalized) on this run. Set by the ownership decision when it
+# preserves a foreign source; carried forward by Write-WinREState
+# into the state file's ForeignSourceAcceptedHash field so the next
+# run's fast path accepts the registered hash. $null otherwise.
+$Script:ForeignSourceAcceptedHash = $null
+
+# v49 patch 1: temporary resume task. Created once per Repair or
+# Restore run, after the Audit Mode guard and before the Restore
+# dispatcher (so an interrupted Restore is recoverable), and before
+# hardware detection. Deleted in the finally block on a clean
+# terminal exit unless ResumeTaskShouldPersist was set. The flag is
+# set by: the outer catch on an unhandled exception; the
+# CancelKeyPress handler on Ctrl+C (PowerShell runs finally blocks
+# but bypasses catch blocks on Ctrl+C, so the handler is the only
+# way to preserve the task on that interruption); Invoke-
+# RestoreAction's two mid-transformation failure paths
+# (/setreimage failing after the WIM was replaced, or /enable
+# returning failed/bitlocker after the WIM was in place). A hard
+# kill such as taskkill /F leaves the task because the finally block
+# never runs; a reboot mid-run leaves it because the OS terminates
+# PowerShell. The task fires at boot + 1 minute and at a one-shot
+# T+1 hour trigger, giving an interrupted run a self-healing second
+# chance without a crash-loop. Only created for -Action Repair or
+# Restore and never under -DryRun.
+$Script:ResumeTaskName          = "WinRE Manager - Resume"
+$Script:ResumeTaskCreated       = $false
+$Script:ResumeTaskShouldPersist = $false
+
+# v49: persistent lineage identifier carried through the state file
+# and embedded in the provenance marker. Populated from state on
+# read; if absent, a fresh identifier is generated during Step 3.
+# The identifier is not a security boundary: the state file already
+# assumes local administrative control is not a hostile attacker.
+# It exists so that, once marker survival is proven, a serviced WIM
+# carrying the marker can be recognized as this manager's lineage.
+$Script:LineageId              = $null
+
 # =========================== LOGGING ===========================
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -353,6 +581,118 @@ function Write-Log {
     Write-Host $Msg
 }
 
+# v49: plain-language narration helper. Emits at INFO level, alongside
+# the existing technical lines. Use for phase-boundary prose a
+# non-technical reader can follow ("Checking hardware", "Nothing to
+# do", ...). Existing technical lines are unchanged; narration lines
+# are additive. The function exists so that `Select-String
+# 'Write-Narration'` enumerates every narration site, which keeps
+# narration coverage auditable across future edits.
+function Write-Narration {
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Log -Message $Message -Level INFO
+}
+
+# =========================== RUN SUMMARY ===========================
+# v49: run summary accumulator and renderer. The summary is emitted
+# from the finally block of Main so that every exit path (including
+# the elevation refusal and the outermost catch) produces a
+# structured summary, not just the success paths. Populated by
+# Set-RunSummaryField / Add-RunSummaryLine at decision points in
+# Main; rendered once by Write-RunSummary.
+#
+# Fields:
+#   Result          terminal outcome ("SUCCESS", "WARNING",
+#                   "REBOOT_REQUIRED", "FATAL", "DRY_RUN")
+#   Decision        the pipeline decision ("FAST PATH",
+#                   "ENABLE-ONLY", "FULL UPDATE", "DEFERRED",
+#                   "BACKUP", "RESTORE", "PREFLIGHT")
+#   Why             one-line reason for the decision
+#   WorkPerformed   list of actions taken (or considered under DryRun)
+#   ChangesMade     list of concrete machine-level changes
+#   ChangesNotMade  list of changes explicitly not made (preservation,
+#                   deferral, DryRun)
+#   OperatingMode   "DEDICATED" | "OS-FALLBACK" | "PRESERVED" | "N/A"
+#   NextAction      operator-facing next step, or "No action required."
+#   StartTime       when Initialize-RunSummary was called
+#
+# The summary is output only. No gate reads any RunSummary value.
+function Initialize-RunSummary {
+    $Script:RunSummary = @{
+        StartTime       = (Get-Date)
+        Result          = $null
+        Decision        = $null
+        Why             = $null
+        WorkPerformed   = [System.Collections.Generic.List[string]]::new()
+        ChangesMade     = [System.Collections.Generic.List[string]]::new()
+        ChangesNotMade  = [System.Collections.Generic.List[string]]::new()
+        OperatingMode   = $null
+        NextAction      = $null
+    }
+}
+
+function Set-RunSummaryField {
+    param(
+        [Parameter(Mandatory)][string]$Field,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    if ($Script:RunSummary -and $Script:RunSummary.ContainsKey($Field)) {
+        $Script:RunSummary[$Field] = $Value
+    }
+}
+
+function Add-RunSummaryLine {
+    param(
+        [Parameter(Mandatory)][ValidateSet('WorkPerformed','ChangesMade','ChangesNotMade')][string]$Field,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Line
+    )
+    if ($Script:RunSummary) { $Script:RunSummary[$Field].Add($Line) | Out-Null }
+}
+
+function Write-RunSummary {
+    if (-not $Script:RunSummary) { return }
+    $elapsed = (Get-Date) - $Script:RunSummary.StartTime
+    $runtime = "{0:hh\:mm\:ss}" -f $elapsed
+
+    $resultText        = if ($Script:RunSummary.Result)        { $Script:RunSummary.Result }        else { "(not set)" }
+    $decisionText      = if ($Script:RunSummary.Decision)      { $Script:RunSummary.Decision }      else { "(not set)" }
+    $whyText           = if ($Script:RunSummary.Why)           { $Script:RunSummary.Why }           else { "(not set)" }
+    $modeText          = if ($Script:RunSummary.OperatingMode) { $Script:RunSummary.OperatingMode } else { "(not set)" }
+    $nextText          = if ($Script:RunSummary.NextAction)    { $Script:RunSummary.NextAction }    else { "(not set)" }
+
+    Write-Log "============================================================"
+    Write-Log "WINRE MANAGER RUN SUMMARY"
+    Write-Log "============================================================"
+    Write-Log "Result:         $resultText"
+    Write-Log "Decision:       $decisionText"
+    Write-Log "Why:            $whyText"
+
+    if ($Script:RunSummary.WorkPerformed.Count -gt 0) {
+        Write-Log "Work performed:"
+        foreach ($line in $Script:RunSummary.WorkPerformed) { Write-Log "  - $line" }
+    } else {
+        Write-Log "Work performed: (none)"
+    }
+
+    if ($Script:RunSummary.ChangesMade.Count -gt 0) {
+        Write-Log "Changes made:"
+        foreach ($line in $Script:RunSummary.ChangesMade) { Write-Log "  - $line" }
+    } else {
+        Write-Log "Changes made: (none)"
+    }
+
+    if ($Script:RunSummary.ChangesNotMade.Count -gt 0) {
+        Write-Log "Changes NOT made:"
+        foreach ($line in $Script:RunSummary.ChangesNotMade) { Write-Log "  - $line" }
+    }
+
+    Write-Log "Operating mode: $modeText"
+    Write-Log "Next action:    $nextText"
+    Write-Log "Runtime:        $runtime"
+    Write-Log "============================================================"
+}
+
+# =========================== FILE HELPERS ===========================
 function New-DirectoryIfNotExists {
     param([string]$Path)
     if ($Script:DryRun) { Write-Log "[DRY RUN] Would create: $Path"; return }
@@ -448,6 +788,238 @@ function Set-Checkpoint {
     $content = "$Step|$DesiredStateId|$WorkDir|$checkpointFlag"
     if ($SourceHash) { $content = "$content|$SourceHash" }
     Write-FileAtomically -Path $CheckpointFile -Content $content
+}
+
+# =========================== NATIVE-BOOT VHDX GATE (v49) ===========================
+# Fail-closed detection of the native-boot VHDX topology. The running
+# OS disk is a file-backed virtual disk, and at least one other disk is
+# on a physical bus (not Virtual, not File Backed Virtual). In that
+# topology the OS disk is a VHD/VHDX stored on a host physical disk;
+# the host disk appears to the running OS as a non-OS disk. The
+# existing Remove-StrayRecoveryPartitions logic would treat the host
+# disk's recovery partition as a stray candidate and delete it. The
+# assumption that 'the OS disk is the only disk whose recovery
+# partitions are protected' does not hold here.
+#
+# Detection rules, in order:
+#   1. Query the OS partition via Get-OSPartition and its disk via
+#      Get-Disk. If the OS disk cannot be resolved, the topology is
+#      indeterminate. Fail closed: return $true with a specific reason.
+#   2. If the OS disk BusType is not 'File Backed Virtual', the
+#      topology is not the native-boot VHDX case. Return $false.
+#   3. Enumerate all other disks. If at least one of them has a BusType
+#      that is neither 'Virtual' nor 'File Backed Virtual' (i.e. a
+#      physical bus such as ATA, SATA, NVMe, RAID, SAS, SCSI, USB,
+#      SD/MMC, iSCSI, Fibre Channel, Spaces, SCM, etc.), return $true.
+#   4. If every other disk is Virtual or File Backed Virtual, the
+#      machine is a hypervisor guest whose entire storage stack is
+#      virtual (a Hyper-V VM, a VirtualBox VM, a VMware VM). This is
+#      the safe case: no physical host disk is visible, and the
+#      existing classification is correct. Return $false.
+#
+# Get-OSPartition is defined later in this file; PowerShell resolves
+# function references at call time, so this function can be defined
+# before Get-OSPartition without error as long as Main calls it after
+# both are defined (which it does).
+#
+# Return value: a hashtable with fields:
+#   IsNativeBootVirtual = $true if the fail-closed condition fires
+#   Reason              = human-readable explanation for the log
+#   OSBusType           = the OS disk BusType observed (or '(unresolved)')
+#   HostBusTypes        = array of non-virtual BusTypes observed on
+#                         other disks (empty when not applicable)
+function Test-NativeBootVirtualTopology {
+    $result = @{
+        IsNativeBootVirtual = $false
+        Reason              = ''
+        OSBusType           = '(unresolved)'
+        HostBusTypes        = @()
+    }
+
+    $osPart = Get-OSPartition
+    if (-not $osPart) {
+        $result.IsNativeBootVirtual = $true
+        $result.Reason = "OS partition could not be resolved; storage topology is indeterminate. Refusing to run because the relationship between the running OS disk and any host physical disk cannot be verified."
+        return $result
+    }
+
+    $osDisk = Get-Disk -Number $osPart.DiskNumber -ErrorAction SilentlyContinue
+    if (-not $osDisk) {
+        $result.IsNativeBootVirtual = $true
+        $result.Reason = "OS disk (disk $($osPart.DiskNumber)) could not be resolved; storage topology is indeterminate. Refusing to run because the relationship between the running OS disk and any host physical disk cannot be verified."
+        return $result
+    }
+
+    $osBusType = ''
+    try { $osBusType = [string]$osDisk.BusType } catch { }
+    if (-not $osBusType) {
+        $result.IsNativeBootVirtual = $true
+        $result.Reason = "OS disk (disk $($osPart.DiskNumber)) BusType could not be read; storage topology is indeterminate. Refusing to run because the relationship between the running OS disk and any host physical disk cannot be verified."
+        return $result
+    }
+    $result.OSBusType = $osBusType
+
+    if ($osBusType -ne 'File Backed Virtual') {
+        # Not a file-backed virtual OS disk. This is the ordinary case
+        # (physical OS disk, or a hypervisor guest with a virtual SCSI
+        # or IDE disk that Get-Disk reports as a non-virtual bus). The
+        # existing cleanup logic is correct here.
+        return $result
+    }
+
+    # OS disk is File Backed Virtual. Now determine whether any other
+    # disk is on a physical bus. If yes: native-boot VHDX. If no:
+    # hypervisor guest, safe.
+    $hostBusTypes = @()
+    $unreadableOtherDisks = @()
+    $otherDisks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Number -ne $osDisk.Number })
+    foreach ($d in $otherDisks) {
+        $bt = ''
+        $btReadable = $true
+        try { $bt = [string]$d.BusType } catch { $btReadable = $false }
+        if (-not $bt) { $btReadable = $false }
+        if (-not $btReadable) {
+            # Symmetric with the OS-disk rule: an unreadable BusType on
+            # any disk is treated as "could be a physical bus" and fails
+            # closed. The alternative (silently skipping) would let a
+            # native-boot VHDX through when its host disk's BusType was
+            # momentarily unreadable, which is exactly the indeterminate-
+            # treated-as-safe pattern this gate exists to prevent.
+            $unreadableOtherDisks += $d.Number
+            continue
+        }
+        if ($bt -eq 'Virtual' -or $bt -eq 'File Backed Virtual') { continue }
+        $hostBusTypes += $bt
+    }
+
+    if ($hostBusTypes.Count -gt 0 -or $unreadableOtherDisks.Count -gt 0) {
+        $result.IsNativeBootVirtual = $true
+        $uniqueHostBuses = @($hostBusTypes | Select-Object -Unique)
+        $result.HostBusTypes = $uniqueHostBuses
+        if ($uniqueHostBuses.Count -gt 0 -and $unreadableOtherDisks.Count -gt 0) {
+            $result.Reason = "OS disk (disk $($osPart.DiskNumber)) is 'File Backed Virtual'; at least one other disk is on a physical bus ($($uniqueHostBuses -join ', ')) and $($unreadableOtherDisks.Count) other disk(s) (disk number(s): $($unreadableOtherDisks -join ', ')) had unreadable BusType. This is the native-boot VHD/VHDX topology. Every destructive partition operation is refused."
+        } elseif ($uniqueHostBuses.Count -gt 0) {
+            $result.Reason = "OS disk (disk $($osPart.DiskNumber)) is 'File Backed Virtual' and at least one other disk is on a physical bus ($($uniqueHostBuses -join ', ')). This is the native-boot VHD/VHDX topology: the running OS disk is a VHD/VHDX stored on a host physical disk, and the host disk appears to the running OS as a non-OS disk. The existing recovery-partition classification would treat the host disk's recovery partition as a stray candidate. Every destructive partition operation is refused."
+        } else {
+            $result.Reason = "OS disk (disk $($osPart.DiskNumber)) is 'File Backed Virtual' and $($unreadableOtherDisks.Count) other disk(s) (disk number(s): $($unreadableOtherDisks -join ', ')) had unreadable BusType. The storage topology cannot be verified: the running OS disk is a VHD/VHDX and at least one other disk's bus type could not be determined, so the native-boot VHDX condition cannot be ruled out. Every destructive partition operation is refused."
+        }
+        return $result
+    }
+
+    # Every other disk is virtual (or there are none). Hypervisor guest. Safe.
+    if ($otherDisks.Count -eq 0) {
+        Write-Log "Native-boot VHDX gate: OS disk is 'File Backed Virtual' and no other disks are present; treating as hypervisor guest, not native-boot VHDX. Destructive partition work is allowed under the existing classification rules."
+    } else {
+        Write-Log "Native-boot VHDX gate: OS disk is 'File Backed Virtual' but all other disks are also virtual ($($otherDisks.Count) virtual disk(s)); treating as a hypervisor guest, not native-boot VHDX. Destructive partition work is allowed under the existing classification rules."
+    }
+    return $result
+}
+
+# =========================== RESUME TASK ===========================
+# Temporary self-healing hook for interrupted runs. Created once per
+# Repair or Restore run after the Audit Mode guard and before the
+# Restore dispatcher, deleted in the finally block on clean terminal
+# exit from the pipeline (SUCCESS, WARNING, REBOOT_REQUIRED, or a
+# FATAL exit taken inside Main). Preserved when the run is
+# interrupted: an unhandled exception (the outer catch sets a persist
+# flag), Ctrl+C (a CancelKeyPress handler sets the same flag, because
+# PowerShell runs finally blocks but bypasses catch blocks on
+# Ctrl+C), a hard kill such as taskkill /F (the finally block never
+# runs), a reboot mid-run (the OS terminates PowerShell), or a
+# Restore that returned cleanly but left the machine
+# mid-transformation (Invoke-RestoreAction sets the flag directly on
+# the /setreimage-failed and /enable-failed paths, where the new WIM
+# is in place but WinRE could not be confirmed Enabled). The task
+# is a crash-recovery mechanism, not a retry-until-success mechanism:
+# it fires at boot + 1 minute and at a one-shot T+1 hour trigger, so
+# an interruption that did not reboot the machine is also recovered if
+# the machine stays up. Network availability is deliberately not
+# required (RunOnlyIfNetworkAvailable is false): the offline fallback
+# path is good enough to at least re-enable WinRE after a restart or
+# after an hour, and air-gapped fleets must not lose their
+# self-healing attempt. Registration sets no warning state and does
+# not affect the exit code: the resume task is a per-run safety net,
+# not a machine-state condition.
+function Register-ResumeTask {
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would register temporary resume task '$TaskName' (boot trigger at +1 minute, one-shot trigger at +1 hour)"
+        return $false
+    }
+
+    if (-not $PSCommandPath) {
+        Write-Log "Register-ResumeTask: script was not invoked from a file (`$PSCommandPath is not populated; this is the gist-bootstrap or paste-into-console case). Skipping the temporary resume task - the repair pipeline itself is unaffected." -Level INFO
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Temporary resume task not registered: script was not invoked from a file.'
+        return $false
+    }
+
+    try {
+        # A leftover task with this name is direct evidence that a
+        # previous run was interrupted before its finally-block cleanup.
+        # Register-ScheduledTask -Force overwrites it, which is the
+        # correct behavior; log the evidence so the operator sees it.
+        $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            # Either a previous interrupted run left this task behind, or
+            # this invocation is itself the resume task firing and about
+            # to re-register itself. Both cases are handled identically
+            # (-Force overwrites); the log records that we found one.
+            Write-Log "Found an existing '$TaskName' task; re-registering with -Force (this is expected when the resume task re-registers itself, and is the recovery path when a previous run was interrupted)" -Level WARN
+            Add-RunSummaryLine -Field 'WorkPerformed' -Line "Re-registered the '$TaskName' task (found an existing instance)"
+        }
+
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Repair"
+
+        $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+        $bootTrigger.Delay = "PT1M"
+
+        $oneShotTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddHours(1))
+
+        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+
+        $settings = New-ScheduledTaskSettingsSet `
+            -MultipleInstances IgnoreNew `
+            -StartWhenAvailable `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit (New-TimeSpan -Hours 24)
+        $settings.RunOnlyIfIdle              = $false
+        $settings.RunOnlyIfNetworkAvailable  = $false
+        $settings.IdleSettings.StopOnIdleEnd = $false
+
+        Register-ScheduledTask -TaskName $TaskName `
+            -Action $action `
+            -Trigger @($bootTrigger, $oneShotTrigger) `
+            -Principal $principal `
+            -Settings $settings `
+            -Force -ErrorAction Stop | Out-Null
+
+        Write-Log "Registered temporary resume task '$TaskName' (boot +1m, one-shot T+1h); it will be removed on clean completion"
+        return $true
+    } catch {
+        Write-Log "Could not register the temporary resume task '$TaskName': $_ - the repair pipeline will proceed without self-healing" -Level WARN
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line "Temporary resume task not registered: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Unregister-ResumeTask {
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    if ($Script:DryRun) { return }
+    try {
+        $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+            Write-Log "Removed temporary resume task '$TaskName'"
+        } else {
+            Write-Log "Temporary resume task '$TaskName' was not present at cleanup time (removed by another process?)" -Level WARN
+        }
+    } catch {
+        Write-Log "Could not remove temporary resume task '$TaskName': $_ - it will be overwritten on the next run" -Level WARN
+    }
 }
 
 # =========================== WINRE STATE ===========================
@@ -800,7 +1372,15 @@ function Ensure-RecoveryPartitionAccess {
             return $path
         }
         $part = Get-Partition -Volume $vol -ErrorAction SilentlyContinue
-        if ($part -and ($part.IsBoot -or $part.IsSystem)) { return $TargetDir }
+        # Mirror of the GLOBALROOT branch's null guard: if the volume has
+        # no backing MSFT_Partition (a VM-mounted ISO, a virtual volume
+        # enumerated under a different provider, or a transient Storage
+        # module state), return the original path rather than proceeding
+        # to a $part.DiskNumber dereference that would throw. The call
+        # surface expects the original $TargetDir when a temporary
+        # drive letter cannot be assigned.
+        if (-not $part) { return $TargetDir }
+        if ($part.IsBoot -or $part.IsSystem) { return $TargetDir }
         if ($Script:DryRun) {
             Write-Log "[DRY RUN] Would assign a temporary drive letter to volume {$guid} for image discovery"
             return $TargetDir
@@ -3853,20 +4433,32 @@ function Get-StaleWinREStateImageHash {
 function Read-WinREState {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$CurrentDesiredStateId)
     $empty = @{
-        CurrentImageHash         = $null
-        InjectedDriverSetVersion = $null
-        DesiredStateId           = $null
-        PendingReboot            = $false
-        DeployedDiskNumber       = $null
-        DeployedPartitionNumber  = $null
-        UsedOSFallback           = $false
-        RepairAttempts           = 0
-        LastEnableResult         = "ok"
-        EnableFailureAttempts    = 0
-        DeployedWinREMetadata    = $null
+        CurrentImageHash          = $null
+        InjectedDriverSetVersion  = $null
+        DesiredStateId            = $null
+        PendingReboot             = $false
+        DeployedDiskNumber        = $null
+        DeployedPartitionNumber   = $null
+        UsedOSFallback            = $false
+        RepairAttempts            = 0
+        LastEnableResult          = "ok"
+        EnableFailureAttempts     = 0
+        DeployedWinREMetadata     = $null
         # v48: locally-computable deployment-inputs hash, stored by the
         # v48 full-update path and consulted on offline fallback.
-        LocalInputsId            = $null
+        LocalInputsId             = $null
+        # v49: hash of a foreign source that was preserved (accepted
+        # without normalization) on a previous run. The fast path
+        # accepts the registered hash when it matches either
+        # CurrentImageHash (our own deployment) or
+        # ForeignSourceAcceptedHash (an accepted foreign source). $null
+        # when no foreign source has been accepted on this machine.
+        ForeignSourceAcceptedHash = $null
+        # v49: persistent lineage identifier embedded in the provenance
+        # marker and carried through the state file. $null until the
+        # first Manager-controlled deployment on this machine generates
+        # one.
+        LineageId                 = $null
     }
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
     if (-not (Test-Path $path)) { return $empty }
@@ -3875,18 +4467,20 @@ function Read-WinREState {
         if ($state.DesiredStateId -eq $CurrentDesiredStateId) {
             Write-Log "State file accepted (DesiredStateId match)"
             return @{
-                CurrentImageHash         = $state.CurrentImageHash
-                InjectedDriverSetVersion = $state.InjectedDriverSetVersion
-                DesiredStateId           = $state.DesiredStateId
-                PendingReboot            = if ($state.PendingReboot) { [bool]$state.PendingReboot } else { $false }
-                DeployedDiskNumber       = $state.DeployedDiskNumber
-                DeployedPartitionNumber  = $state.DeployedPartitionNumber
-                UsedOSFallback           = if ($state.UsedOSFallback) { [bool]$state.UsedOSFallback } else { $false }
-                RepairAttempts           = if ($state.RepairAttempts) { [int]$state.RepairAttempts } else { 0 }
-                LastEnableResult         = if ($state.LastEnableResult) { [string]$state.LastEnableResult } else { "ok" }
-                EnableFailureAttempts    = if ($state.EnableFailureAttempts) { [int]$state.EnableFailureAttempts } else { 0 }
-                DeployedWinREMetadata    = if ($state.DeployedWinREMetadata) { [string]$state.DeployedWinREMetadata } else { $null }
-                LocalInputsId            = if ($state.LocalInputsId) { [string]$state.LocalInputsId } else { $null }
+                CurrentImageHash          = $state.CurrentImageHash
+                InjectedDriverSetVersion  = $state.InjectedDriverSetVersion
+                DesiredStateId            = $state.DesiredStateId
+                PendingReboot             = if ($state.PendingReboot) { [bool]$state.PendingReboot } else { $false }
+                DeployedDiskNumber        = $state.DeployedDiskNumber
+                DeployedPartitionNumber   = $state.DeployedPartitionNumber
+                UsedOSFallback            = if ($state.UsedOSFallback) { [bool]$state.UsedOSFallback } else { $false }
+                RepairAttempts            = if ($state.RepairAttempts) { [int]$state.RepairAttempts } else { 0 }
+                LastEnableResult          = if ($state.LastEnableResult) { [string]$state.LastEnableResult } else { "ok" }
+                EnableFailureAttempts     = if ($state.EnableFailureAttempts) { [int]$state.EnableFailureAttempts } else { 0 }
+                DeployedWinREMetadata     = if ($state.DeployedWinREMetadata) { [string]$state.DeployedWinREMetadata } else { $null }
+                LocalInputsId             = if ($state.LocalInputsId) { [string]$state.LocalInputsId } else { $null }
+                ForeignSourceAcceptedHash = if ($state.ForeignSourceAcceptedHash) { [string]$state.ForeignSourceAcceptedHash } else { $null }
+                LineageId                 = if ($state.LineageId) { [string]$state.LineageId } else { $null }
             }
         }
         Write-Log "State file DesiredStateId mismatch - stale" -Level WARN
@@ -3916,7 +4510,14 @@ function Write-WinREState {
         # practice; it is exposed as a parameter only for symmetry with
         # the other state fields and to allow future callers to override
         # it if that becomes necessary.
-        [string]$LocalInputsId = $null
+        [string]$LocalInputsId = $null,
+        # v49: hash of a foreign source that was preserved. Defaults to
+        # the script-scoped value set by the ownership decision; the
+        # parameter exists for symmetry with the other state fields.
+        [AllowNull()][string]$ForeignSourceAcceptedHash = $null,
+        # v49: persistent lineage identifier. Defaults to the
+        # script-scoped value; the parameter exists for symmetry.
+        [AllowNull()][string]$LineageId = $null
     )
     # v47: DeployedWinREMetadata defaults to the script-scoped carry-forward
     # value. Only the full-update deployment path overrides it explicitly.
@@ -3927,6 +4528,16 @@ function Write-WinREState {
     # manner.
     if (-not $PSBoundParameters.ContainsKey('LocalInputsId')) {
         $LocalInputsId = $Script:LocalInputsId
+    }
+    # v49: the same carry-forward pattern applies to the two new fields.
+    # The script-scoped values are set by the ownership decision in
+    # Step 3; a caller that wants to explicitly clear or override them
+    # passes the parameter.
+    if (-not $PSBoundParameters.ContainsKey('ForeignSourceAcceptedHash')) {
+        $ForeignSourceAcceptedHash = $Script:ForeignSourceAcceptedHash
+    }
+    if (-not $PSBoundParameters.ContainsKey('LineageId')) {
+        $LineageId = $Script:LineageId
     }
     $state = @{
         DesiredStateId           = $DesiredStateId
@@ -3943,6 +4554,8 @@ function Write-WinREState {
     if ($null -ne $DeployedPartitionNumber -and [int]$DeployedPartitionNumber -ge 0) { $state.DeployedPartitionNumber = [int]$DeployedPartitionNumber }
     if ($DeployedWinREMetadata) { $state.DeployedWinREMetadata = [string]$DeployedWinREMetadata }
     if ($LocalInputsId) { $state.LocalInputsId = [string]$LocalInputsId }
+    if ($ForeignSourceAcceptedHash) { $state.ForeignSourceAcceptedHash = [string]$ForeignSourceAcceptedHash }
+    if ($LineageId) { $state.LineageId = [string]$LineageId }
     $stateJson = $state | ConvertTo-Json -Depth 3
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
 
@@ -4013,50 +4626,6 @@ function Clear-PartitionDeferral {
     Remove-ItemIfExist $path
 }
 
-# =========================== 7-ZIP ===========================
-function Ensure-7Zip {
-    if (Test-Path $7Zip) { return $true }
-    Write-Log "7-Zip not found - attempting installation via winget..." -Level WARN
-    $wingetPath = (Get-ChildItem -Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-    if (-not $wingetPath) { Write-Log "Winget not found" -Level ERROR; return $false }
-    try {
-        $proc = Start-Process -FilePath $wingetPath -ArgumentList @('install', '--id', '7zip.7zip', '--scope', 'machine', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') -Wait -PassThru -NoNewWindow
-        if ($proc.ExitCode -eq 0 -and (Test-Path $7Zip)) { return $true }
-    } catch { Write-Log "Winget error: $_" -Level ERROR }
-    return (Test-Path $7Zip)
-}
-
-# =========================== DISM MOUNT ===========================
-function Invoke-DismMount {
-    param([string]$ImageFile, [string]$MountDir, [int]$Index = 1)
-    if ($Script:DryRun) { Write-Log "[DRY RUN] Would mount $ImageFile"; return }
-    Write-Log "Dismounting any WIM mounts under $WorkDir"
-    try {
-        Get-WindowsImage -Mounted -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -and $_.Path -like "$WorkDir\*" } |
-            ForEach-Object {
-                Write-Log "Discarding mounted image at $($_.Path)"
-                Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue
-            }
-    } catch { }
-    if (Test-Path $MountDir) { Remove-ItemIfExist $MountDir -Recurse }
-    New-DirectoryIfNotExists $MountDir
-    New-DirectoryIfNotExists "$WorkDir\scratch"
-    for ($i = 1; $i -le 3; $i++) {
-        try { Mount-WindowsImage -ImagePath $ImageFile -Index $Index -Path $MountDir -ScratchDirectory "$WorkDir\scratch" -ErrorAction Stop; return }
-        catch {
-            Write-Log "Mount failed: $_" -Level WARN
-            if ($i -lt 3) {
-                Get-WindowsImage -Mounted -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Path -and $_.Path -like "$WorkDir\*" } |
-                    ForEach-Object { Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue }
-                Start-Sleep 5
-            }
-        }
-    }
-    throw "DISM mount failed after 3 attempts"
-}
-
 # =========================== THIRD-PARTY DRIVER STRIP ===========================
 # v47: Remove every third-party driver from a mounted image. Hard-gated:
 # any failure to enumerate, remove, or re-verify returns $false, and the
@@ -4071,6 +4640,13 @@ function Invoke-DismMount {
 # can change as packages are removed. The loop terminates only when a
 # fresh enumeration returns zero entries. The budget is generous headroom
 # over the initial count and is not expected to be hit in practice.
+#
+# v49: this function remains the sole mechanism that removes drivers,
+# and it remains hard-gated. The v49 source-ownership decision runs
+# BEFORE this function is called and either authorizes the strip
+# (Manager-Owned, Manager-Lineage, Foreign-No-Drivers) or preserves
+# the source without invoking this function at all (Foreign-With-Drivers,
+# or a never-downgrade failure). See the v49 section that follows.
 function Remove-AllThirdPartyDrivers {
     param([Parameter(Mandatory)][string]$MountDir)
 
@@ -4131,6 +4707,610 @@ function Remove-AllThirdPartyDrivers {
 
     Write-Log "Strip: exhausted iteration budget ($budget) without reaching zero - candidate rejected" -Level ERROR
     return $false
+}
+
+# =========================== V49 SOURCE OWNERSHIP AND STORAGE APPLICABILITY ===========================
+# The v49 additions cluster around the moment the candidate WIM is
+# mounted and serviced in Step 3. They split into three concerns:
+#
+#   1. Source ownership. Before any destructive normalization, classify
+#      the source as Manager-Owned, Manager-Lineage, Foreign-No-Drivers,
+#      or Foreign-With-Drivers. Only the first three authorize strip and
+#      injection. Foreign-With-Drivers preserves the source unchanged.
+#      The classification is evidence-based (hash match against the last
+#      deployment, valid provenance marker) plus content-based (the
+#      third-party driver count from the mounted image). It does NOT
+#      attempt OEM identification; the question is only "can we
+#      positively prove this image is one we are authorized to
+#      destructively normalize?"
+#
+#   2. Never downgrade. After injection, if the final image contains a
+#      storage-class driver whose version is older than the source's
+#      version of the same driver (matched by INF basename), the entire
+#      pipeline is discarded and the source is preserved. Conservative
+#      form: any detected downgrade triggers preservation of the whole
+#      source, not a partial fix.
+#
+#   3. Storage applicability. After injection, every SCSIAdapter-class
+#      device on the machine must match at least one INF in the
+#      candidate image's Windows\INF directory. If any controller has
+#      no match, the candidate is rejected before deployment. This is
+#      the pre-deployment gate that catches the ASUS-class failure.
+#
+# The provenance marker is written into the mounted image during Step 3
+# (post-injection, pre-dismount-Save) under $ProvenanceMarkerRelativePath.
+# It is NOT load-bearing in v49: exact-hash ownership is the only
+# authorization the manager trusts beyond the content rule. The marker
+# is written so that a future release, after a field experiment confirms
+# the marker survives a real WU WinRE servicing event, can promote it to
+# a load-bearing lineage signal.
+
+# --- INF parsing ---
+# Extract hardware IDs from an INF file. Microsoft INF model sections
+# ([Manufacturer] referencing model sections per-architecture) contain
+# entries of the form:
+#     %StringName% = InstallSectionName, HWID1, HWID2, ...
+# where each HWID is a hardware ID such as PCI\VEN_8086&DEV_7D0B.
+# The parse walks [Manufacturer] (and any [Manufacturer.<decor>]
+# variants) to collect referenced model-section base names, then reads
+# those sections (and their .NTamd64 / .NTx86 / .NTarm64 / .NT
+# variants) to extract the hardware IDs.
+#
+# The parse is deliberately narrow: it only reports IDs that begin with
+# a well-known bus prefix, so unrelated lines that happen to contain
+# commas are ignored. The returned set is unordered and de-duplicated
+# case-insensitively. Enumeration or parse failure returns an empty
+# array; callers treat an empty return as "no IDs found" and fail
+# closed on the applicability gate.
+function Get-HardwareIdsFromInf {
+    param([Parameter(Mandatory)][string]$InfPath)
+
+    $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $content = $null
+    try {
+        $content = Get-Content -LiteralPath $InfPath -ErrorAction Stop
+    } catch {
+        return @()
+    }
+    if (-not $content) { return @() }
+
+    # Pass 1: index sections (name -> lines). All keys are lowercased
+    # for consistent comparison, regardless of the hashtable's default
+    # case-sensitivity.
+    $sections = @{}
+    $currentSection = $null
+    foreach ($rawLine in $content) {
+        if ($null -eq $rawLine) { continue }
+        $line = ([string]$rawLine).Trim()
+        if ($line.StartsWith(';')) { continue }
+        if ($line.StartsWith('[') -and $line.EndsWith(']')) {
+            $currentSection = $line.Substring(1, $line.Length - 2).Trim().ToLowerInvariant()
+            if (-not $sections.ContainsKey($currentSection)) {
+                $sections[$currentSection] = [System.Collections.Generic.List[string]]::new()
+            }
+            continue
+        }
+        if ($null -eq $currentSection) { continue }
+        $sections[$currentSection].Add($line) | Out-Null
+    }
+
+    # Pass 2: collect model-section base names from any Manufacturer section
+    # (the plain section and any decorated [Manufacturer.NT...] variant).
+    $manufacturerKeys = @($sections.Keys | Where-Object { $_ -eq 'manufacturer' -or $_ -like 'manufacturer.*' })
+    if ($manufacturerKeys.Count -eq 0) { return @() }
+
+    $modelSectionNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($mKey in $manufacturerKeys) {
+        foreach ($line in $sections[$mKey]) {
+            if (-not $line) { continue }
+            $eqIdx = $line.IndexOf('=')
+            if ($eqIdx -lt 0) { continue }
+            $rhs = $line.Substring($eqIdx + 1)
+            $parts = $rhs -split ','
+            if ($parts.Count -eq 0) { continue }
+            $baseSection = $parts[0].Trim()
+            if (-not $baseSection) { continue }
+            [void]$modelSectionNames.Add($baseSection)
+            for ($i = 1; $i -lt $parts.Count; $i++) {
+                $decor = $parts[$i].Trim()
+                if ($decor) {
+                    [void]$modelSectionNames.Add("$baseSection.$decor")
+                }
+            }
+        }
+    }
+    if ($modelSectionNames.Count -eq 0) { return @() }
+
+    # Pass 3: extract HWIDs from each model section and its per-arch variants.
+    $busPrefixes = @('PCI\','USB\','ACPI\','SCSI\','IDE\','SWC\','ROOT\','HDAUDIO\','MONITOR\','DISPLAY\','MF\')
+    $candidateSections = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($ref in $modelSectionNames) {
+        [void]$candidateSections.Add($ref)
+        [void]$candidateSections.Add("$ref.NTamd64")
+        [void]$candidateSections.Add("$ref.NTx86")
+        [void]$candidateSections.Add("$ref.NTarm64")
+        [void]$candidateSections.Add("$ref.NT")
+    }
+
+    foreach ($cand in $candidateSections) {
+        $candLower = $cand.ToLowerInvariant()
+        if (-not $sections.ContainsKey($candLower)) { continue }
+        foreach ($line in $sections[$candLower]) {
+            if (-not $line) { continue }
+            $eqIdx = $line.IndexOf('=')
+            if ($eqIdx -lt 0) { continue }
+            $rhs = $line.Substring($eqIdx + 1)
+            if ($rhs.IndexOf(',') -lt 0) { continue }
+            $parts = $rhs -split ','
+            for ($i = 1; $i -lt $parts.Count; $i++) {
+                $token = $parts[$i].Trim()
+                if (-not $token) { continue }
+                foreach ($prefix in $busPrefixes) {
+                    if ($token.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        [void]$ids.Add($token)
+                        break
+                    }
+                }
+            }
+        }
+    }
+    return @($ids)
+}
+
+# Extract the driver version from an INF [Version] section.
+# INF [Version] contains a DriverVer line:
+#     DriverVer=<MM/DD/YYYY>,<Version>
+# where <Version> is typically a four-part dotted version
+# (e.g. 20.2.8.1028). Returns the Version part, or $null when the line
+# is missing or unparseable.
+function Get-DriverVersionFromInf {
+    param([Parameter(Mandatory)][string]$InfPath)
+
+    $content = $null
+    try {
+        $content = Get-Content -LiteralPath $InfPath -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if (-not $content) { return $null }
+
+    $inVersionSection = $false
+    foreach ($rawLine in $content) {
+        if ($null -eq $rawLine) { continue }
+        $line = ([string]$rawLine).Trim()
+        if ($line.StartsWith(';')) { continue }
+        if ($line.StartsWith('[') -and $line.EndsWith(']')) {
+            $header = $line.Substring(1, $line.Length - 2).Trim()
+            $inVersionSection = ($header -ieq 'Version')
+            continue
+        }
+        if (-not $inVersionSection) { continue }
+        if ($line -match '^DriverVer\s*=\s*(.+)$') {
+            $dvValue = $Matches[1].Trim()
+            $commaIdx = $dvValue.IndexOf(',')
+            if ($commaIdx -ge 0) {
+                return $dvValue.Substring($commaIdx + 1).Trim()
+            }
+            return $dvValue
+        }
+    }
+    return $null
+}
+
+# --- Provenance marker ---
+
+# Read the provenance marker from the root of a mounted image. Returns
+# the parsed marker object, or $null when the file is missing, unparseable,
+# has an unrecognized schema, has no LineageId, or has a LineageId that
+# contradicts the caller's expected value. Every $null return is safe:
+# the caller falls through to content-based classification.
+function Read-ProvenanceMarker {
+    param(
+        [Parameter(Mandatory)][string]$MountDir,
+        [AllowNull()][string]$ExpectedLineageId
+    )
+    $markerPath = Join-Path $MountDir $ProvenanceMarkerRelativePath
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop
+        $marker = $raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Log "Provenance marker present at $markerPath but unparseable: $_ - treating as absent" -Level WARN
+        return $null
+    }
+    $schemaVersion = 0
+    if (-not $marker.SchemaVersion -or -not [int]::TryParse([string]$marker.SchemaVersion, [ref]$schemaVersion) -or $schemaVersion -ne 1) {
+        Write-Log "Provenance marker at $markerPath has unrecognized SchemaVersion ($($marker.SchemaVersion)) - treating as absent" -Level WARN
+        return $null
+    }
+    $markerLineageId = [string]$marker.LineageId
+    if (-not $markerLineageId) {
+        Write-Log "Provenance marker at $markerPath has no LineageId - treating as absent" -Level WARN
+        return $null
+    }
+    if ($ExpectedLineageId -and $markerLineageId -ne $ExpectedLineageId) {
+        Write-Log "Provenance marker LineageId $markerLineageId does not match expected $ExpectedLineageId - treating as absent" -Level WARN
+        return $null
+    }
+    return $marker
+}
+
+# Write the provenance marker into the root of a mounted image. Called
+# after successful injection, before dismount -Save. Returns $true on
+# success; $false on any write failure. Failure is non-fatal to the
+# deployment (the marker is not load-bearing in v49); the caller logs
+# and continues.
+function Write-ProvenanceMarker {
+    param(
+        [Parameter(Mandatory)][string]$MountDir,
+        [Parameter(Mandatory)][string]$LineageId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DesiredStateId
+    )
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would write provenance marker (LineageId=$LineageId, DesiredStateId=$DesiredStateId) into $MountDir"
+        return $true
+    }
+    $markerPath = Join-Path $MountDir $ProvenanceMarkerRelativePath
+    $markerDir  = Split-Path $markerPath -Parent
+    try {
+        if (-not (Test-Path -LiteralPath $markerDir -PathType Container)) {
+            New-Item -Path $markerDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        $markerData = @{
+            SchemaVersion   = 1
+            ManagerVersion  = "$ScriptVersion patch $ScriptPatchLevel"
+            LineageId       = $LineageId
+            DeployedAt      = (Get-Date -Format "o")
+            DeployedStateId = $DesiredStateId
+            # ManagedDrivers: reserved for a future release. In v49 the
+            # marker identifies lineage only; the driver inventory is
+            # not recorded here because the marker is not yet
+            # load-bearing and the inventory would need its own schema
+            # design (stable identity, upgrade semantics, tamper model).
+            ManagedDrivers  = @()
+        }
+        $json = $markerData | ConvertTo-Json -Depth 4
+        [System.IO.File]::WriteAllText($markerPath, $json, [System.Text.UTF8Encoding]::new($false))
+        Write-Log "Wrote provenance marker to $markerPath (LineageId=$LineageId)"
+        return $true
+    } catch {
+        Write-Log "Could not write provenance marker at $markerPath : $_ - deployment continues (marker is not load-bearing in v49)" -Level WARN
+        return $false
+    }
+}
+
+# --- Source ownership classification ---
+# Classify the mounted source WIM by ownership. Returns a hashtable with
+# fields Class and Reason. Never throws. Fail-closed on uncertainty:
+# if the classification cannot be positively established and the source
+# contains third-party drivers, Class is Foreign-With-Drivers.
+#
+# Classes:
+#   Manager-Owned        - staged source hash exactly matches
+#                          state.CurrentImageHash. The bytes are
+#                          identical to what Manager last deployed.
+#   Manager-Lineage      - a valid provenance marker is present in the
+#                          mounted image and its LineageId is either
+#                          unset in state or matches the state's value.
+#   Foreign-No-Drivers   - no positive ownership evidence, but the
+#                          source contains zero third-party drivers.
+#                          Strip is a no-op; injection can proceed.
+#   Foreign-With-Drivers - no positive ownership evidence and the
+#                          source contains at least one third-party
+#                          driver. Preserve.
+function Get-SourceOwnershipClassification {
+    param(
+        [Parameter(Mandatory)][string]$MountDir,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PreStripDrivers,
+        [Parameter(Mandatory)][hashtable]$State,
+        [AllowNull()][string]$StagedSourceHash,
+        [AllowNull()][string]$CurrentLineageId
+    )
+    if ($StagedSourceHash -and $State.CurrentImageHash -and $StagedSourceHash -eq $State.CurrentImageHash) {
+        return @{
+            Class  = 'Manager-Owned'
+            Reason = "staged source hash matches state.CurrentImageHash ($StagedSourceHash)"
+        }
+    }
+
+    $marker = Read-ProvenanceMarker -MountDir $MountDir -ExpectedLineageId $CurrentLineageId
+    if ($marker) {
+        return @{
+            Class  = 'Manager-Lineage'
+            Reason = "valid provenance marker present (LineageId=$($marker.LineageId))"
+        }
+    }
+
+    $thirdPartyCount = @($PreStripDrivers).Count
+    if ($thirdPartyCount -eq 0) {
+        return @{
+            Class  = 'Foreign-No-Drivers'
+            Reason = "no positive ownership evidence; source contains zero third-party drivers (strip would be a no-op)"
+        }
+    }
+    return @{
+        Class  = 'Foreign-With-Drivers'
+        Reason = "no positive ownership evidence; source contains $thirdPartyCount third-party driver(s)"
+    }
+}
+
+# --- Storage controller enumeration ---
+# Enumerate every SCSIAdapter-class device currently present on the
+# machine. Returns an array of objects, one per device, with fields:
+#   FriendlyName = the device's display name
+#   InstanceId   = the PnP instance ID
+#   Ids          = the union of HardwareID, CompatibleID, and the
+#                  InstanceId prefix up to the last backslash
+# Returns $null when the enumeration itself fails (indeterminate),
+# and an empty array when the enumeration succeeds but finds no
+# devices. The caller treats $null as "fail closed" and empty as
+# "nothing to verify".
+function Get-StorageControllerDevices {
+    $devs = $null
+    try {
+        $devs = @(Get-PnpDevice -Class 'SCSIAdapter' -PresentOnly -ErrorAction Stop)
+    } catch {
+        Write-Log "Storage applicability: could not enumerate SCSIAdapter-class devices: $_" -Level WARN
+        return $null
+    }
+    $result = @()
+    foreach ($dev in $devs) {
+        # Skip software/virtual storage devices. The applicability gate
+        # exists to verify that the WinRE image has a driver for the
+        # machine's PHYSICAL storage controller. Windows-component
+        # controllers such as 'Microsoft VHD Loopback Controller'
+        # (InstanceId {GUID}\MSVHDHBA\...) and 'Xvdd SCSI Miniport'
+        # (InstanceId SWD\XVDDENUM\...) are not what the OS disk is on;
+        # their INFs live in the DriverStore, not in Windows\INF; and
+        # requiring them to be present in the mounted image produces a
+        # false rejection on every machine that has these components.
+        if ($dev.InstanceId -match '^\{[0-9A-Fa-f-]+\}\\' -or $dev.InstanceId -match '^SWD\\') {
+            Write-Log "Storage applicability: skipping software/virtual storage device '$($dev.FriendlyName)' (InstanceId $($dev.InstanceId))"
+            continue
+        }
+        $ids = [System.Collections.Generic.List[string]]::new()
+        if ($dev.HardwareID) {
+            foreach ($h in @($dev.HardwareID)) {
+                if ($h) { $ids.Add([string]$h) }
+            }
+        }
+        if ($dev.CompatibleID) {
+            foreach ($h in @($dev.CompatibleID)) {
+                if ($h) { $ids.Add([string]$h) }
+            }
+        }
+        if ($dev.InstanceId) {
+            $iid = [string]$dev.InstanceId
+            $lastSlash = $iid.LastIndexOf('\')
+            if ($lastSlash -gt 0) { $ids.Add($iid.Substring(0, $lastSlash)) }
+        }
+        $result += [PSCustomObject]@{
+            FriendlyName = if ($dev.FriendlyName) { [string]$dev.FriendlyName } else { '(unnamed)' }
+            InstanceId   = if ($dev.InstanceId) { [string]$dev.InstanceId } else { '' }
+            Ids          = @($ids)
+        }
+    }
+    return @($result)
+}
+
+# --- Storage-driver applicability check ---
+# Verify that the mounted image contains at least one INF whose hardware
+# IDs prefix-match at least one hardware ID of every SCSIAdapter-class
+# device on the machine. This is the pre-deployment safety gate that
+# catches the ASUS class of failure: a candidate image with no driver
+# for a machine's storage controller.
+#
+# Returns a hashtable with fields:
+#   Applicable   - $true only when every controller has at least one
+#                  matching INF, or when there are no controllers to
+#                  check; $false otherwise.
+#   Reason       - human-readable explanation for the log and state
+#   Controllers  - count of controller devices considered
+#   Matched      - count of controller devices that matched at least
+#                  one INF
+# Fails closed on any enumeration or parsing uncertainty.
+function Test-StorageDriverApplicability {
+    param([Parameter(Mandatory)][string]$MountDir)
+
+    $controllers = Get-StorageControllerDevices
+    if ($null -eq $controllers) {
+        return @{
+            Applicable  = $false
+            Reason      = "could not enumerate SCSIAdapter-class devices; refusing to certify the candidate"
+            Controllers = 0
+            Matched     = 0
+        }
+    }
+    if ($controllers.Count -eq 0) {
+        Write-Log "Storage applicability: no SCSIAdapter-class devices present; nothing to verify"
+        return @{
+            Applicable  = $true
+            Reason      = "no SCSIAdapter-class devices present"
+            Controllers = 0
+            Matched     = 0
+        }
+    }
+
+    $infDir = Join-Path $MountDir "Windows\INF"
+    if (-not (Test-Path -LiteralPath $infDir -PathType Container)) {
+        return @{
+            Applicable  = $false
+            Reason      = "mounted image has no Windows\INF directory; cannot verify storage-driver applicability"
+            Controllers = $controllers.Count
+            Matched     = 0
+        }
+    }
+    $infFiles = @(Get-ChildItem -LiteralPath $infDir -Filter '*.inf' -File -ErrorAction SilentlyContinue)
+    if ($infFiles.Count -eq 0) {
+        return @{
+            Applicable  = $false
+            Reason      = "mounted image has no INF files under Windows\INF; cannot verify storage-driver applicability"
+            Controllers = $controllers.Count
+            Matched     = 0
+        }
+    }
+
+    $allInfIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($inf in $infFiles) {
+        $ids = Get-HardwareIdsFromInf -InfPath $inf.FullName
+        if ($ids) {
+            foreach ($id in $ids) { [void]$allInfIds.Add($id) }
+        }
+    }
+    Write-Log "Storage applicability: parsed $($infFiles.Count) INF(s) and collected $($allInfIds.Count) unique hardware ID(s); machine has $($controllers.Count) SCSIAdapter-class device(s)"
+
+    $matchedDevices   = @()
+    $unmatchedDevices = @()
+    foreach ($ctrl in $controllers) {
+        $matched = $false
+        foreach ($cid in $ctrl.Ids) {
+            foreach ($iid in $allInfIds) {
+                # Prefix match: the machine hardware ID starts with the
+                # INF hardware ID. Windows hardware-ID matching is
+                # prefix-based (a specific machine HWID extends a
+                # broader INF HWID with subsystem/revision decorators).
+                if ($cid.StartsWith($iid, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $matched = $true
+                    break
+                }
+            }
+            if ($matched) { break }
+        }
+        if ($matched) {
+            $matchedDevices += $ctrl
+            Write-Log "Storage applicability: controller '$($ctrl.FriendlyName)' has a matching INF in the candidate image"
+        } else {
+            $unmatchedDevices += $ctrl
+            $idList = if ($ctrl.Ids.Count -gt 0) { $ctrl.Ids -join '; ' } else { '(no IDs)' }
+            Write-Log "Storage applicability: controller '$($ctrl.FriendlyName)' (InstanceId $($ctrl.InstanceId)) has NO matching INF in the candidate image - hardware IDs considered: $idList" -Level WARN
+        }
+    }
+
+    if ($unmatchedDevices.Count -gt 0) {
+        return @{
+            Applicable  = $false
+            Reason      = "$($unmatchedDevices.Count) of $($controllers.Count) storage controller(s) have no matching INF in the candidate image"
+            Controllers = $controllers.Count
+            Matched     = $matchedDevices.Count
+        }
+    }
+
+    return @{
+        Applicable  = $true
+        Reason      = "all $($controllers.Count) storage controller(s) have at least one matching INF"
+        Controllers = $controllers.Count
+        Matched     = $matchedDevices.Count
+    }
+}
+
+# --- Never-downgrade check ---
+# Compare the storage-class drivers in the mounted image before strip
+# against those after injection. For each post-injection driver whose
+# INF basename matches a pre-strip driver's INF basename, if the
+# post-injection version is older than the pre-strip version, report a
+# downgrade.
+#
+# Returns a hashtable with fields:
+#   Downgrade - $true when any comparison found a downgrade
+#   Details   - array of human-readable strings, one per detected downgrade
+#
+# The comparison is by INF basename (e.g. iastorvd.inf), which is the
+# correct granularity: different basenames are different driver families
+# even if they share a vendor. Version comparison uses
+# [System.Version]::TryParse on both sides; unparseable versions are
+# treated as indeterminate and do not produce a downgrade claim.
+#
+# Both $PreStripDrivers and $PostInjectDrivers are expected to come from
+# a filterless Get-WindowsDriver call (the third-party inventory form).
+# The function filters to ClassName = 'SCSIAdapter'.
+function Test-StorageDriverWouldDowngrade {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PreStripDrivers,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PostInjectDrivers
+    )
+    $downgradeDetails = @()
+
+    # Index pre-strip storage-class drivers by INF basename
+    $preStripVersions = @{}
+    foreach ($d in $PreStripDrivers) {
+        if (-not $d.ClassName -or ([string]$d.ClassName) -ne 'SCSIAdapter') { continue }
+        if (-not $d.OriginalFileName -or -not $d.Version) { continue }
+        $baseName = ([System.IO.Path]::GetFileName([string]$d.OriginalFileName)).ToLowerInvariant()
+        if (-not $baseName) { continue }
+        $verStr = [string]$d.Version
+        if (-not $preStripVersions.ContainsKey($baseName)) {
+            $preStripVersions[$baseName] = $verStr
+        }
+    }
+    if ($preStripVersions.Count -eq 0) {
+        return @{ Downgrade = $false; Details = @() }
+    }
+
+    # For each post-injection storage-class driver, compare versions
+    foreach ($d in $PostInjectDrivers) {
+        if (-not $d.ClassName -or ([string]$d.ClassName) -ne 'SCSIAdapter') { continue }
+        if (-not $d.OriginalFileName -or -not $d.Version) { continue }
+        $baseName = ([System.IO.Path]::GetFileName([string]$d.OriginalFileName)).ToLowerInvariant()
+        if (-not $baseName) { continue }
+        if (-not $preStripVersions.ContainsKey($baseName)) { continue }
+        $sourceVer = $preStripVersions[$baseName]
+        $candVer   = [string]$d.Version
+        $vSource = $null; $vCand = $null
+        if (-not [System.Version]::TryParse($sourceVer, [ref]$vSource)) { continue }
+        if (-not [System.Version]::TryParse($candVer,   [ref]$vCand))   { continue }
+        if ($vCand -lt $vSource) {
+            $downgradeDetails += "$baseName : source $sourceVer -> candidate $candVer"
+        }
+    }
+
+    if ($downgradeDetails.Count -gt 0) {
+        return @{ Downgrade = $true; Details = @($downgradeDetails) }
+    }
+    return @{ Downgrade = $false; Details = @() }
+}
+
+# =========================== 7-ZIP ===========================
+function Ensure-7Zip {
+    if (Test-Path $7Zip) { return $true }
+    Write-Log "7-Zip not found - attempting installation via winget..." -Level WARN
+    $wingetPath = (Get-ChildItem -Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+    if (-not $wingetPath) { Write-Log "Winget not found" -Level ERROR; return $false }
+    try {
+        $proc = Start-Process -FilePath $wingetPath -ArgumentList @('install', '--id', '7zip.7zip', '--scope', 'machine', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') -Wait -PassThru -NoNewWindow
+        if ($proc.ExitCode -eq 0 -and (Test-Path $7Zip)) { return $true }
+    } catch { Write-Log "Winget error: $_" -Level ERROR }
+    return (Test-Path $7Zip)
+}
+
+# =========================== DISM MOUNT ===========================
+function Invoke-DismMount {
+    param([string]$ImageFile, [string]$MountDir, [int]$Index = 1)
+    if ($Script:DryRun) { Write-Log "[DRY RUN] Would mount $ImageFile"; return }
+    Write-Log "Dismounting any WIM mounts under $WorkDir"
+    try {
+        Get-WindowsImage -Mounted -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path -like "$WorkDir\*" } |
+            ForEach-Object {
+                Write-Log "Discarding mounted image at $($_.Path)"
+                Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue
+            }
+    } catch { }
+    if (Test-Path $MountDir) { Remove-ItemIfExist $MountDir -Recurse }
+    New-DirectoryIfNotExists $MountDir
+    New-DirectoryIfNotExists "$WorkDir\scratch"
+    for ($i = 1; $i -le 3; $i++) {
+        try { Mount-WindowsImage -ImagePath $ImageFile -Index $Index -Path $MountDir -ScratchDirectory "$WorkDir\scratch" -ErrorAction Stop; return }
+        catch {
+            Write-Log "Mount failed: $_" -Level WARN
+            if ($i -lt 3) {
+                Get-WindowsImage -Mounted -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Path -and $_.Path -like "$WorkDir\*" } |
+                    ForEach-Object { Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue }
+                Start-Sleep 5
+            }
+        }
+    }
+    throw "DISM mount failed after 3 attempts"
 }
 
 # =========================== OEM EXTRACTION HELPERS ===========================
@@ -4403,8 +5583,562 @@ function Get-GitHubBaseWinRE {
     return $true
 }
 
+# =========================== V49 BACKUP AND RESTORE ===========================
+# Byte-for-byte backup and restore of the currently-registered WinRE WIM.
+# Both actions are dispatched from Main before the repair pipeline runs
+# and never invoke the repair pipeline themselves.
+#
+# Backup writes a timestamped directory under $BackupPath (default
+# $BackupDefaultPath) containing:
+#   winre.wim   - byte-for-byte copy of the currently-registered WIM
+#   backup.json - sidecar metadata (timestamp, WinRE registration info,
+#                 source path/size/hash, DISM image metadata)
+#
+# The WIM copy is hash-verified against the source; the sidecar records
+# the same hash so a later restore can re-verify.
+#
+# Restore writes a backed-up WIM back to the currently-registered route
+# (dedicated recovery partition or OS-fallback). It does not create a
+# partition. The target WIM is replaced transactionally: the previous
+# WIM is preserved as a rollback copy until the new copy is verified
+# in place. After a successful restore the state file, checkpoint, and
+# partition deferral marker are deleted so the next repair run re-
+# evaluates the machine from a clean slate.
+#
+# Neither function performs a native-VHDX gate check because neither
+# modifies partition geometry. Only partition operations are gated.
+
+function Invoke-BackupAction {
+    param(
+        [AllowNull()][AllowEmptyString()][string]$BackupPath
+    )
+
+    Set-RunSummaryField -Field 'Decision' -Value 'BACKUP'
+    Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+    Write-Narration "Backup: capturing the currently-registered Windows RE image."
+
+    if (-not $BackupPath) { $BackupPath = $BackupDefaultPath }
+    Write-Log "Backup destination: $BackupPath"
+
+    # ---- Locate the currently-registered WIM ----
+    $currentState = Get-WinREState
+    Write-Log "Current WinRE: status=$($currentState.Status), location=$($currentState.Location)"
+    if (-not $currentState.Location) {
+        Write-Log "Backup cannot proceed: WinRE has no registered location. Establish a WinRE route (run the default repair action) and re-run Backup." -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'WinRE has no registered location'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Run the default repair action to establish a WinRE route, then re-run Backup.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No backup was written.'
+        return $EXIT_WARNING
+    }
+
+    $wimPath = $null
+    $accessPath = @(Ensure-RecoveryPartitionAccess -TargetDir $currentState.Location)[0]
+    if ($accessPath) {
+        foreach ($cand in @((Join-Path $accessPath "Recovery\WindowsRE\winre.wim"), (Join-Path $accessPath "winre.wim"))) {
+            if (Test-Path -LiteralPath $cand -PathType Leaf) { $wimPath = $cand; break }
+        }
+    }
+    if (-not $wimPath) {
+        $canonical = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
+        if (Test-Path -LiteralPath $canonical -PathType Leaf) { $wimPath = $canonical }
+    }
+    if (-not $wimPath) {
+        Write-Log "Backup cannot proceed: no readable winre.wim found at the registered location ($($currentState.Location))." -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Registered WIM could not be located'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Run the default repair action to restore a working WinRE, then re-run Backup.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No backup was written.'
+        return $EXIT_WARNING
+    }
+    Write-Log "Backup source WIM: $wimPath"
+
+    # ---- Hash and read metadata ----
+    $sourceHash = Get-LiveWimHash -WimPath $wimPath
+    if (-not $sourceHash) {
+        Write-Log "Backup cannot proceed: could not read the source WIM." -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'Source WIM is unreadable'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No backup was written.'
+        return $EXIT_FATAL
+    }
+    $sourceSize = (Get-Item -LiteralPath $wimPath -Force).Length
+    Write-Log "Backup source WIM size: $([math]::Round($sourceSize/1MB,1)) MiB, SHA256: $sourceHash"
+
+    $dismMeta = Get-WimServicingMetadata -WimPath $wimPath
+    if ($dismMeta) {
+        Write-Log "Backup source DISM metadata: Version=$($dismMeta.Version), SPBuild=$($dismMeta.SPBuild), SPLevel=$($dismMeta.SPLevel), Architecture=$($dismMeta.Architecture)"
+    } else {
+        Write-Log "Backup source DISM metadata could not be read - sidecar will record it as null" -Level WARN
+    }
+
+    # ---- Prepare destination ----
+    $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+    $destDir = Join-Path $BackupPath $timestamp
+    $destWim = Join-Path $destDir 'winre.wim'
+    $sidecarPath = Join-Path $destDir 'backup.json'
+
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would create backup directory: $destDir"
+        Write-Log "[DRY RUN] Would copy $([math]::Round($sourceSize/1MB,1)) MiB to $destWim and verify hash"
+        Write-Log "[DRY RUN] Would write sidecar metadata to $sidecarPath"
+        Set-RunSummaryField -Field 'Result' -Value 'DRY_RUN'
+        Set-RunSummaryField -Field 'Why' -Value 'DryRun requested; no backup written'
+        Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
+        return $EXIT_SUCCESS
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $BackupPath -PathType Container)) {
+            New-Item -Path $BackupPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        if (Test-Path -LiteralPath $destDir) {
+            throw "destination directory already exists: $destDir"
+        }
+        New-Item -Path $destDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Log "Backup cannot proceed: could not prepare destination directory: $_" -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'Destination directory could not be prepared'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No backup was written.'
+        return $EXIT_FATAL
+    }
+
+    # ---- Copy ----
+    try {
+        Copy-Item -LiteralPath $wimPath -Destination $destWim -Force -ErrorAction Stop
+    } catch {
+        Write-Log "Backup copy failed: $_" -Level ERROR
+        try { Remove-Item -LiteralPath $destDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'Copy failed'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No backup was written.'
+        return $EXIT_FATAL
+    }
+
+    # ---- Verify ----
+    $destHash = Get-LiveWimHash -WimPath $destWim
+    if (-not $destHash -or $destHash -ne $sourceHash) {
+        Write-Log "Backup copy hash verification failed (source=$sourceHash, dest=$destHash)." -Level ERROR
+        try { Remove-Item -LiteralPath $destDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'Copy hash mismatch'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No complete backup was written (partial copy removed).'
+        return $EXIT_FATAL
+    }
+    Write-Log "Backup copy hash verified: $destHash"
+
+    # ---- Sidecar ----
+    $sidecar = @{
+        SchemaVersion     = 1
+        ManagerVersion    = "$ScriptVersion patch $ScriptPatchLevel"
+        BackupTime        = (Get-Date -Format 'o')
+        ComputerName      = $env:COMPUTERNAME
+        WinREStatus       = $currentState.Status
+        WinRELocation     = $currentState.Location
+        WinREVersion      = $currentState.Version
+        SourceWimPath     = $wimPath
+        SourceWimSize     = $sourceSize
+        SourceWimHash     = $sourceHash
+        Architecture      = $env:PROCESSOR_ARCHITECTURE
+        DISMImageMetadata = $dismMeta
+    }
+    try {
+        $sidecarJson = $sidecar | ConvertTo-Json -Depth 4
+        [System.IO.File]::WriteAllText($sidecarPath, $sidecarJson, [System.Text.UTF8Encoding]::new($false))
+        Write-Log "Wrote backup sidecar: $sidecarPath"
+    } catch {
+        Write-Log "Backup sidecar write failed: $_ - the WIM is present and verified; sidecar is metadata only" -Level WARN
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value "Backup WIM written to $destWim; sidecar write failed"
+        Set-RunSummaryField -Field 'NextAction' -Value 'The backup WIM can still be used for restore; the sidecar is metadata only.'
+        Add-RunSummaryLine -Field 'ChangesMade' -Line "Backup WIM written to $destWim ($([math]::Round($sourceSize/1MB,1)) MiB)"
+        Add-RunSummaryLine -Field 'ChangesMade' -Line "SHA256: $sourceHash"
+        return $EXIT_WARNING
+    }
+
+    Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
+    Set-RunSummaryField -Field 'Why' -Value 'WinRE WIM backed up successfully'
+    Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
+    Add-RunSummaryLine -Field 'ChangesMade' -Line "Backup directory: $destDir"
+    Add-RunSummaryLine -Field 'ChangesMade' -Line "WIM: $destWim ($([math]::Round($sourceSize/1MB,1)) MiB)"
+    Add-RunSummaryLine -Field 'ChangesMade' -Line "SHA256: $sourceHash"
+    return $EXIT_SUCCESS
+}
+
+function Invoke-RestoreAction {
+    param(
+        [AllowNull()][AllowEmptyString()][string]$BackupPath
+    )
+
+    Set-RunSummaryField -Field 'Decision' -Value 'RESTORE'
+    Write-Narration "Restore: writing a backed-up Windows RE image back to the currently-registered route."
+
+    if (-not $BackupPath) {
+        Write-Log "Restore requires -BackupPath (a directory containing winre.wim and backup.json)." -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'No backup path provided'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Re-run with -BackupPath <directory>.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was attempted.'
+        return $EXIT_WARNING
+    }
+    if (-not (Test-Path -LiteralPath $BackupPath -PathType Container)) {
+        Write-Log "Restore cannot proceed: backup directory does not exist: $BackupPath" -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Backup directory not found'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Verify the backup path and re-run.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was attempted.'
+        return $EXIT_WARNING
+    }
+
+    $srcWim = Join-Path $BackupPath 'winre.wim'
+    $sidecarPath = Join-Path $BackupPath 'backup.json'
+    if (-not (Test-Path -LiteralPath $srcWim -PathType Leaf)) {
+        Write-Log "Restore cannot proceed: no winre.wim found at $srcWim" -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Backup WIM not found'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value "Place winre.wim in $BackupPath and re-run."
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was attempted.'
+        return $EXIT_WARNING
+    }
+
+    $srcHash = Get-LiveWimHash -WimPath $srcWim
+    if (-not $srcHash) {
+        Write-Log "Restore cannot proceed: could not read the backup WIM." -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'Backup WIM is unreadable'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        return $EXIT_FATAL
+    }
+    $srcSize = (Get-Item -LiteralPath $srcWim -Force).Length
+    Write-Log "Backup WIM: $srcWim ($([math]::Round($srcSize/1MB,1)) MiB, SHA256: $srcHash)"
+
+    if (Test-Path -LiteralPath $sidecarPath -PathType Leaf) {
+        try {
+            $sidecar = Get-Content -LiteralPath $sidecarPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($sidecar.SourceWimHash -and $sidecar.SourceWimHash -ne $srcHash) {
+                Write-Log "Restore cannot proceed: backup WIM hash ($srcHash) does not match the sidecar-recorded hash ($($sidecar.SourceWimHash)). The backup may be corrupted." -Level ERROR
+                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                Set-RunSummaryField -Field 'Why' -Value 'Backup WIM hash does not match sidecar'
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+                Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+                return $EXIT_FATAL
+            }
+            Write-Log "Sidecar verified (recorded hash matches backup WIM)"
+        } catch {
+            Write-Log "Sidecar present but unparseable: $_ - proceeding with WIM alone" -Level WARN
+        }
+    } else {
+        Write-Log "No sidecar present; proceeding with WIM alone (hash is verified on copy)" -Level WARN
+    }
+
+    # ---- Resolve current registration ----
+    $stateNow = Get-WinREState
+    if (-not $stateNow.Location) {
+        Write-Log "Restore cannot proceed: WinRE has no registered location. Restore puts the backup back where WinRE currently lives; it does not create a new route. Run the default repair action first, then re-run Restore." -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'No registered WinRE route'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Run the default repair action first to establish a WinRE route.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+        return $EXIT_WARNING
+    }
+
+    $targetPart = Resolve-WinRELocationToPartition -Location $stateNow.Location
+    $osPart = Get-OSPartition
+
+    $isOSFallback = $false
+    $targetDir = $null
+    $permanentPath = $null
+    $targetLetter = $null
+
+    if ($targetPart -and $osPart -and
+        $targetPart.DiskNumber -eq $osPart.DiskNumber -and
+        $targetPart.PartitionNumber -eq $osPart.PartitionNumber) {
+        $isOSFallback = $true
+        $targetDir = "$env:SystemDrive\Recovery\WindowsRE"
+        $permanentPath = $targetDir
+    } elseif ($targetPart) {
+        $isTyped = ($targetPart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($targetPart.MbrType -eq 0x27)
+        if (-not $isTyped) {
+            Write-Log "Restore cannot proceed: the registered WinRE target (disk $($targetPart.DiskNumber) part $($targetPart.PartitionNumber)) is neither a type-coded recovery partition nor the OS partition. Run the default repair action first." -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Why' -Value 'Registered route is not a recognized type'
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Run the default repair action first.'
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+            return $EXIT_WARNING
+        }
+        $targetLetter = $targetPart.DriveLetter
+        if (-not $targetLetter) {
+            $avail = Get-AvailableDriveLetter
+            if (-not $avail) {
+                Write-Log "Restore cannot proceed: no drive letter available to access the target recovery partition." -Level ERROR
+                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                Set-RunSummaryField -Field 'Why' -Value 'No drive letter available'
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+                return $EXIT_FATAL
+            }
+            if ($Script:DryRun) {
+                $targetLetter = $avail
+                Write-Log "[DRY RUN] Would assign drive letter ${targetLetter}: to the target recovery partition"
+            } else {
+                $assigned = Invoke-DriveLetterAssignment -DiskNumber $targetPart.DiskNumber -PartitionNumber $targetPart.PartitionNumber -PreferredLetter $avail
+                if (-not $assigned) {
+                    Write-Log "Restore cannot proceed: could not assign a drive letter to the target recovery partition." -Level ERROR
+                    Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                    Set-RunSummaryField -Field 'Why' -Value 'Drive letter assignment failed'
+                    Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+                    return $EXIT_FATAL
+                }
+                $targetLetter = $assigned
+                if (-not $Script:tempDriveLetters.Contains($assigned)) { $Script:tempDriveLetters.Add($assigned) }
+            }
+        }
+        $targetDir = "${targetLetter}:\Recovery\WindowsRE"
+        $permanentPath = "\\?\GLOBALROOT\device\harddisk$($targetPart.DiskNumber)\partition$($targetPart.PartitionNumber)\Recovery\WindowsRE"
+    } else {
+        Write-Log "Restore cannot proceed: the registered WinRE location ($($stateNow.Location)) could not be resolved to a partition. Run the default repair action first." -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Registered location did not resolve to a partition'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Run the default repair action first.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+        return $EXIT_WARNING
+    }
+
+    $targetWim = Join-Path $targetDir 'winre.wim'
+    Write-Log "Restore target: $targetWim (mode=$(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' }))"
+
+    # ---- Short-circuit when target already matches ----
+    if (Test-Path -LiteralPath $targetWim -PathType Leaf) {
+        $currentHash = Get-LiveWimHash -WimPath $targetWim
+        if ($currentHash -and $currentHash -eq $srcHash) {
+            Write-Log "Target already matches the backup WIM (SHA256=$srcHash) - nothing to do"
+            Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
+            Set-RunSummaryField -Field 'Why' -Value 'Target already matches backup'
+            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Target already matched the backup; no changes made.'
+            return $EXIT_SUCCESS
+        }
+    }
+
+    # ---- Prepare target ----
+    if ($isOSFallback) {
+        if ($Script:DryRun) {
+            Write-Log "[DRY RUN] Would verify C: is FullyDecrypted before OS-fallback restore"
+        } else {
+            $cEnc = Test-VolumeEncrypted -MountPoint 'C:'
+            if ($cEnc -ne $false) {
+                Write-Log "Restore cannot proceed: the OS-fallback target requires C: to be FullyDecrypted (Test-VolumeEncrypted=$cEnc). Complete decryption of C: and re-run. The script does not modify C:'s BitLocker state." -Level ERROR
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Why' -Value 'OS-fallback target requires C: FullyDecrypted'
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'OS-FALLBACK'
+                Set-RunSummaryField -Field 'NextAction' -Value 'Decrypt C: and re-run Restore.'
+                Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+                return $EXIT_WARNING
+            }
+        }
+    } else {
+        if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $targetPart.DiskNumber -PartitionNumber $targetPart.PartitionNumber)) {
+            Write-Log "Restore cannot proceed: the target recovery partition could not be made ready for reagentc." -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'Target recovery partition not ready'
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+            return $EXIT_FATAL
+        }
+    }
+
+    # ---- Prepare restore workspace ----
+    $restoreWorkDir = Join-Path $env:SystemDrive 'Recovery\OEM\RestoreWork'
+    if (-not $Script:DryRun) {
+        try {
+            if (Test-Path -LiteralPath $restoreWorkDir -PathType Container) {
+                Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue
+            }
+            New-Item -Path $restoreWorkDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Log "Restore cannot proceed: could not prepare restore workspace at $restoreWorkDir : $_" -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'Restore workspace could not be prepared'
+            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            return $EXIT_FATAL
+        }
+    } else {
+        Write-Log "[DRY RUN] Would prepare restore workspace at $restoreWorkDir"
+    }
+
+    # ---- DryRun stops here ----
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would disable WinRE (if Enabled), replace $targetWim with $srcWim, reagentc /setreimage, reagentc /enable"
+        Write-Log "[DRY RUN] Would delete state file, checkpoint, and partition deferral marker on success"
+        Set-RunSummaryField -Field 'Result' -Value 'DRY_RUN'
+        Set-RunSummaryField -Field 'Why' -Value 'DryRun requested; no restore performed'
+        Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+        Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
+        return $EXIT_SUCCESS
+    }
+
+    # ---- Disable WinRE (if enabled) ----
+    $preRestoreState = Get-WinREState
+    if ($preRestoreState.Status -eq 'Enabled') {
+        Write-Log "Disabling WinRE before restoring the backup WIM"
+        $disOut = cmd /c "reagentc /disable 2>&1"
+        $disExit = $LASTEXITCODE
+        Write-Log "reagentc /disable: exit=$disExit, output=$disOut"
+        if ($disExit -ne 0) {
+            Write-Log "Restore aborted: reagentc /disable failed (exit $disExit). The existing WinRE route is intact; no changes were made." -Level ERROR
+            try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable failed'
+            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+            return $EXIT_FATAL
+        }
+        Start-Sleep 2
+        $verifyDisabled = Get-WinREState
+        if ($verifyDisabled.Status -ne 'Disabled') {
+            Write-Log "Restore aborted: WinRE still reports $($verifyDisabled.Status) after reagentc /disable." -Level ERROR
+            try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable verification failed'
+            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            return $EXIT_FATAL
+        }
+    } else {
+        Write-Log "WinRE is currently $($preRestoreState.Status); proceeding without a disable step"
+    }
+
+    # ---- Transactional replacement ----
+    $prevWorkDir = $WorkDir
+    $WorkDir = $restoreWorkDir
+    $deployOk = $false
+    try {
+        if ($isOSFallback) {
+            New-DirectoryIfNotExists $targetDir
+            $deployOk = Deploy-WimTransactional -SourceWim $srcWim -TargetPath $targetWim -TargetDescription "OS-fallback restore target"
+        } else {
+            $deployOk = Deploy-WimToPartition -Partition @{ DriveLetter = $targetLetter; DiskNumber = $targetPart.DiskNumber; PartitionNumber = $targetPart.PartitionNumber } -SourceWim $srcWim
+        }
+    } finally {
+        $WorkDir = $prevWorkDir
+    }
+    if (-not $deployOk) {
+        Write-Log "Restore failed: could not replace the target WIM. Attempting to re-enable WinRE with the existing WIM." -Level ERROR
+        if ($preRestoreState.Status -eq 'Enabled') {
+            $reenableResult = if ($isOSFallback) {
+                Invoke-ReagentcEnable -ReRegisterPath $permanentPath
+            } else {
+                Invoke-ReagentcEnable -AllowTempLetter -Partition @{ DiskNumber = $targetPart.DiskNumber; PartitionNumber = $targetPart.PartitionNumber } -ReRegisterPath $permanentPath
+            }
+            Write-Log "Re-enable attempt result: $reenableResult"
+        }
+        try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'WIM replacement failed'
+        Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'The target WIM was not replaced.'
+        return $EXIT_FATAL
+    }
+    Write-Log "Restore: target WIM replaced and hash-verified"
+
+    # ---- setreimage ----
+    $reSetOutput = cmd /c "reagentc /setreimage /path `"$permanentPath`" 2>&1"
+    $reSetExit = $LASTEXITCODE
+    Write-Log "reagentc /setreimage: exit=$reSetExit, output=$reSetOutput"
+    if ($reSetExit -ne 0) {
+        Write-Log "Restore failed at reagentc /setreimage: $reSetOutput" -Level ERROR
+        # v49 patch 1: the WIM has been replaced but reagentc was not
+        # re-registered. The machine is mid-transformation: the new
+        # bytes are in place, but the on-disk registration and the
+        # state file disagree with reality. Preserve the resume task
+        # so the next boot or T+1h trigger retries the repair
+        # pipeline; the state file, checkpoint, and deferral marker
+        # are still deleted below so the retry starts from a clean
+        # slate.
+        $Script:ResumeTaskShouldPersist = $true
+        # The WIM has been replaced and reagentc is now pointing at the
+        # new bytes; a re-enable attempt with the previous re-register
+        # path is not meaningful. Record state invalidation and exit.
+        $statePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+        Remove-ItemIfExist $statePath
+        Remove-ItemIfExist $CheckpointFile
+        Clear-PartitionDeferral
+        try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'reagentc /setreimage failed after WIM replacement'
+        Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+        Set-RunSummaryField -Field 'NextAction' -Value 'Run the default repair action to restore a working WinRE route.'
+        Add-RunSummaryLine -Field 'ChangesMade' -Line "WIM replaced at $targetWim"
+        Add-RunSummaryLine -Field 'ChangesMade' -Line 'State file, checkpoint, and deferral marker were deleted.'
+        return $EXIT_FATAL
+    }
+
+    # ---- enable ----
+    $enableResult = if ($isOSFallback) {
+        Invoke-ReagentcEnable -ReRegisterPath $permanentPath
+    } else {
+        Invoke-ReagentcEnable -AllowTempLetter -Partition @{ DiskNumber = $targetPart.DiskNumber; PartitionNumber = $targetPart.PartitionNumber } -ReRegisterPath $permanentPath
+    }
+    Write-Log "reagentc /enable result: $enableResult"
+
+    # ---- Invalidate manager state (WIM has changed) ----
+    $statePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+    Remove-ItemIfExist $statePath
+    Remove-ItemIfExist $CheckpointFile
+    Clear-PartitionDeferral
+
+    try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+
+    if ($enableResult -eq 'ok') {
+        Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
+        Set-RunSummaryField -Field 'Why' -Value 'Backup restored and WinRE re-enabled'
+        Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+        Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
+        Add-RunSummaryLine -Field 'ChangesMade' -Line "Restored WIM to $targetWim (SHA256=$srcHash)"
+        Add-RunSummaryLine -Field 'ChangesMade' -Line 'Deleted state file, checkpoint, and partition deferral marker.'
+        return $EXIT_SUCCESS
+    }
+    if ($enableResult -eq 'reboot') {
+        Set-RunSummaryField -Field 'Result' -Value 'REBOOT_REQUIRED'
+        Set-RunSummaryField -Field 'Why' -Value 'Backup restored; WinRE enable is pending a reboot'
+        Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+        Set-RunSummaryField -Field 'NextAction' -Value 'Reboot the machine to complete WinRE enable.'
+        Add-RunSummaryLine -Field 'ChangesMade' -Line "Restored WIM to $targetWim"
+        Add-RunSummaryLine -Field 'ChangesMade' -Line 'Deleted state file, checkpoint, and partition deferral marker.'
+        return $EXIT_REBOOT_REQUIRED
+    }
+
+    # ---- enable failed or bitlocker ----
+    Write-Log "Restore: WIM replaced but reagentc /enable returned $enableResult. The WIM is in place; a subsequent repair run or manual reagentc /enable may resolve." -Level WARN
+    # v49 patch 1: the WIM has been replaced but WinRE could not be
+    # confirmed Enabled. Preserve the resume task so the next boot or
+    # T+1h trigger retries the repair pipeline; the state file,
+    # checkpoint, and deferral marker have already been deleted
+    # above, so the retry starts from a clean slate.
+    $Script:ResumeTaskShouldPersist = $true
+    Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+    Set-RunSummaryField -Field 'Why' -Value "WIM restored, but reagentc /enable returned $enableResult"
+    Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+    Set-RunSummaryField -Field 'NextAction' -Value 'Run the default repair action, or run reagentc /enable manually.'
+    Add-RunSummaryLine -Field 'ChangesMade' -Line "Restored WIM to $targetWim"
+    Add-RunSummaryLine -Field 'ChangesMade' -Line 'Deleted state file, checkpoint, and partition deferral marker.'
+    return $EXIT_WARNING
+}
+
 # =========================== MAIN ===========================
 try {
+    # ---- v49: initialize the run summary before anything else ----
+    # The summary is rendered from the finally block, so every exit path
+    # produces one. It is populated at decision points throughout this
+    # block and by the dispatched action functions.
+    Initialize-RunSummary
+
     # ---- v48 patch 2: fail-fast elevation guard ----
     # Runs before the program lock, before hardware probes, network
     # fetches, workspace allocation, and any servicing work. On
@@ -4431,6 +6165,13 @@ try {
     # behavior unambiguous and matches production's prerequisites.
     $currentPrincipal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+        Set-RunSummaryField -Field 'Why' -Value 'Elevation guard refused an unelevated launch'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Re-run from an elevated PowerShell prompt.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (refused before any state mutation).'
+
         $elevMsg = "FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session. Re-run from an elevated prompt, or launch via the scheduled task's SYSTEM context. No changes have been made to WinRE, partitions, BitLocker, drive letters, the workspace, or the state file."
         try { New-DirectoryIfNotExists $LogDir } catch { }
         Write-Log $elevMsg -Level ERROR
@@ -4439,7 +6180,18 @@ try {
 
     New-DirectoryIfNotExists $LogDir
     Write-Log "========== WinRE Manager Started (v$ScriptVersion patch $ScriptPatchLevel) =========="
+    # v49 patch 1: log the invocation context so the log distinguishes
+    # scheduled-task (SYSTEM) runs from interactive runs. Not a gate;
+    # context for operator review and for correlating a log entry with
+    # the Task Scheduler event log.
+    $runningAsSystem = ($currentPrincipal.Identity.User -and $currentPrincipal.Identity.User.Value -eq 'S-1-5-18')
+    if ($runningAsSystem) {
+        Write-Log "Invocation context: running as NT AUTHORITY\SYSTEM (scheduled task, service, or other SYSTEM-context launcher)"
+    } else {
+        Write-Log "Invocation context: running as $($currentPrincipal.Identity.Name) (interactive or user-context launcher)"
+    }
     if ($Script:DryRun) { Write-Log "*** DRY RUN MODE ***" }
+    Write-Narration "Starting WinRE Manager (action: $Action)."
 
     # ---- Program lock (v44 patch 4) ----
     # Exclusive file handle at FileShare.None. Kernel-enforced, no DACL,
@@ -4456,6 +6208,13 @@ try {
             )
             Write-Log "Acquired program lock at $lockPath"
         } catch [System.IO.IOException] {
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+            Set-RunSummaryField -Field 'Why' -Value 'Another WinRE Manager instance is already running'
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Wait for the other instance to finish.'
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (lock contention).'
+
             Write-Log "Another WinRE Manager instance is already running (program lock file is exclusively held). Exiting without making any changes. This is not a deployment failure - the other instance is doing the work and will complete on its own. If you need to run manually, wait for the other instance to finish, or run scripts\Test-WinRE.ps1 for a read-only diagnostic that is safe to run concurrently." -Level WARN
             exit $EXIT_WARNING
         } catch {
@@ -4464,6 +6223,17 @@ try {
         }
     } else {
         Write-Log "[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances"
+    }
+
+    # ---- v49: action dispatcher ----
+    # Backup is state-independent: it does not touch reagentc or the
+    # partition table, so it can run in any machine state (including
+    # Audit Mode). Restore and the repair pipeline both mutate state
+    # that requires a normal-running Windows, so they run after the
+    # Audit Mode guard.
+    if ($Action -eq 'Backup') {
+        $actionExit = Invoke-BackupAction -BackupPath $BackupPath
+        exit $actionExit
     }
 
     # ---- Audit Mode / OOBE / sysprep guard ----
@@ -4479,12 +6249,64 @@ try {
         $auditVerb = if ($Script:DryRun) { "Would defer" } else { "Deferring" }
         Write-Log "$auditVerb WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=$imageState). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made." -Level WARN
         Write-Log "Complete OOBE, sign in to a normal desktop session, and re-run this script." -Level WARN
-        if (-not $Script:DryRun) { exit $EXIT_WARNING }
+        if (-not $Script:DryRun) {
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+            Set-RunSummaryField -Field 'Why' -Value "Windows is not in a normal-running state (ImageState=$imageState)"
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Complete OOBE, sign in to a normal desktop session, and re-run.'
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (deferred before any mutation).'
+            exit $EXIT_WARNING
+        }
+    }
+
+    # ---- v49 patch 1: temporary resume task ----
+    # Created here, after the Audit Mode guard, and before any work
+    # begins for either Restore or the default Repair pipeline. Placed
+    # after the Audit Mode guard so Audit Mode runs do not churn the
+    # task; placed before the Restore dispatcher so an interrupted
+    # Restore (which disables WinRE, replaces the WIM, and re-enables)
+    # is recoverable by the resume hook on the next boot or at T+1h.
+    # The task is never created for -Action Backup (dispatched above)
+    # or under -DryRun.
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would create the temporary resume task '$($Script:ResumeTaskName)' (boot trigger at +1 minute, one-shot trigger at +1 hour); it would be removed on clean completion"
+    } else {
+        $Script:ResumeTaskCreated = Register-ResumeTask -TaskName $Script:ResumeTaskName
+        if ($Script:ResumeTaskCreated) {
+            # v49 patch 1: PowerShell runs finally blocks on Ctrl+C but
+            # bypasses catch blocks, so without this handler the persist
+            # flag would remain $false and the finally block would
+            # delete the resume task on exactly the interruption it
+            # exists for. The handler runs before the default Ctrl+C
+            # termination and sets the flag; default handling then
+            # proceeds and the finally block preserves the task.
+            try {
+                [Console]::CancelKeyPress += {
+                    $Script:ResumeTaskShouldPersist = $true
+                }
+            } catch {
+                Write-Log "Could not register the Ctrl+C handler for the resume task: $_ - Ctrl+C will proceed through the normal cleanup path and the task will be removed" -Level WARN
+            }
+        }
+    }
+
+    # ---- v49: Restore action ----
+    # Runs after the Audit Mode guard because it calls reagentc /enable,
+    # and after resume-task registration so an interrupted Restore is
+    # recoverable. The resume hook re-invokes the script with
+    # -Action Repair, which routes the interrupted machine back through
+    # the standard repair pipeline.
+    if ($Action -eq 'Restore') {
+        $actionExit = Invoke-RestoreAction -BackupPath $BackupPath
+        exit $actionExit
     }
 
     # ---- Hardware ----
+    Write-Narration "Checking this machine's hardware and Windows build."
     $Hardware = Get-HardwareObject
     Write-Log "System: $($Hardware.Manufacturer) $($Hardware.Model), MT=$($Hardware.MachineType), OS=$($Hardware.WinPE) (build $($Hardware.Build))"
+    Write-Narration "Detected $($Hardware.Manufacturer) $($Hardware.Model) on Windows $($Hardware.WinPE) (build $($Hardware.Build))."
 
     # ---- v48: Architecture gate ----
     # Get-HardwareObject reports the actual OS architecture from the
@@ -4495,9 +6317,43 @@ try {
     # EXIT_WARNING is returned.
     if ($Hardware.Architecture -ne 'x64') {
         Write-Log "Unsupported OS architecture '$($Hardware.Architecture)': this manager supports x64 only. No WinRE, partition, image, checkpoint, or recovery-state changes have been made. The machine remains as it was before this run; the previous WinRE route (if any) is untouched. ARM64 support would require a separate, tested change to the WinRE image pipeline." -Level WARN
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+        Set-RunSummaryField -Field 'Why' -Value "Unsupported OS architecture '$($Hardware.Architecture)' (x64 only)"
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'No action required; the manager does not run on this architecture.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (refused before any state mutation).'
         exit $EXIT_WARNING
     }
     Write-Log "Architecture gate passed: x64"
+    Write-Narration "Architecture: x64 (supported)."
+
+    # ---- v49: Native-boot VHDX gate ----
+    # Runs immediately after the architecture gate, before any state
+    # mutation. Refuses to run when the OS disk is a file-backed virtual
+    # disk and any other disk is on a physical bus: that is the native-
+    # boot VHD/VHDX topology, where the host physical disk appears to
+    # the running OS as a non-OS disk and would be subject to the stray-
+    # recovery cleanup. See the function's header comment for the
+    # detection rules.
+    $vhdGate = Test-NativeBootVirtualTopology
+    if ($vhdGate.IsNativeBootVirtual) {
+        Write-Narration "Refusing to run: the running OS is on a VHD/VHDX and a host physical disk is visible. This topology is not supported for destructive recovery work."
+        Write-Log "Native-boot VHDX gate refused: $($vhdGate.Reason)" -Level WARN
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+        Set-RunSummaryField -Field 'Why' -Value "Native-boot VHD/VHDX topology: $($vhdGate.Reason)"
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'The manager does not run on native-boot VHD/VHDX configurations. No action was taken.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (refused before any state mutation).'
+        exit $EXIT_WARNING
+    } else {
+        if ($vhdGate.OSBusType -eq 'File Backed Virtual') {
+            Write-Narration "Storage topology: OS disk is virtual and all other disks are virtual; treated as a hypervisor guest."
+        } else {
+            Write-Narration "Storage topology: OS disk is not file-backed virtual."
+        }
+    }
 
     # ---- v48: LocalInputsId ----
     # Locally-computable deployment-inputs hash. Computed once here, in
@@ -4557,6 +6413,12 @@ try {
             if ($storedLocalInputsId -ne $currentLocalInputsId) {
                 Write-Log "Offline fallback: stored LocalInputsId $storedLocalInputsId does not match the current locally-computable inputs $currentLocalInputsId. A hardware or OS input changed while the machine was offline; the stored DesiredStateId no longer describes this machine. Deferring rather than taking the fast path on a stale DSI. Bring the machine online so a fresh manifest can be fetched and a new DesiredStateId computed." -Level WARN
                 $Script:nonFatalWarning = $true
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+                Set-RunSummaryField -Field 'Why' -Value 'Offline fallback: stored LocalInputsId does not match current hardware/OS inputs'
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+                Set-RunSummaryField -Field 'NextAction' -Value 'Bring the machine online so a fresh manifest can be fetched.'
+                Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made.'
                 exit $EXIT_WARNING
             }
             Write-Log "Offline fallback: stored LocalInputsId matches current locally-computable inputs ($currentLocalInputsId)"
@@ -4651,6 +6513,12 @@ try {
         Write-Log "VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined. Re-run when PnP enumeration is healthy." -Level WARN
         $Script:nonFatalWarning = $true
         Remove-ItemIfExist $CheckpointFile
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+        Set-RunSummaryField -Field 'Why' -Value 'VMD hardware detection was indeterminate'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Re-run when PnP enumeration is healthy.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made.'
         exit $EXIT_WARNING
     }
 
@@ -4696,6 +6564,7 @@ try {
 
     $WinREState = Get-WinREState
     Write-Log "WinRE status: $($WinREState.Status), Location: $($WinREState.Location), Version: $(if ($WinREState.Version) { $WinREState.Version } else { 'unknown' })"
+    Write-Narration "Checking existing Windows RE configuration."
 
     $state = Read-WinREState -CurrentDesiredStateId $DesiredStateId
     $storedHash = $state.CurrentImageHash
@@ -4705,6 +6574,12 @@ try {
     # deployment path overrides this with the metadata of the WIM it just
     # deployed.
     $Script:DeployedWinREMetadata = $state.DeployedWinREMetadata
+    # v49: carry the LineageId and ForeignSourceAcceptedHash forward in
+    # script scope. Write-WinREState defaults to these values when its
+    # parameters are not explicitly supplied, so a state write always
+    # preserves them unless a caller deliberately overrides.
+    $Script:LineageId = $state.LineageId
+    $Script:ForeignSourceAcceptedHash = $state.ForeignSourceAcceptedHash
     # v47: LKG-validation hash. The operational read above refuses to
     # accept a stale state file, which correctly nulls $storedHash on the
     # first v47 run on a v46 machine. The file's CurrentImageHash is still
@@ -4729,6 +6604,10 @@ try {
             if ($repairAttempts -gt 3) {
                 Write-Log "WinRE registration repair has failed $($state.RepairAttempts) times without resolving WinRE state. Manual intervention required." -Level ERROR
                 Remove-ItemIfExist $CheckpointFile
+                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
+                Set-RunSummaryField -Field 'Why' -Value 'WinRE registration repair failed 3 times'
+                Set-RunSummaryField -Field 'NextAction' -Value 'Manual intervention required.'
                 exit $EXIT_FATAL
             }
 
@@ -4753,6 +6632,10 @@ try {
                         Write-Log "Pending-reboot repair: target recovery partition could not be made unencrypted - deferring" -Level WARN
                         $Script:nonFatalWarning = $true
                         Remove-ItemIfExist $CheckpointFile
+                        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                        Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
+                        Set-RunSummaryField -Field 'Why' -Value 'Pending-reboot repair: target partition could not be made unencrypted'
+                        Set-RunSummaryField -Field 'NextAction' -Value 'Re-run after the target volume is decrypted.'
                         exit $EXIT_WARNING
                     }
                 } else {
@@ -4763,6 +6646,10 @@ try {
                         Write-Log "Pending-reboot OS-fallback: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=$prEnc) - deferring without changing C: BitLocker state" -Level WARN
                         $Script:nonFatalWarning = $true
                         Remove-ItemIfExist $CheckpointFile
+                        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                        Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
+                        Set-RunSummaryField -Field 'Why' -Value 'Pending-reboot OS-fallback: C: is not confirmed fully decrypted'
+                        Set-RunSummaryField -Field 'NextAction' -Value 'Complete decryption of C: and re-run.'
                         exit $EXIT_WARNING
                     }
                 }
@@ -4795,6 +6682,11 @@ try {
                                      -UsedOSFallback $state.UsedOSFallback `
                                      -RepairAttempts 0
                     Remove-ItemIfExist $CheckpointFile
+                    Set-RunSummaryField -Field 'Result' -Value $(if ($state.UsedOSFallback) { 'WARNING' } else { 'SUCCESS' })
+                    Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
+                    Set-RunSummaryField -Field 'Why' -Value 'Pending-reboot registration repair succeeded'
+                    Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($state.UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+                    Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
                     if ($state.UsedOSFallback) { exit $EXIT_WARNING }
                     if ($Script:nonFatalWarning) { exit $EXIT_WARNING }
                     exit $EXIT_SUCCESS
@@ -4819,6 +6711,11 @@ try {
                              -RepairAttempts $repairAttempts
             Remove-ItemIfExist $CheckpointFile
             Write-Log "========== WinRE Manager completed - reboot still required =========="
+            Set-RunSummaryField -Field 'Result' -Value 'REBOOT_REQUIRED'
+            Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
+            Set-RunSummaryField -Field 'Why' -Value "Pending-reboot repair attempt $repairAttempts of 3 did not confirm Enabled"
+            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($state.UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            Set-RunSummaryField -Field 'NextAction' -Value 'Reboot and re-run.'
             exit $EXIT_REBOOT_REQUIRED
         }
     }
@@ -4831,6 +6728,10 @@ try {
         Write-Log "Verify the machine has completed OOBE and is not in Audit Mode. To reset the failure counter, delete ${loopStatePath} and re-run." -Level ERROR
         if (-not $Script:DryRun) {
             Remove-ItemIfExist $CheckpointFile
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
+            Set-RunSummaryField -Field 'Why' -Value 'reagentc /enable failed 3 consecutive times'
+            Set-RunSummaryField -Field 'NextAction' -Value "Delete $loopStatePath and re-run."
             exit $EXIT_FATAL
         }
     }
@@ -4923,6 +6824,16 @@ try {
     # WIM hash remains in use for copy verification, deployment
     # verification, and the pre-/disable race detector, not as a rebuild
     # trigger.
+    #
+    # v49: a new first branch short-circuits the chain when the registered
+    # WIM hash matches a previously-accepted foreign source. In that case
+    # the manager must not rebuild: doing so would strip and re-inject the
+    # foreign source, which is exactly the class of behavior the source-
+    # ownership model exists to prevent. The state file records the
+    # accepted hash; the branch fires before forceUpgrade so that an OS
+    # upgrade does not silently re-authorize destructive normalization of
+    # a foreign source. The operator is expected to let Windows Update
+    # service the WinRE image instead.
     $needInject = $false
     $registeredSourceChanged = $false
     $registeredMetaString = $null
@@ -4963,7 +6874,14 @@ try {
         Write-Log "Byte drift from last deployment: $(if ($byteDrift) { 'YES' } else { 'NO' })"
     }
 
-    if ($forceUpgrade) { $needInject = $true; Write-Log "OS upgrade detected - forcing WIM rebuild" }
+    # v49: first branch. See comment above. Only fires when the registered
+    # WIM hash matches the state-recorded foreign-accepted hash exactly.
+    if ($state.ForeignSourceAcceptedHash -and $ActiveLocationHash -and $ActiveLocationHash -eq $state.ForeignSourceAcceptedHash) {
+        Write-Log "Registered WinRE hash matches a previously-accepted foreign source ($($state.ForeignSourceAcceptedHash)); the manager will not destructively normalize this foreign source. Taking the fast path."
+        $Script:ForeignSourceAccepted = $true
+        $needInject = $false
+    }
+    elseif ($forceUpgrade) { $needInject = $true; Write-Log "OS upgrade detected - forcing WIM rebuild" }
     elseif ($registeredMetadataUnreadable) { $needInject = $true; Write-Log "Registered WinRE metadata could not be read - forcing rebuild so the repair path can replace the image" }
     elseif ($registeredSourceChanged) { $needInject = $true; Write-Log "Registered WinRE metadata changed from $($state.DeployedWinREMetadata) to $registeredMetaString - rebuilding" }
     elseif ($storedHash -and $storedDriverVersion -and -not $state.DeployedWinREMetadata) { $needInject = $true; Write-Log "State has no DeployedWinREMetadata anchor (previous deployment could not record it) - rebuilding" }
@@ -5128,6 +7046,11 @@ try {
             # yet resolved the underlying issue, and the staged WIM stays
             # available for the eventual successful run. The marker alone
             # suppresses identical retries.
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'DEFERRED'
+            Set-RunSummaryField -Field 'Why' -Value "Dedicated recovery creation was deferred for this DesiredStateId on $since"
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+            Set-RunSummaryField -Field 'NextAction' -Value "Resolve the space/layout issue, then delete $env:SystemDrive\Recovery\OEM\$StateFileName and $env:SystemDrive\Recovery\OEM\$PartitionDeferralFileName to retry."
             exit $EXIT_WARNING
         }
         if ($fastPathWillFire) {
@@ -5200,10 +7123,15 @@ try {
     }
 
     if ($nothingToDo) {
-        if ($Script:UsedOSFallback) {
+        if ($Script:ForeignSourceAccepted) {
+            Write-Log "Operating mode: PRESERVED (foreign source accepted on a previous run; no normalization performed)"
+            Write-Narration "Nothing to do. The Windows recovery environment is a preserved foreign source and is functional."
+        } elseif ($Script:UsedOSFallback) {
             Write-Log "Operating mode: OS-FALLBACK (degraded - WinRE is on the OS partition)"
+            Write-Narration "Nothing to do. The Windows recovery environment is healthy (OS-fallback mode)."
         } else {
             Write-Log "Operating mode: DEDICATED (WinRE on dedicated recovery partition)"
+            Write-Narration "Nothing to do. The Windows recovery environment is already healthy."
         }
         Remove-ItemIfExist $CheckpointFile
 
@@ -5218,6 +7146,25 @@ try {
                              -DeployedDiskNumber $state.DeployedDiskNumber -DeployedPartitionNumber $state.DeployedPartitionNumber `
                              -RepairAttempts 0
         }
+
+        $fastPathResult = if ($Script:ForeignSourceAccepted) { 'SUCCESS' }
+                          elseif ($Script:UsedOSFallback) { 'WARNING' }
+                          elseif ($Script:nonFatalWarning) { 'WARNING' }
+                          else { 'SUCCESS' }
+        $fastPathMode = if ($Script:ForeignSourceAccepted) { 'PRESERVED' }
+                        elseif ($Script:UsedOSFallback) { 'OS-FALLBACK' }
+                        else { 'DEDICATED' }
+        $fastPathWhy = if ($Script:ForeignSourceAccepted) { 'Preserved foreign source matched the accepted hash' }
+                       elseif ($Script:UsedOSFallback) { 'OS-fallback route is healthy (degraded)' }
+                       else { 'Recovery environment is already healthy' }
+
+        Set-RunSummaryField -Field 'Result' -Value $fastPathResult
+        Set-RunSummaryField -Field 'Decision' -Value 'FAST PATH'
+        Set-RunSummaryField -Field 'Why' -Value $fastPathWhy
+        Set-RunSummaryField -Field 'OperatingMode' -Value $fastPathMode
+        Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (fast path).'
+
         if ($Script:UsedOSFallback) { exit $EXIT_WARNING }
         if ($Script:nonFatalWarning) { exit $EXIT_WARNING }
         exit $EXIT_SUCCESS
@@ -5229,6 +7176,7 @@ try {
     $needEnableOnly = (-not $needInject -and $WinREState.Status -ne "Enabled" -and $activeOnRecovery)
     if ($needEnableOnly) {
         Write-Log "Enable-only path: image current, WinRE disabled, on recovery partition"
+        Write-Narration "Enabling the existing recovery environment."
 
         $enableResult = "failed"
         $targetPart = $null
@@ -5255,6 +7203,11 @@ try {
                                  -EnableFailureAttempts $decryptAttempts
                 $Script:nonFatalWarning = $true
                 Remove-ItemIfExist $CheckpointFile
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Decision' -Value 'ENABLE-ONLY'
+                Set-RunSummaryField -Field 'Why' -Value 'Target recovery partition could not be made unencrypted'
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+                Set-RunSummaryField -Field 'NextAction' -Value 'Re-run after the target volume is decrypted.'
                 exit $EXIT_WARNING
             }
 
@@ -5308,6 +7261,11 @@ try {
                                      -RepairAttempts 0
                 }
                 Remove-ItemIfExist $CheckpointFile
+                Set-RunSummaryField -Field 'Result' -Value 'REBOOT_REQUIRED'
+                Set-RunSummaryField -Field 'Decision' -Value 'ENABLE-ONLY'
+                Set-RunSummaryField -Field 'Why' -Value 'Enable succeeded; reboot required to complete'
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+                Set-RunSummaryField -Field 'NextAction' -Value 'Reboot the machine to complete WinRE enable.'
                 exit $EXIT_REBOOT_REQUIRED
             }
             if ($Script:nonFatalWarning) {
@@ -5316,6 +7274,11 @@ try {
                                        else { "one or more non-fatal warnings were logged above" }
                 Write-Log "Enable succeeded; exiting EXIT_WARNING because $enableWarningReason"
                 Remove-ItemIfExist $CheckpointFile
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Decision' -Value 'ENABLE-ONLY'
+                Set-RunSummaryField -Field 'Why' -Value "Enable succeeded; warning: $enableWarningReason"
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+                Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
                 exit $EXIT_WARNING
             }
             if ($Script:DryRun) {
@@ -5324,6 +7287,11 @@ try {
                 Write-Log "Enable succeeded cleanly"
             }
             Remove-ItemIfExist $CheckpointFile
+            Set-RunSummaryField -Field 'Result' -Value $(if ($Script:DryRun) { 'DRY_RUN' } else { 'SUCCESS' })
+            Set-RunSummaryField -Field 'Decision' -Value 'ENABLE-ONLY'
+            Set-RunSummaryField -Field 'Why' -Value 'Enable succeeded cleanly'
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+            Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
             exit $EXIT_SUCCESS
         }
         if ($needEnableOnly -and $enableResult -eq "failed") {
@@ -5338,6 +7306,11 @@ try {
                              -LastEnableResult "failed" `
                              -EnableFailureAttempts $newEnableAttempts
             Remove-ItemIfExist $CheckpointFile
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'ENABLE-ONLY'
+            Set-RunSummaryField -Field 'Why' -Value "reagentc /enable failed (attempt $newEnableAttempts of 3)"
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+            Set-RunSummaryField -Field 'NextAction' -Value 'The next scheduled run will retry.'
             exit $EXIT_WARNING
         }
         if ($needEnableOnly -and $enableResult -eq "bitlocker") {
@@ -5352,6 +7325,11 @@ try {
                              -LastEnableResult "bitlocker" `
                              -EnableFailureAttempts $newEnableAttempts
             Remove-ItemIfExist $CheckpointFile
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'ENABLE-ONLY'
+            Set-RunSummaryField -Field 'Why' -Value "reagentc /enable refused with BitLocker error (attempt $newEnableAttempts of 3)"
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
+            Set-RunSummaryField -Field 'NextAction' -Value 'The next scheduled run will retry.'
             exit $EXIT_WARNING
         }
     }
@@ -5360,6 +7338,11 @@ try {
     if ($Script:offlineFallback) {
         Write-Log "Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable. Cannot proceed without a live manifest. Will retry on the next scheduled run when the network is available." -Level WARN
         Remove-ItemIfExist $CheckpointFile
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Decision' -Value 'DEFERRED'
+        Set-RunSummaryField -Field 'Why' -Value 'Offline fallback: full update required but manifest unavailable'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'The next scheduled run will retry when the network is available.'
         exit $EXIT_WARNING
     }
 
@@ -5449,6 +7432,11 @@ try {
         Write-Log "Full update deferred: no eligible fixed NTFS workspace has at least $minimumWorkDirDisplay free. $candidateSummary. Free space on an eligible volume and re-run; no partition changes were made." -Level WARN
         Remove-ItemIfExist $CheckpointFile
         $Script:nonFatalWarning = $true
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Decision' -Value 'DEFERRED'
+        Set-RunSummaryField -Field 'Why' -Value "No eligible fixed NTFS workspace has at least $minimumWorkDirDisplay free"
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Free space on an eligible volume and re-run.'
         exit $EXIT_WARNING
     }
 
@@ -5498,6 +7486,8 @@ try {
 
     # ============ FULL UPDATE PATH ============
     Write-Log "Starting full update"
+    Write-Narration "Preparing to service the recovery image."
+    Set-RunSummaryField -Field 'Decision' -Value 'FULL UPDATE'
 
     # v47: capture the registered-source fingerprint immediately before
     # source acquisition. The recheck helper compares this against a
@@ -5557,7 +7547,7 @@ try {
             } else {
                 "no VMD drivers"
             }
-            Write-Log "[DRY RUN]   Step 3: Mount base WIM, inject $oemDesc and $vmdDesc, dismount with -Save"
+            Write-Log "[DRY RUN]   Step 3: Mount base WIM, classify source ownership, inject $oemDesc and $vmdDesc, run never-downgrade and storage-applicability gates, write provenance marker, dismount with -Save"
         }
         if ($step -lt 4 -and $needInject) {
             Write-Log "[DRY RUN]   Step 4: dism /Export-Image /Compress:max to WorkDir\winre_optimized.wim"
@@ -5572,6 +7562,11 @@ try {
         Write-Log "[DRY RUN]   Step 7: Remove stray type-coded recovery partitions on non-OS disks"
 
         Remove-ItemIfExist $CheckpointFile
+        Set-RunSummaryField -Field 'Result' -Value 'DRY_RUN'
+        Set-RunSummaryField -Field 'Why' -Value 'DryRun requested; full-update plan was previewed without any mutation'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Re-run without -DryRun to execute the plan.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (DryRun).'
         exit $EXIT_SUCCESS
     }
 
@@ -5582,9 +7577,12 @@ try {
     if ($step -le 2) {
         if ($needInject) {
             Write-Log "Step 2: Obtaining base WIM"
+            Write-Narration "Acquiring the source recovery image."
             if (-not $ActiveLocationImage -and -not $FallbackImage) {
                 if (-not (Get-GitHubBaseWinRE -WorkDir $WorkDir -Hardware $Hardware)) {
                     Write-Log "GitHub base WIM retrieval failed" -Level FATAL
+                    Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                    Set-RunSummaryField -Field 'Why' -Value 'GitHub base WIM retrieval failed'
                     exit $EXIT_FATAL
                 }
             } else {
@@ -5614,12 +7612,16 @@ try {
                         Write-Log "Base WIM copy is unreadable after Copy-Item - rejecting candidate" -Level ERROR
                         Remove-ItemIfExist "$WorkDir\base.wim"
                         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+                        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                        Set-RunSummaryField -Field 'Why' -Value 'Base WIM copy is unreadable'
                         exit $EXIT_WARNING
                     }
                     if ($copiedHash -ne $selection.SourceHash) {
                         Write-Log "Base WIM copy hash mismatch: source=$($selection.SourceHash), copied=$copiedHash - rejecting candidate" -Level ERROR
                         Remove-ItemIfExist "$WorkDir\base.wim"
                         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+                        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                        Set-RunSummaryField -Field 'Why' -Value 'Base WIM copy hash mismatch'
                         exit $EXIT_WARNING
                     }
                     Write-Log "Copied base WIM from $($selection.SourcePath); copy hash verified"
@@ -5632,6 +7634,8 @@ try {
                     $Script:StagedWimSourceHash = $null
                     if (-not (Get-GitHubBaseWinRE -WorkDir $WorkDir -Hardware $Hardware)) {
                         Write-Log "GitHub base WIM retrieval failed" -Level FATAL
+                        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                        Set-RunSummaryField -Field 'Why' -Value 'GitHub base WIM retrieval failed'
                         exit $EXIT_FATAL
                     }
                 }
@@ -5665,9 +7669,87 @@ try {
 
     if ($step -le 3 -and $needInject) {
         Write-Log "Step 3: Mounting and injecting"
+        Write-Narration "Mounting and customizing the recovery image."
         if ($OEMPackage -or $requiredDrivers.Count -gt 0) { if (-not (Test-Path $7Zip)) { Ensure-7Zip | Out-Null } }
         $MountDir = "$WorkDir\mount"
         Invoke-DismMount -ImageFile "$WorkDir\base.wim" -MountDir $MountDir -Index 1
+
+        # ===== v49 source-ownership decision =====
+        # Enumerate the mounted image's third-party drivers before any
+        # strip. This inventory is used both for the ownership
+        # classification (foreign source with drivers -> preserve) and
+        # for the never-downgrade check after injection. The enumeration
+        # is the same form Remove-AllThirdPartyDrivers uses: filterless
+        # Get-WindowsDriver, which Microsoft documents as the third-
+        # party inventory of a mounted image.
+        # Enumerate the mounted image's third-party drivers. Retry up to
+        # three times on failure: the DISM WIM provider can transiently
+        # return "Class not registered" (COM error 0x80040154) when its
+        # session state is briefly unavailable. A persistent failure
+        # still rejects the candidate (fail-closed preserved); a
+        # transient failure recovers without deferring the run.
+        $preStripDrivers = $null
+        $lastEnumError = $null
+        for ($enumAttempt = 1; $enumAttempt -le 3; $enumAttempt++) {
+            try {
+                $preStripDrivers = @(Get-WindowsDriver -Path $MountDir -ErrorAction Stop)
+                $lastEnumError = $null
+                break
+            } catch {
+                $lastEnumError = $_
+                if ($enumAttempt -lt 3) {
+                    Write-Log "Source-ownership decision: driver enumeration attempt $enumAttempt failed: $_ - retrying in 5s" -Level WARN
+                    Start-Sleep -Seconds 5
+                }
+            }
+        }
+        if ($null -eq $preStripDrivers) {
+            Write-Log "Source-ownership decision: driver enumeration failed after 3 attempts: $lastEnumError - candidate rejected" -Level ERROR
+            try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
+            Remove-ItemIfExist $MountDir
+            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+            Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+            Remove-ItemIfExist "$WorkDir\base.wim"
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Why' -Value 'Ownership decision: driver enumeration failed after retries'
+            exit $EXIT_WARNING
+        }
+        Write-Log "Source-ownership decision: pre-strip third-party inventory: $($preStripDrivers.Count) package(s)"
+
+        $ownership = Get-SourceOwnershipClassification -MountDir $MountDir -PreStripDrivers $preStripDrivers `
+                        -State $state -StagedSourceHash $Script:StagedWimSourceHash -CurrentLineageId $Script:LineageId
+        Write-Log "Source-ownership classification: $($ownership.Class) - $($ownership.Reason)"
+
+        if ($ownership.Class -eq 'Foreign-With-Drivers') {
+            Write-Log "Preserving foreign source: third-party drivers present and no positive ownership evidence. No strip, no injection, no deployment. The existing WinRE route remains intact." -Level WARN
+            try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
+            Remove-ItemIfExist $MountDir
+            Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+            Remove-ItemIfExist "$WorkDir\base.wim"
+
+            $acceptedHash = if ($ActiveLocationHash) { $ActiveLocationHash } else { $Script:StagedWimSourceHash }
+            $Script:ForeignSourceAccepted = $true
+            $Script:ForeignSourceAcceptedHash = $acceptedHash
+            $Script:nonFatalWarning = $true
+
+            Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
+                             -PendingReboot $false `
+                             -DeployedDiskNumber $state.DeployedDiskNumber `
+                             -DeployedPartitionNumber $state.DeployedPartitionNumber `
+                             -UsedOSFallback $state.UsedOSFallback `
+                             -RepairAttempts 0 `
+                             -ForeignSourceAcceptedHash $acceptedHash
+            Remove-ItemIfExist $CheckpointFile
+
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'PRESERVED'
+            Set-RunSummaryField -Field 'Why' -Value 'Foreign WinRE source with third-party drivers preserved; no normalization performed'
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'PRESERVED'
+            Set-RunSummaryField -Field 'NextAction' -Value 'No action required. WinRE is functional; the manager will not modify this foreign source.'
+            Add-RunSummaryLine -Field 'ChangesMade' -Line "State file records ForeignSourceAcceptedHash=$acceptedHash"
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Image was preserved: no strip, no injection, no deployment.'
+            exit $EXIT_WARNING
+        }
 
         # v47: normalize the mounted image to zero third-party drivers
         # before injecting the current recipe. Hard gate: any failure to
@@ -5682,6 +7764,8 @@ try {
             Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
             Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
             Remove-ItemIfExist "$WorkDir\base.wim"
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Why' -Value 'Strip stage failed; candidate rejected'
             exit $EXIT_WARNING
         }
 
@@ -5877,6 +7961,85 @@ try {
             $allDirs | ForEach-Object { Remove-ItemIfExist $_ -Recurse }
         }
 
+        # ===== v49 never-downgrade check =====
+        # Runs after injection, before ResetBase. Enumerate the current
+        # third-party driver set and compare storage-class drivers against
+        # the pre-strip inventory. Any detected downgrade preserves the
+        # entire source.
+        if ($Script:ImageInjectionComplete) {
+            $postInjectDrivers = @()
+            try {
+                $postInjectDrivers = @(Get-WindowsDriver -Path $MountDir -ErrorAction Stop)
+            } catch {
+                Write-Log "Never-downgrade check: post-injection driver enumeration failed: $_ - preserving source and deferring" -Level ERROR
+                try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
+                Remove-ItemIfExist $MountDir
+                Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+                Remove-ItemIfExist "$WorkDir\base.wim"
+                Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Why' -Value 'Post-injection driver enumeration failed'
+                exit $EXIT_WARNING
+            }
+            $downgradeCheck = Test-StorageDriverWouldDowngrade -PreStripDrivers $preStripDrivers -PostInjectDrivers $postInjectDrivers
+            if ($downgradeCheck.Downgrade) {
+                Write-Log "Never-downgrade invariant: candidate image would replace an existing storage driver with an older version. Preserving the source; no deployment." -Level WARN
+                foreach ($det in $downgradeCheck.Details) {
+                    Write-Log "  Downgrade: $det" -Level WARN
+                }
+                try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
+                Remove-ItemIfExist $MountDir
+                Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+                Remove-ItemIfExist "$WorkDir\base.wim"
+                Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+
+                $acceptedHash = if ($ActiveLocationHash) { $ActiveLocationHash } else { $Script:StagedWimSourceHash }
+                $Script:ForeignSourceAccepted = $true
+                $Script:ForeignSourceAcceptedHash = $acceptedHash
+                $Script:nonFatalWarning = $true
+
+                Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
+                                 -PendingReboot $false `
+                                 -DeployedDiskNumber $state.DeployedDiskNumber `
+                                 -DeployedPartitionNumber $state.DeployedPartitionNumber `
+                                 -UsedOSFallback $state.UsedOSFallback `
+                                 -RepairAttempts 0 `
+                                 -ForeignSourceAcceptedHash $acceptedHash
+                Remove-ItemIfExist $CheckpointFile
+
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Decision' -Value 'PRESERVED'
+                Set-RunSummaryField -Field 'Why' -Value 'Never-downgrade invariant: candidate would replace a newer storage driver with an older one'
+                Set-RunSummaryField -Field 'OperatingMode' -Value 'PRESERVED'
+                Set-RunSummaryField -Field 'NextAction' -Value 'No action required. WinRE is functional; the manager will not perform the downgrade.'
+                Add-RunSummaryLine -Field 'ChangesMade' -Line "State file records ForeignSourceAcceptedHash=$acceptedHash"
+                Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Image was preserved; no deployment performed.'
+                exit $EXIT_WARNING
+            }
+        }
+
+        # ===== v49 storage applicability check =====
+        # Runs after injection, before ResetBase. Verifies that every
+        # SCSIAdapter-class device on this machine has at least one
+        # matching INF in the candidate image. This is the pre-deployment
+        # gate that catches the ASUS class of failure.
+        if ($Script:ImageInjectionComplete) {
+            $applicability = Test-StorageDriverApplicability -MountDir $MountDir
+            Write-Log "Storage applicability: Applicable=$($applicability.Applicable), Controllers=$($applicability.Controllers), Matched=$($applicability.Matched), Reason=$($applicability.Reason)"
+            if (-not $applicability.Applicable) {
+                Write-Log "Storage applicability gate rejected the candidate: $($applicability.Reason). Dismounting with -Discard and deferring." -Level ERROR
+                try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
+                Remove-ItemIfExist $MountDir
+                Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
+                Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+                Remove-ItemIfExist "$WorkDir\base.wim"
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Why' -Value "Storage applicability gate rejected candidate: $($applicability.Reason)"
+                Set-RunSummaryField -Field 'NextAction' -Value 'No action required. The manager will retry when the manifest or environment changes.'
+                exit $EXIT_WARNING
+            }
+        }
+
         # ResetBase removes superseded components from the WinSxS store.
         # The size reduction only materialises on disk in Step 4's export.
         # Failure is non-fatal: the export writes whatever size the image
@@ -5891,6 +8054,20 @@ try {
             } else {
                 Write-Log "Component cleanup and ResetBase completed successfully"
             }
+        }
+
+        # ===== v49 provenance marker write =====
+        # Written after injection and ResetBase, before dismount -Save, so
+        # the marker persists in the exported image. Not load-bearing in
+        # v49: no gate reads it. The marker provides the data future
+        # releases need to recognize Manager lineage across a servicing
+        # event (once the marker-survival experiment succeeds).
+        if ($Script:ImageInjectionComplete) {
+            if (-not $Script:LineageId) {
+                $Script:LineageId = [guid]::NewGuid().ToString('N')
+                Write-Log "Generated new LineageId: $($Script:LineageId)"
+            }
+            Write-ProvenanceMarker -MountDir $MountDir -LineageId $Script:LineageId -DesiredStateId $DesiredStateId | Out-Null
         }
 
         Dismount-WindowsImage -Path $MountDir -Save; Remove-ItemIfExist $MountDir
@@ -5913,19 +8090,27 @@ try {
         Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
         Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
         Remove-ItemIfExist "$WorkDir\base.wim"
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Image injection did not complete'
+        Set-RunSummaryField -Field 'NextAction' -Value 'The next scheduled run will retry.'
         exit $EXIT_WARNING
     }
 
     $OptimizedWim = "$WorkDir\winre_optimized.wim"
     if ($step -lt 4 -and $needInject) {
         Write-Log "Step 4: Optimizing"
+        Write-Narration "Optimizing the recovery image."
         & dism /Export-Image /SourceImageFile:"$WorkDir\base.wim" /SourceIndex:1 /DestinationImageFile:$OptimizedWim /Compress:max /ScratchDir:"$WorkDir\scratch" | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Log "dism /Export-Image failed with exit code $LASTEXITCODE" -Level FATAL
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'dism /Export-Image failed'
             exit $EXIT_FATAL
         }
         if (-not (Test-Path $OptimizedWim)) {
             Write-Log "dism /Export-Image reported success but $OptimizedWim does not exist" -Level FATAL
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'Export succeeded but the optimized WIM is missing'
             exit $EXIT_FATAL
         }
         if ($Script:ImageInjectionComplete) {
@@ -5967,7 +8152,7 @@ try {
 
     $SourceWim = if ($needInject) { $OptimizedWim } else { $imageToCheck }
     $finalSizeMB = Get-FileSizeMB -Path $SourceWim
-    if ($finalSizeMB -le 0) { Write-Log "Could not determine WIM size" -Level FATAL; exit $EXIT_FATAL }
+    if ($finalSizeMB -le 0) { Write-Log "Could not determine WIM size" -Level FATAL; Set-RunSummaryField -Field 'Result' -Value 'FATAL'; Set-RunSummaryField -Field 'Why' -Value 'Could not determine WIM size'; exit $EXIT_FATAL }
     Write-Log "Source WIM: $SourceWim ($finalSizeMB MiB)"
 
     # v48 patch 2: cache source-derived values before any operation that
@@ -5997,6 +8182,11 @@ try {
                 Write-Log "Recorded retry-suppressing deferral for DesiredStateId $DesiredStateId; next run will verify the existing route before skipping identical retries. Delete $env:SystemDrive\Recovery\OEM\$StateFileName and $env:SystemDrive\Recovery\OEM\$PartitionDeferralFileName to force a retry."
             }
             $Script:nonFatalWarning = $true
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'DEFERRED'
+            Set-RunSummaryField -Field 'Why' -Value "Dedicated replacement deferred: $($created.Reason)"
+            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($Script:UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            Set-RunSummaryField -Field 'NextAction' -Value 'Resolve the deferral reason and re-run.'
             exit $EXIT_WARNING
         } elseif ($created -and $created.Status -eq "Created") {
             $recoveryPartition = @{ DriveLetter = $created.DriveLetter; DiskNumber = $created.DiskNumber; PartitionNumber = $created.PartitionNumber; Partition = $null }
@@ -6026,9 +8216,15 @@ try {
     $FinalWim = Join-Path $TargetDir "winre.wim"
 
     Write-Log "Step 5: Deploying WIM to $TargetDir"
+    Write-Narration "Deploying the recovery image."
     if ($Script:DryRun) {
         Write-Log "[DRY RUN] Would deploy $SourceWim to $TargetDir and enable WinRE"
         Remove-ItemIfExist $CheckpointFile
+        Set-RunSummaryField -Field 'Result' -Value 'DRY_RUN'
+        Set-RunSummaryField -Field 'Why' -Value 'DryRun requested; deployment was previewed without any mutation'
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Re-run without -DryRun to execute the deployment.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (DryRun).'
         exit $EXIT_SUCCESS
     }
 
@@ -6039,6 +8235,8 @@ try {
     if ($recoveryPartition) {
         if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $recoveryPartition.DiskNumber -PartitionNumber $recoveryPartition.PartitionNumber)) {
             Write-Log "FATAL: Could not make target recovery partition unencrypted" -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'Could not make target recovery partition unencrypted'
             exit $EXIT_FATAL
         }
     } else {
@@ -6050,6 +8248,10 @@ try {
             Write-Log "OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=$osFallbackEnc). reagentc refuses to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state." -Level WARN
             $Script:nonFatalWarning = $true
             Remove-ItemIfExist $CheckpointFile
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Why' -Value 'OS-fallback requires C: FullyDecrypted'
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'OS-FALLBACK'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Complete decryption of C: and re-run.'
             exit $EXIT_WARNING
         }
     }
@@ -6070,6 +8272,8 @@ try {
             Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
             Remove-ItemIfExist "$WorkDir\base.wim"
             $Script:nonFatalWarning = $true
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Why' -Value 'Registered WinRE source changed during candidate preparation'
             exit $EXIT_WARNING
         }
         Write-Log "Disabling WinRE before deployment"
@@ -6079,12 +8283,16 @@ try {
         if ($disExit -ne 0) {
             Write-Log "reagentc /disable failed (exit $disExit): $disOut" -Level ERROR
             Write-Log "FATAL: cannot deploy a new WinRE image while WinRE is still Enabled - aborting" -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable failed'
             exit $EXIT_FATAL
         }
         Start-Sleep 3
         $verifyDisabled = Get-WinREState
         if ($verifyDisabled.Status -ne "Disabled") {
             Write-Log "WinRE still reports $($verifyDisabled.Status) after reagentc /disable - aborting" -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable verification failed'
             exit $EXIT_FATAL
         }
     }
@@ -6113,6 +8321,8 @@ try {
 
     if (-not $deployOk) {
         Write-Log "FATAL: WIM deployment failed" -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'WIM deployment failed'
         exit $EXIT_FATAL
     }
 
@@ -6121,6 +8331,8 @@ try {
     Write-Log "reagentc /setreimage: exit=$setImageExit, output=$setImageOutput -> $permanentPath"
     if ($setImageExit -ne 0) {
         Write-Log "FATAL: reagentc /setreimage failed: $setImageOutput" -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'reagentc /setreimage failed'
         exit $EXIT_FATAL
     }
 
@@ -6317,6 +8529,8 @@ try {
             }
             if (-not $finalPart) {
                 Write-Log "FATAL: WinRE location could not be resolved after 3 verification attempts: $($finalState.Location)" -Level ERROR
+                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                Set-RunSummaryField -Field 'Why' -Value 'WinRE location could not be resolved after deployment'
                 exit $EXIT_FATAL
             }
 
@@ -6331,8 +8545,11 @@ try {
             if ($isFinalOSPart) {
                 if ($Script:UsedOSFallback) {
                     Write-Log "Operating mode: OS-FALLBACK (WinRE on OS partition at $($finalState.Location)) - degraded but functional" -Level WARN
+                    $Script:UsedOSFallback = $true
                 } else {
                     Write-Log "FATAL: WinRE is on the OS partition but the script did not deploy it via OS-fallback" -Level ERROR
+                    Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                    Set-RunSummaryField -Field 'Why' -Value 'WinRE ended up on the OS partition without an OS-fallback deployment'
                     exit $EXIT_FATAL
                 }
             }
@@ -6344,17 +8561,23 @@ try {
                     Invoke-DriveLetterRemoval -Letter $finalPart.DriveLetter | Out-Null
                 }
                 Write-Log "Operating mode: DEDICATED"
+                $Script:UsedOSFallback = $false
             }
             else {
                 Write-Log "FATAL: WinRE is on an unexpected partition (disk $($finalPart.DiskNumber) part $($finalPart.PartitionNumber))" -Level ERROR
+                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                Set-RunSummaryField -Field 'Why' -Value 'WinRE is on an unexpected partition after deployment'
                 exit $EXIT_FATAL
             }
         }
         elseif ($Script:UsedOSFallback) {
             Write-Log "Operating mode: OS-FALLBACK (WinRE at $($finalState.Location)) - degraded but functional" -Level WARN
+            $Script:UsedOSFallback = $true
         }
         else {
             Write-Log "FATAL: WinRE Enabled but location is empty" -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'WinRE Enabled but location is empty'
             exit $EXIT_FATAL
         }
     }
@@ -6366,6 +8589,11 @@ try {
     else {
         if ($enableResult -eq "bitlocker") {
             Write-Log "WinRE is not enabled at exit. Last enable attempt returned: bitlocker. The state file records the failure for the loop-breaker." -Level WARN
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'FULL UPDATE'
+            Set-RunSummaryField -Field 'Why' -Value 'reagentc /enable refused with BitLocker error'
+            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($Script:UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            Set-RunSummaryField -Field 'NextAction' -Value 'The next scheduled run will retry; the loop-breaker fires after 3 failures.'
             exit $EXIT_WARNING
         }
         Write-Log "WinRE not enabled - final attempt" -Level WARN
@@ -6387,8 +8615,35 @@ try {
         }
         else {
             Write-Log "FATAL: WinRE is not enabled at exit" -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'WinRE is not enabled at exit'
             exit $EXIT_FATAL
         }
+    }
+
+    # ---- Terminal summary fields ----
+    $finalMode = if ($Script:UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' }
+    $finalResult = if ($Script:rebootRequired) { 'REBOOT_REQUIRED' }
+                   elseif ($Script:UsedOSFallback) { 'WARNING' }
+                   elseif ($Script:nonFatalWarning) { 'WARNING' }
+                   else { 'SUCCESS' }
+    $finalNext = if ($Script:rebootRequired) { 'Reboot the machine to complete WinRE enable.' }
+                 elseif ($Script:UsedOSFallback) { 'Review warnings above; OS-fallback mode is functional but degraded.' }
+                 elseif ($Script:nonFatalWarning) { 'Review warnings above.' }
+                 else { 'No action required.' }
+
+    Set-RunSummaryField -Field 'Result' -Value $finalResult
+    Set-RunSummaryField -Field 'Decision' -Value 'FULL UPDATE'
+    Set-RunSummaryField -Field 'OperatingMode' -Value $finalMode
+    Set-RunSummaryField -Field 'NextAction' -Value $finalNext
+    if (-not $Script:RunSummary.Why) {
+        Set-RunSummaryField -Field 'Why' -Value 'Full update completed'
+    }
+    Add-RunSummaryLine -Field 'ChangesMade' -Line "Deployed WinRE image to $FinalWim"
+    if ($recoveryPartition) {
+        Add-RunSummaryLine -Field 'ChangesMade' -Line "Target: disk $($recoveryPartition.DiskNumber) part $($recoveryPartition.PartitionNumber) (DEDICATED)"
+    } else {
+        Add-RunSummaryLine -Field 'ChangesMade' -Line "Target: OS-fallback at $TargetDir"
     }
 
     if ($Script:rebootRequired) { exit $EXIT_REBOOT_REQUIRED }
@@ -6399,6 +8654,13 @@ try {
 catch {
     Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
     Write-Log "Stack: $($_.ScriptStackTrace)" -Level ERROR
+    # v49 patch 1: leave the resume task registered so the next boot
+    # trigger or the one-shot T+1 hour trigger retries the
+    # interrupted run. This flag is consulted by the finally block.
+    $Script:ResumeTaskShouldPersist = $true
+    Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+    Set-RunSummaryField -Field 'Why' -Value "Unhandled exception: $($_.Exception.Message)"
+    Set-RunSummaryField -Field 'NextAction' -Value 'Review the log for details.'
     exit $EXIT_FATAL
 }
 finally {
@@ -6430,6 +8692,19 @@ finally {
         } catch { $leaks += $letter }
     }
     if ($leaks.Count -gt 0) { Write-Log "Drive letters still assigned: $($leaks -join ', ')" -Level ERROR }
+
+    # v49 patch 1: remove the temporary resume task on clean
+    # completion. Left registered only when the catch block set the
+    # persist flag (unhandled exception), or when the process was
+    # hard-killed and the finally block never ran (in which case the
+    # task remains and fires on the next boot or at T+1 hour).
+    if ($Script:ResumeTaskCreated -and -not $Script:ResumeTaskShouldPersist) {
+        Unregister-ResumeTask -TaskName $Script:ResumeTaskName
+    }
+
+    # v49: render the run summary before releasing the lock. The summary
+    # is output only; nothing downstream reads it.
+    try { Write-RunSummary } catch { }
 
     # Lock released last, after every cleanup step.
     if ($Script:ProgramLockStream) {

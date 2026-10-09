@@ -27,6 +27,8 @@ The `-ExecutionPolicy Bypass -File` form applies the bypass only to the child pr
 
 If you want to inspect the machine first, run the read-only harness (`Test-WinRE.ps1`). It requires no elevation and modifies nothing. See the [README](../README.md) for the harness menu options.
 
+**As of v49, the recommended single-machine path is the wrapper.** `scripts\WinRE-Manager.cmd` opens a menu grouped into SAFETY, DIAGNOSTICS, MAINTENANCE, REPAIR, and RECOVERY sections. Backup and restore are the first two options an operator sees; the destructive repair run sits at the bottom of the numbered list, immediately before Quit, so the safe and preparatory options are read first. The wrapper is the recommended entry point for a first-time user; direct script invocation is for scripting, CI, and pinned-version deployments. See the [README's menu table](../README.md#just-want-to-fix-winre-on-your-pc) for the full option list.
+
 For a single-machine deployment, the rest of this document is reference material — the exit-code table, the Audit Mode precondition, and the Device Encryption policy all apply to a one-off run exactly as they apply to a fleet run. You can skip the scheduled-task sections.
 
 ### Managed fleet, continuous
@@ -68,6 +70,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1                  # 
 
 Confirm exit 0 and `Operating mode: DEDICATED` in the log. Only then expand the ring.
 
+The v49 release adds three pre-deployment gates that narrow what the pipeline will deploy — a **source-ownership classification** (a foreign WIM that a vendor populated with its own drivers is preserved as-is rather than stripped and re-injected), a **never-downgrade storage-driver check** (a candidate image that would inject a storage driver older than one already present in the mounted image is discarded entirely — the source is preserved and the run defers), and a **pre-deployment storage-applicability gate** (which runs inside Step 3, after injection is confirmed complete, before ResetBase and before the dismount, and is the last refusal before the WIM is written to the active route). Each of these changes the pipeline's deployment decision on at least some machines; the `ScriptVersion` bump from 48 to 49 is what converges the fleet onto the new pipeline. See the "v49 migration" section below for the fleet-level rollout behaviour.
+
 ### Rule 2 — never leave a machine without a working recovery route: do not interfere with the recovery window
 
 The one case in which the script cannot guarantee a working recovery route on a single run is the post-deletion residual corner: a failure **after** the old recovery partition has been deleted, on a machine whose C: is encrypted, with no successful retry. The trigger set is wider than the commonly cited `New-Partition` or `Format-Volume` pair: the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, and the recovery-partition deletion itself when the previous route cannot be restored, all reach the same corner. The correct operational response is **not to interrupt the script while it is inside the destructive window** — every interruption between the delete and the enable is an opportunity for the machine to land in that corner.
@@ -81,6 +85,8 @@ Concretely:
 
 The scheduled task's own `ExecutionTimeLimit = PT6H` and the script's internal timeouts (300-second BitLocker polling, 5-second sleeps, 15-second network timeout) are the effective limits inside that. Nothing outside the script needs to enforce a shorter one.
 
+**If a Repair or Restore run is interrupted**, the v49 temporary resume task registers itself on every Repair or Restore run and fires at boot+1m and one-shot at T+1h. The task is deleted on clean completion and preserved on interruption — including Ctrl+C, a hard kill, a reboot mid-run, an unhandled exception in the outer catch, and the two v49 restore mid-transformation failure paths. The resume run re-invokes the script in resume mode and completes the operation from the checkpoint. **Do not delete the resume task manually** unless you intend to abandon the interrupted operation — see the "Temporary resume task" section below.
+
 **v48 expands the destructive-surface scope.** As of v48 patch 1, the intervening-anchor path extends the destructive window's entry to include a resize of the intervening data partition (typically `D:`) in addition to or instead of the OS partition. The window's scope is unchanged — the same partition-delete / create / format / deploy / register sequence runs — but the pre-shrink target may be the anchor rather than C:. The operational guidance above applies to the intervening-anchor case without change. The narrow scope means the participating partitions are predictable: one non-recovery data partition immediately preceding the type-coded recovery cluster, on the OS disk, validated before any mutation.
 
 ### Rule 3 — minimize the `reagentc /disable` → `reagentc /enable` window: do not schedule around it
@@ -93,15 +99,15 @@ Rule 3 is enforced by the script's own ordering — every preparatory step that 
 - **Do not use a "stop task if it runs longer than X" setting** on the scheduled task or in an MDM-side policy that could fire inside the window. The scheduled task's own `ExecutionTimeLimit` is the correct upper bound; a second, shorter policy that runs in parallel can kill the run at the worst possible moment.
 - **Do not use an orchestration layer that kills the process after a fixed timeout** shorter than the scheduled task's own limit. An RMM tool or an MDM remediation platform with a 60-second or 120-second timeout will kill the script inside the window on a machine where the destructive sequence actually runs; the same tool on a healthy machine will see the fast path complete in 10–20 seconds and never trigger its timeout.
 
-The single-run recovery story is: `Restore-PreviousWinRERoute` on delete failure, `Remove-OrphanPartition` plus `Restore-OSPartitionSize` on create failure, and the enable-only path on a clean-but-disabled state. These handle every ordinary failure. They do not handle a process kill inside the window.
+The single-run recovery story is: `Restore-PreviousWinRERoute` on delete failure, `Remove-OrphanPartition` plus `Restore-OSPartitionSize` on create failure, and the enable-only path on a clean-but-disabled state. These handle every ordinary failure. They do not handle a process kill inside the window — but as of v49 the resume task catches the interruption case and re-invokes the script on the next boot or within the hour.
 
 ### Rule 4 — do no work unless needed: trust the fast path; do not force reruns
 
 Rule 4 has four concrete operational consequences.
 
 - **Healthy machines take the fast path.** Runtime is dominated by Windows' own CIM and PnP enumeration and the driver-manifest fetch — typically 10–20 seconds on a modern machine. The script itself makes no state changes. There is no reason to tune the schedule around the cost of a healthy run.
-- **Do not force a full update on a healthy machine.** Deleting the state file, bumping the manifest version, or bumping `ScriptVersion` forces one full-update pass per machine. Do it only when there is a reason — the migration sections below describe the five version boundaries that do this deliberately.
-- **Do not retry a deferral.** The script's deferrals are protective. An Audit Mode deferral, a VMD-query-indeterminate deferral, an OS-fallback BitLocker deferral, a v45 pre-shrink deferral, a v47 race-detector abort, an offline-fallback deferral, the v48 architecture-gate refusal, the v48 intervening-anchor surplus rejection, the v48 multi-intervening rejection, and the v48 offline `LocalInputsId` mismatch — none is improved by running the script again before the underlying condition changes. The correct response is to resolve the condition, then re-run. **One nuance: the v45 pre-shrink deferral has two classes.** The four `RetrySuppressible = $true` reasons (post-shrink free space below minimum, pre-shrink failed, pre-shrink verification failed, resize rounding reduced planned extent) write a deferral marker and will not re-attempt until the marker is cleared. The other reasons — including the `C: volume could not be read for free-space check` failure and the pre-deletion resolver guard — return `RetrySuppressible = $false` and will retry on the next scheduled run without operator intervention. Check the specific reason in the log.
+- **Do not force a full update on a healthy machine.** Deleting the state file, bumping the manifest version, or bumping `ScriptVersion` forces one full-update pass per machine. Do it only when there is a reason — the migration sections below describe the six version boundaries that do this deliberately.
+- **Do not retry a deferral.** The script's deferrals are protective. An Audit Mode deferral, a VMD-query-indeterminate deferral, an OS-fallback BitLocker deferral, a v45 pre-shrink deferral, a v47 race-detector abort, an offline-fallback deferral, the v48 architecture-gate refusal, the v48 intervening-anchor surplus rejection, the v48 multi-intervening rejection, the v48 offline `LocalInputsId` mismatch, the v49 native-boot VHDX fail-closed gate, and the v49 pre-deployment storage-applicability gate — none is improved by running the script again before the underlying condition changes. The correct response is to resolve the condition, then re-run. **One nuance: the v45 pre-shrink deferral has two classes.** The four `RetrySuppressible = $true` reasons (post-shrink free space below minimum, pre-shrink failed, pre-shrink verification failed, resize rounding reduced planned extent) write a deferral marker and will not re-attempt until the marker is cleared. The other reasons — including the `C: volume could not be read for free-space check` failure and the pre-deletion resolver guard — return `RetrySuppressible = $false` and will retry on the next scheduled run without operator intervention. Check the specific reason in the log.
 - **The enable-failure counter is a feature, not a bug.** A machine that fails the enable step three times in a row hits the loop-breaker and exits `EXIT_FATAL` with a "manual intervention required" message. Retrying automatically produces the same result. Resolve the underlying enable failure, delete the state file, then re-run.
 
 ## Preconditions
@@ -110,6 +116,7 @@ Before the first run on any machine, confirm:
 
 - **Windows build**: 19041+ for Windows 10, 22000+ for Windows 11.
 - **Architecture**: x64 only (v48 patch 1). The manager refuses to run on ARM64, x86, or any architecture whose token cannot be resolved, exiting with `EXIT_WARNING` before any state mutation. The refusal is a stable, named deferral: a machine in the fleet whose architecture is not `x64` will continue to exit 2 on every run until the manager adds support or the machine is replaced.
+- **OS volume topology (v49)**: not a native-boot VHDX. The manager refuses to run destructive operations when the OS disk's bus type is `File Backed Virtual` **and** at least one other disk is on a physical bus — the native-boot VHD/VHDX topology, where the running OS disk is a VHD/VHDX stored on a host physical disk. A hypervisor guest whose entire storage stack is virtual (every other disk on `Virtual` or `File Backed Virtual`) is not refused and runs the full pipeline normally. The gate exits `EXIT_WARNING` before any partition or WinRE change. `Resize-Partition` and `New-Partition` against a VHDX-backed volume have different semantics than against a physical disk; the pipeline has not been validated under that topology. This is a stable deferral, and the gate has no `-DryRun` carve-out — a dry run on a VHDX-boot host also exits `EXIT_WARNING`.
 - **7-Zip** present at `C:\Program Files\7-Zip\7z.exe`, or `winget` available so the script can install it.
 - **Internet access** to the driver manifest, the three OEM maps, and the base WIM repository for the first deployment on a fresh machine. On a machine whose state file is present and its local safety checks pass, a network outage does not prevent the run — see the "Offline behavior" section below. The endpoints are: `gist.github.com`, `api.github.com`, `downloads.dell.com`, `ftp.ext.hp.com`, and the vendor-specific Lenovo endpoints (`download.lenovo.com`, `support.lenovo.com` — the latter is only reached by the map builder, not by production).
 - **Windows is in a normal-running state.** The script refuses to run before any state-modifying action when the machine has not yet completed OOBE. This is the v43 patch 5 (further revision) Audit Mode guard and it matters for freshly imaged machines. See the "Audit Mode and OOBE" section below.
@@ -117,7 +124,7 @@ Before the first run on any machine, confirm:
 
 There is **no BitLocker precondition on the OS volume**. The v43 patch 5 (further revision 5) policy is target-volume-based: the enable-only and dedicated-partition paths do not depend on C:'s BitLocker state at all. If the target recovery partition is encrypted, the script decrypts it in place via `Set-RecoveryPartitionReadyForWinRE` before calling reagentc. The only route that depends on C:'s BitLocker state is the OS-fallback route, because on that route the target volume *is* C:. The destructive partition path does not depend on C:'s state either — as of v44 patch 6 it does not consult C: at all. Neither the OS-fallback gate nor the destructive path modifies C:'s BitLocker state. See the "Device Encryption" section below.
 
-The harness's System diagnostic (`scripts\Test-WinRE.ps1` Option 1) reports `ImageState`, C:'s BitLocker state, the target recovery partition's BitLocker state, and the workspace-selection eligibility. Run it on a representative machine before pushing the task to a fleet.
+The harness's System diagnostic (`scripts\Test-WinRE.ps1` Option 1) reports `ImageState`, C:'s BitLocker state, and the target recovery partition's BitLocker state. As of harness v28 it also reports the machine's present SCSIAdapter-class storage controllers, which is the input the v49 pre-deployment storage-applicability gate reads. Run it on a representative machine before pushing the task to a fleet.
 
 ## Scheduled task
 
@@ -201,6 +208,22 @@ Notes on the settings:
 - `RunOnlyIfNetworkAvailable = false` is deliberate as of v44 patch 5. The script now has an offline fallback: when the manifest fetch fails, it trusts the state file's stored `DesiredStateId` and takes the fast path if the local safety checks pass. With `true`, the task would not fire when the network is down, so the fallback would only help manual invocations — not the scheduled path where the machine actually needs it. The offline fallback is self-limiting (`EXIT_WARNING` when a full update is needed, never a silent partial deployment) and safe on a machine whose state file is valid. A first deployment on a machine with no state file will still exit `EXIT_FATAL` when offline, which is correct: the live manifest is required to compute the initial `DesiredStateId`. See the "Offline behavior" section below.
 - `StartWhenAvailable = true` handles missed triggers after a cold boot.
 
+### The wrapper's stable install location (v49)
+
+The `scripts\WinRE-Manager.cmd` wrapper's install option (menu option **5 — Install automatic maintenance**) does not use the paths in the XML above. It installs a copy of `WinRE.ps1` at:
+
+```
+C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1
+```
+
+and registers the task against **that** copy. The install step creates the containing directory, copies the operator's local `WinRE.ps1` to the stable path, SHA256-verifies the copy, and refuses to register the task if the copy's hash does not match the source. The task is registered against the installed copy, not the operator's local clone, so the task survives deletion or relocation of the operator's original files.
+
+The wrapper's task uses the same profile as the XML above for the settings that matter — SYSTEM, highest run level, startup+5m and every-30-days-at-03:00 triggers, `IgnoreNew`, `StartWhenAvailable`, battery-allowed, 24-hour execution limit, no idle requirement, and — deliberately — network **not** required, so the offline fallback fires on scheduled runs. The wrapper's execution time limit is 24 hours rather than the XML template's 6 hours; both are well above the effective runtime of any run the script produces, and the choice is not load-bearing.
+
+The wrapper's removal option (menu option **6 — Remove automatic maintenance**) unregisters the task but leaves the installed copy in place, so a subsequent reinstall does not need to re-copy. The removal screen tells the operator how to delete the containing directory manually.
+
+The XML template above is for a fleet operator who wants to hand-author the task. If you use the wrapper's install option instead, the paths differ and the version in the XML's `Description` and `URI` fields is not what the wrapper uses. Both approaches produce equivalent execution on the machine; the choice is which one the operator wants to maintain.
+
 ## One instance per machine
 
 `WinRE.ps1` assumes exclusive access to its selected image workspace and to the recovery partition it is operating on. Full updates select an eligible fixed NTFS volume and store the selection in the checkpoint for resume. As of **v44 patch 4**, the script enforces single-instance execution with a startup file lock.
@@ -246,6 +269,8 @@ This is a change from the pre-patch-4 behavior. Before the lock, a concurrent in
 
 **What it does not protect against.** A **manual** invocation — from an interactive PowerShell session, an RMM tool's "run now" button, an Intune remediation script, or anything else that launches `WinRE.ps1` outside the scheduled task — can overlap with a scheduled run. `IgnoreNew` is a property of the task, not of the script, so it has no effect on processes launched any other way. The v44 patch 4 file lock closes this gap for every launch path: the manual invocation and the scheduled run cannot both hold the lock.
 
+The v49 temporary `WinRE Manager - Resume` task does not participate in the program lock directly — it invokes the production script in resume mode, which acquires the lock normally. A resume run that coincides with a scheduled run is serialized by the same lock, and whichever side loses the race exits with the same `Another WinRE Manager instance is already running` message.
+
 ### If you need to run `WinRE.ps1` manually on a machine that has the scheduled task installed
 
 The lock makes manual invocations safe, but a manual run that coincides with a scheduled run will still find itself on one side or the other of the lock:
@@ -265,6 +290,16 @@ If the lock cannot be acquired for a reason other than contention — a permissi
 
 and continues without the lock. This is deliberate: the lock is defensive, and a broken lock must not prevent a legitimate deployment. The run is then vulnerable to the pre-patch-4 rename error for its entire duration. If you see this line, investigate why the lock could not be acquired and fix the underlying condition — otherwise the machine is one concurrent invocation away from the pre-patch-4 failure mode.
 
+### Temporary resume task (v49)
+
+Every Repair or Restore run registers a scheduled task named `WinRE Manager - Resume`. The task fires at boot+1m and as a one-shot at T+1h; it is deleted on clean completion and preserved on interruption. The persist flag is set in three cases: the outer catch (an unhandled exception), the `CancelKeyPress` handler (Ctrl+C — the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C), and `Invoke-RestoreAction`'s two mid-transformation failure paths. Two further interruption classes leave the task registered without setting the flag, because the `finally` block never runs to consult it: a hard kill (e.g. `taskkill /F`) and a reboot mid-run (the OS terminates PowerShell).
+
+The task is a per-run safety net, not machine state. Its presence indicates an interrupted Repair or Restore; its absence is the normal state after a clean completion. When present, the resume run re-invokes the production script in resume mode and completes the operation from the checkpoint. **Do not delete it manually** unless you intend to abandon the interrupted operation.
+
+**Under `$PSCommandPath`-less invocation** — gist bootstrap via `Invoke-RestMethod | Invoke-Expression`, or paste-into-console — the guard in `Register-ResumeTask` logs at INFO and does not register the task. This is by design: those invocation modes have no `$PSCommandPath`, and the guard skips the registration. A run initiated from such an invocation cannot be resumed by the task; the operator must re-run the script manually after an interruption.
+
+**The task profile** is SYSTEM / highest run level, startup+1m and one-shot T+1h, `StartWhenAvailable`, battery-allowed, no idle requirement, network not required, 24-hour execution limit. The same profile as the primary scheduled task's conservative settings, so a resume run behaves identically to a scheduled run for the purposes of the offline fallback and the fast-path gates.
+
 ## Where to put the script
 
 Place `WinRE.ps1` in a directory that:
@@ -273,6 +308,8 @@ Place `WinRE.ps1` in a directory that:
 2. **Cannot be modified by non-admin users.** A scheduled task running as SYSTEM must not execute a script that a standard user can overwrite. `C:\ProgramData\OEM\` with default ACLs is safe; do not use `C:\Temp\`.
 
 The script writes to `C:\ProgramData\OEM\Logs\` for the log, checkpoint file, and lock file. `SYSTEM` can write there by default.
+
+**The wrapper's install option uses `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` as the stable install location** and registers the task against that copy rather than against the operator's local clone. Both `C:\ProgramData\OEM\` and `C:\ProgramData\OEM\WinRE-Manager\` have the same ACL properties for the purposes of the scheduled task.
 
 ## Workspace selection (v45 patch 1)
 
@@ -387,7 +424,39 @@ The reasoning: guessing "absent" on a machine that genuinely has VMD hardware wo
 
 A run that defers this way leaves the machine unchanged: no WIM deployed, no partition touched, no `reagentc` call made. The next scheduled run retries the enumeration; a transient PnP service issue is the most likely cause. If the deferral fires repeatedly, resolve the underlying PnP service issue — the deferral is a protective stop, not a degraded-success.
 
-## Offline behavior (v44 patch 5; fast-path gate updated in v47 patch 1; `LocalInputsId` added in v48 patch 1)
+## v49 pre-deployment gates
+
+The v49 release adds three gates that narrow what the pipeline will deploy. Each is described in full in [driver-injection.md](driver-injection.md); this section covers the deployment-time implications.
+
+### Source-ownership classification
+
+Every candidate source WIM is classified into one of four ownership classes — `Manager-Owned`, `Manager-Lineage`, `Foreign-No-Drivers`, `Foreign-With-Drivers` — before the strip stage runs. A `Foreign-With-Drivers` source is **preserved as-is**: the strip-and-reinject pipeline is skipped, the mounted image is dismounted with `-Discard`, and no WIM is deployed. The existing WinRE route is left untouched, and the state file records `ForeignSourceAcceptedHash` so subsequent runs recognize the preserved source and take the fast path. The run exits `EXIT_WARNING`. The other three classes proceed through the strip and injection as in v47/v48.
+
+**Operational consequence:** a machine whose registered WinRE was populated by a vendor tool with third-party drivers now deploys with those drivers instead of the manager's recipe. This is the intended v49 behavior; the ASUS-incident field case is the reason it exists. If the operator wants the manager's recipe applied, the source must be replaced with one that classifies as `Manager-Owned`, `Manager-Lineage`, or `Foreign-No-Drivers` — typically by using the LKG copy or the GitHub cold-start source.
+
+The classification is not operator-configurable in v49; it is derived from the source's actual driver set (a third-party driver count of zero vs. non-zero) plus two positive-ownership signals: a staged-source hash exact-match against `state.CurrentImageHash` (Manager-Owned) and a valid provenance marker whose `LineageId` matches the state file's (Manager-Lineage).
+
+### Never-downgrade storage-driver check
+
+After injection completes and before ResetBase, the manager compares each storage-class driver in the final image against the pre-strip inventory, matched by INF basename. If any post-injection driver would be older than the source's version of the same basename, the entire candidate is discarded — not just the offending driver — the mounted image is dismounted with `-Discard`, the source is preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`. The whole source is preserved rather than partially normalized.
+
+**Operational consequence:** a machine whose source image would inject a storage driver older than what is already present does not deploy. The existing WinRE route is untouched, and the state file records the preserved-source hash so subsequent runs recognize the accepted source and take the fast path.
+
+The log names each detected downgrade — the driver's INF basename, the source version, and the candidate version.
+
+### Pre-deployment storage-applicability gate
+
+The gate runs inside Step 3, after injection is confirmed complete and after the never-downgrade check, before ResetBase and before the dismount. It is the last refusal before the WIM is written to the active route, but its position is inside Step 3 — the deploy step runs later in the pipeline, and a candidate that fails the gate is dismounted with `-Discard` before the pipeline reaches the deploy stage. The manager verifies that the candidate image contains an INF whose `HardwareID` or `CompatibleID` matches one of the machine's present SCSIAdapter-class devices. A candidate that does not match is refused rather than deployed.
+
+**Operational consequence:** a machine whose candidate image does not contain a driver for its actual storage controller defers with `EXIT_WARNING` rather than receiving a candidate with no driver. The gate is the last refusal before deployment; it was added after the ASUS-incident field case, and **it has never fired in the field**.
+
+If a canary machine exits 2 with the applicability gate's refusal, capture the full log and the harness Option 1 "Storage controllers" block (v28) — the machine's controller IDs are what the maintainer needs to update the manifest's VMD patterns or the OEM pack resolution.
+
+### Self-hosted configurations
+
+A self-hosted manifest whose `requiredDevices` patterns omit a controller present on your fleet, or a self-hosted OEM pack whose INFs do not cover your fleet's controllers, will cause the applicability gate to refuse the candidate on the affected machines. Keep both complete for the hardware you deploy to. The v49 pipeline does not add new external URLs; it only reads the manifest and pack content differently than v47/v48 did.
+
+## Offline behavior (v44 patch 5; fast-path gate updated in v47 patch 1; `LocalInputsId` added in v48 patch 1; v49 gates run offline as well)
 
 The script's network calls — the driver manifest fetch, the OEM map fetches, and the base WIM download — each default to a 15-second per-call timeout. The timeout applies to each individual request, not to the aggregate; the retry loops (2 attempts for the manifest, 3 for the OEM pack download) can multiply it. Before v44 patch 5, an offline machine would hang for over 10 minutes across the aggregate of the default 100-second timeouts before failing. That is now capped at roughly 90 seconds in the fully-offline case, dominated by the fixed sleeps in the retry loops rather than by the network timeouts.
 
@@ -405,9 +474,13 @@ The local safety checks remain fully enforced and do not depend on the manifest.
 - The state file's stored `LocalInputsId` matches the current locally-computable inputs (v48 patch 1). A stored value of `$null` (a state file predating v48 patch 1) skips the check with a WARN.
 - The recovery-partition layout is one of the healthy shapes: exactly one **type-coded** recovery partition on the OS disk with the active location on it, or no recovery partition with `UsedOSFallback = $true` in the state file and the active location on the OS partition.
 
+The v49 pipeline refinements — source-ownership classification, never-downgrade check, storage-applicability gate — run inside the full-update path, which the offline fallback does not reach. They do not add new offline-path conditions. The native-boot VHDX fail-closed gate runs as a startup refusal on all paths, including offline, and a VHDX-boot machine defers before the offline fallback is engaged.
+
 If all pass, the script takes the fast path, logs `Offline fallback: using state file's stored DesiredStateId <id>`, verifies the machine is healthy, and exits `EXIT_WARNING` (code 2) because `$Script:offlineFallback = $true` is set. The exit code is a degraded-success signal, not a failure. The machine is unchanged. Total runtime is under 90 seconds.
 
 **The v46 → v47 transition on offline machines.** A v46-or-earlier state file lacks `DeployedWinREMetadata`. Its absence forces `$needInject = $true` regardless of network state, and the offline guard then fires: the machine needs a full update, but the live manifest is required for that, so the run exits `EXIT_WARNING` without further work. From the second v47 run onward, the state file has the anchor written by the first successful online run, and the offline fast path can fire normally. The one-time cost of the v47 migration on offline machines is therefore: the first scheduled v47 run must happen while the machine can reach the driver manifest.
+
+**The v48 → v49 transition on offline machines.** The v49 `ScriptVersion` bump changes the `SCRIPT` component of the `DesiredStateId`; a state file written under v48 has `SCRIPT=48` and will not match the current DSI. On a machine whose first v49 run is offline, the offline guard fires — the machine needs a full update, but the live manifest is required — and the run exits `EXIT_WARNING` without a rebuild. The first successful online v49 run writes the new DSI and subsequent offline runs take the fast path.
 
 **On the next scheduled run with network**, the script performs a full manifest fetch, detects any hardware drift that occurred while offline (a CPU swap, a BIOS update that flipped VMD, a motherboard replacement), and either takes the fast path (if no drift) or forces a rebuild (if drift).
 
@@ -440,6 +513,27 @@ Because the offline fallback makes an offline scheduled run useful, the recommen
 The scheduled task's `StartWhenAvailable = true` continues to handle missed triggers after a cold boot. Combined with the offline fallback, a machine that reboots offline and misses its weekly window will still take a fast-path validation run on the next opportunity and exit `EXIT_WARNING`, then complete normally on the next run with network.
 
 See [exit-codes.md](exit-codes.md) and [troubleshooting.md](troubleshooting.md) for the full offline exit-code discussion.
+
+## Backup and restore (v49)
+
+The v49 release adds two standalone actions to the production script:
+
+- **`-Action Backup -BackupPath <dir>`** — captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar `backup.json` recording the source hash, size, and DISM servicing metadata.
+- **`-Action Restore -BackupPath <dir>`** — writes a previously captured WIM back to the currently registered route transactionally.
+
+Both actions are exposed by the `WinRE-Manager.cmd` wrapper: menu option **1 — Back up current WinRE** in the SAFETY section, and menu option **8 — Restore WinRE from backup** in the RECOVERY section. The restore option is rendered only when at least one valid backup directory — one containing both `winre.wim` and `backup.json` — exists under the default backup location `C:\Backup\WindowsRE`. When no such backup exists, the entry and the RECOVERY section header are omitted, and the underlying `choice` key set drops `8`, so the option cannot be pressed.
+
+**Backup is non-destructive.** It does not rebuild, replace, or reconfigure the active WinRE route, and it does not write to the state file. It may temporarily assign a drive letter in order to access a WIM registered through a GLOBALROOT/volume path, and cleans the letter up under the existing temporary-drive-letter machinery. A backup operation exits `EXIT_SUCCESS` on clean completion.
+
+**Restore is transactional.** It validates the backup, resolves the current registered route, handles dedicated and OS-fallback targets, uses the existing deployment machinery, re-registers WinRE, and re-enables it. Restore does not create a new partition or invent a replacement route — a usable current WinRE route must already exist. The operator is required to type `RESTORE` to confirm.
+
+**Restore exits.** A clean restore exits `EXIT_SUCCESS` (or `EXIT_REBOOT_REQUIRED` if `reagentc /enable` schedules the registration for the next reboot). The two mid-transformation failure paths — `/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place — exit `EXIT_WARNING` and preserve the temporary `WinRE Manager - Resume` task so the operation is resumed on the next boot or within the hour. A rollback-restore failure exits `EXIT_FATAL`.
+
+**Fleet operators who use the scheduled task do not normally invoke these actions.** They are exposed by the wrapper for a single-machine operator or a technician doing manual intervention. A fleet operator who needs to run a backup from an orchestration tool can invoke `WinRE.ps1 -Action Backup -BackupPath <dir>` directly; the action is a standalone command, not a pipeline stage.
+
+## Migration sections
+
+The v44 patch 1, v45 patch 1, v46 patch 1, v47 patch 1, v48 patch 1, and v49 revisions each bump `ScriptVersion`, change the `SCRIPT` component of the `DesiredStateId`, and force one full-update pass per managed machine on the next scheduled run. The roll-out behaviour of each is documented below.
 
 ## v44 patch 1 migration
 
@@ -582,9 +676,56 @@ Two cases where the v48 pipeline defers where v47 deferred differently:
 
 Change `$ScriptVersion` back to 47 and revert the five bundled changes: the intervening-anchor plan logic, the architecture gate, the `LocalInputsId` computation and its state-file field, the LKG-by-hash discovery scan in `Get-LKGWinREImagePath`, and the transactional WIM replacement. The state file written under the v48 DSI becomes stale, the next run takes the full-update path under v47's behavior, and the `LocalInputsId` field becomes inert. No data is lost; another fleet-wide rebuild occurs on the next run.
 
+## v49 migration
+
+The v49 revision is the largest single release since v48. It bundles four distinct changes to the production pipeline (three inside the full-update path plus one startup refusal), two standalone backup and restore actions, a temporary crash-recovery scheduled task, and a rewritten interactive wrapper:
+
+- **Source-ownership classification.** Every candidate source WIM is classified into one of four ownership classes, and a `Foreign-With-Drivers` source is preserved as-is rather than stripped and re-injected. This narrows the v47 strip-and-reinject policy to sources the manager itself deployed or in-box images with no third-party drivers.
+- **Never-downgrade storage-driver check.** A candidate image that would inject a storage driver older than one already present in the mounted image is discarded — the mounted image is dismounted with `-Discard`, the source is preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`.
+- **Pre-deployment storage-applicability gate.** The gate runs inside Step 3, after injection is confirmed complete, before ResetBase and before the dismount. The manager verifies that the candidate image contains an INF matching one of the machine's present SCSIAdapter-class devices. A candidate that does not match is refused, dismounted with `-Discard`, and deferred.
+- **Native-boot VHDX fail-closed gate.** The manager refuses to run destructive operations when the OS disk's bus type is `File Backed Virtual` **and** at least one other disk is on a physical bus — the native-boot VHD/VHDX topology, where the running OS disk is a VHD/VHDX stored on a host physical disk. A hypervisor guest whose entire storage stack is virtual is not refused.
+- **Backup and restore actions.** `-Action Backup` and `-Action Restore` are standalone commands that do not participate in the repair pipeline.
+- **Temporary crash-recovery scheduled task.** Every Repair or Restore run registers a `WinRE Manager - Resume` task that fires at boot+1m and one-shot at T+1h; deleted on clean completion, preserved on interruption.
+- **Rewritten interactive wrapper.** Reordered menu, semantic colours, conditional restore visibility, and a stable install location for the permanent maintenance task.
+
+v49 bumps `ScriptVersion` from 48 to 49, which changes the `SCRIPT` component of the `DesiredStateId` and forces one full-update pass per managed machine on the next scheduled run — the same shape as the prior `ScriptVersion`-bump migrations.
+
+The v49 pass is **not materially slower on a healthy machine than any other full-update pass**. The source-ownership classification is a set membership test against the source WIM's driver inventory (already enumerated by the v47 strip stage on the manager-owned path); the never-downgrade check is a version comparison against the same inventory; the applicability gate is a set membership test against the machine's storage controllers. On a machine whose source and manifest are unchanged from v48, the pass produces the same output as v48's pass did; the gates' decisions are the same.
+
+Concretely, on the first run after the update, every machine will:
+
+1. Compute the new `DesiredStateId` (with `SCRIPT=49`).
+2. Compare it to the state file written by v48 (any patch).
+3. Find a mismatch, set `needInject = $true`, and take the full-update path.
+4. Run the startup sequence in code order: elevation guard (v48 patch 2), program lock (v44 patch 4), `-Action Backup` dispatcher, Audit Mode guard (v43 patch 5, further revision), temporary resume-task registration (v49), `-Action Restore` dispatcher, hardware and architecture resolution, architecture gate (v48 patch 1), native-boot VHDX fail-closed gate (v49). On a Repair run the two action dispatchers do not fire and execution continues past them. Of these, the elevation guard, the Audit Mode guard, the architecture gate, and the VHDX gate can exit `EXIT_WARNING` (or `EXIT_FATAL` for the elevation guard) before any further work.
+5. Obtain a base WIM via the v47 three-source preference order (unchanged).
+6. Classify the source's ownership class.
+7. On a non-`Foreign-With-Drivers` source: strip to zero third-party drivers, then inject the current OEM and VMD recipe subject to the never-downgrade check.
+   On a `Foreign-With-Drivers` source: skip the strip and injection; the source is preserved as-is.
+8. Run the pre-deployment storage-applicability gate, then run ResetBase on the mounted image.
+9. Plan geometry and deploy as in v48 (transactional WIM replacement; intervening-anchor handling where applicable).
+10. Write the state file with the new DSI, the `LocalInputsId`, and the `DeployedWinREMetadata` anchor.
+11. Return to the fast path on the second run.
+
+Three cases handled without operator attention:
+
+- **Machines with `PendingReboot = true` or `EnableFailureAttempts >= 3`.** The DSI mismatch is detected before the pending-reboot and loop-breaker blocks, so the full-update path executes and the counters are reset.
+- **Machines carrying a v48 deferral marker at `C:\Recovery\OEM\winre_partition_deferred.json`.** The marker is keyed by `DesiredStateId`; it is stale under the v49 DSI and is cleared on read by `Read-PartitionDeferral`.
+- **Machines with a v48 patch 1 Step 3 or Step 4 checkpoint.** The checkpoint is bound to the v48 source hash; if the source is still available with the same bytes, it is honored; otherwise it is invalidated and the run rebuilds from Step 2. The v49 source-ownership classification does not change the checkpoint binding — the checkpoint binds to the source WIM, not to the class the source is later classified into.
+
+One case where the v49 pipeline defers where v48 deferred differently:
+
+- **Pre-deployment storage-applicability gate refusal.** A machine whose candidate image does not contain an INF matching one of its present SCSIAdapter-class devices now defers with `EXIT_WARNING` where v48 would have deployed. **This gate has never fired in the field.** If a canary produces the refusal, capture the full log and the harness Option 1 "Storage controllers" block (v28).
+
+The v49 `ScriptVersion` bump adds two optional fields to the state-file schema: `ForeignSourceAcceptedHash` (set when a `Foreign-With-Drivers` source is preserved, so subsequent runs recognize the accepted foreign source) and `LineageId` (the persistent lineage identifier written into the provenance marker and carried forward across runs). Both are absent on state files written by v48 or earlier; their absence is handled as any other missing field. The fields added by v47 patch 1 (`DeployedWinREMetadata`) and v48 patch 1 (`LocalInputsId`) are unchanged. The backup and restore actions write a `backup.json` sidecar in the operator-supplied backup directory; they do not touch the state file. The temporary resume task is a separate scheduled task, not a state-file field.
+
+### Rollback
+
+Change `$ScriptVersion` back to 48 and revert the v49 changes: the source-ownership classification, the never-downgrade storage-driver check, the pre-deployment storage-applicability gate, the native-boot VHDX fail-closed gate, the backup and restore actions, and the temporary resume task. The rewritten wrapper (`WinRE-Manager.cmd`) is independent of `WinRE.ps1`'s version and can be left in place; the wrapper's install option still registers the task against the stable `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` copy. The state file written under the v49 DSI becomes stale, the next run takes the full-update path under v48's behavior, and the fleet converges onto the v48 pipeline. No data is lost; another fleet-wide rebuild occurs on the next run.
+
 ## Later patches (no ScriptVersion bump)
 
-The v44 patches 2 through 8 and the v46 patch 2 additions do **not** bump `ScriptVersion` and do **not** change the `DesiredStateId`. They apply to every subsequent run without a state-file action. A machine that is already healthy continues to take the fast path. A machine that was mid-deployment when the patch rolled out continues from where it was — the checkpoint and state-file schemas are unchanged.
+The v44 patches 2 through 8, the v46 patch 2 additions, the v47 patches 2 and 3, and the v48 patch 2 do **not** bump `ScriptVersion` and do **not** change the `DesiredStateId`. They apply to every subsequent run without a state-file action. A machine that is already healthy continues to take the fast path. A machine that was mid-deployment when the patch rolled out continues from where it was — the checkpoint and state-file schemas are unchanged.
 
 The **v47 patch 2** revision is also not a fleet-wide rebuild: it does not bump `ScriptVersion`, and its only DSI-value change is a one-time event on a narrow machine class (machines with a padded `Win32_ComputerSystemProduct.Version` field). It is documented under `### v47 patch 2 specifically` below. The **v47 patch 1** revision is not in this list; it bumps `ScriptVersion` and is documented under "v47 patch 1 migration" above.
 
@@ -629,12 +770,12 @@ For MDM / orchestration:
 |---|---|
 | 0 | None. Record success. |
 | 1 | Reboot the machine at the next convenient window. The script will finish on the next boot. |
-| 2 | Investigate. WinRE is functional but degraded, or the script deferred work, or the enable step failed and the counter incremented. Collect the log and check the state file's `LastUpdated` timestamp, its `LastEnableResult` field, whether a deferral marker exists at `C:\Recovery\OEM\winre_partition_deferred.json`, and the state file's `LocalInputsId`. **Sixteen** distinct cases are documented in [exit-codes.md](exit-codes.md): OS-fallback, **v47 strip-failure abort**, **v47 patch 2 base-WIM copy-integrity check**, Step 3 → Step 4 pipeline gate, Audit Mode deferral, VMD-query-indeterminate deferral, OS-fallback BitLocker deferral, **v45 pre-shrink deferral**, enable-only failure, concurrent-instance deferral (v44 patch 4), offline-fallback deferral (v44 patch 5), **v47 race-detector abort** at the two `/disable` sites, **v48 architecture-gate refusal**, **v48 intervening-anchor surplus rejection**, **v48 multi-intervening rejection**, and **v48 offline `LocalInputsId` mismatch**. The concurrent-instance case is **not a failure** — the other instance is doing the work. The offline-fallback fast-path case is a **degraded-success** — the machine is healthy and unchanged. The VMD-query-indeterminate, v45 pre-shrink, v47 race-detector, v48 architecture-gate, v48 surplus, v48 multi-intervening, and v48 `LocalInputsId` cases are **protective deferrals** — no state was committed. |
-| 3 | Investigate. The run failed and did not write state, or the enable-failure loop-breaker fired. Collect the log. Do not retry automatically. One exception: the v48 patch 2 elevation guard exits 3 with `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.` — this is expected behavior on an unelevated launch, not a failure. Relaunch from an elevated prompt or via `scripts\WinRE-Manager.cmd`. |
+| 2 | Investigate. WinRE is functional but degraded, or the script deferred work, or the enable step failed and the counter incremented. Collect the log and check the state file's `LastUpdated` timestamp, its `LastEnableResult` field, whether a deferral marker exists at `C:\Recovery\OEM\winre_partition_deferred.json`, whether a `WinRE Manager - Resume` scheduled task is present, and the state file's `LocalInputsId`. **Eighteen** distinct cases are documented in [exit-codes.md](exit-codes.md): OS-fallback, **v47 strip-failure abort**, **v47 patch 2 base-WIM copy-integrity check**, Step 3 → Step 4 pipeline gate, Audit Mode deferral, VMD-query-indeterminate deferral, OS-fallback BitLocker deferral, **v45 pre-shrink deferral**, enable-only failure, concurrent-instance deferral (v44 patch 4), offline-fallback deferral (v44 patch 5), **v47 race-detector abort** at the two `/disable` sites, **v48 architecture-gate refusal**, **v48 intervening-anchor surplus rejection**, **v48 multi-intervening rejection**, **v48 offline `LocalInputsId` mismatch**, **v49 native-boot VHDX fail-closed gate**, and **v49 pre-deployment storage-applicability gate**. The concurrent-instance case is **not a failure** — the other instance is doing the work. The offline-fallback fast-path case is a **degraded-success** — the machine is healthy and unchanged. The VMD-query-indeterminate, v45 pre-shrink, v47 race-detector, v48 architecture-gate, v48 surplus, v48 multi-intervening, v48 `LocalInputsId`, v49 VHDX, and v49 applicability cases are **protective deferrals** — no state was committed. |
+| 3 | Investigate. The run failed and did not write state, or the enable-failure loop-breaker fired. Collect the log. Do not retry automatically. Two exceptions: the v48 patch 2 elevation guard exits 3 with `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.` — this is expected behavior on an unelevated launch, not a failure; relaunch from an elevated prompt or via `scripts\WinRE-Manager.cmd`. The v49 restore rollback failure (see "Backup and restore" above) exits 3 with `rollback restore hash verification failed` and warrants a bug report; the branch has not been exercised in the field. |
 
-Do **not** treat exit code 2 as success. A machine in OS-fallback is intentionally reported as a warning; it will be treated as a healthy machine by the fast path only if the state file records `UsedOSFallback = true` for the current `DesiredStateId`. A machine on which the Audit Mode guard or a v45 pre-shrink deferral fired will have an unchanged (or absent) state file and a single deferral line in the log. See [exit-codes.md](exit-codes.md) for how to distinguish the sixteen cases.
+Do **not** treat exit code 2 as success. A machine in OS-fallback is intentionally reported as a warning; it will be treated as a healthy machine by the fast path only if the state file records `UsedOSFallback = true` for the current `DesiredStateId`. A machine on which the Audit Mode guard or a v45 pre-shrink deferral fired will have an unchanged (or absent) state file and a single deferral line in the log. See [exit-codes.md](exit-codes.md) for how to distinguish the eighteen cases.
 
-Do **not** configure retry loops that ignore the exit code and re-run unconditionally. Deferrals are not improved by retrying — the same gate will fire on the next run (Rule 4). Enable failures are handled by the counter; after three consecutive failures the loop-breaker fires and requires manual intervention. The concurrent-instance deferral is not a failure at all; retrying while the other instance is still running will simply produce another `EXIT_WARNING`. The VMD-query-indeterminate deferral is not improved by retrying — the underlying PnP service issue must be resolved. The v45 pre-shrink deferral is not improved by retrying until the constraint is resolved (free space on C:, disk layout, oversized recovery partition, or shrink failure). The one exception is the transient volume-read failure: it returns `RetrySuppressible = $false` and does not write a deferral marker, so the next scheduled run retries it automatically without operator intervention. The v47 race-detector abort is not improved by retrying immediately — the underlying Windows Update servicing of the registered WinRE is a transient condition, and the next scheduled run (or a manual re-run after the WU settles) is the correct response. The v47 strip-failure abort is not improved by retrying until the specific strip failure has been diagnosed — see [troubleshooting.md](troubleshooting.md) for the specific failure modes. The v48 architecture-gate refusal is a stable deferral: any machine whose architecture is not `x64` will continue to exit 2 on every run until the manager adds support or the machine is replaced. The v48 intervening-anchor surplus and multi-intervening rejections are stable layout deferrals; a retry produces the same rejection until the layout is changed. The v48 offline `LocalInputsId` mismatch resolves on the next run with network, which recomputes the DSI. Resolve the underlying condition, then re-run.
+Do **not** configure retry loops that ignore the exit code and re-run unconditionally. Deferrals are not improved by retrying — the same gate will fire on the next run (Rule 4). Enable failures are handled by the counter; after three consecutive failures the loop-breaker fires and requires manual intervention. The concurrent-instance deferral is not a failure at all; retrying while the other instance is still running will simply produce another `EXIT_WARNING`. The VMD-query-indeterminate deferral is not improved by retrying — the underlying PnP service issue must be resolved. The v45 pre-shrink deferral is not improved by retrying until the constraint is resolved (free space on C:, disk layout, oversized recovery partition, or shrink failure). The one exception is the transient volume-read failure: it returns `RetrySuppressible = $false` and does not write a deferral marker, so the next scheduled run retries it automatically without operator intervention. The v47 race-detector abort is not improved by retrying immediately — the underlying Windows Update servicing of the registered WinRE is a transient condition, and the next scheduled run (or a manual re-run after the WU settles) is the correct response. The v47 strip-failure abort is not improved by retrying until the specific strip failure has been diagnosed — see [troubleshooting.md](troubleshooting.md) for the specific failure modes. The v48 architecture-gate refusal is a stable deferral: any machine whose architecture is not `x64` will continue to exit 2 on every run until the manager adds support or the machine is replaced. The v48 intervening-anchor surplus and multi-intervening rejections are stable layout deferrals; a retry produces the same rejection until the layout is changed. The v48 offline `LocalInputsId` mismatch resolves on the next run with network, which recomputes the DSI. The v49 native-boot VHDX gate is a stable topology deferral. The v49 applicability gate requires manifest or OEM pack data to be updated — a retry alone will produce the same refusal. Resolve the underlying condition, then re-run.
 
 ## MDM / Intune
 
@@ -650,11 +791,13 @@ When using Intune to push a remediation, be aware that the remediation script ma
 
 **Do not disable the lock to "fix" the remediation.** Before patch 4, the same collision caused an `EXIT_FATAL` (code 3) with a rename error. Some Intune remediation pipelines treated that as a hard failure and retried aggressively, which could produce a cascade of colliding runs. The lock converts the collision into a clean, self-limiting `EXIT_WARNING`. If your Intune pipeline retries on any non-zero exit, adjust it to treat code 2 as a soft failure (route to a queue) and code 3 as a hard failure (investigate). See [exit-codes.md](exit-codes.md) for the recommended orchestration policy.
 
+**v49 note.** The wrapper's install option registers a task named `Maintain Windows RE` against the stable `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` copy. If your Intune package ships both the wrapper and a scheduled task, decide which one owns the task registration. If both register a task, they will collide on the `IgnoreNew` policy but not on the program lock (they invoke the same script from different paths). The recommended arrangement is: the Intune package ships `WinRE.ps1`, `Test-WinRE.ps1`, and the map builders; the wrapper is for interactive use on a single machine, not for the fleet deployment. Fleet deployments use the task XML template above or an Intune-registered task with the operator's chosen script path.
+
 ## Hosting your own maps, manifest, and base WIM repository
 
 By default, WinRE Manager fetches the driver manifest, the three OEM maps, and the base WIM repository from the project maintainer's GitHub account. All five artifacts can be replaced with self-hosted equivalents so your fleet does not depend on those external endpoints.
 
-See [self-hosting.md](self-hosting.md) for the trust model, the exact URLs and variables to change, the map-builder scripts, and the air-gapped deployment procedure.
+See [self-hosting.md](self-hosting.md) for the trust model, the exact URLs and variables to change, the map-builder scripts, and the air-gapped deployment procedure. The v49 pre-deployment gates read the same artifacts (the manifest's `requiredDevices` patterns, the OEM pack's INFs) — keep them complete for the hardware you deploy to.
 
 ## Log collection
 
@@ -666,6 +809,8 @@ The log at `C:\ProgramData\OEM\Logs\WinRE-Manager.log` is append-only and grows 
 
 At ~100 log lines per healthy run, an unmanaged machine generates ~5 MB per year. Rotation is not urgent but is worth having.
 
+**v49 note.** The v49 source-ownership classification, the never-downgrade check, and the pre-deployment storage-applicability gate each log their decision on the runs where they fire (the applicability gate has never fired in the field; the other two are new in v49). If you collect logs, watch for those lines as the first data point on the new pipeline's behavior on your hardware.
+
 ## Canary and ring deployment
 
 The script is destructive on the recovery partition and non-destructive on the OS partition, but it does modify the OS partition geometry on the shrink path. Roll out in rings:
@@ -674,112 +819,31 @@ The script is destructive on the recovery partition and non-destructive on the O
 2. **Early ring.** ~5% of the fleet. Mix of vendors and partition styles.
 3. **Broad ring.** The rest.
 
-### v44 patch 1 specifically
+### v49 specifically
 
-Add a step 0 before the canary ring: run the current script on one machine and confirm the full-update pass completes and the state file is rewritten under the new `DesiredStateId`. Then roll out normally. The `Migration Note` in `CHANGELOG.md` and the "v44 patch 1 migration" section above describe the expected behaviour.
-
-### v44 patch 3 specifically
-
-No state-file action is needed on healthy machines — the surviving part of the fix (the `base.wim` cleanup) is exercised on the next full-update pass, and the guard portion is removed by v44 patch 6 anyway. See "Later patches (no ScriptVersion bump)" below.
-
-### v44 patch 4 specifically
-
-Watch for the new `EXIT_WARNING` from concurrent invocations in your orchestration logs. A cluster of these on a machine usually means an RMM tool or a manual operation overlapped with the scheduled task; it is a signal about the operator side, not a script defect.
-
-### v44 patch 5 specifically
-
-The first observable change is faster failure on machines with network issues. Machines that previously exited `EXIT_FATAL` after ~100-second timeouts now exit `EXIT_WARNING` after ~15-second timeouts, and healthy machines take the fast path offline instead of failing. Confirm on a canary that an offline run exits 2 with the `Offline fallback: using state file's stored DesiredStateId …` line rather than 3.
-
-### v44 patch 6 specifically
+The v49 revision bumps `ScriptVersion` from 48 to 49 and forces one full-update pass per managed machine. The pass is not materially slower than any other full-update pass. The canary is primarily about confirming that the new gates behave as expected on your fleet's hardware and confirming that the wrapper's new menu works as documented.
 
 Watch for:
 
-- The new VMD fail-closed deferral on machines with an unhealthy PnP service. These exit 2 with the `VMD hardware detection was indeterminate` message.
-- The corrected OS-fallback remediation message naming `manage-bde -off C:` instead of the earlier (wrong) "complete encryption" guidance.
-- The new Lenovo five-state resolution log lines when the map has a malformed entry.
+- **Machines that exit 0 after the first v49 full-update pass.** The normal case. The log should show the source-ownership class the candidate received, the storage-driver injection decisions, the applicability gate's pass decision, and the state write with the v49 DSI. `Operating mode: DEDICATED` confirms the end state. (A never-downgrade detection does not produce this shape — it discards the candidate and exits 2 before the applicability gate runs.)
+- **Machines whose log shows a `Foreign-With-Drivers` source preservation.** The v49 pipeline skipped the strip and injection, dismounted with `-Discard`, and exited `EXIT_WARNING` without deploying anything. The existing WinRE route is untouched; the state file records `ForeignSourceAcceptedHash` so subsequent runs recognize the preserved source and take the fast path. This is the intended v49 behavior for a source the manager did not deploy. If your fleet has machines whose registered WinRE was populated by vendor servicing tools, expect this line; if you want the manager's recipe applied, the source must be replaced with a `Manager-Owned`, `Manager-Lineage`, or `Foreign-No-Drivers` source.
+- **Machines whose log shows a never-downgrade detection.** A candidate image would inject a storage driver older than one already present in the mounted image. The candidate is discarded — dismounted with `-Discard`, the source preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits 2. The existing WinRE route is untouched. This is the intended v49 behavior for a machine whose source would regress a driver. Watch for repeated detections on the same driver across the fleet — that suggests the manifest or OEM pack is stale for your hardware.
+- **Machines whose log shows the pre-deployment storage-applicability gate refusing a candidate.** **This gate has never fired in the field.** If a canary produces the refusal, capture the full log and the harness Option 1 "Storage controllers" block (v28). The machine defers with `EXIT_WARNING`, the WIM is not written to the active route, and the old recovery route is intact.
+- **Machines whose log shows the native-boot VHDX fail-closed gate refusing.** A VHDX-boot machine will continue to exit 2 on every run until the topology is supported or the machine is converted. Do not retry expecting a different result.
+- **Machines whose log shows a `WinRE Manager - Resume` task after a run.** The v49 temporary resume task is preserved on interruption. Do not delete it manually — the next boot or the T+1h one-shot will complete the operation. If the task keeps reappearing after each attempt, the interrupted operation is failing in the same way every time; read the log around the failing step.
+- **Wrapper usability canary.** On a single machine, run `WinRE-Manager.cmd` and confirm the reordered menu appears as documented: SAFETY (backup) at the top, DIAGNOSTICS next, MAINTENANCE next, REPAIR next with the yellow `LIVE` chip on the run-for-real option, RECOVERY last with the restore option rendered only when a valid backup exists, and Quit bound to the `Q` key. Confirm the install / remove maintenance options (5 and 6) register and unregister the `Maintain Windows RE` task successfully. Confirm the backup (option 1) and restore (option 8) actions complete against a real backup directory.
 
-### v44 patch 7 specifically
+- **Backup and restore actions.** Both actions are new in v49. Run a `-Action Backup` on a canary and confirm the `backup.json` sidecar is written alongside the WIM copy. Run a `-Action Restore` against that backup and confirm the WIM is restored, the state file is not modified, and `reagentc /info` reports `Enabled`. The two restore mid-transformation failure paths have not been exercised in the field; if the canary produces either, capture the full log and file a bug — the transactional helper's rollback behaviour on real storage is high-signal.
 
-Watch for machines that exit 0 after one full-update pass where they previously cycled through rebuilds. Before patch 7, a machine with a Basic Data partition labelled "Recovery" on the OS disk never converged: the fast-path count included the label-only partition, so the "exactly one recovery partition on the OS disk" condition was never satisfied, while the destructive path correctly refused to delete it. After patch 7 the classifier, count, and destructive path all agree on the type-code rule, so the machine converges — either to a proper `DEDICATED` state (if the OS-shrink succeeds) or stably to OS-fallback (if it does not).
+### v48 patch 2 specifically
 
-### v44 patch 8 specifically
+The v48 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId`. It adds the fail-fast elevation guard, a source-WIM hash cache that closes a pre-existing enable-only fallthrough path, a resize-target resynchronisation fix on the extension-failure fallback path (the D1 fix), and several cosmetic log and comment corrections. The canary is primarily observational:
 
-No state-file action and no observable orchestration change. The reorder is an internal cost reduction for healthy paths. Confirm on a canary that a fast-path run still exits 0 with the same log shape as before.
-
-### v45 patch 1 specifically
-
-The v45 revision bumps `ScriptVersion` and forces one full-update pass per managed machine. The pass itself is not slower than a normal full-update pass. Watch for:
-
-- **Machines that exit 0 after the first full-update pass.** The normal case; the machine converged to `DEDICATED` (via the reuse path, or via a successful destructive replacement). Returned to the fast path on the second run.
-- **Machines that exit 2 with `Dedicated replacement deferred before partition deletion (<Reason>)` in the log.** The v45 pre-shrink deferral fired; the old recovery partition is preserved and the machine is unchanged. Investigate the `<Reason>`. Common causes: insufficient free space on C:, blocking layout, oversized recovery-typed partition, transient volume read, or shrink failure. Resolve the constraint and delete `C:\Recovery\OEM\winre_partition_deferred.json` to force a retry.
-- **Machines that exit 2 with the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`.** This is the post-deletion residual corner the `[v45 patch 1]` CHANGELOG entry documents. The v45 reorder narrowed it: only `New-Partition` or `Format-Volume` failures after deletion, on an encrypted C:, now reach the corner (the shrink case is closed). **Capture the full log and file a bug** — the project wants field data on this corner.
-- **Machines with an extension-failure fallback log line.** If the log shows `Extension-failure fallback: creating recovery partition`, the run continued with a slightly different geometry than the plan and exited 2. This is expected. If the log shows `Extension-failure fallback unavailable`, the machine fell through to the OS-fallback decision. Check the machine's end state with the harness.
-
-**Exit-code observations.** Watch for these exit-code patterns as well:
-
-- **Exit code 2 with `UsedOSFallback = true` in the state file and a state file `LastUpdated` timestamp newer than the run's start time** — the post-delete partition creation could not complete and the run deliberately ended in OS-fallback. (As of v45 patch 1, a shrink failure no longer reaches this path — the pre-shrink runs in the reversible window and defers with the old route preserved.) The log will show the `Dedicated recovery partition creation failed after all attempts.` banner.
-- **Exit code 2 with `Setup\State\ImageState=…` in the log and the state file absent or unchanged** — the Audit Mode / OOBE guard fired. The machine has not finished OOBE. This is expected on freshly imaged machines that are still pre-first-sign-in; wait for the machine to reach a normal desktop and re-run on the next scheduled trigger.
-- **Exit code 2 with `VMD hardware detection was indeterminate; deferring because the driver set cannot be safely determined.` in the log and the state file unchanged (or the state file absent)** — the VMD hardware presence check could not complete because of a PnP enumeration error. No WIM was deployed, no partition was touched, no `reagentc` call was made. Resolve the PnP service issue and re-run. Do not retry immediately; the same check will fire.
-- **Exit code 2 with `OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=…)` in the log and the state file's `LastUpdated` timestamp unchanged (or the state file absent)** — the dedicated replacement could not complete and the run fell through to the OS-fallback route, whose target (C:) is not confirmed fully decrypted. No WIM was deployed and no `reagentc` call was made. Wait for C: to reach `FullyDecrypted`, or complete decryption of C: with `manage-bde -off C:`, then re-run on the next scheduled trigger. Do not retry immediately.
-- **Exit code 2 with `Dedicated replacement deferred before partition deletion (<Reason>)` in the log and the state file unchanged** — the v45 pre-shrink deferral fired. The old recovery partition is still present and WinRE is still registered to it. Free space on C:, correct the disk layout, address the oversized partition, retry a transient volume read, or investigate the shrink or route-restore failure as appropriate, then delete `C:\Recovery\OEM\winre_partition_deferred.json` (and, if you also want to clear the deployment identity, `C:\Recovery\OEM\winre_state.json`) to force a retry.
-- **Exit code 2 with `Image injection did not complete. Stopping before Step 4 and before any deployment.` in the log** — OEM or VMD injection failed and the pipeline gate stopped the run before deployment. The WIM was not deployed, the partition was not touched, and WinRE was not disabled. The checkpoint was set back to 2. The next run retries from step 2. Investigate the injection failure (OEM pack download, extraction, INF validation, or VMD driver download).
-- **Exit code 2 with `Enable-only /enable failed (attempt N of 3)` or `Enable-only /enable refused with the BitLocker error after the target partition was confirmed unencrypted (attempt N of 3)` in the log and a non-`"ok"` `LastEnableResult` in the state file** — the enable step failed on a machine whose deployment is current. The counter incremented. Investigate the enable failure itself (ReAgent.xml corruption, missing registration, a Windows component problem, an antivirus product holding a file). The next run retries enable-only. If the counter reaches 3, the loop-breaker fires on the following run and the exit code becomes 3.
-- **Exit code 2 with `Another WinRE Manager instance is already running (program lock file is exclusively held)` in the log** — a concurrent instance holds the lock. This is not a failure. It appears when a manual invocation overlaps with a scheduled run, or when an Intune remediation fires while the scheduled task is running. No action required; the other instance is completing the work.
-- **Exit code 2 with `Offline fallback: the machine requires a full update (state file is stale or unhealthy), but the driver manifest is unavailable` in the log** — the machine is offline and the state file indicates a full update is needed. No operator action; the next scheduled run with network completes the work. **If the log instead shows `Offline fallback: using state file's stored DesiredStateId …`**, the fast path fired and the exit is a degraded-success, not a deferral — the machine is healthy and unchanged.
-- **Exit code 2 with the compound signature `Pre-deletion inventory:` followed in the same run by `OS-fallback deferred: C: could not be confirmed fully decrypted`** — the post-deletion residual corner that the `[v45 patch 1]` CHANGELOG entry documents. The existing type-coded recovery partition was deleted and a post-deletion `New-Partition` or `Format-Volume` failure occurred, and the OS-fallback gate deferred because C: is encrypted. The machine ends with neither a dedicated recovery partition nor OS-fallback. **Capture the full log and file a bug** — the project wants field data on this corner. See [troubleshooting.md](troubleshooting.md) for the operator-facing procedure.
-- **Exit code 3 with `Cannot rename because item at '<workspace>\winre.wim' does not exist`** — this is now only reachable if the lock could not be acquired for a non-contention reason. Check the log for `Could not set up program lock at …` earlier in the run. Investigate permissions on `C:\ProgramData\OEM\Logs\`, whether the directory exists, and whether a filesystem issue is affecting the log path.
-- **Exit code 3 with `dism /Export-Image failed` in the log** — 7-Zip or DISM problem.
-- **Exit code 3 with `cannot deploy a new WinRE image while WinRE is still Enabled`** — `reagentc /disable` returned nonzero. Investigate before retrying.
-- **Exit code 3 with `FATAL: WinRE is not enabled at exit`** — the machine lost its recovery partition. This is the pre-patch-5 Device Encryption failure mode. Follow the recovery procedure in [troubleshooting.md](troubleshooting.md).
-- **Exit code 3 with `Refusing to retry reagentc /enable`** — the enable-failure loop-breaker fired. Do not retry automatically; the same guard will fire because the state file still records the counter. Resolve the underlying enable failure (see `troubleshooting.md`), delete `C:\Recovery\OEM\winre_state.json`, then re-run.
-- **Exit code 3 with `Driver manifest unavailable and no state file exists`** — the machine is offline and has no state file. A first deployment requires a live manifest. Retry when the network is available.
-
-### v46 patch 1 specifically
-
-The v46 patch 1 revision clamps `tailEnd` to `diskSize − 1 MiB` before aligning in `Get-PartitionPlan`, and bumps `ScriptVersion` from 45 to 46. It forces one full-update pass per managed machine on the next scheduled run — the same shape as the v44 patch 1 and v45 patch 1 migrations. The pass itself is not slower than a normal full-update pass.
-
-The v46 patch 1 canary is primarily about confirming that machines the v45 plan-clamp bug left in OS-fallback recover. Watch for:
-
-- **Machines that exit 0 after the first full-update pass.** The normal case. The machine may be recovering from a v45 OS-fallback state (the DSI mismatch invalidates the old state file and the plan-clamp fix makes the plan valid), or it may be a healthy machine taking the standard migration pass. Either way, `Operating mode: DEDICATED` in the log is the confirmation.
-- **Machines that stay in OS-fallback after the first v46 pass.** This should not happen on any layout the v45 plan-clamp bug could produce; if it does, the machine has a different post-delete failure. Capture the log and check the plan summary line for the `alignment reserve` value and the post-delete check for `overlapCount=0`. See [troubleshooting.md](troubleshooting.md) for the plan-rejection corner and its fall-through conditions.
-- **Machines that exit 2 with `Dedicated replacement deferred before partition deletion (<Reason>)`.** A pre-shrink deferral fired during the v46 migration pass. The old recovery partition is preserved and the machine is unchanged. Investigate the `<Reason>`, resolve the constraint, and delete `C:\Recovery\OEM\winre_partition_deferred.json` to force a retry.
-
-
-### v46 patch 2 specifically
-
-The v46 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId`. It adds three build-drift log lines, a small read guard in `Get-RecoveryPartitions`, and four post-review hardenings of `Ensure-AdequateRecoveryPartition`. The canary is primarily observational:
-
-- **Confirm the three new log lines appear on a canary full-update pass.** The startup line reads `WinRE status: ..., Location: ..., Version: <version>`; the force-upgrade detection line reads `Source WIM build: <build> (path: <path>)`; the post-deploy line reads `Post-deploy WIM build: <build> (source: <path>)`. On a fast-path run, the first two lines appear and the third does not — that is expected, because the fast path does not deploy a WIM.
-- **Confirm the `CmdletizationQuery_NotFound_DiskNumber` error is silent on machines with an SD/MMC card reader or an empty USB enclosure.** Before v46 patch 2, such a machine produced three copies of the error in the harness diagnostic and one per `Get-RecoveryPartitions` invocation in the production log. After v46 patch 2, the same machine produces no such error. If it still appears, the log's version banner will tell you whether the machine is running the patched build.
-- **Do not expect any change to the fast-path behaviour or the state-file schema.** v46 patch 2 is observational only, except for the four hardenings, which change only the failure behaviour of the destructive sequence.
-- **If a canary machine exits 2 with `Dedicated replacement deferred before partition deletion (active WinRE location could not be resolved)`.** As of v48 patch 1, the pre-deletion resolver guard fires ahead of the pre-shrink and ahead of `reagentc /disable`; the machine is left with WinRE still `Enabled` and the old recovery partition intact. This is a code-review hardening that has not been exercised in the field; if you see it, please capture the full log and file a bug per the [Reporting a bug](../CONTRIBUTING.md#bug-reports) section. See [troubleshooting.md](troubleshooting.md) for the re-registration procedure.
-
-### v47 patch 1 specifically
-
-The v47 patch 1 revision introduces the third-party driver strip stage and bumps `ScriptVersion` from 46 to 47. It forces one full-update pass per managed machine on the next scheduled run — the same shape as the earlier `ScriptVersion`-bump migrations. The pass itself is not materially slower than a normal full-update pass; on an already-clean image, the strip stage is a no-op.
-
-Watch for:
-
-- **Machines that exit 0 after the first v47 full-update pass.** The normal case. The log should show the strip stage running (`Strip: pre-strip third-party inventory: N package(s)` and, if N was zero, `Strip: image already has zero third-party drivers`), a source-selection line naming the branch taken, ResetBase, the export, and `Deployed WinRE metadata: <Version>|<SPBuild>` immediately before the state write. `Operating mode: DEDICATED` confirms the end state.
-- **Machines whose log shows `Strip: removed <OEM#.inf>` lines.** The strip stage actually ran against a non-empty third-party driver set — this is the case the field data does not yet cover. If any of these lines appear on the canary, the canary has exercised the strip-and-reinject loop against a non-empty set, which is exactly the case the project wants more field data on. Capture the full log and report it.
-- **Machines whose log shows `Strip: initial Get-WindowsDriver enumeration failed` or `Strip: Remove-WindowsDriver failed for <OEM#.inf>`** — the strip stage rejected the candidate. The checkpoint was rolled back to Step 2, `base.wim` and any stale `winre_optimized.wim` were removed, and the run exited `EXIT_WARNING`. The old recovery route is intact. Capture the full log and file a bug — the strip-failure path has not been exercised in the field either.
-- **Machines whose log shows `Registered-source recheck at Step 5 deployment : CHANGED` or `Registered-source recheck at Ensure-AdequateRecoveryPartition : CHANGED`** — the v47 race detector fired. The abort happened before the `/disable` call; the machine's registered WinRE drifted during candidate preparation. On a machine whose WU is currently servicing WinRE, this is expected; the abort is protective. On a machine with no plausible WU activity, investigate. Both abort sites return `EXIT_WARNING` with the machine unchanged.
-- **Machines whose log shows `State has no DeployedWinREMetadata anchor (previous deployment could not record it) - rebuilding`** — this is the expected message for the first v47 run on a machine whose state file was written by v46 or earlier. The machine will rebuild on this run and the anchor will be written by the end. Any subsequent run should log `Registered WinRE metadata: <ver>|<sp>; last deployed: <ver>|<sp>` and take the fast path.
-- **Machines whose log shows `Registered WinRE metadata could not be read - forcing rebuild so the repair path can replace the image`** — the registered image's DISM metadata is unreadable. The rebuild proceeds and the repair path replaces the image. If this fires repeatedly across runs, the registered image is persistently unreadable and the machine is not converging — investigate the registered recovery partition's storage state.
-- **Machines whose log shows `Pre-injection third-party driver count: N` with N > 0 after the strip stage** — the filterless and filtered DISM queries disagreed. The strip stage remains authoritative (the filterless form is the documented third-party inventory), but the discrepancy was flagged with a non-fatal warning. Capture the log; this is the observability cross-check working as designed, but the project wants field data on when it fires.
-- **Machines that exit 2 with `Checkpoint step N has no recorded source identity (legacy or GitHub-sourced checkpoint); invalidating to rebuild from a known source`, `Checkpoint step N source identity <hash> cannot be re-validated against the current selection (no selected source, or GitHub cold-start has no on-disk hash); invalidating to rebuild`, or `Checkpoint step N source identity <hash> does not match the currently-selected source <hash> (<reason>); invalidating to rebuild`** — the v47 source-hash binding invalidated a stale checkpoint on resume. The run restarts from Step 0 and rebuilds from the current source. This is a protective invalidation, not a failure. If it fires on a machine whose checkpoint was from a same-source run, the source actually changed during the interval, which the invalidator correctly caught.
-
-Also check the ASUS PRIME H510M-D v47 field-verification transcript in `CHANGELOG.md` for the expected shape of a healthy migration run — the log lines the canary should produce are the same ones.
-
-### v47 patch 2 specifically
-
-The v47 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId` on any machine whose `Win32_ComputerSystemProduct.Version` field is not padded. It ships six hardening fixes on top of v47 patch 1: the OS-fallback missing-WIM guard without a status restriction; the base-WIM copy-integrity check; the machine-type fallback trim; the workspace candidate filter `IsSystem -and -not IsBoot`; the GitHub base-WIM extraction contract change (`return $false` instead of throw); and the `-SuppressSuccessLog` switch on the duplicate `Verified partition` log line. The canary is primarily observational:
-
-- **Confirm the version banner reads `v47 patch 2`.** The startup line reads `========== WinRE Manager Started (v47 patch 2) ==========`.
-- **Confirm the new log signatures are absent on a healthy canary.** A canary that takes the fast path will not emit any of the v47 patch 2 signatures. A canary that runs a full update will show `Copied base WIM from <path>; copy hash verified` after the base-WIM copy. The mismatch branch (`Base WIM copy hash mismatch: source=..., copied=... - rejecting candidate`) is not expected on a healthy canary.
-- **On a machine with a padded `Version` field** (observed: some ASUS), expect a one-time `DesiredStateId` change from the trim fix and one full-update pass. All other machines continue on the fast path.
-- **On a machine with a v47 patch 1 Step 3 checkpoint on disk**, expect that checkpoint to be invalidated on the first v47 patch 2 run and the run to rebuild from Step 2.
-- **The six hardenings are code-review fixes**, not field-verified changes. They are covered by inspection and by the harness parser self-tests, not by the four v47 patch 2 field runs. If a canary hits any of them, capture the full log per the [Reporting a bug](../CONTRIBUTING.md#bug-reports) section.
+- **Confirm the version banner reads `v48 patch 2`.** The startup line reads `========== WinRE Manager Started (v48 patch 2) ==========`.
+- **Confirm the elevation guard fires on an unelevated launch.** From a non-admin PowerShell, running `.\scripts\WinRE.ps1 -DryRun` should produce a single FATAL log line (`FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.`) and exit code 3 in milliseconds, before the log directory is created. From an elevated prompt, the same command should proceed as in v48 patch 1.
+- **Confirm the elevation guard accepts the SYSTEM context.** The scheduled task runs as SYSTEM; the guard should not fire on scheduled runs. If it does, the SYSTEM token's Administrator role membership is not being recognized and the scheduled task will fail with code 3 on every run — investigate before rolling out.
+- **The source-WIM hash cache fix is not observable on a healthy canary.** It closes a path on the enable-only fallthrough when `/setreimage` fails. The change is code-review-only in v48 and has not been exercised in the field.
+- **The comment corrections are inert.**
 
 ### v48 patch 1 specifically
 
@@ -804,16 +868,6 @@ Watch for:
 - **Offline v48 machines.** A machine whose state file was written by v47 and whose next run is offline will have `$needInject = $true` forced by the DSI mismatch and will exit 2 with `Offline fallback: the machine requires a full update`, since a rebuild needs the live manifest. The `LocalInputsId` comparison does not fire on that path; it fires when a full-update-needing machine has a v48 state file and its hardware has drifted. The next online run writes the v48 state file and the anchor.
 - **Offline `LocalInputsId` mismatch (v48 patch 1).** A machine whose state file was written by v48 (with a `LocalInputsId`), whose next run is offline, and whose locally-observable deployment inputs have changed (hardware identity, OS build, CPU vendor/generation) will exit 2 with `Offline fallback: stored LocalInputsId <hash> does not match the current locally-computable inputs <hash>`. This is a protective deferral: the stored `DesiredStateId` no longer describes this machine. The machine is unchanged; bring it online so a fresh manifest can be fetched and a new DSI computed. Note that this check fires **before** the offline fast path evaluates the drift detector, so a machine with both a `LocalInputsId` mismatch and a metadata anchor mismatch reports the `LocalInputsId` line first.
 
-### v48 patch 2 specifically
-
-The v48 patch 2 revision does not bump `ScriptVersion` and does not change the `DesiredStateId`. It adds the fail-fast elevation guard, a source-WIM hash cache that closes a pre-existing enable-only fallthrough path, a resize-target resynchronisation fix on the extension-failure fallback path (the D1 fix), and several cosmetic log and comment corrections. The canary is primarily observational:
-
-- **Confirm the version banner reads `v48 patch 2`.** The startup line reads `========== WinRE Manager Started (v48 patch 2) ==========`.
-- **Confirm the elevation guard fires on an unelevated launch.** From a non-admin PowerShell, running `.\scripts\WinRE.ps1 -DryRun` should produce a single FATAL log line (`FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.`) and exit code 3 in milliseconds, before the log directory is created. From an elevated prompt, the same command should proceed as in v48 patch 1.
-- **Confirm the elevation guard accepts the SYSTEM context.** The scheduled task runs as SYSTEM; the guard should not fire on scheduled runs. If it does, the SYSTEM token's Administrator role membership is not being recognized and the scheduled task will fail with code 3 on every run — investigate before rolling out.
-- **The source-WIM hash cache fix is not observable on a healthy canary.** It closes a path on the enable-only fallthrough when `/setreimage` fails. The change is code-review-only in v48 and has not been exercised in the field.
-- **The comment corrections are inert.**
-
 ## Rolling back
 
 The script does not have an uninstall path. To disable it:
@@ -823,17 +877,38 @@ schtasks /Delete /TN "WinRE Manager" /F
 schtasks /Delete /TN "WinRE Manager Weekly" /F
 ```
 
+If the wrapper's install option was used, the task name is `Maintain Windows RE`:
+
+```powershell
+schtasks /Delete /TN "Maintain Windows RE" /F
+```
+
+The wrapper's removal option (menu option **6 — Remove automatic maintenance**) performs the same unregistration.
+
 The state file, deferral marker, log, lock file, and any deployed recovery partition remain. The machine is in a healthy end state and Windows Update will continue to service the recovery image normally. The lock file at `C:\ProgramData\OEM\Logs\WinREManager.lock` is inert once the scheduled task is removed; it can be deleted manually if desired, and it will be recreated if the script is ever run again. The deferral marker at `C:\Recovery\OEM\winre_partition_deferred.json` is likewise inert; it can be deleted manually.
+
+If the wrapper's install option was used, the installed copy at `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` is left in place after removal. Delete the containing directory manually if you want it gone:
+
+```powershell
+Remove-Item "C:\ProgramData\OEM\WinRE-Manager" -Recurse -Force
+```
+
+If a `WinRE Manager - Resume` scheduled task is present, it indicates an interrupted Repair or Restore; do not delete it manually unless you intend to abandon the interrupted operation. To remove it after resolving the interrupted state:
+
+```powershell
+schtasks /Delete /TN "WinRE Manager - Resume" /F
+```
 
 If you need to revert a machine to its pre-WinRE-Manager state, restore the partition layout from a backup. The script does not create one.
 
-To revert a `DesiredStateId` change specifically, see the "Rollback" subsections under "v44 patch 1 migration", "v45 patch 1 migration", "v46 patch 1 migration", "v47 patch 1 migration", and "v48 patch 1 migration" above. To revert code from a patch that does not change the `DesiredStateId`, see the "Rollback for later non-bumping patches" subsection above.
+To revert a `DesiredStateId` change specifically, see the "Rollback" subsections under "v44 patch 1 migration", "v45 patch 1 migration", "v46 patch 1 migration", "v47 patch 1 migration", "v48 patch 1 migration", and "v49 migration" above. To revert code from a patch that does not change the `DesiredStateId`, see the "Rollback for later non-bumping patches" subsection above.
 
 ## Related documents
 
-- [architecture.md](architecture.md) — the four design invariants that this document translates into deployment-time guidance, plus the pipeline, the control-flow invariants, and the state-carrying artifacts.
-- [self-hosting.md](self-hosting.md) — how to replace the driver manifest, OEM maps, and base WIM repository with your own hosting, including the trust model and the air-gapped deployment procedure.
-- [exit-codes.md](exit-codes.md) — how to interpret the exit codes, including the sixteen cases for code 2.
-- [state-and-idempotency.md](state-and-idempotency.md) — what the state file records, the deferral marker's relationship to the deployment identity, and the offline fallback's residual risk.
-- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 single-boundary geometry and pre-shrink deferral reasons.
-- [troubleshooting.md](troubleshooting.md) — when the run fails.
+- [architecture.md](architecture.md) — the four design invariants that this document translates into deployment-time guidance, plus the pipeline, the control-flow invariants, the state-carrying artifacts, and the v49 pipeline refinements.
+- [self-hosting.md](self-hosting.md) — how to replace the driver manifest, OEM maps, and base WIM repository with your own hosting, including the trust model, the air-gapped deployment procedure, and the v49 pre-deployment gates' implications.
+- [exit-codes.md](exit-codes.md) — how to interpret the exit codes, including the eighteen cases for code 2.
+- [state-and-idempotency.md](state-and-idempotency.md) — what the state file records, the deferral marker's relationship to the deployment identity, the offline fallback's residual risk, and the v49 pipeline refinements.
+- [recovery-partition.md](recovery-partition.md) — the full partition lifecycle, including the v45 single-boundary geometry, pre-shrink deferral reasons, and the v49 native-boot VHDX fail-closed gate.
+- [driver-injection.md](driver-injection.md) — the v47 strip stage, the v49 source-ownership classification, the never-downgrade storage-driver check, and the pre-deployment storage-applicability gate.
+- [troubleshooting.md](troubleshooting.md) — when the run fails, including the v49 gate refusals and the resume-task states.

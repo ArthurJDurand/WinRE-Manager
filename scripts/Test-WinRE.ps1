@@ -17,8 +17,10 @@
       - Get-DesiredStateId (seven-field recipe, production ScriptVersion
         - the $ProductionScriptVersion default tracks production's
         $ScriptVersion and must be bumped whenever production bumps;
-        currently 48)
+        currently 49)
       - Get-LocalInputsId (v48 three-field locally-computable hash)
+      - Get-StorageControllerDevices (v49 SCSIAdapter-class device
+        enumeration, mirroring production's software-device filter)
       - Get-DriverManifest retry policy (2 attempts, 2s sleep, WARN log)
       - VMD detection (fail-closed on PnP enumeration error)
       - Lenovo map resolution status machine (5 states)
@@ -50,7 +52,47 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 27
+    Version : 28
+
+    v28 changes vs v27:
+    1. $ProductionScriptVersion default bumped 48 -> 49 to track
+       production's ScriptVersion. Production v49 ships with
+       $ScriptVersion = 49; without this bump, Option S reports a
+       false DSI MISMATCH for every state file v49 production writes.
+       Same class of drift that v21 (44 -> 45), v22 (45 -> 46),
+       v23 (46 -> 47), and v27 (47 -> 48) corrected. This is the
+       fifth correction in the same family; the v27 changelog note
+       about a guard that reads production's $ScriptVersion directly
+       is still the recommended long-term fix and remains unfixed.
+    2. Added Get-StorageControllerDevices, a mirror of production
+       v49's enumeration of present SCSIAdapter-class devices. The
+       function extracts the union of HardwareID, CompatibleID, and
+       the InstanceId prefix up to the last backslash for each
+       device. Software/virtual controllers (InstanceId starting
+       with {GUID}\ or SWD\) are skipped, mirroring production's
+       software-device filter.
+    3. Added a VMD storage-controller enumeration diagnostic to
+       Option 1 (System diagnostic) that uses the new mirror. The
+       new section runs before the manifest's VMD patterns are
+       shown, so the operator sees the machine's controller IDs
+       side by side with the manifest's requiredDevices patterns.
+       When VMD presence is false but SCSIAdapter-class devices are
+       present, the section prints an explicit advisory: this is
+       the exact ASUS-incident shape (a controller the manifest
+       does not recognize), and the production v49 storage-
+       applicability gate is the last check before deployment that
+       would refuse an unsuitable candidate.
+    4. Added a parser self-test (Parser: Get-StorageControllerDevices
+       shape) that verifies the enumeration returns either NULL (an
+       indeterminate result the caller must handle) or an array of
+       objects each carrying FriendlyName, InstanceId, and Ids. SKIP
+       when zero devices are present: that is legitimate on some VMs
+       and does not indicate a broken enumeration.
+    5. Rewrote stale v48 references in the architecture warning and
+       the Get-DesiredStateId header comment version-agnostically,
+       and fixed an over-indented try { in the
+       Compare-WimServicingMetadata self-test.
+    6. Menu title and startup Rule bumped 27 -> 28.
 
     v27 changes vs v26:
     1. $ProductionScriptVersion default bumped 47 -> 48 to track
@@ -814,7 +856,7 @@ function Get-IntelProcessorGeneration {
 }
 
 function Get-DesiredStateId {
-    # Mirror of production v48's Get-DesiredStateId. The
+    # Mirror of production's Get-DesiredStateId. The
     # $ProductionScriptVersion default MUST track production's
     # $ScriptVersion. If it falls behind, Show-StateFileParity reports
     # a false DSI MISMATCH for every state file production has written.
@@ -825,7 +867,7 @@ function Get-DesiredStateId {
         $OEMPackage,
         [Parameter(Mandatory)][string]$ExpectedDriverSetVersion,
         [bool]$VMDPresent = $false,
-        [int]$ProductionScriptVersion = 48
+        [int]$ProductionScriptVersion = 49
     )
     $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
     $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
@@ -1030,6 +1072,56 @@ function Get-RecoveryPartitions {
                      ForEach-Object { $_.Group | Select-Object -First 1 }
     }
     return @($allParts)
+}
+
+# v28: mirror of production v49's Get-StorageControllerDevices.
+# Enumerates SCSIAdapter-class devices present on this machine and
+# extracts the union of HardwareID, CompatibleID, and the InstanceId
+# prefix up to the last backslash for each. Windows-component
+# software/virtual controllers (InstanceId starting with {GUID}\ or
+# SWD\) are skipped, mirroring production: those are not the machine's
+# physical storage controller, their INFs live in the DriverStore
+# rather than Windows\INF, and treating them as validation targets
+# produces false rejections.
+#
+# Returns $null when the enumeration itself fails (indeterminate) and
+# an empty array when the enumeration succeeds but finds no such
+# devices. The VMD diagnostic distinguishes the two cases.
+function Get-StorageControllerDevices {
+    $devs = $null
+    try {
+        $devs = @(Get-PnpDevice -Class 'SCSIAdapter' -PresentOnly -ErrorAction Stop)
+    } catch {
+        return $null
+    }
+    $result = @()
+    foreach ($dev in $devs) {
+        if ($dev.InstanceId -match '^\{[0-9A-Fa-f-]+\}\\' -or $dev.InstanceId -match '^SWD\\') {
+            continue
+        }
+        $ids = [System.Collections.Generic.List[string]]::new()
+        if ($dev.HardwareID) {
+            foreach ($h in @($dev.HardwareID)) {
+                if ($h) { $ids.Add([string]$h) }
+            }
+        }
+        if ($dev.CompatibleID) {
+            foreach ($h in @($dev.CompatibleID)) {
+                if ($h) { $ids.Add([string]$h) }
+            }
+        }
+        if ($dev.InstanceId) {
+            $iid = [string]$dev.InstanceId
+            $lastSlash = $iid.LastIndexOf('\')
+            if ($lastSlash -gt 0) { $ids.Add($iid.Substring(0, $lastSlash)) }
+        }
+        $result += [PSCustomObject]@{
+            FriendlyName = if ($dev.FriendlyName) { [string]$dev.FriendlyName } else { '(unnamed)' }
+            InstanceId   = if ($dev.InstanceId)   { [string]$dev.InstanceId }   else { '' }
+            Ids          = @($ids)
+        }
+    }
+    return @($result)
 }
 
 # Render a partition as disk/part/size/label/type for diagnostic output.
@@ -1305,7 +1397,7 @@ function Show-SystemDiagnostic {
     Write-KV "Architecture"     "$($profile.Architecture)" $archColor
     if ($profile.Architecture -ne 'x64') {
         Write-Diag ""
-        Write-Diag "  WARNING: architecture is '$($profile.Architecture)'; production v48 supports x64 only." "Red"
+        Write-Diag "  WARNING: architecture is '$($profile.Architecture)'; production supports x64 only." "Red"
         Write-Diag "           A live production run would refuse with EXIT_WARNING before any mutation." "Red"
     }
 
@@ -1808,10 +1900,42 @@ function Show-SystemDiagnostic {
     if (-not $man) {
         Write-Diag "  (manifest fetch failed after retries - VMD presence cannot be determined)" "Red"
     } else {
-        $vmdIds = @($man.drivers | Where-Object { $_.match.requiredDevices } | ForEach-Object { $_.match.requiredDevices })
-        if ($vmdIds.Count -gt 0) {
-            Write-KV "Manifest VMD device IDs" ($vmdIds -join ', ') "DarkGray"
+        # v28: enumerate the machine's actual SCSIAdapter-class devices
+        # before consulting the manifest. This is the diagnostic that
+        # closes the gap the ASUS incident exposed: the machine had a
+        # controller (PCI\VEN_8086&DEV_7D0B) the manifest did not
+        # recognize, the VMD detector reported "0 of 3 patterns matched",
+        # and nothing in the previous output showed the operator which
+        # IDs to compare against. The enumeration runs first, then the
+        # manifest patterns are shown, then the match verdict.
+        $controllers = Get-StorageControllerDevices
+        if ($null -eq $controllers) {
+            Write-KV "Storage controllers" "INDETERMINATE (PnP enumeration failed)" "Yellow"
+            Write-Diag "  Production v49 would similarly refuse to certify the candidate" "DarkGray"
+            Write-Diag "  if its own enumeration also fails." "DarkGray"
+        } elseif ($controllers.Count -eq 0) {
+            Write-KV "Storage controllers" "none present (SCSIAdapter class)" "Gray"
+        } else {
+            Write-KV "Storage controllers" "$($controllers.Count) SCSIAdapter-class device(s)" "White"
+            foreach ($ctrl in $controllers) {
+                Write-Diag ""
+                Write-Diag "    $($ctrl.FriendlyName)" "Cyan"
+                Write-Diag "      InstanceId: $($ctrl.InstanceId)" "DarkGray"
+                foreach ($id in $ctrl.Ids) {
+                    Write-Diag "      ID:         $id" "Gray"
+                }
+            }
         }
+
+        $vmdIds = @($man.drivers | Where-Object { $_.match.requiredDevices } | ForEach-Object { $_.match.requiredDevices })
+        Write-Diag ""
+        if ($vmdIds.Count -gt 0) {
+            Write-KV "Manifest VMD patterns" "$($vmdIds.Count) pattern(s)" "DarkGray"
+            foreach ($p in $vmdIds) {
+                Write-Diag "      $p" "DarkGray"
+            }
+        }
+
         $vmd = Get-VmdPresence -Manifest $man
         if ($null -eq $vmd) {
             Write-Diag "  (manifest has no requiredDevices patterns - VMD not applicable)" "Yellow"
@@ -1822,6 +1946,27 @@ function Show-SystemDiagnostic {
         } else {
             Write-KV "Matching PnP devices" "$($vmd.MatchCount) of $($vmd.PatternCount) pattern(s)" $(if ($vmd.Present) { "Green" } else { "Gray" })
             Write-KV "VMD hardware present" "$($vmd.Present)" $(if ($vmd.Present) { "Cyan" } else { "Gray" })
+            # v28: explicit advisory when the machine has SCSIAdapter
+            # devices but the manifest's VMD patterns did not match any
+            # of them. This is the exact ASUS-incident shape: a controller
+            # exists, the manifest does not recognize it, and production
+            # v49 will classify VMD as absent and inject no VMD driver.
+            # The v49 storage-applicability gate is the last check before
+            # deployment and will refuse the candidate if it has no INF
+            # matching the machine's controller IDs. The advisory below
+            # is operator-facing only; production does not depend on the
+            # operator to make the decision.
+            if (-not $vmd.Present -and $controllers -and $controllers.Count -gt 0) {
+                Write-Diag ""
+                Write-Diag "  NOTE: VMD hardware was NOT detected, but $($controllers.Count) SCSIAdapter-class device(s) are present." "Yellow"
+                Write-Diag "        Compare the device IDs above against the manifest patterns." "Yellow"
+                Write-Diag "        If a device's ID is a VMD controller the manifest does not" "Yellow"
+                Write-Diag "        list, production v49 classifies VMD as absent and injects" "Yellow"
+                Write-Diag "        no VMD driver for that controller. The v49 storage-applicability" "Yellow"
+                Write-Diag "        gate is the last check before deployment: if the candidate" "Yellow"
+                Write-Diag "        image contains no INF matching the controller's IDs, the" "Yellow"
+                Write-Diag "        run will defer rather than deploy an unusable image." "Yellow"
+            }
         }
     }
 
@@ -2260,7 +2405,7 @@ function Show-SystemDiagnostic {
     }
 
     Write-Diag ""
-        try {
+    try {
         $cmpCases = @(
             @{ Name = "A newer Version";                A = @{Version="10.0.26200.1000"; SPBuild="1000"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; Expected = "A-newer-or-equal" }
             @{ Name = "A older Version";                A = @{Version="10.0.26100.9545"; SPBuild="9545"; SPLevel="0"; Architecture="x64"}; B = @{Version="10.0.26200.1000"; SPBuild="1000"; SPLevel="0"; Architecture="x64"}; Expected = "A-older" }
@@ -2302,6 +2447,56 @@ function Show-SystemDiagnostic {
         Write-Host " Compare-WimServicingMetadata threw: $_" -ForegroundColor Gray
         Record "Parser: Compare-WimServicingMetadata" $false "$_"
     }
+
+    # Check 17 (v28): Get-StorageControllerDevices shape. Production v49
+    # enumerates SCSIAdapter-class devices to gate the storage-driver
+    # applicability check. The harness mirror is used by the diagnostic
+    # above; a shape change (missing FriendlyName / InstanceId / Ids) or
+    # a change to the software-device filter would silently degrade the
+    # harness's ability to show the operator which controllers exist.
+    # SKIP when zero devices are present: that is legitimate on some VMs
+    # and does not indicate a broken enumeration.
+    try {
+        $scDevices = Get-StorageControllerDevices
+        if ($null -eq $scDevices) {
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " Get-StorageControllerDevices: enumeration returned NULL (indeterminate)" -ForegroundColor Gray
+            Record "Parser: Get-StorageControllerDevices shape" $false "enumeration returned NULL"
+        } elseif ($scDevices.Count -eq 0) {
+            Write-Host "  " -NoNewline
+            Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+            Write-Host " Get-StorageControllerDevices: 0 devices present (legitimate on some VMs)" -ForegroundColor Gray
+            Record "Parser: Get-StorageControllerDevices shape" $false -State "SKIP" -Detail "0 devices present"
+        } else {
+            $requiredCtrlProps = @("FriendlyName", "InstanceId", "Ids")
+            $ctrlMissing = @()
+            foreach ($dev in $scDevices) {
+                foreach ($prop in $requiredCtrlProps) {
+                    if ($null -eq $dev.PSObject.Properties[$prop]) {
+                        if ($ctrlMissing -notcontains $prop) { $ctrlMissing += $prop }
+                    }
+                }
+            }
+            if ($ctrlMissing.Count -eq 0) {
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Get-StorageControllerDevices: $($scDevices.Count) device(s), all required properties present" -ForegroundColor Gray
+                Record "Parser: Get-StorageControllerDevices shape" $true "$($scDevices.Count) device(s)"
+            } else {
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Get-StorageControllerDevices: missing properties: $($ctrlMissing -join ', ')" -ForegroundColor Gray
+                Record "Parser: Get-StorageControllerDevices shape" $false "missing: $($ctrlMissing -join ', ')"
+            }
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Get-StorageControllerDevices threw: $_" -ForegroundColor Gray
+        Record "Parser: Get-StorageControllerDevices shape" $false "$_"
+    }
+
     Write-Diag "  Diagnostic complete. Parser self-test results are in the summary." "Green"
 }
 
@@ -3047,7 +3242,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v27)"
+    $titleContent = "WinRE Manager Test Harness (v28)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -3095,7 +3290,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v27"
+Rule "WinRE Manager test harness v28"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

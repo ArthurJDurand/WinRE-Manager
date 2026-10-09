@@ -18,7 +18,7 @@ Run `Test-WinRE.ps1` in any of the following situations:
 
 - **Before deploying to a machine you have not touched before.** A single read-only scan tells you whether the machine is healthy, what state WinRE is in, and whether production would take the fast path or rebuild. Takes a few seconds.
 - **Before deploying to a fleet.** Run it on one representative machine per vendor/model combination to confirm it agrees with your expectations, then push the scheduled task out. If a machine reports something unexpected, this is where you catch it.
-- **After a Windows Update that might change tooling output.** A new build can change `manage-bde`, `reagentc`, or `Get-Partition` output format, or the shape of a `Get-Disk` / `Get-Volume` object. The parser self-test catches the drift before production runs against it, with a specific PASS/FAIL per dependency.
+- **After a Windows Update that might change tooling output.** A new build can change `manage-bde`, `reagentc`, or `Get-Partition` output format, or the shape of a `Get-Disk` / `Get-Volume` / `Get-PnpDevice` object. The parser self-test catches the drift before production runs against it, with a specific PASS/FAIL per dependency.
 - **When production has exited with an unfamiliar error.** The diagnostic reproduces production's vantage point and reports each dependency check independently, so you can see exactly which step failed.
 - **When you are evaluating the project.** A read-only run gives you a complete picture of what the tool does and what it looks at, without touching anything.
 
@@ -30,14 +30,14 @@ An interactive PowerShell script that:
 
 - Exercises the download and extraction paths of the production script against live sources.
 - Runs a parser self-test against the local Windows tooling to verify that every regex and API dependency the production script relies on still produces the expected shape.
-- Reports the state of the machine from the same vantage point the production script uses, including the BitLocker state of C:, the BitLocker state of the target recovery partition, and the Windows Setup `ImageState`.
+- Reports the state of the machine from the same vantage point the production script uses, including the BitLocker state of C:, the BitLocker state of the target recovery partition, the Windows Setup `ImageState`, and — as of v28 — the machine's present SCSIAdapter-class storage controllers with their HardwareID and CompatibleID sets.
 - Recomputes the `DesiredStateId` production would compute right now and compares it to the on-disk state file, so a field engineer can see whether production would take the fast path or rebuild (Option S).
 - Reports results as PASS / FAIL / SKIP.
 - Modifies nothing. Does not touch partitions, BitLocker, WinRE registration, drive letters, or the state file. Does not require elevation.
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v27.** The version history is:
+**Current version: v28.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -52,10 +52,24 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v25** mirrors production v47 patch 3: `Remove-WindowsDriver` added to the DISM cmdlet availability check, `BusType` added to the `Get-Disk` shape check, `-NonInteractive` exits non-zero on any FAIL, `Test-OemMaps` guards the Lenovo call on vendor, `Compare-WimServicingMetadata` mirror and regression self-test added, and the Option S DSI-mismatch detail sentence names all seven components. See "v25 changes" below.
 - **v26** adds a Plan adjacency preview to Option 1 - a read-only mirror of the geometric and partition-identity subset of production's `Get-PartitionPlan` rejection checks. See "v26 changes" below.
 - **v27** mirrors production v48 patch 1: `$ProductionScriptVersion` default bumped 47 -> 48, `Get-LocalInputsId` mirror added and displayed in `Show-StateFileParity`, `Test-PlanAdjacencyReadOnly` extended to mirror v48's intervening-anchor handling, and `Architecture` added to `Get-ThisMachineProfile` and rendered with a red banner when the value is not `x64`. See "v27 changes" below.
+- **v28** mirrors production v49: `$ProductionScriptVersion` default bumped 48 -> 49, `Get-StorageControllerDevices` mirror added, a new VMD storage-controller diagnostic added to Option 1, and a new parser self-test check for the `Get-StorageControllerDevices` shape. See "v28 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
 The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the machine's state and reports what production would do, but it does not simulate the destructive path or the plan. The shrink-first code paths are exercised on disposable VMs (see "v45 destructive-path regression" below), not through the harness.
+
+### v28 changes
+
+Four changes, all downstream of the v49 cycle.
+
+- **`$ProductionScriptVersion` default bumped 48 -> 49.** The harness's `Get-DesiredStateId` mirror carries this default to track production's `$ScriptVersion`. Left at 48 it would report a false `DSI MISMATCH` for every state file v49 production writes, the same class of drift the earlier bumps corrected. This is the fifth correction in the same family (v21, v22, v23, v27, v28).
+- **`Get-StorageControllerDevices` mirror added.** Enumerates present SCSIAdapter-class devices and extracts the union of `HardwareID`, `CompatibleID`, and the `InstanceId` prefix up to the last backslash. Software and virtual controllers (`InstanceId` starting with `{GUID}\` or `SWD\`) are skipped, mirroring production's software-device filter. The mirror is used by the Option 1 VMD diagnostic and verified by the new parser self-test (Check 17).
+- **New VMD diagnostic section added to Option 1.** The section enumerates the machine's controllers (friendly name, InstanceId, and the union of IDs), then the manifest's VMD patterns, then the match verdict, then an advisory when VMD presence is false but SCSIAdapter-class devices are present. The advisory names the exact ASUS-incident shape: a controller that exists on the machine and does not match any manifest VMD pattern.
+- **New parser self-test check (Check 17) for the `Get-StorageControllerDevices` shape.** Verifies that the enumeration returns either NULL (an indeterminate result the caller must handle) or an array of objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. SKIP when zero devices are present — legitimate on some VMs.
+
+Additionally, stale "v48" references in the architecture warning and the `Get-DesiredStateId` header comment were rewritten version-agnostically (they now say "production" rather than "production v48"), and the over-indented `try {` in the `Compare-WimServicingMetadata` self-test was fixed.
+
+The parser self-test count moves from seventeen checks to eighteen with the `Get-StorageControllerDevices` check.
 
 ### v27 changes
 
@@ -203,9 +217,9 @@ The default working directory is `C:\Temp\WinRETest`. All downloads and extracti
 
 **Cleanup guard (v18).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
 
-## Output style (v16; extended in v17 through v26, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, and v26's Plan adjacency preview section as the departures)
+## Output style (v16; extended in v17 through v28, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, and v28's VMD storage-controller diagnostic section as the departures)
 
-As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. The rest of the output format is unchanged from v16.
+As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. The rest of the output format is unchanged from v16.
 
 ### Colour-coded values
 
@@ -215,7 +229,8 @@ Diagnostic values are rendered with a colour that reflects their state:
 - **PASS / FAIL / SKIP results.** Rendered in green, red, and dark gray respectively — in `Say` (via the `-Level` mapping), in the parser self-test's `[OK]` / `[FAIL]` / `[SKIP]` tags, and in `Show-Summary`'s per-result lines and totals.
 - **BitLocker state on C:.** The `VolumeStatus` value is green when it reads `FullyDecrypted` and yellow for every other reported value; the `ProtectionStatus` value is green when it reads `On` and gray otherwise. When the state is hazardous (the four mid-operation `VolumeStatus` values with `ProtectionStatus` not `On`) or ambiguous (`FullyEncrypted` with `ProtectionStatus` not `On`), the diagnostic prints an additional warning block below the values, in yellow. The warning blocks are the field engineer's cue that production's OS-fallback route will defer on this machine.
 - **OS volume free-space banner.** When the OS volume's free space falls into the Red or Yellow band, the harness draws a boxed warning banner above the disk tables. The Red banner's headline is `LOW DISK SPACE ON OS VOLUME`; the Yellow banner's headline is `OS VOLUME FREE SPACE IS LOW`. The banner body names the exact free/total figures and a short recommendation. The banner is yellow for the Yellow band and red for the Red band.
-- **VMD hardware presence (v18).** The line reads `VMD hardware present  True` or `VMD hardware present  False` on a successful enumeration, and `VMD presence  INDETERMINATE` with the enumeration error below it on a failed one. The indeterminate state renders in yellow.
+- **VMD hardware presence (v18; extended v28).** The line reads `VMD hardware present  True` or `VMD hardware present  False` on a successful enumeration, and `VMD presence  INDETERMINATE` with the enumeration error below it on a failed one. The indeterminate state renders in yellow. As of v28 the section is preceded by the storage-controller enumeration block, whose entries render Cyan for the friendly name, DarkGray for the InstanceId, and Gray for each ID.
+- **Storage controllers (v28).** The block names the count of SCSIAdapter-class devices, then one sub-block per device with the friendly name, the InstanceId, and the union of `HardwareID`, `CompatibleID`, and the InstanceId prefix. The block is followed by the manifest's VMD patterns and the match verdict. When VMD is not present but SCSIAdapter-class devices are present, an additional advisory block renders in yellow and names the ASUS-incident shape: the applicability gate production v49 will run immediately before deployment is the last check before the WIM is written to the active route.
 - **Option S verdict (v18).** DSI MATCH is green, DSI MISMATCH is yellow, and INDETERMINATE is yellow with a paragraph explaining that a live production run would defer rather than commit state.
 - **Classifier verdict (v20).** `DEDICATED` is green, `OS-FALLBACK` is yellow, `RECOVERY-ON-SECONDARY` is yellow, `LABEL-ONLY` is yellow, and `UNEXPECTED` is red. The `LABEL-ONLY` colouring matches `OS-FALLBACK` and `RECOVERY-ON-SECONDARY` because the machine is not in a fatal state — production will simply take the full-update path on the next run rather than the fast path — but it is not the healthy DEDICATED state either.
 
@@ -223,7 +238,7 @@ Diagnostic values are rendered with a colour that reflects their state:
 
 The **All disks**, **All partitions**, **All volumes**, and **Recovery partitions** sections of Option 1 render as aligned tables with fixed column headers. Each row is colour-coded by relevance: the OS partition and OS disk stand out in White, the reagentc-registered recovery partition stands out in Cyan, and other rows render Gray. Recovery-partition rows are further colour-coded green when the partition is both type-coded and on the OS disk, yellow when type-coded but on a secondary disk, and red when it is not type-coded at all.
 
-The remaining sections — hardware, reagentc raw output, WinRE parsed state, OS partition / OS disk, OS partition supported sizes, bucket sizing preview, Build numbers, Windows Setup state, BitLocker on C:, target recovery partition state, VMD hardware presence, and the parser self-test — render as aligned key/value pairs or as free-form diagnostic lines. The parser self-test in particular is line-per-check: one `[OK]` / `[FAIL]` / `[SKIP]` line per check, with the state tag colour-coded.
+The remaining sections — hardware, reagentc raw output, WinRE parsed state, OS partition / OS disk, OS partition supported sizes, bucket sizing preview, Build numbers, Windows Setup state, BitLocker on C:, target recovery partition state, VMD hardware presence (with the v28 storage-controller block), and the parser self-test — render as aligned key/value pairs or as free-form diagnostic lines. The parser self-test in particular is line-per-check: one `[OK]` / `[FAIL]` / `[SKIP]` line per check, with the state tag colour-coded.
 
 ### `Write-Diag` and `Write-KV`
 
@@ -261,7 +276,7 @@ The menu renders the shortcut letter in colour, defaulting to Cyan. The state-fi
 
 Read-only information gathering. Dumps:
 
-- Hardware: manufacturer, model, product name/version, baseboard, CPU, OS build, Intel generation.
+- Hardware: manufacturer, model, product name/version, baseboard, CPU, OS build, Intel generation, architecture token. As of v27, the architecture line renders with a red banner when the value is anything other than `x64`.
 - Raw `reagentc /info` output and the parsed status/location.
 - The WinRE classifier verdict: `DEDICATED`, `OS-FALLBACK`, `RECOVERY-ON-SECONDARY`, `LABEL-ONLY`, or `UNEXPECTED`. As of v20 this mirrors the v44 patch 7 cycle's rule: only a **type-coded** recovery partition on the OS disk reaches `DEDICATED`. A label-only match on the OS disk gets its own `LABEL-ONLY` verdict.
 - OS partition and OS disk.
@@ -271,12 +286,12 @@ Read-only information gathering. Dumps:
 - Recovery partitions per `Get-RecoveryPartitions`, with `isTyped`, `isLabel`, and `onOsDisk` annotations.
 - The OS partition's `SizeMin`, `SizeMax`, shrinkable bytes, extendable bytes, and `S == M` status.
 - The bucket sizing preview: for the active WIM's size, what bucket the production script would compute.
-- **The Plan adjacency preview (v26):** a read-only check that mirrors the geometric and partition-identity subset of production's `Get-PartitionPlan` rejection checks against the current layout. On a clean layout it reports that production would not reject the layout on the checks evaluated; on a separated-recovery or oversized-recovery layout it prints the enriched rejection reason(s). The preview does not compute a bucket size or a planned extent, so the planned-extent rejections are not evaluated.
+- **The Plan adjacency preview (v26):** a read-only check that mirrors the geometric and partition-identity subset of production's `Get-PartitionPlan` rejection checks against the current layout. On a clean layout it reports that production would not reject the layout on the checks evaluated; on a separated-recovery or oversized-recovery layout it prints the enriched rejection reason(s). The preview does not compute a bucket size or a planned extent, so the planned-extent rejections are not evaluated. As of v27 the preview also mirrors v48's intervening-anchor handling and reports either acceptance with the anchor identity or rejection with the specific anchor failure.
 - **The Build numbers block (v22):** the registered WinRE version (from `reagentc /info`), the active WIM build (from `Get-WindowsImage` on the registered WIM), and the backup WIM build (from `Get-WindowsImage` on `C:\Recovery\WindowsRE\winre.wim`, or `(none present)` when the file is absent).
 - The Windows Setup state (`ImageState`), with a warning when the value is present and is not `IMAGE_STATE_COMPLETE`.
 - BitLocker on C: (`ProtectionStatus`, `VolumeStatus`, `EncryptionMethod`, `EncryptionPercentage`), **plus a hazard warning for the four mid-operation states and a separate ambiguity warning for `Fully Encrypted + Protection Off`** (v12, warning text updated in v14).
 - **The target recovery partition state** (v14): the BitLocker status of the partition reagentc is registered to. This is the state that determines whether the production script will need to run `manage-bde -off` before calling `reagentc /enable`.
-- VMD hardware presence per manifest (fail-closed as of v18: an enumeration error reports `INDETERMINATE`).
+- VMD hardware presence per manifest (fail-closed as of v18: an enumeration error reports `INDETERMINATE`). As of v28 the section is preceded by the storage-controller enumeration block described below.
 
 Then it runs the parser self-test (below).
 
@@ -392,21 +407,35 @@ The three values are the harness's read-only mirror of production v46 patch 2's 
 
 The block does not produce a PASS/FAIL/SKIP record and does not appear in the summary.
 
-#### VMD hardware presence (v18)
+#### VMD hardware presence (v18; extended v28)
 
-The VMD section runs the same `Get-PnpDevice` query that production uses, with the same fail-closed semantics. Three outcomes:
+The VMD section runs the same `Get-PnpDevice` query that production uses, with the same fail-closed semantics. As of v28 the section is preceded by a storage-controller enumeration block that closes the diagnostic gap the ASUS incident exposed: the machine had a controller (`PCI\VEN_8086&DEV_7D0B`) that the manifest did not recognize as VMD, the VMD detector reported "0 of 3 patterns matched", and nothing in the previous output showed the operator which IDs to compare against.
+
+**Storage-controller enumeration (v28).** The block runs first. It reports one of three outcomes:
+
+- **Enumeration failed (NULL).** Prints `Storage controllers  INDETERMINATE (PnP enumeration failed)` in yellow, with a note that production v49 would similarly refuse to certify the candidate if its own enumeration also failed.
+- **Enumeration succeeded, zero devices.** Prints `Storage controllers  none present (SCSIAdapter class)` in gray.
+- **Enumeration succeeded, one or more devices.** Prints the device count, then one sub-block per device: the friendly name (Cyan), the InstanceId (DarkGray), and each ID in the union of `HardwareID`, `CompatibleID`, and the InstanceId prefix up to the last backslash (Gray).
+
+Software and virtual controllers (`InstanceId` starting with `{GUID}\` or `SWD\`) are skipped, mirroring production v49's software-device filter.
+
+**Manifest VMD patterns.** Immediately after the controller enumeration, the block prints the manifest's `requiredDevices` patterns, one per line, under a `Manifest VMD patterns  N pattern(s)` header. This is the operator's side-by-side view: the machine's controller IDs above, the manifest's expected IDs below.
+
+**Match verdict.** Then the VMD presence verdict:
 
 - **Manifest has no `requiredDevices` patterns.** The section prints `(manifest has no requiredDevices patterns - VMD not applicable)`. This is informational.
 - **Enumeration succeeded.** The section prints the matching device count and a `VMD hardware present  True/False` line, colour-coded.
 - **Enumeration failed (indeterminate).** The section prints `VMD presence  INDETERMINATE` with the enumeration error message, and a note that production would defer rather than assume absence. Colour-coded yellow.
 
-The `INDETERMINATE` outcome is new in v18 and mirrors production v44 patch 6.
+**ASUS-shape advisory (v28).** When VMD is not present but SCSIAdapter-class devices are, an additional advisory block renders in yellow. It names the exact ASUS-incident shape and states that production v49's storage-applicability gate — the last check before deployment — is what refuses a candidate that does not match the machine's controller IDs. The advisory is operator-facing only; production does not depend on the operator to make the decision.
+
+The `INDETERMINATE` outcome is v18; the storage-controller enumeration, the manifest-pattern display, and the ASUS-shape advisory are v28.
 
 #### Windows Setup state (v13)
 
 The diagnostic reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and warns when the value is present and not `IMAGE_STATE_COMPLETE`. Production's Audit Mode guard defers in that state before any state-modifying action. The diagnostic's check mirrors the guard so that a field engineer pre-flighting a freshly imaged machine sees the deferral condition before running production.
 
-### Option S — State file parity check (v15; VMD handling and wording refined in v18, v19, and v21; `DeployedWinREMetadata` display added in v23)
+### Option S — State file parity check (v15; VMD handling and wording refined in v18, v19, and v21; `DeployedWinREMetadata` display added in v23; `LocalInputsId` display added in v27)
 
 Read-only. Recomputes the `DesiredStateId` production would compute right now — reading the live driver manifest, resolving the OEM package for this machine's vendor, and detecting VMD hardware presence — then reads the on-disk state file at `C:\Recovery\OEM\winre_state.json` and reports whether production would accept it or treat it as stale.
 
@@ -421,6 +450,8 @@ If the state file does not exist, the harness reports that production will take 
 As of v21 the parity display also includes the state file's `RepairAttempts` field alongside `PendingReboot`, `LastEnableResult`, and `EnableFailureAttempts`. Before v21 the display omitted this field even though the state file carries it; a field engineer diagnosing a pending-reboot loop had to read the JSON directly.
 
 As of v23 the parity display also includes the state file's `DeployedWinREMetadata` field. When present (a state file written by a v47 production run), it renders green. When absent (a v46-or-earlier state file), it renders yellow with a note that production v47 will force a rebuild on the next run because the drift detector has no anchor to compare against. Before v23 the field was silently absent from the display; a field engineer diagnosing a rebuild-on-first-v47-run had to read the JSON directly.
+
+As of v27 the parity display also includes the state file's `LocalInputsId`, alongside the computed value. Production writes the field (v48 patch 1) and consults it on offline fallback; the harness makes a mismatch visible before the machine goes offline. A stored `LocalInputsId` that differs from the current locally-computable value means a hardware or OS input has changed since the state file was written, and production's offline fallback will defer rather than trust the stale DSI.
 
 Option S is the field engineer's tool for answering "is this machine about to rebuild?" without running the production script. It does not exercise the offline fallback (v44 patch 5): Option S always performs a live manifest fetch and a live VMD detection, so on an offline machine the harness reports the fetch failure rather than a DSI verdict.
 
@@ -437,7 +468,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Seventeen checks as of v25 (sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, and v27 did not change the count or the contents. v25 added the `Compare-WimServicingMetadata` regression check. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions. v19 through v21 did not change the check count or the check contents; v22 added one check.
+Eighteen checks as of v28 (seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, and v27 did not change the count or the contents. v28 added the `Get-StorageControllerDevices` shape check. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -458,6 +489,7 @@ Seventeen checks as of v25 (sixteen as of v22, fifteen as of v18, ten before v18
 | 14 | CPU generation parser | Fourteen regression cases: 11th/12th/13th Gen, Core, Core Ultra, and negative cases for AMD/Celeron/Pentium/Xeon/Atom return the expected values. | v18 |
 | 15 | DesiredStateId | 64-hex, deterministic across repeat calls, VMD-sensitive, ScriptVersion-sensitive. | v18 |
 | 16 | Compare-WimServicingMetadata | Eight regression cases covering the DISM servicing-metadata comparison rules. | v25 |
+| 17 | Get-StorageControllerDevices shape | The enumeration returns either NULL (indeterminate) or an array of objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. SKIP when zero devices are present. | v28 |
 
 ### What a FAIL means
 
@@ -473,6 +505,7 @@ The most likely FAILs and their implications:
 - **Check 12 or 13 (Get-Disk / Get-Volume shape).** A property production reads has been removed or renamed. Production may misclassify a disk or a volume.
 - **Check 14 (CPU generation parser).** A CPU string no longer parses to the expected generation. `DesiredStateId` will contain a different `CPU=` value than intended, which will force a rebuild on machines whose state file was written under the previous parse. Investigate the raw CPU string (the diagnostic's Hardware section reports it) and extend the parser.
 - **Check 15 (DesiredStateId).** The DSI recipe has changed silently — a field dropped from the hash, or the output is no longer deterministic. This is a production correctness bug; do not deploy production to a fleet until the recipe is fixed.
+- **Check 17 (Get-StorageControllerDevices shape).** The `Get-PnpDevice` result shape has changed, or the software-device filter (`{GUID}\` and `SWD\` prefixes) has stopped matching. Production v49's storage-applicability gate uses this enumeration to decide whether the candidate image contains an INF matching the machine's controller; a shape change that removed or renamed `FriendlyName`, `InstanceId`, or `Ids` would silently degrade the harness's diagnostic output, and a change to the filter would change which devices count as the machine's storage controllers. Investigate the raw `Get-PnpDevice -Class 'SCSIAdapter' -PresentOnly` output.
 
 ### What a SKIP means
 
@@ -480,6 +513,7 @@ A SKIP means the check could not run in the current context. The reasons:
 
 - **Not elevated.** `Get-BitLockerVolume` requires elevation on some machines. The check SKIPs rather than FAILing.
 - **The state it inspects is absent.** WinRE location is empty, no OS partition, no lettered volume to sample, or similar. The check has nothing to inspect.
+- **Zero devices present (Check 17).** The `Get-StorageControllerDevices` enumeration returns an empty array on some VMs (no SCSIAdapter-class devices). A zero-device result is legitimate; the check SKIPs rather than FAILing. The distinction matters: NULL means the enumeration failed (indeterminate), and an empty array means the enumeration succeeded but found nothing (legitimate). The check verifies both cases.
 - **A precondition was not met.** `Test-VmdDrivers` (not a parser check) records SKIP when the Intel CPU generation cannot be parsed, because driver applicability was not evaluated. Option S records SKIP when the VMD query is indeterminate, because the DSI parity verdict cannot be computed from an indeterminate driver-set determination. Check 2b records SKIP when WinRE is Disabled or reagentc suppressed the version line.
 
 A SKIP does not indicate a defect.
@@ -502,7 +536,7 @@ The legacy `-Ok` boolean is still supported: when `-State` is not supplied, the 
 Passed 8, failed 1, skipped 1 (of 10)
 ```
 
-The BitLocker, target-partition, `ImageState`, Build numbers, and Option S outputs are informational — Option S records a result for the parity check itself but its intermediate verdict output is a separate thing. The BitLocker, target-partition, Build numbers, and `ImageState` blocks do not produce PASS/FAIL/SKIP records and do not appear in `Show-Summary`.
+The BitLocker, target-partition, `ImageState`, Build numbers, storage-controller, and Option S outputs are informational — Option S records a result for the parity check itself but its intermediate verdict output is a separate thing. The BitLocker, target-partition, Build numbers, storage-controller, and `ImageState` blocks do not produce PASS/FAIL/SKIP records and do not appear in `Show-Summary`.
 
 ## Non-interactive mode
 
@@ -512,7 +546,7 @@ The BitLocker, target-partition, `ImageState`, Build numbers, and Option S outpu
 
 Runs `Invoke-AllRelevant`, prints the summary, exits.
 
-`-NonInteractive` runs the download and extraction tests. It does not run the System Diagnostic (Option 1) or the State file parity check (Option S), so the BitLocker warnings, the target-partition state block, the `ImageState` check, the Build numbers block, and the DSI comparison are not printed in this mode. If you need any of those, run the harness interactively and choose Option 1 or Option S.
+`-NonInteractive` runs the download and extraction tests. It does not run the System Diagnostic (Option 1) or the State file parity check (Option S), so the BitLocker warnings, the target-partition state block, the `ImageState` check, the Build numbers block, the storage-controller block, and the DSI comparison are not printed in this mode. If you need any of those, run the harness interactively and choose Option 1 or Option S.
 
 The exit code is 0 when no FAIL results were recorded, and 1 when at least one FAIL was recorded (v25+). SKIPs do not affect the exit code. The summary remains the authoritative view of what ran. The behavior was introduced in v25 so that CI and cron consumers can treat the harness as a regression gate rather than a reporter.
 
@@ -528,6 +562,7 @@ The harness is deliberately narrow. It does not and cannot test:
 - **State file, checkpoint file, or deferral-marker writes.** Those files are production-only artifacts. Option S reads the state file but does not modify it.
 - **The full-update pipeline.** The harness exercises the download and extraction steps in isolation, not the pipeline.
 - **The v45 shrink-first pipeline.** The plan, the pre-shrink, the extension path, and the whole-layout assertion are all production-only code paths. See the "v45 destructive-path regression" section below for how they are tested.
+- **The v49 pre-deployment gates.** The source-ownership classification, the never-downgrade storage-driver check, the pre-deployment storage-applicability gate, and the native-boot VHDX fail-closed gate are all production-only. The harness surfaces the *inputs* those gates read — the storage controllers (v28), the source-WIM ownership class is not currently surfaced — but does not exercise the gates themselves. See the "v49 destructive-path coverage" section below.
 
 Those paths are covered by field testing on representative hardware. See the "Field-tested hardware" table in the [README](../README.md).
 
@@ -535,7 +570,7 @@ Those paths are covered by field testing on representative hardware. See the "Fi
 
 The harness shares code paths with production in the download, extraction, and CPU-generation helpers. It is documented in the file's own docstring which functions are "based on" the production versions and which are harness-specific.
 
-Twelve known differences:
+Thirteen known differences:
 
 - **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test. As of v17, the harness prints an explicit three-line note before the driver loop explaining this. The state-file parity check (Option S) *does* apply the hardware filter, because it is replicating production's DSI computation and production's DSI includes VMD presence.
 - **The harness does not run production's BitLocker helper functions.** The BitLocker sections in the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and categorize the result for display as hazardous, ambiguous, or safe. Production's `Test-VolumeEncrypted` returns a tri-state ($true / $false / $null); the harness's three-way UI categorization is a display-level view of the same underlying state, not a distinct predicate. The harness does not call `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`. This is intentional: the harness does not exercise production's BitLocker control flow, and a change to that control flow does not require a harness update to remain correct. The v14 update changed the warning text and added the target-partition state block, but did not change the classifier itself.
@@ -543,12 +578,13 @@ Twelve known differences:
 - **Network behavior is aligned with production as of v17.** Every `Invoke-RestMethod` and `Invoke-WebRequest` call in the harness carries `-TimeoutSec $NetworkTimeoutSeconds` where `$NetworkTimeoutSeconds = 15`. Before v17, the harness used PowerShell's default ~100-second timeout on each call, so a fully offline machine would take over 10 minutes to fail. The v17 alignment means the harness fails as fast as production does on a bad network. The `Invoke-OemPackDownload` helper's zero-byte check was also restored to match production's ordering: the length check now runs before the hash comparison, so a zero-byte download with an expected hash logs "file is empty" rather than "SHA256 mismatch". Both changes are correctness improvements that make the harness a more faithful replica of production's download path.
 - **VMD query-failure handling, Lenovo resolution, and Option S wording are aligned with production as of v18 and v19.** The harness's VMD presence check now treats a PnP enumeration error as indeterminate (matching production v44 patch 6), and the harness's `Get-LenovoWinPEPack` now sets `$Script:LenovoPackResolution` to the same five states as production. Before v18, an enumeration error in the harness produced a definitive answer, and a malformed Lenovo map entry looked identical to a legitimate no-pack case. Both were drift risks: the harness could disagree with production about what a live run would do. v19 corrected two further Option S wording issues (the state-file-absent-and-VMD-indeterminate case now records `SKIP`; the header and DSI MATCH verdict no longer overstate what DSI equality proves).
 - **The active-location classifier is aligned with production as of v20.** The harness's WinRE classifier now requires a type-coded recovery partition on the OS disk to reach the `DEDICATED` verdict, mirroring patch 3 of the v44 patch 7 cycle. Before v20, the classifier promoted a label-only match to `DEDICATED`, which could have reported `DEDICATED` for a machine whose registered location was a Basic Data partition labelled "Recovery" while production would have taken the full-update path. The harness's `LABEL-ONLY` verdict is informational and has no direct production equivalent; production's active-location classifier logs a WARN in the same situation without stopping.
-- **The `DesiredStateId` mirror is aligned with production as of v21 (through v27).** The harness's `Get-DesiredStateId` carries a `$ProductionScriptVersion` default that must track production's `$ScriptVersion`. It was pinned at 44 while production advanced to 45, which made every Option-S comparison against a v45-written state file report `DSI MISMATCH` incorrectly. The default became 45 in v21, 46 in v22, 47 in v23, and 48 in v27; the parameter-header comment states the tracking rule. Before v21, a field engineer running Option S against a machine updated to v45 patch 1 would have seen a false "production will treat this state file as stale" verdict on a machine whose state file production would actually accept. v22, v23, and v27 close the analogous gaps for v46, v47, and v48.
+- **The `DesiredStateId` mirror is aligned with production as of v21 (through v28).** The harness's `Get-DesiredStateId` carries a `$ProductionScriptVersion` default that must track production's `$ScriptVersion`. It was pinned at 44 while production advanced to 45, which made every Option-S comparison against a v45-written state file report `DSI MISMATCH` incorrectly. The default became 45 in v21, 46 in v22, 47 in v23, 48 in v27, and 49 in v28; the parameter-header comment states the tracking rule. Before each bump, a field engineer running Option S against a machine updated to the corresponding production version would have seen a false "production will treat this state file as stale" verdict on a machine whose state file production would actually accept. v22, v23, v27, and v28 close the analogous gaps for v46, v47, v48, and v49.
 - **The reagentc version parser and the Build numbers block are aligned with production as of v22.** The harness's `Get-WinREState` now extracts `Windows RE Version` from `reagentc /info` and returns it as `Version`, and Option 1 renders the "Build numbers" block described above. Both mirror production v46 patch 2's build-drift logging. The harness shows the values; it does not write them to a production log file, and the values do not enter the harness's DSI computation.
 - **`Show-StateFileParity` displays `DeployedWinREMetadata` as of v23.** The state file's DISM servicing metadata anchor (v47 patch 1's `DeployedWinREMetadata` field, in `<Version>|<SPBuild>` form) renders in the parity output alongside the other state-file fields. When present, it renders green; when absent (a v46-or-earlier state file), it renders yellow with a note that production v47 will force a rebuild on the next run because the drift detector has no anchor to compare against. This mirrors production v47 patch 1's `DeployedWinREMetadata` field — the harness shows the value, but no production decision depends on the harness reading it.
 - **The Plan adjacency preview is a mirror, not a simulation.** Option 1's preview evaluates the geometric and partition-identity subset of `Get-PartitionPlan`'s rejection checks read-only. It does not compute a bucket size, does not run the pre-shrink, does not choose a target partition, and does not exercise the extension path or the whole-layout assertion. A clean preview confirms the layout would not be rejected on the checks evaluated; it is not a prediction that the full plan would succeed. As of v27 the preview also mirrors v48's intervening-anchor handling and reports either acceptance with the anchor identity or rejection with the specific anchor failure.
-- **`Architecture` is reported in `Get-ThisMachineProfile` as of v27.** The harness's hardware-profile helper now carries the same normalized architecture token production's `Get-HardwareObject` produces, and the System Diagnostic renders it with a red banner when the value is anything other than `x64`. This surfaces production's v48 architecture-gate refusal before an operator runs production on a non-x64 host. The token does not enter the harness's DSI computation, matching production, where it is a gate input rather than a `DesiredStateId` component.
-- **`LocalInputsId` is displayed in Option S as of v27.** `Show-StateFileParity` shows both the computed and the stored `LocalInputsId` alongside the other state-file fields. Production writes the field and consults it on offline fallback; the harness makes a mismatch visible before the machine goes offline.
+- **`Architecture` and `LocalInputsId` are reported as of v27.** The harness's hardware-profile helper now carries the same normalized architecture token production's `Get-HardwareObject` produces, and the System Diagnostic renders it with a red banner when the value is anything other than `x64`. This surfaces production's v48 architecture-gate refusal before an operator runs production on a non-x64 host. Option S shows both the computed and the stored `LocalInputsId`, matching production v48 patch 1's offline-fallback input. Neither the architecture token nor `LocalInputsId` enters the harness's DSI computation — matching production, where they are gate inputs rather than `DesiredStateId` components.
+- **The storage-controller enumeration and VMD diagnostic are aligned with production as of v28.** `Get-StorageControllerDevices` mirrors production v49's SCSIAdapter-class enumeration, including the software-device filter (`{GUID}\` and `SWD\` prefixes skipped). The Option 1 diagnostic surfaces the machine's controller IDs, the manifest's VMD patterns, and the ASUS-shape advisory. The harness does not run the pre-deployment storage-applicability gate itself — that is a production-only check immediately before the WIM is written to the active route — but it gives the operator the same inputs production's gate reads, so a mismatch that would cause production to refuse the candidate is visible before the run.
+- **The harness does not exercise the v49 pre-deployment gates.** The source-ownership classification, the never-downgrade storage-driver check, the pre-deployment storage-applicability gate, and the native-boot VHDX fail-closed gate are all production-only. The harness surfaces the storage controllers (v28) that the applicability gate reads; it does not classify the source WIM, does not compare driver versions, and does not check the OS volume topology.
 
 The harness has no mirror of the v45 shrink-first pipeline. Option 1 and Option S report the machine's current state and the DSI comparison, but they do not simulate the plan, the pre-shrink, the extension path, or the whole-layout assertion. That is by design: those paths are destructive and cannot be simulated read-only.
 
@@ -586,6 +622,21 @@ The v48 patch 1 release introduces five changes: intervening-partition handling,
 - **`LocalInputsId` offline-drift guard.** Unexercised on the offline path. The test shape: a machine whose stored `LocalInputsId` was written by a prior run, taken offline, and whose hardware or OS build is changed while offline (VM snapshot manipulation or an in-place build change), then run with the manifest unreachable. The run should exit `EXIT_WARNING` with the `Offline fallback: stored LocalInputsId ... does not match` line rather than take the fast path.
 - **Transactional WIM replacement rollback.** Unexercised. The rollback branch fires when a copy fails mid-replacement after the previous WIM has been preserved. The test shape: mock `Copy-Item` to fail on the new-WIM copy, confirm the rollback copy is restored and hash-verified, and confirm the log shows `Rollback copy restored to <path>` before the run returns to the enable attempt.
 - **Intervening-anchor post-deletion failure.** Unexercised on the intervening path. This is the same class of residual the deliberate post-deletion failure test exercises for the non-intervening path: the anchor is shrunk, the recovery partition is deleted, and a later step (create, format, drive letter, or extension) fails. Follow the setup and recording requirements in "The post-deletion failure test (gating)" above, on an `C: | D: | Recovery` VM.
+
+### v49 destructive-path coverage
+
+The v49 release introduces several pre-deployment gates, post-run persistence features, and the backup / restore actions. The happy path for the interim features (backup, restore, resume task on clean completion) is exercised by the wrapper's own smoke tests. The gates and the interruption paths below are the v49 coverage that remains.
+
+- **Source-ownership classification.** Unexercised in the field. The classification runs before the strip stage. The test shape: prepare four VMs, one for each ownership class, and confirm the classification decision matches the expected class. In particular, a `Foreign-With-Drivers` source should be preserved as-is (strip stage skipped) rather than stripped and re-injected. The `Manager-Owned` and `Manager-Lineage` classes should be stripped and re-injected. The `Foreign-No-Drivers` class should be stripped (a no-op) and re-injected. Record the class the harness reports and the strip-stage decision.
+- **Never-downgrade storage-driver check.** Unexercised in the field. The check runs during the injection stage. The test shape: a VM whose registered WinRE carries a version N storage driver, and a candidate package that resolves to version N-1 of the same driver. Confirm the check skips the injection and retains the existing driver, and that the log names the driver, the two versions, and the skip decision. Confirm the reverse (a candidate with a newer version) is injected normally.
+- **Pre-deployment storage-applicability gate.** Unexercised in the field — it has never fired. This gate is the last refusal before the WIM is written to the active route: the candidate must contain an INF matching one of the machine's present SCSIAdapter-class devices. The test shape: a VM whose controller is deliberately absent from the manifest's VMD patterns and from the OEM pack's INFs, and a candidate image prepared from the manifest. Confirm the gate refuses the candidate, the run exits `EXIT_WARNING`, and the log names the candidate image path, the machine's storage controllers, and the fact that no INF matched. This is the highest-signal v49 test because the gate has never fired in the field.
+- **Native-boot VHDX fail-closed gate.** Unexercised on VHDX-boot hardware. The test shape: a Windows VM booted from a native VHDX rather than a physical or pass-through volume. Confirm the gate refuses before any destructive operation and the run exits `EXIT_WARNING` with the topology-named refusal. Confirm the log line names the VHDX topology and the specific operations the manager does not support under it.
+- **Backup action.** Exercised on the clean path by the wrapper. The failure branches (a source-WIM read error, a destination-write error, a copy hash mismatch, a drive-letter exhaustion) have not been exercised. Test each against a VM: mock the source read to fail, mock the destination write to fail, tamper with the copy to cause a hash mismatch, and exhaust drive letters. Confirm the run exits with a non-zero code, the machine state is unchanged, and the log names the specific failure point.
+- **Restore action.** Exercised on the clean path by the wrapper. The two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, `/enable` returning failed/bitlocker after the WIM is in place) have not been exercised. Test both against a VM: mock `/setreimage` to return non-zero after the WIM has been written, and mock `/enable` to return a terminal failure after the WIM is in place. Confirm in each case that the resume task's persist flag is set, that the transactional helper leaves the machine's previous WIM in place (either by completing the rollback or by reporting a rollback-restore failure), and that the machine's end state matches one of the two documented outcomes.
+- **Temporary resume task persist triggers.** Exercised on the clean-completion path only — the task is registered and then deleted. The five persist triggers (outer catch, Ctrl+C, the two restore failure paths, hard kill, reboot) have not been exercised. The Ctrl+C trigger is the load-bearing one and is high-signal. Test each: force an unhandled exception, send Ctrl+C during a run, invoke the two restore failure paths above, kill the PowerShell process mid-run (`Stop-Process -Force`), and reboot the VM mid-run. Confirm in each case that the resume task is preserved, that it fires on the next boot (or within the hour), and that the resume run completes the interrupted operation.
+- **Stable install location and copy-hash verification.** Exercised on the clean path by the wrapper. The copy-hash mismatch refusal branch has not been exercised. Test by mocking the copy to introduce a byte discrepancy (or by racing an AV/EDR product that alters the copy in place). Confirm the install step refuses to register the task, the log names the source and destination hashes, and the installed copy is left in place.
+
+Each of these tests should be recorded with the same data the v45 / v46 tests record: the VM setup, the branch that fired (with the log line), the machine's end state, the exit code, and any divergence from the documented behavior.
 
 ### v46 patch 2 hardenings (inside the post-deletion gate)
 
@@ -701,6 +752,7 @@ Each test needs a different starting state. Use a snapshot-restorable VM; the de
 - **Deferral marker lifecycle.** Run the pre-shrink failure test, re-run without fixing the constraint (the marker is honored), then mock the fast-path conditions to be met or fix the constraint so the machine converges (the marker is cleared and the run exits `EXIT_SUCCESS`).
 - **MBR.** Set up an MBR VM with a type-coded recovery partition; run the full-update path and verify the created partition carries MBR type `0x27`.
 - **Post-deletion failure.** See "The post-deletion failure test" above — the setup, procedure, expected sequence, end state, and recording requirements are all documented there.
+- **v49 pre-deployment gates.** See "v49 destructive-path coverage" above — the setup, expected behavior, and high-signal branches are documented there.
 
 ### What to record when a test is run
 
@@ -712,6 +764,7 @@ For each test, record:
 - The end state: C: size, partition count, WinRE status, registered location.
 - The exit code.
 - Whether the deferral marker was written, honored, or cleared.
+- Whether the resume task is present after the run (v49 tests).
 - Any divergence from the expected behavior.
 
 If a divergence is found, report it as a bug with the test setup and the full log. The fix ships as its own patch, gated on the test that found it. For the post-deletion failure test, the fix is the gate the CHANGELOG entry describes.
@@ -728,6 +781,8 @@ The harness is a single file. To add a test:
 
 For diagnostic output added to Option 1 or its sub-sections, use `Write-Diag` for free-form lines and `Write-KV` for aligned key/value pairs. The caller chooses the colour in both cases; there is no automatic severity mapping. For values inside tables, follow the pattern of the surrounding table and pick a colour from the restricted palette (Gray, DarkGray, Cyan, Green, Yellow, Red, Magenta, White).
 
+When adding a check to the parser self-test, use the pattern of the existing checks: enumerate the object's expected properties, compare against the observed shape, record `PASS` when all are present, `FAIL` when one is missing, and `SKIP` when the state the check inspects is legitimately absent. A check that a machine can be in without fault should SKIP rather than FAIL — for example, the `Get-StorageControllerDevices` shape check (v28) SKIPs on zero devices because a VM with no SCSIAdapter-class devices is a valid configuration.
+
 Do not add tests that modify the machine's state. The harness's contract with the operator is that it is read-only.
 
 ## Related documents
@@ -736,6 +791,6 @@ Do not add tests that modify the machine's state. The harness's contract with th
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — the four-bullet requirement for any PR that touches the destructive sequence, and the scope of the post-deletion gate that this document's gating test unblocks.
 - [troubleshooting.md](troubleshooting.md) — how to use the diagnostic output to diagnose a failure, including the BitLocker hazard, VMD-query-indeterminate, and target-partition recovery procedures, plus the compound signature of the post-deletion corner.
 - [deployment.md](deployment.md) — the deployment-time translation of the four invariants, the Audit Mode precondition for production deployment, and the one-instance-per-machine program lock.
-- [driver-injection.md](driver-injection.md) — what the injection tests are actually testing.
+- [driver-injection.md](driver-injection.md) — what the injection tests are actually testing, including the v49 source-ownership classification and never-downgrade check.
 - [state-and-idempotency.md](state-and-idempotency.md) — the `DesiredStateId` composition that Option S recomputes, the deferral marker's relationship to the deployment identity, and the offline fallback's residual risk.
 - [recovery-partition.md](recovery-partition.md) — the full partition lifecycle that the v45 destructive-path regression tests exercise.

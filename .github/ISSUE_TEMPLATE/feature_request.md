@@ -24,6 +24,18 @@ labels: ['enhancement', 'needs-triage']
 - Would this alter any exit-code semantics?
 - Does it touch the partition lifecycle, BitLocker state, the state file, the checkpoint file (`C:\ProgramData\OEM\Logs\winre_checkpoint.txt`), or the deferral marker (`C:\Recovery\OEM\winre_partition_deferred.json`)? The checkpoint file carries the source-content binding (v47) and the marker governs retry suppression (v45); both are part of the deployment's persistence surface.
 
+### If this feature would touch one of the v49 gates or persistence features
+
+v49 introduced a set of pre-deployment gates and post-run persistence features. If your feature would interact with any of them, say so explicitly:
+
+- The **source-ownership classification** and the rule that a `Foreign-With-Drivers` WIM is preserved as-is (does your feature need a fifth class, or a change to the classification rule?).
+- The **never-downgrade storage-driver check** (does your feature inject a driver that the check would refuse?).
+- The **pre-deployment storage-applicability gate** (does your feature deploy a candidate that the gate would refuse?).
+- The **native-boot VHDX fail-closed gate** (does your feature change the refusal, or make some destructive operation safe on VHDX?).
+- The **backup and restore actions** and the `backup.json` sidecar format (does your feature change the format, or read the backup outside restore?).
+- The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its registration, its five persist triggers, its clean-completion removal, or its `$PSCommandPath` guard — does your feature change when it is registered, or what it invokes?).
+- The **stable install location** at `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` and the SHA256-verify-before-register step (does your feature change where the maintenance task is registered, or what is installed?).
+
 ---
 
 **On the design invariants.** WinRE Manager's design is organized around four rules, in this order — see [`docs/architecture.md`](docs/architecture.md) for the full hierarchy:

@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v48 patch 2, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v48 patch 2) ==========`) -->
+- **WinRE.ps1 version:** <!-- e.g. v49, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v49) ==========`) -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
@@ -27,12 +27,15 @@ labels: ['bug', 'needs-triage']
   <!-- This is the partition reagentc is registered to. It is what production prepares via Set-RecoveryPartitionReadyForWinRE. If the block says "BitLocker-managed", production will run manage-bde -off against it before calling reagentc /enable. -->
 - **VMD hardware present:** <!-- output of the harness Option 1 "VMD hardware presence" block, or "yes/no" from BIOS if the harness cannot be run. VMD presence is one of the DesiredStateId inputs. -->
   <!-- If the harness reports "INDETERMINATE", copy the enumeration error line printed under it (the harness emits `PnP enumeration error: …` in the line below the INDETERMINATE verdict). The specific error text distinguishes a service issue from an antivirus/EDR block from a device in an error state. -->
+- **Storage controllers present (v28 harness):** <!-- output of the harness Option 1 "Storage controllers" block, if shown. The v49 pre-deployment storage-applicability gate compares the candidate image's INFs against these controllers. If the run deferred at the applicability gate, this block is what the maintainer needs. -->
 - **State file fields:** <!-- if C:\Recovery\OEM\winre_state.json exists, paste: DesiredStateId, LastUpdated, LastEnableResult, and EnableFailureAttempts -->
   <!-- LastEnableResult and EnableFailureAttempts are optional in the JSON and default to "ok" / 0 if absent. LastUpdated distinguishes a run that reached the state-write point (timestamp newer than run start) from a deferral (timestamp unchanged). DesiredStateId is required for the maintainer to check whether the state file would be accepted on this machine. -->
   <!-- If you can run the harness, Option S "State file parity check" reports whether the on-disk state file matches the ID production would compute right now. As of v48 it also reports the stored and computed `LocalInputsId` so an offline-fallback mismatch can be diagnosed without running production. -->
 - **Checkpoint file (if present):** <!-- copy `C:\ProgramData\OEM\Logs\winre_checkpoint.txt` verbatim. It carries the staged step, the recorded `DesiredStateId`, the workspace path, the `WIM_READY` flag, and the recorded source-content hash. The fifth field (source hash) was introduced on `WIM_READY` checkpoints in v47 patch 1 and extended to Step 3 checkpoints in v47 patch 2. Relevant for v47 checkpoint-invalidation bugs (`Checkpoint step N source identity ... does not match the currently-selected source`) and stale-workspace resume issues. -->
 - **Partition deferral marker:** <!-- if C:\Recovery\OEM\winre_partition_deferred.json exists, paste its contents (the DesiredStateId and Since fields). If it does not exist, say so. -->
   <!-- The marker is written when a pre-shrink deferral suppresses identical retries across runs. Its presence explains why a subsequent run exited EXIT_WARNING without re-attempting the pre-shrink. -->
+- **Resume task present (v49):** <!-- query: Get-ScheduledTask -TaskName 'WinRE Manager - Resume' -ErrorAction SilentlyContinue. If it exists, paste its State, LastRunTime, NextRunTime, and the action's Arguments (the "Task To Run" field from `schtasks /query /tn "WinRE Manager - Resume" /v /fo list`). If it does not exist, say so. -->
+  <!-- The resume task is registered by every Repair or Restore run and is deleted on clean completion. If it is still present, either a prior run was interrupted (Ctrl+C, hard kill, reboot, or an unhandled exception) or a Repair/Restore run is currently in flight. Its five persist triggers are the outer catch, the CancelKeyPress handler, Invoke-RestoreAction's two mid-transformation failure paths, a hard kill, and a reboot. If the log mentions `$PSCommandPath` and this task was not registered, that is expected under gist-bootstrap or paste-into-console invocation — not a bug. -->
 - **Elevation:** <!-- Running as SYSTEM, as admin, unelevated -->
 - **7-Zip present:** <!-- yes/no -->
 - **Concurrent invocation:** <!-- was any other WinRE.ps1 process running at the same time? Scheduled task, manual invocation, RMM tool "run now", Intune remediation. -->
@@ -99,6 +102,8 @@ labels: ['bug', 'needs-triage']
 - `Preserving existing target ... as rollback copy` or `Deploy-WimTransactional ... copy failed - restoring rollback copy` or `Deploy-WimTransactional ... rollback restore hash verification failed` or `Rollback copy restored to <path>` — the v48 transactional WIM replacement. Include the source path, target path, source hash, target hash (if any), and whether the rollback restore hash-verified.
 - `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session` — the v48 patch 2 fail-fast elevation guard. This is expected behavior, not a bug. The fix is to relaunch from an elevated prompt or via `scripts\WinRE-Manager.cmd`. The script exits with code 3 in this case.
 
+**v49 log signatures are not listed here yet.** The v49 features that add new log output — source-ownership classification, the never-downgrade storage-driver check, the pre-deployment storage-applicability gate, the native-boot VHDX fail-closed gate, the backup and restore actions, the temporary resume task, and the stable install location — are new in this release and their exact log strings have not been catalogued. If your run failed in a way that mentions one of those features, paste the lines verbatim and the maintainer will add them to this list.
+
 <details>
 <summary>C:\ProgramData\OEM\Logs\WinRE-Manager.log (relevant slice)</summary>
 
@@ -112,7 +117,7 @@ paste here
 <summary>Test-WinRE.ps1 output</summary>
 
 ```
-paste the interactive output here. Options 1 (System diagnostic) and S (State file parity check) are the most useful.
+paste the interactive output here. Options 1 (System diagnostic) and S (State file parity check) are the most useful. On the v28 harness the Option 1 output includes the "Storage controllers" block and the VMD diagnostic advisory when VMD is not detected but SCSIAdapter-class devices are present.
 ```
 
 </details>

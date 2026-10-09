@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207.x-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
-[![Version](https://img.shields.io/badge/version-v48%20patch%202-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v49.1-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ArthurJDurand)
 
@@ -24,17 +24,23 @@ WinRE Manager repairs, rebuilds, and maintains the **Windows Recovery Environmen
 2. **Extract** the archive.
 3. **Open** the `scripts` folder and double-click **`WinRE-Manager.cmd`**.
 
-The wrapper opens a menu:
+The wrapper opens a menu grouped into sections:
 
-| Option | What it does |
-|---|---|
-| **1 — Test harness** | Read-only checks of your Windows recovery setup. It does not modify WinRE, partitions, BitLocker, or Windows configuration. |
-| **2 — Preview (DryRun)** | Shows what the repair would do without making partition or WinRE changes. |
-| **3 — Run for real** | Performs the repair after showing a warning and requiring you to type `RUN`. |
-| **4 — Show recent log** | Prints the tail of the last run's log and offers to open it in Notepad. |
-| **5 — Quit** | Closes the wrapper. |
+| Section | Option | What it does |
+|---|---|---|
+| **SAFETY** | **1 — Back up current WinRE** | Captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar metadata file. Non-destructive. Recommended before any live repair. |
+| **DIAGNOSTICS** | **2 — Test harness** | Read-only checks of your Windows recovery setup. Does not modify WinRE, partitions, BitLocker, or Windows configuration. |
+| | **3 — Preview plan (DryRun)** | Shows what the repair would do without making partition or WinRE changes. |
+| | **4 — Show recent log** | Prints the tail of the last run's log and offers to open it in Notepad. |
+| **MAINTENANCE** | **5 — Install automatic maintenance** | Registers a SYSTEM scheduled task that runs WinRE Manager on a schedule. |
+| | **6 — Remove automatic maintenance** | Unregisters the scheduled task. The installed script copy is left in place. |
+| **REPAIR** | **7 — Run WinRE Manager** | Performs the repair after showing a warning and requiring you to type `RUN`. |
+| **RECOVERY** | **8 — Restore WinRE from backup** | Writes a previously captured WIM back to the active route. The menu's recovery row shows whether a backup exists at the default location; the restore screen accepts any directory containing `winre.wim` and `backup.json`, including one on an external disk. |
+| **EXIT** | **Q — Quit** | Closes the wrapper. |
 
-**First-run workflow.** On a machine that has never run WinRE Manager, take the options in order: **1** to confirm the current state, **2** to see what a live run would do without doing any of it, then **3** only after the preview looks reasonable.
+The wrapper also shows a status line at the top of the menu with the current backup state and whether the automatic-maintenance task is installed.
+
+**First-run workflow.** On a machine that has never run WinRE Manager, take the options in order: **2** (test harness) to confirm the current state, **3** (preview) to see what a live run would do without doing any of it, **1** (backup) to capture the current WinRE before anything changes, then **7** only after the preview looks reasonable.
 
 > **SmartScreen note.** Files downloaded from the internet carry the Mark-of-the-Web flag, and the built-in Windows zip extractor propagates it to the extracted `.cmd`. If double-clicking `WinRE-Manager.cmd` triggers **"Windows protected your PC,"** click **More info** → **Run anyway**. To clear the flag permanently, right-click the `.cmd` → **Properties** → tick **Unblock** → **OK**. Extracting with 7-Zip instead of the built-in extractor avoids the flag altogether.
 
@@ -124,6 +130,9 @@ A recovery environment that boots but cannot be navigated is barely a recovery e
 - **Intel VMD storage drivers.** On Intel systems configured to use VMD for storage — common on 12th-generation Intel and later laptops, including the HP 15 series — WinRE needs the appropriate VMD / RST storage driver to see the OS disk. Without it, Startup Repair and Reset this PC may fail to access the Windows installation and can surface errors such as `INACCESSIBLE_BOOT_DEVICE`. WinRE Manager detects VMD presence on the machine, resolves the right driver package for the CPU generation, and injects it when required.
 - **OEM WinPE packs, resolved per-machine.** Dell, HP, and Lenovo publish WinPE driver packs for their business models. WinRE Manager reads the machine type, resolves the correct pack, downloads and extracts it with the vendor's own extractor, and injects the applicable INFs.
 - **Injection verified, not assumed.** `Add-WindowsDriver`'s return shape is unreliable across DISM builds. WinRE Manager judges injection success by third-party driver-count delta plus an INF-basename cross-reference between the extracted package and the mounted image.
+- **Source-ownership classification (v49).** Every candidate source image is classified before the strip-and-reinject pipeline runs. A WIM that a vendor populated with its own third-party drivers is preserved as-is — the manager will not strip and re-inject over a foreign WIM it did not deploy. A manager-owned, manager-lineage, or in-box WIM is stripped to zero third-party drivers and re-injected with the current recipe.
+- **Pre-deployment storage-driver applicability gate (v49).** The gate runs inside Step 3, after injection is confirmed complete, before ResetBase and before the dismount. The manager verifies that the candidate image contains an INF whose `HardwareID` or `CompatibleID` matches one of the machine's present SCSIAdapter-class devices. A candidate that does not match is refused, dismounted with `-Discard`, and deferred; the downstream pipeline gate (no Step 4, no partition work, no deployment when injection did not complete) ensures the refusal is honored before any WIM is written to the active route. This was added after a field case where a machine's controller was not in the manifest and the earlier pipeline would have deployed a candidate with no driver for it — a recovery environment that boots but cannot see the OS disk.
+- **Never-downgrade storage-driver check (v49).** After injection completes and before ResetBase, the manager compares each storage-class driver in the final image against the pre-strip inventory, matched by INF basename. If any post-injection driver would be older than the source's version of the same basename, the entire candidate is discarded — not just the offending driver — the mounted image is dismounted with `-Discard`, the source is preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`. The response is deliberately conservative: the whole source is preserved rather than a partial fix.
 
 ### Recovery partition geometry
 
@@ -132,6 +141,7 @@ A recovery environment that boots but cannot be navigated is barely a recovery e
 - **A recovery partition separated from C: by a data partition (v48).** A machine laid out as `C: | D: | Recovery` is now handled automatically: the manager identifies `D:` as an *intervening anchor*, validates it against a strict set of read-only safety conditions, shrinks it from the right, and creates a new recovery partition adjacent to the shrunk anchor. The scope is deliberately narrow — exactly one non-recovery partition between C: and the recovery partition cluster, no partition-moving, no anchor extension. Multi-intervening layouts (`C: | D: | E: | Recovery`) still defer stably with a named reason.
 - **A recovery partition on a non-OS disk.** A stray type-coded recovery partition on a secondary disk can cause Startup Repair to point the BCD at the wrong image. WinRE Manager removes type-coded recovery partitions from non-OS disks.
 - **An OEM factory-restore volume carrying the recovery type code.** Recovery-typed partitions over 2 GiB are preserved for operator review — never deleted, never reused. Windows Setup recovery partitions are under 1.5 GiB; OEM factory volumes can be 7–20 GiB and may carry the same type code.
+- **A VHDX-boot machine (v49).** The manager refuses to run destructive operations when the OS disk's bus type is `File Backed Virtual` **and** at least one other disk is on a physical bus — the native-boot VHD/VHDX topology, where the running OS disk is a VHD stored on a host physical disk. A hypervisor guest whose entire storage stack is virtual is not refused. The fail-closed refusal prevents a partial sequence from leaving the machine without a working recovery route.
 
 Because the plan rejects the entire layout when it detects an oversized recovery-typed partition on the OS disk, any run that requires a rebuild defers with `EXIT_WARNING` until the operator resolves the partition. The script will not silently accept a layout it cannot prove safe, and it does not write a retry-suppressing deferral marker for this condition.
 
@@ -191,20 +201,28 @@ WinRE Manager's safety measures are implemented in the code rather than relying 
 - **Reversible failure window.** The C: pre-shrink runs **before** `reagentc /disable` and **before** any deletion. A failed pre-shrink leaves the old recovery route intact.
 - **Fail closed on the destructive sequence.** If the active WinRE route cannot be resolved, or the OS partition cannot be resolved for the layout assertion, the sequence stops before touching the disk.
 - **Transactional WIM replacement (v48).** The active route's WIM is preserved as a rollback copy before the new one is staged. On a copy failure, the previous WIM is restored from the rollback copy and hash-verified; a rollback-restore failure is reported separately.
+- **Source-ownership classification (v49).** Every candidate source WIM is classified before the strip-and-reinject pipeline runs. A foreign WIM with vendor-injected drivers is preserved as-is; the manager will not normalize a source it did not deploy. See the source-ownership bullet in [SECURITY.md](SECURITY.md) for the trust implications.
+- **Pre-deployment storage-applicability gate (v49).** Runs inside Step 3, after injection is confirmed complete, before ResetBase and before the dismount: the candidate must contain an INF matching one of the machine's actual storage controllers. A candidate that does not match is refused, dismounted with `-Discard`, and deferred; the downstream pipeline gate ensures the refusal is honored before any WIM reaches the active route.
+- **Never-downgrade storage-driver check (v49).** A storage driver that would be a version downgrade against one already present in the mounted image is refused by discarding the entire candidate — the mounted image is dismounted with `-Discard`, the source is preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`. The whole source is preserved rather than partially normalized.
+- **Native-boot VHDX fail-closed gate (v49).** The manager refuses to run destructive operations on a machine whose OS volume is on a native-boot VHDX, before any partition work.
+- **Backup and restore (v49).** The wrapper exposes a byte-for-byte backup of the currently registered WinRE WIM, and a restore operation that writes a previously captured WIM back to the active route transactionally. Backup is non-destructive; restore validates the backup, resolves the current route, and uses the existing deployment machinery.
+- **Temporary crash-recovery task (v49).** Every Repair or Restore run registers a scheduled task that fires shortly after the next boot and once within the hour, so an interrupted run — including a Ctrl+C, a hard kill, or a reboot — is resumed rather than left half-finished. The task is deleted on clean completion. See [SECURITY.md](SECURITY.md) for the privileged-execution implications.
+- **Stable install location for the maintenance task (v49).** The wrapper's install option copies the local `WinRE.ps1` to `C:\ProgramData\OEM\WinRE-Manager\`, SHA256-verifies the copy, and registers the scheduled task against the installed copy — not the operator's local clone. A hash mismatch aborts the install and refuses to register the task.
 - **Targeted.** WinRE is prepared on its *target* volume. C:'s BitLocker state is never modified by the script.
 - **Isolated workspace.** Scratch uses internal fixed NTFS volumes only. USB, SD/MMC, network, FireWire, Fibre Channel, and unknown-bus disks are excluded.
 - **Single instance.** A kernel-enforced file lock prevents two runs from colliding on the same machine.
 - **Architecture gate (v48).** The manager refuses to run on any architecture other than x64, before any state mutation.
 - **Elevation guard (v48 patch 2).** An unelevated launch is refused in milliseconds with a clear message — before the program lock, before hardware probes, before any network fetch.
-- **Typed confirmation.** The interactive wrapper requires typing `RUN` before the destructive path begins.
+- **Typed confirmation.** The interactive wrapper requires typing `RUN` before the destructive path begins, and `RESTORE` before a restore operation.
 
-Full safety model — workspace selection, the pre-shrink window, the transactional WIM replacement, the deferral marker, the architecture gate: **[Architecture](docs/architecture.md)** and **[Recovery partition](docs/recovery-partition.md)**.
+Full safety model — workspace selection, the pre-shrink window, the transactional WIM replacement, the deferral marker, the architecture gate, and the resume task: **[Architecture](docs/architecture.md)** and **[Recovery partition](docs/recovery-partition.md)**.
 
 ## Requirements
 
 - **Windows 10** (build 19041+) or **Windows 11** (build 22000+). Windows 11 24H2 and the 25H2 builds are explicitly supported.
 - **PowerShell 5.1** or **PowerShell 7.x**.
 - **x64 OS architecture.** The manager refuses to run on ARM64, x86, or any architecture whose token cannot be resolved. ARM64 support is not claimed.
+- **A physical disk for the Windows volume — not a VHDX.** WinRE Manager refuses to run destructive operations on a machine whose Windows volume is on a native-boot VHDX (a virtual hard disk that the PC boots from directly, rather than a disk that only exists inside a virtual machine). The partition operations it performs are not reliable under that setup. This is uncommon — normal PCs boot from a physical disk — but the check exists so the manager never risks damaging a configuration it was not built for. If it applies to your machine, the run exits with a warning and changes nothing. *(v49)*
 - **Elevation or SYSTEM** for production. The read-only test harness runs unelevated when invoked directly; the recommended wrapper (`WinRE-Manager.cmd`) launches it elevated for complete query results. An unelevated launch of `WinRE.ps1` is refused in milliseconds with a clear `FATAL` message, rather than failing several minutes later at `Mount-WindowsImage`.
 - **7-Zip** at `C:\Program Files\7-Zip\7z.exe`. The script attempts installation via `winget` if missing.
 - **Internet access** to `gist.github.com`, `api.github.com`, `downloads.dell.com`, `ftp.ext.hp.com`, and `download.lenovo.com` for the first deployment on a fresh machine. On a machine whose state file is present and whose local safety checks pass, an outage does not prevent the run. All five external artifacts can be self-hosted; see **[Self-hosting](docs/self-hosting.md)**.
@@ -230,6 +248,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1               # ele
 
 The examples above use Windows PowerShell 5.1 (`powershell.exe`). If you are running PowerShell 7, substitute `pwsh` for `powershell` — the script works with either, and the harness runs unelevated in both when invoked directly. The production script needs elevation or SYSTEM. (The recommended wrapper, `WinRE-Manager.cmd`, launches the harness elevated for complete query results — see the wrapper's menu description above.)
 
+### Backup and restore actions
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Backup  -BackupPath "D:\WinRE-Backups"
+powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Restore -BackupPath "D:\WinRE-Backups"
+```
+
+Backup captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar `backup.json` recording the source hash, size, and DISM servicing metadata. Restore validates the backup, resolves the current route, and writes the WIM back transactionally — it does not create a new partition or invent a replacement route. A usable current WinRE route must already exist.
+
 ### One-liners (no local clone)
 
 Save the script to a temp path and run it in a child process:
@@ -250,7 +277,7 @@ Substitute the `Test-WinRE.ps1` URL to fetch the read-only harness, and drop `-D
 
 ### Fleet deployment
 
-Run `WinRE.ps1` as `NT AUTHORITY\SYSTEM` on a scheduled task triggered at boot and weekly. Ready-to-paste task XML and MDM guidance are in **[Deployment](docs/deployment.md)**.
+Run `WinRE.ps1` as `NT AUTHORITY\SYSTEM` on a scheduled task triggered at boot and weekly. Ready-to-paste task XML and MDM guidance are in **[Deployment](docs/deployment.md)**. The wrapper's install option (`WinRE-Manager.cmd`, option **5**) does the same thing interactively and pins the task to a stable installed copy of the script, so the task survives deletion or relocation of the operator's local clone.
 
 ## Exit codes
 
@@ -267,11 +294,11 @@ Full matrix and orchestration policy: **[Exit codes](docs/exit-codes.md)**.
 
 | Component | Version |
 |---|---|
-| `scripts/WinRE.ps1` | **v48 patch 2** |
-| `scripts/Test-WinRE.ps1` (read-only harness) | **v27** |
+| `scripts/WinRE.ps1` | **v49 patch 1** |
+| `scripts/Test-WinRE.ps1` (read-only harness) | **v28** |
 | `scripts/WinRE-Manager.cmd` | (interactive wrapper; ships with the release) |
 
-**v48 patch 1** raised `ScriptVersion` from 47 to 48, so every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. **v48 patch 2** kept `ScriptVersion` at 48 and added a fail-fast elevation guard and a source-WIM hash cache; a machine already on v48 patch 1 continues on the fast path. Full release notes, migration steps, and per-machine field evidence are in **[CHANGELOG.md](CHANGELOG.md)**.
+**v49** is the largest single release since v48. It ships the ASUS-incident containment work (source-ownership classification, never-downgrade, storage-applicability gate), the native-boot VHDX fail-closed gate, backup and restore actions, human-readable narration and run-summary output, a temporary crash-recovery scheduled task, and a rewritten interactive wrapper. `ScriptVersion` moves from 48 to 49, so every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. Full release notes, migration steps, and per-machine field evidence are in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Field-tested hardware
 
@@ -280,14 +307,14 @@ Selected results. Full per-machine evidence is in the [changelog](CHANGELOG.md).
 | Vendor | Model | OS | Result |
 |---|---|---|---|
 | ASUS | PRIME H510M-D (i5-11400) | Win11 26300 | v47 patch 1 — clean non-destructive migration from v46; two subsequent runs on the fast path |
-| AB8139 (DMI) | LX15PRO (Ryzen 7 5825U) | Win11 26300 | **v48 patch 1** — first field validation of the intervening-anchor path on the exact `C: \| D: \| Recovery` layout that motivated it |
+| AB8139 (DMI) | LX15PRO (Ryzen 7 5825U) | Win11 26300 | v48 patch 1 — first field validation of the intervening-anchor path on the exact `C: \| D: \| Recovery` layout that motivated it |
 | Dell | Pro Max 16 Premium MA16250 (Core Ultra 7 265H) | Win11 26300 | v47 patch 2 — full rebuild with Dell WinPE11 A10 OEM pack; 64 drivers injected; fast path on the second run |
 | ASUS | Vivobook X1504ZA (i3-1215U) | Win11 26300 | v47 patch 2 — C: actively encrypting at 91% during run; dedicated-partition path completed; new recovery partition not re-claimed by Device Encryption |
 | HP | EliteBook 8 G1i 16" (Core Ultra 5 235U) | Win11 26300 | v46 patch 2 — clean destructive rebuild; first field exercise of the build-drift log lines |
 | Lenovo | IdeaPad 3 15IAU7 (MT 82RK) | Win11 26200 | v46 patch 1 — the machine that motivated the plan-clamp fix; after state-file reset, second full update reached DEDICATED |
 | (VM) | Hyper-V Win11 / Win10 MBR | Win11 26300 / Win10 19045 | v45 patch 1 — destructive path and MBR partition-attribute path verified end-to-end |
 
-The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis). The remaining coverage gaps — post-deletion failure on the intervening-anchor path, the v48 multi-intervening and surplus rejections, the transactional-WIM rollback branch, and the architecture gate on ARM64 — are documented in **[Testing](docs/testing.md)**.
+The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis). **v49-specific field verification is pending** — the outstanding items are documented in the [v49 entry](CHANGELOG.md): provenance-marker survival across a real Windows Update servicing event; two-version `iastorvd.inf` coexistence; the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour across the three flag-setting cases (outer catch, Ctrl+C, and the two Invoke-RestoreAction mid-transformation failures) and the two finally-never-runs interruption classes (hard kill, reboot), plus its clean-completion removal — Ctrl+C is the load-bearing case; the wrapper's backup and restore options with paths containing spaces; and the wrapper's install / reinstall of the permanent maintenance task with the installed copy verified after the local script is renamed. The remaining coverage gaps — post-deletion failure on the intervening-anchor path, the v48 multi-intervening and surplus rejections, the transactional-WIM rollback branch, and the architecture gate on ARM64 — are documented in **[Testing](docs/testing.md)**.
 
 ## Documentation
 

@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Current status
 
-**Production:** `WinRE.ps1` **v48 patch 2** (`ScriptVersion = 48`, `ScriptPatchLevel = "2"`). Field-verified on Windows 11 24H2 (26100) and 25H2 (26200, 26300), and on Windows 10 22H2 (19045).
-**Harness:** `Test-WinRE.ps1` **v27**.
+**Production:** `WinRE.ps1` **v49 patch 1** (`ScriptVersion = 49`, `ScriptPatchLevel = "1"`). v49-specific field verification is pending; the field verification carried forward from v48 patch 2 covers Windows 11 24H2 (26100) and 25H2 (26200, 26300), and Windows 10 22H2 (19045).
+**Harness:** `Test-WinRE.ps1` **v28**.
 
 The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker. Production and harness are deliberately decoupled: a harness move never forces a managed-machine rebuild.
 
@@ -25,9 +25,13 @@ These are the limitations that are still live in the shipping code. Each is docu
 
 4. **Multi-intervening recovery partitions.** v48's intervening-anchor handling accepts exactly one non-recovery partition between C: and the type-coded recovery cluster. A `C: | D: | E: | Recovery` layout rejects with the enriched separation reason and defers stably. The v48 scope is deliberate; a general partition-moving engine is out of scope. See [v48 patch 1](#v48-patch-1--2026-10-06).
 
-5. **Intervening-anchor surplus case.** When the recovery partition being reclaimed is **larger** than the new bucket size, the current v48 plan rejects with a named reason and defers stably. The v48 scope does not extend the anchor: a BitLocker-encrypted anchor is not safely growable via `Resize-Partition` alone, and the invariants forbid additional `manage-bde` work on the anchor. Placing the new recovery partition adjacent to the shrunk anchor and leaving any trailing extent unallocated would accept these layouts; that is a v49 candidate. See [v48 patch 1](#v48-patch-1--2026-10-06).
+5. **Intervening-anchor surplus case.** When the recovery partition being reclaimed is **larger** than the new bucket size, the current v48 plan rejects with a named reason and defers stably. The v48 scope does not extend the anchor: a BitLocker-encrypted anchor is not safely growable via `Resize-Partition` alone, and the invariants forbid additional `manage-bde` work on the anchor. Placing the new recovery partition adjacent to the shrunk anchor and leaving any trailing extent unallocated would accept these layouts; that remains a candidate for a future release — it was floated as a v49 candidate, but v49 shipped without it. See [v48 patch 1](#v48-patch-1--2026-10-06).
 
-6. **Free-space deferral retry suppression.** When the pre-shrink free-space check rejects, the run writes a deferral marker and does not retry on the next scheduled run even if free space has since been freed. This suppresses the full rebuild that would otherwise run before reaching the same rejection point, at the cost of requiring operator intervention when free space changes. The operator path is documented in the script header. A targeted re-evaluation — the marker caches the resize-target identity and planned shrink, the next run re-reads free space and retries only if the condition has resolved — is a v49 candidate. See [v48 patch 2](#v48-patch-2--2026-10-07).
+6. **Free-space deferral retry suppression.** When the pre-shrink free-space check rejects, the run writes a deferral marker and does not retry on the next scheduled run even if free space has since been freed. This suppresses the full rebuild that would otherwise run before reaching the same rejection point, at the cost of requiring operator intervention when free space changes. The operator path is documented in the script header. A targeted re-evaluation — the marker caches the resize-target identity and planned shrink, the next run re-reads free space and retries only if the condition has resolved — remains a candidate for a future release; it was floated as a v49 candidate, but v49 shipped without it. See [v48 patch 2](#v48-patch-2--2026-10-07).
+
+7. **Provenance-marker persistence is not field-verified.** The provenance marker is written into the mounted image under `Sources\Recovery\WinRE-Manager\provenance.json` during Step 3, and is read back by the source-ownership classifier: a marker whose `LineageId` matches the state file's classifies the source `Manager-Lineage`, which authorizes strip and injection. Whether Microsoft's WinRE servicing migrates that specific marker into a replacement image has not been established by field test. If the marker does not survive servicing, the effect is conservative — the source falls through to the content-based classes, and a serviced source that should have been normalized is preserved instead of stripped. The provenance-marker survival test is what closes this gap. (The header's Known-gap bullet now correctly states that the marker is read by the ownership classifier; the earlier "not load-bearing" phrasing and this parenthetical are both removed by the same correction.) See [v49 patch 1](#v49-patch-1--2026-10-08).
+
+8. **Storage-driver coexistence is not characterized.** The behavior of two versions of the same storage-driver family coexisting in one WinRE image has not been characterized experimentally. The never-downgrade rule provides a conservative response — the entire source is preserved rather than partially normalized — but it does not establish a general coexistence, ranking, or replacement policy. Do not infer that coexistence is safe merely because the candidate driver is not older. See [v49 patch 1](#v49-patch-1--2026-10-08).
 
 ### Resolved limitations
 
@@ -49,6 +53,120 @@ These limitations were documented in a release entry and have since been closed.
 - **The v48-specific intervening-anchor logic is concentrated in the planning and pre-shrink stages.** The resize-target abstraction moves the pre-shrink target from C: to the anchor in the intervening case. The post-deletion sequence (`New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, drive-letter assignment) remains the shared recovery-partition path, with the relevant assertions (`Assert-RecoveryPartitionLayout`) and cleanup (`Remove-OrphanPartition`) operating against the validated resize target and boundary. The v48 development accepted the risk that the post-deletion segment has not been exercised under a deliberate failure on the intervening path, on the reasoning that the segment is the same code with different parameters; the 2026-10-06 field validation confirmed the happy path on the exact motivating layout. The deliberate post-deletion failure test remains the gate for future changes to the segment.
 
 - **Pre-shrink segment (plan, pre-shrink, verification, deferral) is not gated.** The v45 reorder placed the risky step in the reversible window, which closes the v44 residual for the shrink case. The v48 pre-shrink changes (resize-target abstraction, anchor-aware free-space check, `-DefragTarget` parameter, active-route resolution moved before the pre-shrink) are all in this ungated segment.
+
+---
+
+## [v49 patch 1] — 2026-10-08
+
+**The headline.** v49 is the largest single release since v48. It ships the ASUS-incident containment work (source-ownership classification, never-downgrade, storage-applicability gate), the native-boot VHDX fail-closed gate, backup and restore actions, human-readable narration and run-summary output, a temporary crash-recovery scheduled task, and a rewritten interactive wrapper. `ScriptVersion` moves from 48 to 49, so every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path.
+
+The release was driven by two converging lines of work. First, the ASUS-incident field case — a controller whose device ID the manifest did not recognise as VMD, so the wrong driver set could have been selected silently — motivated a redesign of the source-selection and driver-injection safety envelope: source-ownership classification, a never-downgrade check, and a pre-deployment storage-applicability gate. Second, the same review identified that the manager had no fail-closed gate against a native-boot VHDX layout, no user-facing backup and restore actions, and no way to present a run's outcome in human-readable form for an operator who is not reading the technical log.
+
+### Added
+
+- **Source-ownership classification.** Every candidate source WIM is classified into one of four ownership classes: `Manager-Owned` (the staged source hash exactly matches the state file's `CurrentImageHash`, so the bytes are identical to what the manager last deployed), `Manager-Lineage` (a valid provenance marker is present in the mounted image and its `LineageId` matches the state file's), `Foreign-No-Drivers` (no positive ownership evidence, but the source contains zero third-party drivers), and `Foreign-With-Drivers` (no positive ownership evidence and at least one third-party driver present). The classification gate decides whether the strip-and-reinject pipeline runs. Source selection — which of the registered WIM, the hash-validated LKG, or the GitHub cold-start source is used as the base — is a separate step (`Select-BaseWinRESource`) and is not influenced by the ownership classification. A `Foreign-With-Drivers` WIM is preserved as-is: the manager will not strip and re-inject over a foreign WIM that a vendor populated with its own drivers. The four-class list is authoritative; the earlier `Microsoft-Baseline` class is no longer part of the design.
+
+- **Never-downgrade storage-driver check.** After injection completes and before ResetBase, the manager compares each storage-class driver in the final image against the pre-strip inventory, matched by INF basename. If any post-injection driver would be older than the source's version of the same basename, the entire candidate is discarded — not just the offending driver — the mounted image is dismounted with `-Discard`, the source is preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`. Prevents a Windows Update-delivered storage driver from being silently replaced by an older copy on the next scheduled run. The response is deliberately conservative: the whole source is preserved rather than a partial fix.
+
+- **Pre-deployment storage-driver applicability gate.** The gate runs inside Step 3, after injection is confirmed complete, before ResetBase and before the dismount. The manager verifies that the candidate image actually contains an INF whose `HardwareID` or `CompatibleID` matches one of the machine's present SCSIAdapter-class devices. A candidate that does not match the machine's controller is refused, dismounted with `-Discard`, and deferred rather than deployed; the downstream pipeline gate (no Step 4, no partition work, no deployment when injection did not complete) ensures the refusal is honored before any WIM is written to the active route. Motivated by the ASUS incident, in which the machine's controller (PCI\VEN_8086&DEV_7D0B) was not in the manifest's VMD patterns and the earlier pipeline would have deployed a candidate with no driver for it.
+
+- **Native-boot VHDX fail-closed gate.** The manager refuses to run destructive operations when the OS disk's bus type is `File Backed Virtual` **and** at least one other disk is on a physical bus. That combination is the native-boot VHD/VHDX topology: the running OS is on a VHD/VHDX stored on a host physical disk, and the host disk appears to the running OS as a non-OS disk subject to the stray-recovery cleanup. A hypervisor guest whose entire storage stack is virtual — every other disk on `Virtual` or `File Backed Virtual` — is not refused. The check fails closed when the OS disk or its BusType cannot be resolved.
+
+- **Backup and restore actions.** `WinRE.ps1 -Action Backup -BackupPath <dir>` captures a byte-for-byte copy of the currently registered WinRE WIM and writes a sidecar `backup.json` recording the source hash, size, and DISM servicing metadata. The operation is non-destructive with respect to the machine: it does not rebuild, replace, or reconfigure the active WinRE route, and it leaves the original WinRE untouched. It may temporarily assign a drive letter in order to access a WIM registered through a GLOBALROOT/volume path, and cleans the letter up under the existing temporary-drive-letter machinery. `WinRE.ps1 -Action Restore -BackupPath <dir>` writes a previously captured WIM back to the currently registered route transactionally: it validates the backup, resolves the current registered route, handles dedicated and OS-fallback targets, uses the existing deployment machinery, re-registers WinRE, and re-enables it. Restore does not create a new partition or invent a replacement route — a usable current WinRE route must already exist.
+
+- **Human-readable narration and run summary.** A narration layer (`Write-Narration`) emits operator-facing status lines alongside the technical log, at points such as `Starting WinRE Manager...`, `Checking this machine's hardware...`, `Nothing to do. The Windows recovery environment is already healthy.`, `Preparing to service the recovery image.`, `Mounting and customizing the recovery image.`, and `Deploying the recovery image.` A run-summary layer (`Initialize-RunSummary`, `Set-RunSummaryField`, `Add-RunSummaryLine`, `Write-RunSummary`) records the run outcome in a structured block with fields: `Result`, `Decision`, `Why`, `Work performed`, `Changes made`, `Changes NOT made`, `Operating mode`, `Next action`, `Runtime`. The `Decision` field distinguishes `FAST PATH` from the full-update paths; `Operating mode` distinguishes `DEDICATED`, `OS-FALLBACK`, and `PRESERVED`. Both layers are additive; the technical log format is preserved.
+
+- **Temporary crash-recovery scheduled task (`WinRE Manager - Resume`).** v49 patch 1. Every Repair or Restore run registers a task named `WinRE Manager - Resume` that fires at boot+1m and as a one-shot at T+1h. The task invokes the production script in resume mode; it is deleted on clean completion and preserved on interruption. The persist flag is set in three cases: the outer catch (unhandled exception); the `CancelKeyPress` handler (Ctrl+C — the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C); and `Invoke-RestoreAction`'s two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place). Two further interruption classes leave the task registered without setting the flag, because the `finally` block never runs to consult it: a hard kill (e.g. `taskkill /F`) and a reboot mid-run (the OS terminates PowerShell). The task profile is SYSTEM / Highest, startup+1m plus one-shot T+1h, `StartWhenAvailable`, battery-allowed, no idle requirement, network not required, 24-hour execution limit. `Invoke-RestoreAction` has been moved after resume-task registration so an interrupted Restore is recoverable.
+
+- **`$PSCommandPath` guard on `Register-ResumeTask`.** v49 patch 1. Under `Invoke-RestMethod | Invoke-Expression` (gist bootstrap) or paste-into-console invocation, `$PSCommandPath` is `$null`. In that case the function logs at INFO and returns `$false`. The task is a per-run safety net, not machine state, so its absence does not set `nonFatalWarning`.
+
+- **Invocation-context logging.** v49 patch 1. Main logs whether the run is under SYSTEM (scheduled) or interactive, so the log is unambiguous about how the run was initiated.
+
+- **Leftover resume-task detection.** v49 patch 1. `Register-ResumeTask` detects a pre-existing `WinRE Manager - Resume` task and logs a line acknowledging both possibilities: a previous interrupted run, or this run re-registering itself.
+
+### Fixed
+
+- **Dead script state removed.** `$Script:SourceOwnershipClass` and `$Script:StorageApplicabilityOk` were declared and assigned but never read. Both the declarations and the assignments have been removed. No behaviour change.
+
+- **Stale "Part 2" reference removed from `Test-NativeBootVirtualTopology`'s header.** A comment referenced a document section that no longer exists.
+
+### Changed
+
+- **`.NOTES` source-ownership class list corrected.** The source-ownership invariant now lists four classes (`Manager-Owned`, `Manager-Lineage`, `Foreign-No-Drivers`, `Foreign-With-Drivers`), with `Foreign-With-Drivers` described and the obsolete `Microsoft-Baseline` class removed.
+
+- **`.NOTES` resume-task documentation added.** The block describes the temporary resume task, including the three cases that set the persist flag (outer catch, Ctrl+C, and `Invoke-RestoreAction`'s mid-transformation failure paths) and the two interruption classes that leave the task registered without setting the flag because the `finally` block never runs (hard kill, reboot).
+
+### Changed (wrapper)
+
+- **`scripts/WinRE-Manager.cmd` rewritten.** v49 patch 1. The wrapper was rewritten around a reordered menu, semantic colours, an always-present restore option with a backup-presence hint, and a stable install location.
+
+  - **Reordered menu.** Grouped into SAFETY (backup), DIAGNOSTICS (test harness, dry-run, log), MAINTENANCE (install / remove scheduled task), REPAIR (live run), and RECOVERY (restore). The live run sits at the bottom of the numbered list, immediately before Quit, so an operator reads the preparatory options first.
+
+  - **`DESTRUCTIVE` label removed.** The live run is presented with a yellow-background `LIVE` chip, and the section is headed `REPAIR` with a `live WinRE operation` subtitle. Red is reserved for actual errors.
+
+  - **Top-of-menu status lines.** Backup presence (`Available` / `Not found`) and scheduled-task state (`Installed` / `Not installed`) are shown on the menu.
+
+  - **Restore visibility.** The Restore entry `[8]` and the RECOVERY section header are always present. The recovery row shows a hint that reflects the state of the default backup location: `default backup available` when at least one directory under `C:\Backup\WindowsRE` contains both `winre.wim` and `backup.json`, or `no default backup found` otherwise. The restore screen accepts any directory containing both files — including one on an external disk — so the option is never suppressed; a machine with no default backup can still restore from a backup stored elsewhere.
+
+  - **`Q` quit key.** Quit is bound to the letter `Q` rather than to a number, so the numeric range is reserved for menu entries.
+
+  - **Palette chips.** Green-background `SAFE` / `RECOMMENDED` / `BACKUP`, yellow-background `UAC` / `LIVE`, cyan-background `RESTORE`, blue-background `TASK`.
+
+  - **Backup and restore options.** Menu options pass `-Action Backup -BackupPath "<dest>"` / `-Action Restore -BackupPath "<src>"` to `WinRE.ps1`. Restore requires typing `RESTORE` to confirm; the live run requires typing `RUN` to confirm.
+
+  - **Install / Remove scheduled task.** Menu options register and unregister the permanent `Maintain Windows RE` task.
+
+  - **Stable install location.** On install, the elevated child creates `C:\ProgramData\OEM\WinRE-Manager\`, copies the local `WinRE.ps1` there, SHA256-verifies the copy, and refuses to register the task if the copy's hash does not match the source. The task is registered against the installed copy, not against the operator's local download or clone, so the task survives deletion or relocation of the original.
+
+  - **Elevated launcher.** All elevated actions route through a single launcher that Base64-encodes the raw PowerShell command and hands it to `Start-Process -Verb RunAs -EncodedCommand`, which eliminates shell quoting hazards on paths and arguments.
+
+  - **Permanent maintenance task profile.** `Maintain Windows RE`: SYSTEM / Highest, startup+5m and every 30 days at 03:00, `MultipleInstances = IgnoreNew`, `StartWhenAvailable`, `AllowStartIfOnBatteries`, `DontStopIfGoingOnBatteries`, execution time limit 24 hours, no idle requirement, network not required. The 24-hour limit prevents a hung task from permanently blocking the boot trigger under `IgnoreNew`; the network condition is deliberately not required so the offline fallback continues to fire on scheduled runs.
+
+  - **Removal leaves the installed copy in place**; the removal screen tells the operator how to delete the containing directory manually.
+
+### Changed (harness)
+
+- **`Test-WinRE.ps1` moved to v28.** Five changes:
+
+  - **`$ProductionScriptVersion` default bumped 48 -> 49.** Tracks production's `$ScriptVersion`. Without the bump, Option S reports a false DSI MISMATCH for every state file v49 production writes. This is the fifth correction in the same family (v21, v22, v23, v27, v28).
+
+  - **`Get-StorageControllerDevices` mirror added.** Enumerates SCSIAdapter-class devices present on the machine and extracts the union of `HardwareID`, `CompatibleID`, and the `InstanceId` prefix up to the last backslash. Software and virtual controllers (`InstanceId` starting with `{GUID}\` or `SWD\`) are skipped, mirroring production's software-device filter.
+
+  - **VMD diagnostic section added to Option 1.** Enumerates the machine's controllers before the manifest's VMD patterns, then the match verdict, then an advisory when VMD presence is false but SCSIAdapter-class devices are present — the exact ASUS-incident shape.
+
+  - **New parser self-test (Check 17).** `Parser: Get-StorageControllerDevices shape` verifies that the enumeration returns either NULL or an array of objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. SKIP when zero devices are present.
+
+  - **Menu title and startup `Rule` bumped to v28.** Stale "v48" references in the architecture warning and the `Get-DesiredStateId` header comment rewritten version-agnostically. Over-indented `try {` in the `Compare-WimServicingMetadata` self-test fixed.
+
+### Migration Note
+
+`ScriptVersion` moves from 48 to 49, so the `SCRIPT` component of `DesiredStateId` changes. Every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. `ScriptPatchLevel` also moves from 0 to 1; it is not a `DesiredStateId` input, so it does not force a second rebuild — it is visible only in the startup banner (`WinRE Manager Started (v49 patch 1)`). No driver-manifest, OEM-map, or driver-selection inputs changed. The DSI bump is intentional: it is the version boundary that converges the fleet onto the v49 pipeline and ensures the newly added classification, gate, and narration code is exercised on every machine.
+
+A machine whose state file records a v48 `DesiredStateId` will see it rejected as stale on the next run and take the full-update path. On the full-update path, the source-ownership classification decides whether the source WIM is stripped and re-injected; a `Foreign-With-Drivers` source is preserved. The applicability gate may refuse a candidate the earlier pipeline would have deployed; in that case the machine defers with `EXIT_WARNING` until the manifest or the machine's controller set is updated.
+
+Rollback: change `$ScriptVersion` back to 48 and revert the v49 changes (source-ownership classification, never-downgrade, applicability gate, native-boot VHDX gate, backup and restore actions, narration, run summary, resume task). Another fleet-wide rebuild occurs on the next run.
+
+The read-only harness `Test-WinRE.ps1` moves from v27 to v28 in the same window. The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker.
+
+### Field verification
+
+Pending. The v49 features most in need of field verification are:
+
+- Provenance-marker survival across a real Windows Update WinRE servicing event.
+- Two-version `iastorvd.inf` coexistence behaviour.
+- Storage-applicability check false-negative rate (has never fired in the field).
+- The deliberate post-deletion failure test on a disposable VM with an intervening partition (the v48 known gap).
+- The temporary resume task's persist behaviour across the three flag-setting cases (outer catch, Ctrl+C, and `Invoke-RestoreAction`'s mid-transformation failures) and the two `finally`-never-runs interruption classes (hard kill, reboot), plus its clean-completion removal. Ctrl+C is the load-bearing case.
+- The wrapper's backup and restore menu options with paths containing spaces.
+- The wrapper's install / reinstall of the permanent maintenance task, with the installed copy verified after the local script is renamed.
+
+### Known limitations
+
+The six live limitations listed under [Current known limitations](#current-known-limitations) carry forward unchanged from v48 patch 2. No new user-facing limitations were identified. Two v49 validation gaps are added as items 7 and 8: provenance-marker persistence through real Windows Update WinRE servicing, and storage-driver coexistence when multiple versions of the same storage-driver family are present. Neither is a confirmed runtime defect; neither should be treated as experimentally validated. Both are tracked in [Current known limitations](#current-known-limitations).
+
+### Unchanged
+
+The four design invariants, the shrink-first reorder, the transactional WIM replacement, the intervening-anchor plan, the architecture gate, and the `LocalInputsId` computation are all unchanged. The state file schema gains two optional fields: `ForeignSourceAcceptedHash`, set when a foreign source is preserved so the next run's fast path accepts the registered hash; and `LineageId`, the persistent lineage identifier written into the provenance marker and carried forward across runs. Both are absent on state files written by v48 or earlier; their absence is handled the same way as any other missing field. The checkpoint file format is unchanged. The partition geometry on both the intervening-anchor path and the non-intervening path is unchanged.
 
 ---
 
@@ -82,7 +200,7 @@ The changes were driven by the 2026-10-05 elevation-failure logs, by a two-revie
 
 ### Changed (docs and header)
 
-- **Header `Known gap` gains the free-space deferral documentation.** The deferral marker suppresses retries when the pre-shrink free-space check rejects, so freeing space without deleting the marker does not cause the machine to retry. The documentation now names the design rationale (suppress the ~10-15 minute full rebuild that would otherwise run before reaching the same rejection point), the operator path (delete `winre_state.json` and `winre_partition_deferred.json` after freeing space), and the v49 candidate (targeted re-evaluation using the resize-target identity and planned shrink recorded in the marker).
+- **Header `Known gap` gains the free-space deferral documentation.** The deferral marker suppresses retries when the pre-shrink free-space check rejects, so freeing space without deleting the marker does not cause the machine to retry. The documentation now names the design rationale (suppress the ~10-15 minute full rebuild that would otherwise run before reaching the same rejection point), the operator path (delete `winre_state.json` and `winre_partition_deferred.json` after freeing space), and the future-evaluation candidate (targeted re-evaluation using the resize-target identity and planned shrink recorded in the marker). The candidate was labelled "v49" when this entry was written; v49 shipped without implementing it, and the header now generalizes the label.
 
 - **Header build-drift paragraph clarified.** The paragraph's "no gate reads these values" claim was scoped to the logged observability values (reagentc-reported version, WIM builds, SHA256s). `Select-BaseWinRESource` does gate source selection on `Compare-WimServicingMetadata`, which reads its own DISM metadata via a separate call to `Get-WindowsImage`. The paragraph now makes this distinction explicit.
 
@@ -94,7 +212,7 @@ The changes were driven by the 2026-10-05 elevation-failure logs, by a two-revie
 
 ### Field verification
 
-Pending. The three code changes are: elevation guard (trivially testable: unelevated launch must produce the FATAL message in milliseconds; elevated launch must proceed unchanged); source-WIM hash cache (requires a machine on the enable-only path whose `/setreimage` fails, and confirmation that the state file is written after the drive letter is removed); comment corrections (no runtime behavior).
+Pending. The behavioural changes are: the elevation guard (trivially testable: unelevated launch must produce the FATAL message in milliseconds; elevated launch must proceed unchanged); the source-WIM hash cache (requires a machine on the enable-only path whose `/setreimage` fails, and confirmation that the state file is written after the drive letter is removed); the D1 fix (requires a machine whose post-delete C: extension fails, and confirmation that the fallback geometry is not rejected by the post-delete verification); and the comment and log corrections (no runtime behaviour).
 
 The two field logs that motivated the patch are recorded under [v48 patch 1](#v48-patch-1--2026-10-06) Field verification (the elevation failures) and [Current known limitations](#current-known-limitations) item 6 (the free-space deferral design).
 
@@ -153,7 +271,7 @@ The release was driven by three converging lines of work. First, the 2026-10-05 
 
 `ScriptVersion` moves from 47 to 48, so the `SCRIPT` component of `DesiredStateId` changes. Every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. No driver-manifest, OEM-map, or driver-selection inputs changed. The DSI bump is intentional: it is the version boundary that converges the fleet onto the v48 pipeline, and it ensures the newly-added `LocalInputsId` field is populated by every machine that takes the full-update path.
 
-A machine whose state file records a v47 `DesiredStateId` will see it rejected as stale on the next run and take the full-update path. On the full-update path, the intervening-anchor handling either accepts the machine's layout (creating a fresh recovery partition adjacent to a shrunk anchor) or rejects it with a named reason and defers. A machine whose layout falls into the surplus case or the multi-intervening case will defer stably; the operator path is documented in [Current known limitations](#current-known-limitations) items 4 and 5.
+A machine whose state file records a v47 `DesiredStateId` will see it rejected as stale on the next run and take the full-update path. On the full-update path, the intervening-anchor handling either accepts the machine's layout (creating a fresh recovery partition adjacent to a shrunk anchor) or rejects it with a named reason and defers. A machine whose layout falls into the surplus case or the multi-intervening case will defer stably; the operator path is documented under the [multi-intervening recovery partitions](#current-known-limitations) and [intervening-anchor surplus case](#current-known-limitations) limitations.
 
 Rollback: change `$ScriptVersion` back to 47 and revert the five bundled changes: the intervening-anchor plan logic, the architecture gate, the `LocalInputsId` computation and its state-file field, the LKG-by-hash discovery scan, and the transactional WIM replacement. Another fleet-wide rebuild occurs on the next run. The `LocalInputsId` field becomes inert on rollback (it is read only on the offline-fallback path).
 
@@ -184,11 +302,11 @@ Rollback: change `$ScriptVersion` back to 47 and revert the five bundled changes
 The three live limitations carried by v47 patch 3 remain open in this patch, and three new limitations are introduced:
 
 - **Post-deletion create/format failure on encrypted C: (still open).** A `New-Partition` or `Format-Volume` failure **after** the old recovery partition has been deleted, on encrypted C:, with no successful retry. Gated on the deliberate post-deletion failure test in `docs/testing.md`. Full text under [Current known limitations](#current-known-limitations).
-- **Unverified v45 failure paths (still open).** Full text under [Current known limitations](#current-known-limitations) item 2.
-- **Metadata-neutral Dynamic Update drift (still open).** Full text under [Current known limitations](#current-known-limitations) item 3.
-- **Multi-intervening recovery partitions (new).** v48's intervening-anchor handling accepts exactly one non-recovery partition between C: and the recovery cluster. A `C: | D: | E: | Recovery` layout rejects and defers stably. Full text under [Current known limitations](#current-known-limitations) item 4.
-- **Intervening-anchor surplus case (new).** When the recovery partition being reclaimed is larger than the new bucket size, the plan rejects with a named reason and defers stably. Placing the new recovery partition adjacent to the shrunk anchor and leaving any trailing extent unallocated would accept these layouts; that is a v49 candidate. Full text under [Current known limitations](#current-known-limitations) item 5.
-- **Free-space deferral retry suppression (new).** The deferral marker suppresses retries when the pre-shrink free-space check rejects, so freeing space without deleting the marker does not cause the machine to retry. This is a deliberate design decision, documented in the header as of [v48 patch 2](#v48-patch-2--2026-10-07). Full text under [Current known limitations](#current-known-limitations) item 6.
+- **Unverified v45 failure paths (still open).** Full text under the [unverified v45 failure paths limitation](#current-known-limitations).
+- **Metadata-neutral Dynamic Update drift (still open).** Full text under the [metadata-neutral Dynamic Update drift limitation](#current-known-limitations).
+- **Multi-intervening recovery partitions (new).** v48's intervening-anchor handling accepts exactly one non-recovery partition between C: and the recovery cluster. A `C: | D: | E: | Recovery` layout rejects and defers stably. Full text under the [multi-intervening recovery partitions limitation](#current-known-limitations).
+- **Intervening-anchor surplus case (new).** When the recovery partition being reclaimed is larger than the new bucket size, the plan rejects with a named reason and defers stably. Placing the new recovery partition adjacent to the shrunk anchor and leaving any trailing extent unallocated would accept these layouts; that was a v49 candidate, but v49 shipped without it (see [Current known limitations](#current-known-limitations) item 5). Full text under the [intervening-anchor surplus case limitation](#current-known-limitations).
+- **Free-space deferral retry suppression (new).** The deferral marker suppresses retries when the pre-shrink free-space check rejects, so freeing space without deleting the marker does not cause the machine to retry. This is a deliberate design decision, documented in the header as of [v48 patch 2](#v48-patch-2--2026-10-07). Full text under the [free-space deferral retry suppression limitation](#current-known-limitations).
 
 ### Unchanged
 
@@ -324,10 +442,14 @@ project's one outstanding architectural item and is not touched by this patch.
 
 ### Changed (map builders)
 
-- **`-TimeoutSec 15` added to the three builder download paths** (`Build-DellWinPEMap.ps1`,
-  `Build-HPWinPEMap.ps1`, `Build-LenovoWinPEMap.ps1`). Matches the runtime policy.
-  On a clean run the change is a no-op; on a stalled vendor CDN it converts an unbounded
-  hang into a bounded retry.
+- **`-TimeoutSec 15` added to the three builders' `Invoke-WebRequest` download paths**
+  (`Build-DellWinPEMap.ps1`, `Build-HPWinPEMap.ps1`, `Build-LenovoWinPEMap.ps1`).
+  Matches the runtime policy. On a clean run the change is a no-op; on a stalled
+  vendor CDN it converts an unbounded hang into a bounded retry. The Lenovo builder's
+  recipe-card and support-page fetches use `curl-impersonate.exe` rather than
+  `Invoke-WebRequest`; those calls are not covered by this change and remain
+  unbounded. Adding `--max-time` / `--connect-timeout` to them is a candidate for
+  a future release.
 - **`Build-LenovoWinPEMap.ps1` guards the `osId` sort** against non-numeric values with a
   `try { [int]$_.osId } catch { 0 }` fallback. Under the file's
   `$ErrorActionPreference = "Continue"`, a malformed `osId` previously produced a
@@ -437,7 +559,7 @@ Two conditional rebuild triggers apply:
 
 ### Field verification
 
-The v47 patch 2 non-destructive paths have been exercised on four physical machines. All four ran patch 2 code prior to the five hardening fixes documented above; the hardening fixes are new and are covered by code inspection, the harness parser self-tests, and the field evidence from the v47 patch 1 runs — not by the field runs below.
+The v47 patch 2 non-destructive paths have been exercised on four physical machines. All four ran patch 2 code prior to the seven hardening fixes documented above; the hardening fixes are new and are covered by code inspection, the harness parser self-tests, and the field evidence from the v47 patch 1 runs — not by the field runs below.
 
 - **Dell Pro Max 16 Premium MA16250** (Core Ultra 7 265H, Win11 26300, GPT), 2026-10-04 15:03–15:06. Full update triggered by the v46→v47 DSI mismatch; source selection took the `registered-only` branch; the strip stage was a no-op (image already clean); the Dell WinPE11 A10 pack (31.86 MiB) was downloaded and SHA256+MD5-verified; 70 INFs extracted (49 unique basenames); `Add-WindowsDriver` return-shape filter reported 0, but the delta gate judged success (64 new third-party drivers, 49 of 49 matched); ResetBase ran; the export produced a 789.41 MiB WIM; the existing 1,000 MiB type-coded partition was rejected as undersized (1039 MiB required); the destructive pipeline created a 1,100 MiB bucket at offset 975661 MiB; the race detector fired at the `Ensure-AdequateRecoveryPartition` site (`unchanged`); `reagentc /disable` → delete → `New-Partition` → layout assertion PASS → format → attributes → deploy → `/setreimage` → `/enable` all exit 0; `Deployed WinRE metadata: 10.0.26100.9545|9545` recorded. Fast path on the second run (5s), with `Byte drift from last deployment: NO`.
 
@@ -471,7 +593,7 @@ The design is a "tested WinRE servicing strategy using documented Microsoft serv
 - **Hard zero-driver gate.** Any failure to enumerate, remove, or re-verify is a candidate rejection: `Get-WindowsDriver` failure, `Remove-WindowsDriver` failure, a missing `Driver` field in an enumeration entry, or an iteration budget exhaustion all return `$false`, and the caller discards the candidate before any injection, export, partition work, or `reagentc` call. Enumeration failure is never interpreted as zero. On rejection the mounted image is dismounted with `-Discard`, the checkpoint rolls back to Step 2, and `base.wim` and any stale `winre_optimized.wim` are removed so the next run re-acquires the source cleanly.
 - **Source selection with a regression-guarded last-known-good fallback (`Get-LKGWinREImagePath`, `Get-WimServicingMetadata`, `Compare-WimServicingMetadata`).** The base WIM is now sourced from one of three places, in preference order: the currently-registered WinRE image (default), the manager's last-known-good copy at `C:\Recovery\WindowsRE\winre.wim`, or the GitHub base-WIM repository. The registered image is preferred unless the LKG is provably newer by DISM servicing metadata (`Version` + `SPBuild` + `SPLevel`, with `Architecture` required to match). The LKG is trusted only when its SHA256 matches `state.CurrentImageHash`; a partial or stale file is not promoted, and a failed fallback copy in a prior run cannot silently promote a stale WIM. An indeterminate metadata comparison defers to the LKG. The loose fallback-discovery path that v46 used is no longer a source-selection candidate; a WIM found outside the registered location is not treated as a registered source.
 - **Pre-`/disable` source-fingerprint race detector (`Get-RegisteredWinREFingerprint`, `Assert-RegisteredWinREUnchanged`).** Immediately before whichever `reagentc /disable` this execution will perform first, the helper re-reads the registered WinRE's `Location`, `Version`, and WIM SHA256 and compares them against values captured at the start of the rebuild. Any change — location, version, or hash — aborts before the disable. Both `/disable` sites are wrapped: the `Ensure-AdequateRecoveryPartition` site (which runs after the pre-shrink, so an abort restores C: to its captured size first) and the Step 5 deployment site (which runs with the old route intact, so an abort is a clean defer). Named as a race detector, not a lock — Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update, and the residual microseconds between the re-read and the disable returning cannot be eliminated without moving work into the disable→enable window.
-- **Metadata-based drift detection.** The `needInject` trigger now compares the currently-registered WinRE's DISM servicing metadata against a new `DeployedWinREMetadata` field recorded in the state file at the end of every successful deployment. The v46 WIM-hash-drift trigger is retired: a WIM recompression by an external tool changes bytes without changing the semantic desired state, so the WIM hash is no longer a rebuild trigger. The WIM hash remains in use for copy verification, deployment verification, LKG validation, and the pre-`/disable` race detector. Microsoft documents that an LCU bumps `SPBuild` while the base `Version` can remain unchanged, so both are compared; the tradeoff that a Dynamic Update may not change either field is named as a residual under [Current known limitations](#current-known-limitations) item 4.
+- **Metadata-based drift detection.** The `needInject` trigger now compares the currently-registered WinRE's DISM servicing metadata against a new `DeployedWinREMetadata` field recorded in the state file at the end of every successful deployment. The v46 WIM-hash-drift trigger is retired: a WIM recompression by an external tool changes bytes without changing the semantic desired state, so the WIM hash is no longer a rebuild trigger. The WIM hash remains in use for copy verification, deployment verification, LKG validation, and the pre-`/disable` race detector. Microsoft documents that an LCU bumps `SPBuild` while the base `Version` can remain unchanged, so both are compared; the tradeoff that a Dynamic Update may not change either field is named as a residual under the [metadata-neutral Dynamic Update drift limitation](#current-known-limitations).
 - **`Get-GitHubBaseWinRE` extracted as a shared function.** The GitHub download-and-extract path previously lived inline in Step 2; it is now a named function called from the source-selection else-branch, so the source-selection logic can request it from the same call site for either the "neither local source usable" or the "registered unusable" condition.
 
 ### Changed
@@ -864,7 +986,7 @@ Two Option S corrections in the read-only harness. Production `WinRE.ps1` is una
 
 ### Unchanged
 
-The harness's extraction cleanup, user-supplied `TestDir` protection, VMD-indeterminate reporting for the state-file-present case, Lenovo five-state resolution mirror, and parser self-test are unchanged. `Test-WinRE.ps1` remains read-only, requires no elevation, and modifies nothing. Production `WinRE.ps1` v44 patch 6 is unaffected.
+The harness's extraction cleanup, user-supplied `TestDir` protection, VMD-indeterminate reporting for the state-file-present case, Lenovo five-state resolution mirror, and parser self-test are unchanged. `Test-WinRE.ps1` remains read-only with respect to Windows, WinRE, and system configuration. It requires no elevation. It may create and remove its own test artifacts under its configured `$TestDir`. Production `WinRE.ps1` v44 patch 6 is unaffected.
 
 ---
 
