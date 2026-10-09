@@ -42,7 +42,7 @@ The v49 release added a family of gates that run **before** the destructive sequ
 - The **pre-deployment storage-applicability gate** (the last refusal before the WIM is written to the active route: the candidate must contain an INF matching one of the machine's present SCSIAdapter-class devices).
 - The **native-boot VHDX fail-closed gate** (refuses destructive operations on a VHDX-boot OS volume).
 - The **backup and restore actions** (`-Action Backup` and `-Action Restore`; the sidecar `backup.json` format; the transactional restore path).
-- The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its five persist triggers, its clean-completion removal, and its `$PSCommandPath` guard).
+- The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its three persist-flag cases plus its two finally-never-runs interruption classes, its clean-completion removal, and its `$PSCommandPath` guard).
 - The **stable install location** for the permanent maintenance task (`C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1`; the SHA256-verify-before-register step).
 
 A change to any of these that is not covered by an existing field case still requires a `CHANGELOG.md` entry per the Changelog section above.

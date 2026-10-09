@@ -89,6 +89,7 @@ If your PR would alter the post-deletion segment, say so explicitly and include 
 - Parameter blocks in `[Parameter(Mandatory)]` form for required parameters.
 - `Write-Log` is the only logging call in production. The harness uses `Say`.
 - No `Write-Host` in production code paths. The one exception is `Write-Log` itself, which uses `Write-Host` internally to echo to the console alongside the file append.
+- `Test-WinRE.ps1` is a separate console UI and is not subject to this rule; it uses `Say`, `Write-Diag`, and `Write-KV`, which call `Write-Host` directly.
 - For a pure syntax check of a `.ps1` file, prefer `[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path <path>).Path, [ref]$null, [ref]$null)` over `Get-Command`. Both throw on a syntax error; the Parser form is explicit about its purpose.
 
 ## Testing
@@ -99,7 +100,8 @@ Before you submit:
 # 1. Parser check — throws on any syntax error
 [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\WinRE.ps1).Path, [ref]$null, [ref]$null)
 
-# 2. Dry run on a real machine (VM preferred)
+# 2. Dry run on a real machine (VM preferred) — must run elevated;
+#    -DryRun is not exempt from the elevation guard
 powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -DryRun
 
 # 3. Harness

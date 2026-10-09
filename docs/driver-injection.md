@@ -53,7 +53,7 @@ For how to host your own manifest and OEM maps, see [self-hosting.md](self-hosti
 - **`drivers[].match.requiredDevices`** — array of device hardware IDs. The union of all `requiredDevices` values across all manifest entries is matched against present PnP devices in a single query; if any device matches, VMD hardware is considered present. A driver entry that declares `requiredDevices` is downloaded only when that machine-wide check succeeds. If `requiredDevices` is absent or empty on an entry, the VMD-presence filter is bypassed for that entry; the OS match and the Intel CPU-vendor / generation range still apply.
 - **`drivers[].driverUrl`** — URL to a `.7z` archive containing one or more driver INFs.
 
-**v49 note.** The `requiredDevices` patterns do not directly gate the candidate — the pre-deployment storage-applicability gate reads the candidate image's INFs and the machine's present SCSIAdapter-class devices — but the patterns influence the candidate's contents: a manifest that omits a controller present on your fleet will cause the VMD-detection step to classify the machine as having no VMD hardware, the VMD package will not be selected for injection, and the applicability gate will then refuse the resulting candidate on machines with that controller. Keep the patterns complete for the hardware you deploy to; a trimmed manifest is the most likely way a self-hoster triggers the applicability gate. See "The pre-deployment storage-applicability gate (v49)" below.
+**v49 note.** The `requiredDevices` patterns do not directly gate the candidate — the pre-deployment storage-applicability gate reads the candidate image's INFs and the machine's present SCSIAdapter-class devices — but the patterns influence the candidate's contents: a manifest that omits a controller present on your fleet will cause the VMD-detection step to classify the machine as having no VMD hardware, and the VMD package will not be selected for injection. The applicability gate will then refuse the resulting candidate if the OEM pack also does not cover the controller — the ASUS-incident cascade. Keep the patterns complete for the hardware you deploy to; a trimmed manifest is the most likely way a self-hoster triggers the applicability gate. See "The pre-deployment storage-applicability gate (v49)" below.
 
 ### VMD hardware presence (fail-closed as of v44 patch 6)
 
@@ -310,22 +310,9 @@ On rejection the caller dismounts with `-Discard`, rolls the checkpoint back to 
 
 ### Relationship to injection
 
-The strip runs **before** injection, in the same Step 3 block, when the source-ownership classification permits. The order within Step 3 is:
+The strip runs **before** injection, in the same Step 3 block, when the source-ownership classification permits. The twelve-step ordering within Step 3 is enumerated under "Step 3 ordering (v49)" above; the strip is step 3 and the injection paths are steps 5 and 6.
 
-1. Mount `base.wim`.
-2. Classify the source's ownership class.
-3. If the source is not `Foreign-With-Drivers`, strip to zero third-party drivers. Prove zero.
-4. Capture the pre-injection third-party driver count (expected to be zero after a successful strip; the preserved `Foreign-With-Drivers` case does not reach this step).
-5. Download, extract, and inject the OEM pack (only when the strip ran).
-6. Download, extract, and inject the VMD packages (only when the strip ran).
-7. Run the never-downgrade storage-driver check.
-8. Verify the injection success gate.
-9. Run the pre-deployment storage-applicability gate.
-10. ResetBase (only if injection succeeded).
-11. **Provenance marker write (v49).** If the `LineageId` is not yet set, generate one; write the marker into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. The marker is not load-bearing in v49 — no gate in the current run reads it, and a write failure is logged and the pipeline continues — but it is read on subsequent runs by the source-ownership classifier.
-12. Dismount with `-Save`.
-
-If step 3 fails, steps 4–12 never run. The candidate is discarded; the machine is unchanged. If step 3 succeeds but step 8 fails, the injection failure gate fires — same exit code, same checkpoint rollback, same disk-state outcome, but the failure is attributed to the injection rather than to the strip. If step 7 detects a downgrade, the candidate is discarded before the success gate is evaluated. If step 9 refuses, the candidate is dismounted with `-Discard` and the run defers.
+If step 3 fails, steps 4–12 never run. The candidate is discarded; the machine is unchanged. If step 3 succeeds but the injection paths in steps 5–6 set `$Script:ImageInjectionComplete = $false`, the injection failure gate fires — same exit code, same checkpoint rollback, same disk-state outcome, but the failure is attributed to the injection rather than to the strip. If step 7 detects a downgrade, the candidate is discarded before the success gate is evaluated. If step 9 refuses, the candidate is dismounted with `-Discard` and the run defers.
 
 The strip is thus the enforcement of Rule 4's "drivers go into a clean base" corollary, narrowed by the v49 source-ownership classification to sources that are not foreign-with-drivers. See [`architecture.md`](architecture.md) — "Rule 4" and "The v47 rebuild pipeline" — "Why the strip is Rule 4's enforcement, not a separate rule" — for the design reasoning.
 

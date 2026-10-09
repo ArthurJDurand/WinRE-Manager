@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v49, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v49) ==========`) -->
+- **WinRE.ps1 version:** <!-- e.g. v49 patch 1, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v49 patch 1) ==========`) -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
@@ -35,7 +35,7 @@ labels: ['bug', 'needs-triage']
 - **Partition deferral marker:** <!-- if C:\Recovery\OEM\winre_partition_deferred.json exists, paste its contents (the DesiredStateId and Since fields). If it does not exist, say so. -->
   <!-- The marker is written when a pre-shrink deferral suppresses identical retries across runs. Its presence explains why a subsequent run exited EXIT_WARNING without re-attempting the pre-shrink. -->
 - **Resume task present (v49):** <!-- query: Get-ScheduledTask -TaskName 'WinRE Manager - Resume' -ErrorAction SilentlyContinue. If it exists, paste its State, LastRunTime, NextRunTime, and the action's Arguments (the "Task To Run" field from `schtasks /query /tn "WinRE Manager - Resume" /v /fo list`). If it does not exist, say so. -->
-  <!-- The resume task is registered by every Repair or Restore run and is deleted on clean completion. If it is still present, either a prior run was interrupted (Ctrl+C, hard kill, reboot, or an unhandled exception) or a Repair/Restore run is currently in flight. Its five persist triggers are the outer catch, the CancelKeyPress handler, Invoke-RestoreAction's two mid-transformation failure paths, a hard kill, and a reboot. If the log mentions `$PSCommandPath` and this task was not registered, that is expected under gist-bootstrap or paste-into-console invocation — not a bug. -->
+  <!-- The resume task is registered by every Repair or Restore run and is deleted on clean completion. If it is still present, either a prior run was interrupted (Ctrl+C, hard kill, reboot, or an unhandled exception) or a Repair/Restore run is currently in flight. Three cases set the persist flag directly: an unhandled exception in the outer catch, a Ctrl+C via the CancelKeyPress handler, and Invoke-RestoreAction's two mid-transformation failure paths. Two further interruption classes leave the task registered without setting the flag because the finally block never runs: a hard kill and a reboot. If the log mentions `$PSCommandPath` and this task was not registered, that is expected under gist-bootstrap or paste-into-console invocation — not a bug. -->
 - **Elevation:** <!-- Running as SYSTEM, as admin, unelevated -->
 - **7-Zip present:** <!-- yes/no -->
 - **Concurrent invocation:** <!-- was any other WinRE.ps1 process running at the same time? Scheduled task, manual invocation, RMM tool "run now", Intune remediation. -->

@@ -22,7 +22,7 @@ Run `Test-WinRE.ps1` in any of the following situations:
 - **When production has exited with an unfamiliar error.** The diagnostic reproduces production's vantage point and reports each dependency check independently, so you can see exactly which step failed.
 - **When you are evaluating the project.** A read-only run gives you a complete picture of what the tool does and what it looks at, without touching anything.
 
-The harness requires no elevation and modifies nothing. It is safe to run on any machine, at any time, including on a machine you are about to hand to a user.
+The harness requires no elevation and does not modify WinRE, partitions, BitLocker, drive letters, or the state file. All its work is confined to its working directory (`$TestDir`, default `C:\Temp\WinRETest`), where it creates and removes its own test artifacts. It is safe to run on any machine, at any time, including on a machine you are about to hand to a user.
 
 ## What the harness is
 
@@ -33,7 +33,7 @@ An interactive PowerShell script that:
 - Reports the state of the machine from the same vantage point the production script uses, including the BitLocker state of C:, the BitLocker state of the target recovery partition, the Windows Setup `ImageState`, and — as of v28 — the machine's present SCSIAdapter-class storage controllers with their HardwareID and CompatibleID sets.
 - Recomputes the `DesiredStateId` production would compute right now and compares it to the on-disk state file, so a field engineer can see whether production would take the fast path or rebuild (Option S).
 - Reports results as PASS / FAIL / SKIP.
-- Modifies nothing. Does not touch partitions, BitLocker, WinRE registration, drive letters, or the state file. Does not require elevation.
+- Modifies nothing outside its working directory. Does not touch partitions, BitLocker, WinRE registration, drive letters, or the state file; all its work is confined to `$TestDir`. Does not require elevation.
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
@@ -60,7 +60,7 @@ The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the m
 
 ### v28 changes
 
-Five changes, all downstream of the v49 cycle.
+Six changes, all downstream of the v49 cycle.
 
 - **`$ProductionScriptVersion` default bumped 48 -> 49.** The harness's `Get-DesiredStateId` mirror carries this default to track production's `$ScriptVersion`. Left at 48 it would report a false `DSI MISMATCH` for every state file v49 production writes, the same class of drift the earlier bumps corrected. This is the fifth correction in the same family (v21, v22, v23, v27, v28).
 - **`Get-StorageControllerDevices` mirror added.** Enumerates present SCSIAdapter-class devices and extracts the union of `HardwareID`, `CompatibleID`, and the `InstanceId` prefix up to the last backslash. Software and virtual controllers (`InstanceId` starting with `{GUID}\` or `SWD\`) are skipped, mirroring production's software-device filter. The mirror is used by the Option 1 VMD diagnostic and verified by the new parser self-test (Check 17).
@@ -92,7 +92,7 @@ The parser self-test count is unchanged. The preview is diagnostic and does not 
 
 ### v25 changes
 
-Six functional changes and one comment set, all downstream of the production v47 patch 3 cycle. See the [v47 patch 3](../CHANGELOG.md) entry for the full context.
+Six functional changes, one menu bump, and one comment set, all downstream of the production v47 patch 3 cycle. See the [v47 patch 3](../CHANGELOG.md) entry for the full context.
 
 - `Remove-WindowsDriver` added to the DISM cmdlet availability check.
 - `BusType` added to the `Get-Disk` shape check.
@@ -100,7 +100,8 @@ Six functional changes and one comment set, all downstream of the production v47
 - `Test-OemMaps` only calls `Get-LenovoWinPEPack` on Lenovo hardware.
 - `Compare-WimServicingMetadata` mirror and eight-case regression self-test added - a new parser self-test check.
 - Option S DSI-mismatch detail sentence names all seven `DesiredStateId` components.
-- Comment-only clarifications in the classifier, `Get-DesiredStateId`, and `.DESCRIPTION`.
+- Menu title and startup `Rule` bumped 24 → 25.
+- Comment-only clarifications in the classifier (`RECOVERY-ON-SECONDARY` marked harness-only), `Get-DesiredStateId` (DSI-component-mirror discipline note), and `.DESCRIPTION` (the harness's `Write-Host` usage exception).
 
 The parser self-test count moved from sixteen to seventeen with the `Compare-WimServicingMetadata` check.
 
@@ -219,7 +220,7 @@ The default working directory is `C:\Temp\WinRETest`. All downloads and extracti
 
 ## Output style (v16; extended in v17 through v28, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, and v28's VMD storage-controller diagnostic section as the departures)
 
-As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v18, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. The rest of the output format is unchanged from v16.
+As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. The rest of the output format is unchanged from v16.
 
 ### Colour-coded values
 
@@ -592,7 +593,7 @@ The harness has no mirror of the v45 shrink-first pipeline. Option 1 and Option 
 
 The v45 patch 1 changes to `Ensure-AdequateRecoveryPartition` are the largest rework of the destructive path since v43. The reorder moves the shrink into the reversible window; the geometry model changes from deficit-plus-slack to single-boundary; the plan gains several validity checks; the deletion loop reorders the active partition last; a post-delete extension path with a safe fallback replaces the pre-delete extend; and a whole-layout assertion verifies the created partition's geometry. The happy path through these code paths has been exercised end-to-end on a disposable Hyper-V VM (2026-10-02 08:56).
 
-The v46 patch 1 cycle added two physical-hardware exercises on top of the VM run.
+The v46 patch 1 cycle added three physical-hardware exercises on top of the VM run: two clean-path runs on different vendors, and the plan-rejection exercise on the machine that motivated the fix.
 
 **`Assert-RecoveryPartitionLayout` has been exercised in the passing case.** The Dell Latitude 3540 and the HP EliteBook 6 G1i 16" both took the v46 patch 1 destructive path on 2026-10-02 and both logged `Verified recovery partition layout: disk 0 partition 4, offset O MiB, size S MiB` before reaching `DEDICATED`. Both runs also confirmed the C:-to-recovery gap and the disk-end trailing reserve were within tolerance, which is what the assertion exists to verify. This is the first physical-hardware exercise of the whole-layout assertion on the v45/v46 pipeline.
 
@@ -616,12 +617,14 @@ The v45 destructive-path VM test documented below remains the recommended next s
 
 ### v48 patch 1 destructive-path coverage
 
-The v48 patch 1 release introduces five changes: intervening-partition handling, the architecture gate, `LocalInputsId`, LKG-by-hash at any discovered recovery location, and transactional WIM replacement. Four are covered below; the fifth (LKG-by-hash) is a source-selection change and is not covered here.
+The v48 patch 1 release introduces five changes: intervening-partition handling, the architecture gate, `LocalInputsId`, LKG-by-hash at any discovered recovery location, and transactional WIM replacement. The four that are covered below are listed first; the fifth (LKG-by-hash) is a source-selection change and is not covered here. Two additional sub-case gaps of the intervening-partition handling are listed after the four.
 
 - **Architecture gate.** Unexercised on ARM64 hardware. A live run on any non-x64 host should exit `EXIT_WARNING` before any state mutation; a live run on an x64 host should log `Architecture gate passed: x64` and continue unchanged. The gate has no DryRun carve-out: a dry run on a non-x64 host also exits `EXIT_WARNING` unconditionally.
 - **`LocalInputsId` offline-drift guard.** Unexercised on the offline path. The test shape: a machine whose stored `LocalInputsId` was written by a prior run, taken offline, and whose hardware or OS build is changed while offline (VM snapshot manipulation or an in-place build change), then run with the manifest unreachable. The run should exit `EXIT_WARNING` with the `Offline fallback: stored LocalInputsId ... does not match` line rather than take the fast path.
 - **Transactional WIM replacement rollback.** Unexercised. The rollback branch fires when a copy fails mid-replacement after the previous WIM has been preserved. The test shape: mock `Copy-Item` to fail on the new-WIM copy, confirm the rollback copy is restored and hash-verified, and confirm the log shows `Rollback copy restored to <path>` before the run returns to the enable attempt.
 - **Intervening-anchor post-deletion failure.** Unexercised on the intervening path. This is the same class of residual the deliberate post-deletion failure test exercises for the non-intervening path: the anchor is shrunk, the recovery partition is deleted, and a later step (create, format, drive letter, or extension) fails. Follow the setup and recording requirements in "The post-deletion failure test (gating)" above, on an `C: | D: | Recovery` VM.
+- **v48 multi-intervening rejection.** Unexercised. A `C: | D: | E: | Recovery` layout rejects with the enriched separation reason. Confirm the plan rejects the layout with the enriched message and the run defers without touching the machine.
+- **v48 surplus rejection.** Unexercised. A layout where the recovery partition being reclaimed is larger than the new bucket size rejects with the named surplus reason. Confirm the plan rejects the layout with the named surplus reason and defers without touching the machine.
 
 ### v49 destructive-path coverage
 

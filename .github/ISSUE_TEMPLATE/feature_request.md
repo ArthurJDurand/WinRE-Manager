@@ -33,7 +33,7 @@ v49 introduced a set of pre-deployment gates and post-run persistence features. 
 - The **pre-deployment storage-applicability gate** (does your feature deploy a candidate that the gate would refuse?).
 - The **native-boot VHDX fail-closed gate** (does your feature change the refusal, or make some destructive operation safe on VHDX?).
 - The **backup and restore actions** and the `backup.json` sidecar format (does your feature change the format, or read the backup outside restore?).
-- The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its registration, its five persist triggers, its clean-completion removal, or its `$PSCommandPath` guard — does your feature change when it is registered, or what it invokes?).
+- The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its registration, its three persist-flag cases plus its two finally-never-runs interruption classes, its clean-completion removal, or its `$PSCommandPath` guard — does your feature change when it is registered, or what it invokes?).
 - The **stable install location** at `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` and the SHA256-verify-before-register step (does your feature change where the maintenance task is registered, or what is installed?).
 
 ---

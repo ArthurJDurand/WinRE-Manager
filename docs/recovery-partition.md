@@ -171,11 +171,11 @@ The v46 patch 1 fix clamps `tailEnd` to `diskSize − 1 MiB` before aligning, on
 
 The clamp is stated in [architecture.md](architecture.md) invariant 18 and its reasoning is documented as the "ninth direction" of the wrong-question pattern in the same document.
 
-**A note on numbering.** The substeps below (0 through 11) are the internal stages of `Ensure-AdequateRecoveryPartition`. They are not the same as the "eight steps" of the full-update pipeline described in [architecture.md](architecture.md); the eight-step pipeline is the top-level flow (Wipe WorkDir, Obtain base WIM, Mount and inject, Optimize, Ensure a suitable recovery partition, Deploy the WIM, Enforce the single-recovery-partition invariant, Final verification), and this document expands Step 5 into the substeps below.
-
 ## The OS partition resize sequence (v45 patch 1)
 
 The sequence below is the shrink-first pipeline. It replaces the v44 pipeline (in v44: disable, then delete → extend → shrink → create; the CHANGELOG's compact list shows only the destructive portion) with (plan → shrink → disable → delete → extend → create). What changed is **when** each step runs and **what happens if it fails**.
+
+**A note on numbering.** The substeps below (0 through 11) are the internal stages of `Ensure-AdequateRecoveryPartition`. They are not the same as the "eight steps" of the full-update pipeline described in [architecture.md](architecture.md); the eight-step pipeline is the top-level flow (Wipe WorkDir, Obtain base WIM, Mount and inject, Optimize, Ensure a suitable recovery partition, Deploy the WIM, Enforce the single-recovery-partition invariant, Final verification), and this document expands Step 5 into the substeps below.
 
 ### 0. Startup guards
 
@@ -213,7 +213,7 @@ The plan rejects a layout when any of the following holds:
 - **Intervening-anchor path only (v48 patch 1).** The anchor is an EFI System Partition, a Microsoft Reserved Partition, or a system/boot partition; the anchor has no readable volume; the anchor filesystem is not NTFS; the anchor has no drive letter; the anchor's encryption state is indeterminate; the anchor is BitLocker-locked; the anchor's supported-size query failed; the planned anchor size is zero or negative; or the planned anchor size is below the anchor's supported minimum.
 - **Intervening-anchor surplus rejection (v48 patch 1).** When the recovery partition being reclaimed is larger than the new bucket size, the anchor's current end is farther from the disk tail than the plan needs to seat the recovery partition at the aligned boundary. The plan rejects with the named surplus reason (`intervening anchor is N MiB smaller than the plan requires to seat the recovery partition at the disk tail`); the v48 scope does not extend the anchor because a BitLocker-encrypted anchor is not safely growable via `Resize-Partition` alone.
 
-Any of those conditions produces `Deferred` with the corresponding `Reason`, and no partition or WinRE change is made. `RetrySuppressible` is not set for plan rejections — the layout requires operator review, and retrying would produce the same rejection. Since v47 patch 3, the seven partition-identity rejection reasons (cross-disk inventory, overlap with C:, oversized recovery-typed partition, recovery-typed overlap with C:, recovery-typed precedes C:, extent overlap / ordering, and separated-from-C:) name the offending partition(s) - disk number, partition number, size, volume label, and type code - so the log identifies the layout the operator needs to resolve without requiring a separate harness run.
+Any of those conditions produces `Deferred` with the corresponding `Reason`, and no partition or WinRE change is made. `RetrySuppressible` is not set for plan rejections — the layout requires operator review, and retrying would produce the same rejection. Since v47 patch 3, the seven partition-identity rejection reasons (cross-disk inventory, overlap with C:, oversized recovery-typed partition, recovery-typed overlap with C:, recovery-typed precedes C:, extent overlap / ordering, and separated-from-C:) name the offending partition(s) — disk number, partition number, size, volume label, and type code — so the log identifies the layout the operator needs to resolve without requiring a separate harness run.
 
 If the plan is valid, the script logs a summary line:
 
@@ -327,7 +327,7 @@ The new partition is created at `Plan.PlannedPartitionStart` with size `Plan.Pla
 - **Size within tolerance** — the partition's `Size` is within one alignment block (1 MiB) of `Plan.PlannedPartitionSize`.
 - **No overlap with the boundary partition** — the boundary partition's end is at or before the new partition's start.
 - **Boundary-to-recovery gap within tolerance** — the gap between the boundary partition's end and the new partition's start is within one alignment block. A gap within tolerance is logged; a gap beyond tolerance is a fatal geometry mismatch.
-- **End at `AlignedManagedExtentEnd`** — the partition's end is within one alignment block of the aligned managed extent end. The same log-or-fail policy applies.
+- **End at the current plan's own end (`$plannedEnd`)** — the partition's end is within one alignment block of the current plan's end. On the normal path `$plannedEnd` equals `$plan.AlignedManagedExtentEnd`; when the extension-failure fallback ran, `$plannedEnd` reflects the fallback geometry (step 5). The same log-or-fail policy applies.
 
 **Fail-closed on an unresolvable boundary partition (v46 patch 2; generalized for the intervening anchor in v48 patch 1).** Before the adjacency checks, the assertion resolves the boundary partition — the caller-supplied `-BoundaryPartition` when present, otherwise the OS partition via `Get-OSPartition`. If neither resolves, the assertion returns `$false` rather than skipping the adjacency check. The layout cannot be verified against a boundary, so it is not accepted. This is the last check before `Format-Volume`; failing closed here prevents a partition that cannot be validated against a boundary from being formatted and registered.
 
@@ -370,11 +370,11 @@ Candidates in use are skipped, unless the letter is already owned by the target 
 
 **Each assignment method is verified against the target partition.** After `Set-Partition`, `Add-PartitionAccessPath`, or `diskpart assign letter=X`, the function re-queries the specific disk and partition and requires its `DriveLetter` to equal the letter just assigned. A bare `Test-Path "X:\"` is not sufficient: a mapped network drive at X: would resolve to the share and read as a successful assignment even though the target partition never received a letter.
 
-**Bail-outs.** At the top of each candidate iteration, the function aborts with a single ERROR if the target partition no longer exists, or if its disk is offline or not `Online`. Both cases would fail identically for all 23 candidates and produce 23 WARN lines; the bail-out returns `$null` immediately, and the caller handles it the same way as a genuine exhaustion.
+**Bail-outs.** At the top of each candidate iteration, the function emits a single ERROR-level log line and returns `$null` if the target partition no longer exists, or if its disk is offline or not `Online`. Both cases would fail identically for all 23 candidates and produce 23 WARN lines; the bail-out returns `$null` immediately, and the caller handles it the same way as a genuine exhaustion.
 
 **Per-method error capture.** When all three methods fail for a given letter, the function logs the error from the last method: the exception message from the cmdlet, or a "returned but the letter did not resolve" note if the API succeeded without effect, or diskpart's stdout. The final log line reads `All three methods failed for <letter>: - <diagnostic>`, so an operator sees why the search is exhausting candidates rather than a bare "failed".
 
-**Preferred letter reuse.** If the current run has already held a drive letter on a recovery partition earlier in this run (tracked in `$Script:tempDriveLetters`), the helper prefers that letter over a fresh one from `Get-AvailableDriveLetter`. Windows caches letter-to-volume mappings in `MountedDevices`; reusing a letter the script held earlier is more likely to succeed cleanly than picking a fresh one, and it avoids the assign-remove-reassign churn that can leave stale entries. The fallback chain is unchanged: if the preferred letter fails, the helper moves on.
+**Preferred letter reuse.** If the current run has already held a drive letter on a recovery partition earlier in this run (tracked in `$Script:tempDriveLetters`), the caller selects that letter as the preferred letter; the helper tries it first, before falling back to a fresh one from `Get-AvailableDriveLetter`. Windows caches letter-to-volume mappings in `MountedDevices`; reusing a letter the script held earlier is more likely to succeed cleanly than picking a fresh one, and it avoids the assign-remove-reassign churn that can leave stale entries. The fallback chain is unchanged: if the preferred letter fails, the helper moves on.
 
 If no drive letter can be assigned — all 23 candidates fail, or the function bailed out early — the script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
 
@@ -396,7 +396,7 @@ This early check is defensive: the deploy step (Step 5 in the main flow) calls `
 
 Return `@{ DriveLetter = $assignedLetter; DiskNumber = $osDisk.Number; PartitionNumber = $newPart.PartitionNumber }`.
 
-The main flow adds the assigned drive letter to `$Script:tempDriveLetters` so it can be removed at exit.
+The function adds the assigned drive letter to `$Script:tempDriveLetters` before returning, so the caller can remove it at exit.
 
 ## The pre-shrink deferral and the retry-suppressing marker
 
@@ -440,7 +440,7 @@ When a recovery partition deletion fails after WinRE has already been disabled, 
 
 **`Restore-PreviousWinRERoute`.** On any deletion failure, the script calls `Restore-PreviousWinRERoute -PreviousState $stateBefore`. The function:
 
-1. Checks the current WinRE state. If already `Enabled` and the current location matches the previous location, it returns `$true` immediately.
+1. Checks the previous state first: if `$PreviousState.Status -ne 'Enabled'`, there is nothing to restore and the function returns `$false`. It then reads the current WinRE state; if already `Enabled` and the current location matches the previous location, it returns `$true` immediately.
 2. Resolves the previous location to a partition. If unresolvable, it returns `$false`.
 3. If the previous target is the OS partition (OS-fallback state), it checks C:'s BitLocker state. If C: is not confirmed fully decrypted, it returns `$false`. Otherwise it re-enables via the OS-fallback path.
 4. If the previous target is a recovery partition, it calls `Set-RecoveryPartitionReadyForWinRE` to prepare the target. If preparation fails, it returns `$false`. Otherwise it re-enables via the dedicated-partition path.

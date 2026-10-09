@@ -69,7 +69,7 @@ Three v47 patch 1-specific failures have their own sections: the strip stage fai
 
 ## The machine has no recovery partition and WinRE is disabled
 
-**This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 or later, this failure mode no longer occurs on the dedicated-partition route.** The pre-patch-5 code deleted the recovery partition on a machine mid-Device-Encryption and could not recreate it. The current code prevents that by applying the recovery type GUID at partition creation and by decrypting in place if the Device Encryption service claims the partition anyway.
+**This is the most severe failure mode the project has seen, and it was caused by a bug in pre-v43-patch-5 code. If you are running v43 patch 5 (further revision 5) or later, this failure mode no longer occurs on the dedicated-partition route.** The pre-patch-5 code deleted the recovery partition on a machine mid-Device-Encryption and could not recreate it. The current code prevents that by applying the recovery type GUID at partition creation and by decrypting in place if the Device Encryption service claims the partition anyway.
 
 **Symptom.** After a run that exited with code 3 (`EXIT_FATAL`), the machine has:
 
@@ -128,7 +128,7 @@ Read the `Conversion Status:` line.
 
   This starts decryption. On a machine mid-encryption, decryption is usually faster than encryption. Wait until `Conversion Status:` reads `Fully Decrypted` before continuing.
 
-**Step 2 — update `WinRE.ps1` to v45 patch 1 or later.** Check the `.NOTES` block at the top of the file for its `Version` line. If the version is below 45, deploy the v45 release (or the current release) before proceeding.
+**Step 2 — update `WinRE.ps1` to v43 patch 5 (further revision 5) or later.** Check the `.NOTES` block at the top of the file for its `Version` line. If the version is below 43 patch 5 (further revision 5), deploy the current release before proceeding.
 
 **Step 3 — re-run `WinRE.ps1`.** With the current policy, the script will:
 
@@ -231,7 +231,7 @@ A `FriendlyName` that names a `.vhdx` file and a `BusType` of `File Backed Virtu
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v49) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v49 patch 1) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -405,33 +405,33 @@ Followed by the dismount, checkpoint rollback to Step 2, and removal of `base.wi
 
 ## The source-ownership classification preserved a foreign WIM (v49)
 
-**Symptom.** The run takes the full-update path and reaches the strip stage, but the strip stage is skipped on this run because the source was classified as a foreign WIM that a vendor populated with its own drivers. The run continues with the source preserved as-is rather than stripped and re-injected. The machine completes with a deployed image that carries the source's drivers, not the manager's recipe.
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no WIM was deployed, no partition was touched, WinRE was not disabled. The mounted source was classified as a foreign WIM that a vendor populated with its own drivers, and the manager preserved the source rather than normalize it. The pipeline exited after the classification step, before the strip stage, before injection, before export, and before any partition work.
 
 **Log signature.** *A v49-introduced line naming the source's classification. The exact string prefix is not yet catalogued here. The section below describes the semantic content. Paste the line verbatim into a bug report so the maintainer can catalogue it.*
 
-The line names one of the four ownership classes — `Manager-Owned`, `Manager-Lineage`, `Foreign-No-Drivers`, or `Foreign-With-Drivers` — and, in the `Foreign-With-Drivers` case, states that the strip-and-reinject pipeline is being skipped so the foreign drivers are preserved.
+The line names one of the four ownership classes — `Manager-Owned`, `Manager-Lineage`, `Foreign-No-Drivers`, or `Foreign-With-Drivers` — and, in the `Foreign-With-Drivers` case, states that the source is preserved and the strip-and-reinject pipeline is being skipped.
 
-**Cause.** The v49 source-ownership classification runs before the strip stage and decides whether the strip-and-reinject pipeline runs at all. The rule is: a source WIM that a vendor populated with its own third-party drivers is preserved as-is. The manager will not strip and re-inject over a foreign WIM. This is a deliberate narrowing of the v47 strip-everything-then-inject policy: the strip now applies only to manager-owned images, manager-lineage images, and in-box WIMs with no third-party drivers.
+**Cause.** The v49 source-ownership classification runs before the strip stage and decides whether the strip-and-reinject pipeline runs at all. The rule is: a source WIM that a vendor populated with its own third-party drivers is preserved as-is. The manager will not strip and re-inject over a foreign WIM. When the classification is `Foreign-With-Drivers`, the pipeline exits immediately: the mounted image is dismounted with `-Discard`, the staged artifacts (`base.wim` and any `winre_optimized.wim`) are removed, the state file records `ForeignSourceAcceptedHash` set to the source's hash, and the run exits `EXIT_WARNING`. No WIM is exported and no WIM is deployed. This is a deliberate narrowing of the v47 strip-everything-then-inject policy: the strip now applies only to manager-owned images, manager-lineage images, and in-box WIMs with no third-party drivers.
 
-The typical field trigger is a machine whose registered WinRE was deployed by a vendor tool (Dell, HP, Lenovo factory-image utilities) rather than by the manager, and that carries vendor-injected third-party drivers. Under v47 the manager would have stripped them and injected the current recipe. Under v49 it preserves them.
+The typical field trigger is a machine whose registered WinRE was deployed by a vendor tool (Dell, HP, Lenovo factory-image utilities) rather than by the manager, and that carries vendor-injected third-party drivers. Under v47 the manager would have stripped them and injected the current recipe. Under v49 it preserves them and exits without deploying.
 
-**This is not a failure.** The run continues and deploys a working WIM. The consequence is that the deployed image carries the source's drivers instead of the manager's recipe, which is the intended v49 behavior for this case.
+**The run exits `EXIT_WARNING` but is not a failure.** The machine's existing WinRE route is left completely intact — the manager did not touch the currently-registered image or the partition it lives on. The state file records `ForeignSourceAcceptedHash`, so subsequent runs recognize the preserved source and take the fast path rather than re-classifying it.
 
-**Resolution.** No action is required. If the operator specifically wants the manager's recipe applied, the source must be replaced with one that classifies as `Manager-Owned`, `Manager-Lineage`, or `Foreign-No-Drivers` — for example by using the LKG copy at `C:\Recovery\WindowsRE\winre.wim` (if it is a manager-owned image) or the GitHub cold-start source (an in-box image with no third-party drivers). Deleting the state file and re-running with the LKG or GitHub source available forces a rebuild against a manager-owned source on the next run.
+**Resolution.** No action is required for the machine to be functional — the existing WinRE route is preserved. If the operator specifically wants the manager's recipe applied, the source must be replaced with one that classifies as `Manager-Owned`, `Manager-Lineage`, or `Foreign-No-Drivers` — for example by using the LKG copy at `C:\Recovery\WindowsRE\winre.wim` (if it is a manager-owned image) or the GitHub cold-start source (an in-box image with no third-party drivers). Deleting the state file and re-running with the LKG or GitHub source available forces a rebuild against a manager-owned source on the next run.
 
-## A storage driver was skipped because it would be a version downgrade (v49)
+## The never-downgrade storage-driver check discarded the candidate (v49)
 
-**Symptom.** The run takes the full-update path, reaches the injection stage, and injects fewer storage drivers than the manifest and OEM pack resolution call for. The machine completes with a working recovery environment; the log records that one or more storage drivers were skipped.
+**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no WIM was deployed, no partition was touched, WinRE was not disabled. The never-downgrade check detected that the candidate would inject a version-downgrade of a storage-class driver, and the whole candidate was discarded. The pipeline exited before the storage-applicability gate.
 
 **Log signature.** *A v49-introduced line naming the driver and the version comparison. The exact string prefix is not yet catalogued here. The section below describes the semantic content. Paste the line verbatim into a bug report so the maintainer can catalogue it.*
 
-The line names the driver's INF name, its version in the candidate package, the version already present in the mounted image, and a statement that the injection was skipped to avoid a version downgrade.
+The line names the driver's INF basename, its version in the candidate image, the version already present in the mounted image, and states that the source is being preserved rather than replaced. There is no partial-normalize path in v49: the whole source is preserved rather than a single driver retained.
 
-**Cause.** The v49 never-downgrade storage-driver check runs during the injection stage. When the manager is about to inject a storage driver, it compares the driver's version against any matching driver already present in the mounted image. A driver that would be a version downgrade is not injected; the existing driver is retained. This prevents a Windows Update-delivered storage driver from being silently replaced by an older copy on the next scheduled run — a scenario where the manifest or a vendor pack carries a stale driver that would regress the recovery environment's ability to see the OS disk.
+**Cause.** The v49 never-downgrade storage-driver check runs after injection completes and before ResetBase, comparing each storage-class driver in the final image against the pre-strip inventory, matched by INF basename. If any post-injection driver would be older than the source's version of the same basename, the whole candidate is discarded: the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, the checkpoint rolls back to `Step=2`, the state file records `ForeignSourceAcceptedHash` set to the preserved source's hash, and the run exits `EXIT_WARNING`. No WIM is deployed. This prevents a Windows Update-delivered storage driver from being silently replaced by an older copy on the next scheduled run — a scenario where the manifest or a vendor pack carries a stale driver that would regress the recovery environment's ability to see the OS disk. The response is deliberately conservative: the whole source is preserved rather than a partial fix.
 
-**This is not a failure.** The skip is the check working as designed. The consequence is that the deployed image carries the newer driver that was already present, not the older one the recipe would have injected.
+**The run exits `EXIT_WARNING` but is not a failure.** The machine's existing WinRE route is left completely intact — the manager did not touch the currently-registered image or the partition it lives on. The state file records `ForeignSourceAcceptedHash`, so subsequent runs recognize the accepted source and take the fast path.
 
-**Resolution.** No action is required. If the operator believes the check's version comparison is wrong — for example, the "older" driver is genuinely newer under the vendor's versioning scheme — file a bug with the INF name, the two version strings, and the vendor's versioning documentation for the driver.
+**Resolution.** No action is required for the machine to be functional — the existing WinRE route is preserved. If the operator believes the check's version comparison is wrong — for example, the "older" driver is genuinely newer under the vendor's versioning scheme — file a bug with the INF name, the two version strings, and the vendor's versioning documentation for the driver. To apply the manager's recipe, the manifest or OEM pack must be updated to resolve a newer version of the same driver (or to omit the stale driver), then the state file must be deleted and the run repeated.
 
 ## The pre-deployment storage-applicability gate refused the candidate (v49)
 
@@ -928,15 +928,18 @@ At registration: a line naming the task, its two triggers (boot+1m and one-shot 
 
 At deletion (clean completion): a line naming the task and stating it was removed. On clean completion the task is deleted; on interruption it is preserved.
 
-**Cause.** Every Repair or Restore run registers the temporary `WinRE Manager - Resume` task. It is deleted on clean completion. The persist flag — which suppresses the deletion on exit — is set by five triggers:
+**Cause.** Every Repair or Restore run registers the temporary `WinRE Manager - Resume` task. It is deleted on clean completion. Three cases set the persist flag — which suppresses the deletion on exit — directly:
 
 1. The outer catch, on an unhandled exception.
 2. The `CancelKeyPress` handler, on Ctrl+C. This is the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C.
 3. `Invoke-RestoreAction`'s two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place).
-4. A hard kill, where `finally` never runs.
+
+Two further interruption classes leave the task registered without setting the flag, because the `finally` block never runs to consult it:
+
+4. A hard kill (e.g. `taskkill /F`).
 5. A reboot mid-run, where the OS terminates PowerShell.
 
-If the task is present, one of the five occurred.
+If the task is present, one of the five interruption classes occurred.
 
 **Resolution.**
 
@@ -1140,7 +1143,7 @@ Exit code 3. The machine is unchanged. No WIM deployed, no partition touched.
 
 ## OEM or VMD injection failed (Step 3 → Step 4 pipeline gate)
 
-**Symptom.** The script exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no partition work, no WIM deployment, no `reagentc` calls, and the state file is unchanged (or absent). The difference from the Audit Mode deferral is that the run got much further — the WIM was downloaded or copied to `WorkDir`, mounted, stripped (v47 patch 1) or preserved as-is (v49 source-ownership), and an OEM or VMD injection attempt was made against it.
+**Symptom.** The script exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no partition work, no WIM deployment, no `reagentc` calls, and the state file is unchanged (or absent). The difference from the Audit Mode deferral is that the run got much further — the WIM was downloaded or copied to `WorkDir`, mounted, stripped (v47 patch 1, gated by the v49 source-ownership classification), and an OEM or VMD injection attempt was made against it.
 
 **Log signature.** The last lines of the run before exit:
 
@@ -1169,7 +1172,7 @@ or (in the failure-branch form when the OEM or VMD download itself failed):
 or
 
 ```
-[WARN] VMD download failed for <name>: <message>
+[ERROR] FATAL ERROR: <message>  (from the outer catch block when a VMD download throws)
 ```
 
 Followed by:
@@ -1194,7 +1197,7 @@ In every case, `$Script:ImageInjectionComplete` was set to `$false` and the pipe
 
 As of v44 patch 7, the VMD extraction directory is cleared before each `7z x` invocation, so a stale INF from an earlier run can no longer satisfy the INF-basename cross-reference or the third-party-driver-count delta and mask a failed extraction. If the failure is a VMD injection failure and the log shows the fresh extraction happened (no stale-INF contamination warning), the extraction itself genuinely failed.
 
-As of v49, the never-downgrade storage-driver check runs during the injection stage and may skip a specific driver. A skipped driver is not a failed injection — the check retains the existing driver and the pipeline continues. See "A storage driver was skipped because it would be a version downgrade" above.
+As of v49, the never-downgrade storage-driver check runs after injection completes and before ResetBase. If it detects that the candidate would inject a version-downgrade of a storage-class driver, the whole candidate is discarded and the run exits `EXIT_WARNING` before the storage-applicability gate. See "The never-downgrade storage-driver check discarded the candidate" above.
 
 **Why the run stops.** A WIM with no OEM or VMD drivers is broken on hardware whose storage controller requires those drivers. On a VMD-based system the resulting WinRE cannot see the OS disk at all, and the deployed recovery environment is worse than useless — it is actively misleading. The v44 patch 1 gate prevents this class of broken deployment, where the earlier pipeline would have exported, deployed, and registered a non-functional WIM. The gate is a protective failure, not a degraded-success: the run stops before anything is committed.
 
@@ -1744,7 +1747,7 @@ Parser: reagentc location  [FAIL] ...did not match any line
 
 **Resolution.** Automatic. The script falls through to the full-update path. A rebuild on a healthy machine is a no-op for the partition layout; it copies the current WIM, verifies it, and rewrites the state file.
 
-**Expected during the v44 patch 1, v45 patch 1, v46 patch 1, v47 patch 1, v47 patch 2, and v49 rollouts.** Each revision changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45, v46 patch 1, and v47 patch 1 each changed the `SCRIPT` component; v47 patch 2 changes the DSI value on one narrow machine class by normalising the `Win32_ComputerSystemProduct.Version` field (machines whose padded value is at least four characters long while its trimmed value is shorter than four); v49 changes the `SCRIPT` component again to 49. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
+**Expected during the v44 patch 1, v45 patch 1, v46 patch 1, v47 patch 1, v47 patch 2, v48 patch 1, and v49 rollouts.** Each revision changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45, v46 patch 1, v47 patch 1, and v48 patch 1 each changed the `SCRIPT` component; v47 patch 2 changes the DSI value on one narrow machine class by normalising the `Win32_ComputerSystemProduct.Version` field (machines whose padded value is at least four characters long while its trimmed value is shorter than four); v49 changes the `SCRIPT` component again to 49. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
 
 Under v47 the first run also writes the `DeployedWinREMetadata` anchor. From the second v47 run onward the drift detector compares against it.
 

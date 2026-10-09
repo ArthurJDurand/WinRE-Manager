@@ -191,6 +191,10 @@
        two of the seven fields and change more often in the field
        than SCRIPT.
     7. Menu title and startup Rule bumped 24 -> 25.
+    8. Comment-only clarifications in the classifier
+       (RECOVERY-ON-SECONDARY marked harness-only),
+       Get-DesiredStateId (DSI-component-mirror discipline note),
+       and .DESCRIPTION (the harness's Write-Host usage exception).
 
     v24 changes vs v23:
     1. Fixed the active-WIM diagnostic probe. The prior code
