@@ -258,9 +258,10 @@
                 FATAL exit taken inside Main). It is left registered
                 only when the run is interrupted: an unhandled
                 exception (the outer catch sets a persist flag),
-                Ctrl+C (a CancelKeyPress handler sets the same flag,
-                because PowerShell runs finally blocks but bypasses
-                catch blocks on Ctrl+C), a hard kill such as
+                Ctrl+C (a compiled ConsoleCancelKeyPress delegate
+                sets a static persist field, because PowerShell runs
+                finally blocks but bypasses catch blocks on Ctrl+C),
+                a hard kill such as
                 taskkill /F (the finally block never runs), a
                 reboot mid-run (the OS terminates PowerShell), or a
                 Restore that returned cleanly but left the machine
@@ -271,10 +272,9 @@
                 paths delete the state file, checkpoint, and
                 deferral marker so the retry starts from a clean
                 slate). The Ctrl+C distinction is load-bearing:
-                without the
-                CancelKeyPress handler, the finally block would
-                delete the task on exactly the interruption it
-                exists for. Network availability is deliberately not
+                without the CancelKeyPress handler, the finally
+                block would delete the task on exactly the
+                interruption it exists for. Network availability is deliberately not
                 required, so the offline fallback path can fire on
                 the resume attempt. The task's purpose is self-healing
                 an interrupted run that was killed after assigning a
@@ -544,14 +544,15 @@ $Script:ForeignSourceAcceptedHash = $null
 # Restore run, after the Audit Mode guard and before the Restore
 # dispatcher (so an interrupted Restore is recoverable), and before
 # hardware detection. Deleted in the finally block on a clean
-# terminal exit unless ResumeTaskShouldPersist was set. The flag is
-# set by: the outer catch on an unhandled exception; the
-# CancelKeyPress handler on Ctrl+C (PowerShell runs finally blocks
-# but bypasses catch blocks on Ctrl+C, so the handler is the only
-# way to preserve the task on that interruption); Invoke-
-# RestoreAction's two mid-transformation failure paths
-# (/setreimage failing after the WIM was replaced, or /enable
-# returning failed/bitlocker after the WIM was in place). A hard
+# terminal exit unless a persist signal fired: either this flag
+# was set (by the outer catch on an unhandled exception, or by
+# Invoke-RestoreAction's two mid-transformation failure paths -
+# /setreimage failing after the WIM was replaced, or /enable
+# returning failed/bitlocker after the WIM was in place), or the
+# C# Ctrl+C probe's static field was set (a compiled
+# ConsoleCancelKeyPress delegate; PowerShell runs finally blocks
+# but bypasses catch blocks on Ctrl+C, so a compiled delegate is
+# the only way to preserve the task on that interruption). A hard
 # kill such as taskkill /F leaves the task because the finally block
 # never runs; a reboot mid-run leaves it because the OS terminates
 # PowerShell. The task fires at boot + 1 minute and at a one-shot
@@ -922,24 +923,26 @@ function Test-NativeBootVirtualTopology {
 # exit from the pipeline (SUCCESS, WARNING, REBOOT_REQUIRED, or a
 # FATAL exit taken inside Main). Preserved when the run is
 # interrupted: an unhandled exception (the outer catch sets a persist
-# flag), Ctrl+C (a CancelKeyPress handler sets the same flag, because
-# PowerShell runs finally blocks but bypasses catch blocks on
-# Ctrl+C), a hard kill such as taskkill /F (the finally block never
-# runs), a reboot mid-run (the OS terminates PowerShell), or a
-# Restore that returned cleanly but left the machine
-# mid-transformation (Invoke-RestoreAction sets the flag directly on
-# the /setreimage-failed and /enable-failed paths, where the new WIM
-# is in place but WinRE could not be confirmed Enabled). The task
-# is a crash-recovery mechanism, not a retry-until-success mechanism:
-# it fires at boot + 1 minute and at a one-shot T+1 hour trigger, so
-# an interruption that did not reboot the machine is also recovered if
-# the machine stays up. Network availability is deliberately not
-# required (RunOnlyIfNetworkAvailable is false): the offline fallback
-# path is good enough to at least re-enable WinRE after a restart or
-# after an hour, and air-gapped fleets must not lose their
-# self-healing attempt. Registration sets no warning state and does
-# not affect the exit code: the resume task is a per-run safety net,
-# not a machine-state condition.
+# flag), Ctrl+C (a compiled ConsoleCancelKeyPress delegate sets a
+# separate static field on the probe class; the finally block reads
+# that field alongside the persist flag, because PowerShell runs
+# finally blocks but bypasses catch blocks on Ctrl+C), a hard kill
+# such as taskkill /F (the finally block never runs), a reboot
+# mid-run (the OS terminates PowerShell), or a Restore that returned
+# cleanly but left the machine mid-transformation (Invoke-
+# RestoreAction sets the flag directly on the /setreimage-failed and
+# /enable-failed paths, where the new WIM is in place but WinRE could
+# not be confirmed Enabled). The task is a crash-recovery mechanism,
+# not a retry-until-success mechanism: it fires at boot + 1 minute
+# and at a one-shot T+1 hour trigger, so an interruption that did not
+# reboot the machine is also recovered if the machine stays up.
+# Network availability is deliberately not required
+# (RunOnlyIfNetworkAvailable is false): the offline fallback path is
+# good enough to at least re-enable WinRE after a restart or after an
+# hour, and air-gapped fleets must not lose their self-healing
+# attempt. Registration sets no warning state and does not affect the
+# exit code: the resume task is a per-run safety net, not a
+# machine-state condition.
 function Register-ResumeTask {
     param([Parameter(Mandatory)][string]$TaskName)
 
@@ -6278,13 +6281,26 @@ try {
             # bypasses catch blocks, so without this handler the persist
             # flag would remain $false and the finally block would
             # delete the resume task on exactly the interruption it
-            # exists for. The handler runs before the default Ctrl+C
-            # termination and sets the flag; default handling then
-            # proceeds and the finally block preserves the task.
+            # exists for. The handler must be a compiled delegate: the
+            # callback runs on a thread-pool thread and cannot mutate
+            # PowerShell session state directly, so it sets a C# static
+            # field instead and the finally block reads that field.
             try {
-                [Console]::CancelKeyPress += {
-                    $Script:ResumeTaskShouldPersist = $true
+                if (-not ('WinRECancelKeyProbe' -as [type])) {
+                    Add-Type -TypeDefinition @'
+using System;
+public static class WinRECancelKeyProbe {
+    public static volatile bool ShouldPersist;
+    private static bool registered;
+    private static readonly ConsoleCancelEventHandler handler = Handle;
+    private static void Handle(object sender, ConsoleCancelEventArgs args) { ShouldPersist = true; }
+    public static void Register() { if (!registered) { Console.CancelKeyPress += handler; registered = true; } }
+    public static void Unregister() { if (registered) { Console.CancelKeyPress -= handler; registered = false; } }
+}
+'@
                 }
+                [WinRECancelKeyProbe]::ShouldPersist = $false
+                [WinRECancelKeyProbe]::Register()
             } catch {
                 Write-Log "Could not register the Ctrl+C handler for the resume task: $_ - Ctrl+C will proceed through the normal cleanup path and the task will be removed" -Level WARN
             }
@@ -8694,13 +8710,19 @@ finally {
     if ($leaks.Count -gt 0) { Write-Log "Drive letters still assigned: $($leaks -join ', ')" -Level ERROR }
 
     # v49 patch 1: remove the temporary resume task on clean
-    # completion. Left registered only when the catch block set the
-    # persist flag (unhandled exception), or when the process was
-    # hard-killed and the finally block never ran (in which case the
-    # task remains and fires on the next boot or at T+1 hour).
-    if ($Script:ResumeTaskCreated -and -not $Script:ResumeTaskShouldPersist) {
+    # completion. Left registered when any persistence signal fired:
+    # $Script:ResumeTaskShouldPersist (set by the outer catch on an
+    # unhandled exception, or by Invoke-RestoreAction's mid-
+    # transformation failure paths) or the C# Ctrl+C probe
+    # (WinRECancelKeyProbe.ShouldPersist). Left registered when the
+    # process was hard-killed and the finally block never ran (the
+    # task then fires on the next boot or at T+1 hour).
+    $persist = $Script:ResumeTaskShouldPersist
+    try { if ([WinRECancelKeyProbe]::ShouldPersist) { $persist = $true } } catch { }
+    if ($Script:ResumeTaskCreated -and -not $persist) {
         Unregister-ResumeTask -TaskName $Script:ResumeTaskName
     }
+    try { [WinRECancelKeyProbe]::Unregister() } catch { }
 
     # v49: render the run summary before releasing the lock. The summary
     # is output only; nothing downstream reads it.

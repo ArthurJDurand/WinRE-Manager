@@ -50,7 +50,7 @@ As of v49, several new log lines are produced by the release's pre-deployment ga
 
 - **The source-ownership classification gate** — classifies each candidate source WIM into one of four ownership classes and may preserve a `Foreign-With-Drivers` source as-is rather than strip-and-reinject.
 - **The never-downgrade storage-driver check** — refuses to inject a storage driver that would be a version downgrade against one already present in the mounted image.
-- **The pre-deployment storage-applicability gate** — the last refusal before the WIM is written to the active route: the candidate must contain an INF matching one of the machine's present SCSIAdapter-class devices.
+- **The pre-deployment storage-applicability gate** — the last refusal before the WIM is written to the active route: every present SCSIAdapter-class device on the machine must have at least one INF in the candidate whose `HardwareID` or `CompatibleID` prefix-matches one of the device's IDs.
 - **The native-boot VHDX fail-closed gate** — refuses destructive operations on a machine whose OS volume is on a native-boot VHDX.
 - **The backup action** (`-Action Backup -BackupPath <dir>`) — captures a byte-for-byte copy of the currently registered WinRE WIM plus a `backup.json` sidecar.
 - **The restore action** (`-Action Restore -BackupPath <dir>`) — writes a previously captured WIM back to the active route.
@@ -441,7 +441,7 @@ The line names the driver's INF basename, its version in the candidate image, th
 
 The line names the candidate image path, the machine's present SCSIAdapter-class devices, and the fact that the candidate contains no INF matching any of them.
 
-**Cause.** The v49 pre-deployment storage-driver applicability gate is the last refusal before the WIM is written to the active route. It verifies that the candidate image actually contains an INF whose `HardwareID` or `CompatibleID` matches one of the machine's present SCSIAdapter-class devices. A candidate that does not match the machine's controller is refused. The gate was added after the ASUS incident: a machine whose controller (`PCI\VEN_8086&DEV_7D0B`) was not in the manifest's VMD patterns would have received a candidate with no driver for it — a recovery environment that boots but cannot see the OS disk.
+**Cause.** The v49 pre-deployment storage-driver applicability gate is the last refusal before the WIM is written to the active route. It verifies that every present SCSIAdapter-class device on the machine has at least one INF in the candidate whose `HardwareID` or `CompatibleID` prefix-matches one of the device's IDs. A candidate that leaves any controller unmatched is refused. The gate was added after the ASUS incident: a machine whose controller (`PCI\VEN_8086&DEV_7D0B`) was not in the manifest's VMD patterns would have received a candidate with no driver for it — a recovery environment that boots but cannot see the OS disk.
 
 **This is a protective refusal.** Proceeding would deploy a candidate that does not match the machine's hardware. The refusal defers the machine with `EXIT_WARNING` until the manifest, the OEM pack resolution, or the machine's controller set is updated.
 
@@ -928,13 +928,13 @@ At registration: a line naming the task, its two triggers (boot+1m and one-shot 
 
 At deletion (clean completion): a line naming the task and stating it was removed. On clean completion the task is deleted; on interruption it is preserved.
 
-**Cause.** Every Repair or Restore run registers the temporary `WinRE Manager - Resume` task. It is deleted on clean completion. Three cases set the persist flag — which suppresses the deletion on exit — directly:
+**Cause.** Every Repair or Restore run registers the temporary `WinRE Manager - Resume` task. It is deleted on clean completion. The persist decision is made by OR-merging two independent signals in the `finally` block: `$Script:ResumeTaskShouldPersist` (set by the outer catch on an unhandled exception, and by `Invoke-RestoreAction`'s two mid-transformation failure paths) and `[WinRECancelKeyProbe]::ShouldPersist` (set by the compiled `ConsoleCancelKeyPress` delegate introduced in v49 patch 1). Three cases set a persist signal directly:
 
-1. The outer catch, on an unhandled exception.
-2. The `CancelKeyPress` handler, on Ctrl+C. This is the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C.
-3. `Invoke-RestoreAction`'s two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place).
+1. The outer catch, on an unhandled exception — sets `$Script:ResumeTaskShouldPersist`.
+2. The compiled `ConsoleCancelKeyPress` delegate, on Ctrl+C — sets `[WinRECancelKeyProbe]::ShouldPersist`. This is the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C, and because the event callback runs on a thread-pool thread that cannot safely mutate PowerShell session state (hence the compiled delegate and the static field rather than a scriptblock).
+3. `Invoke-RestoreAction`'s two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place) — set `$Script:ResumeTaskShouldPersist`.
 
-Two further interruption classes leave the task registered without setting the flag, because the `finally` block never runs to consult it:
+Two further interruption classes leave the task registered without setting either signal, because the `finally` block never runs to consult them:
 
 4. A hard kill (e.g. `taskkill /F`).
 5. A reboot mid-run, where the OS terminates PowerShell.
@@ -966,7 +966,9 @@ If the task is present, one of the five interruption classes occurred.
 
 6. **Under `$PSCommandPath`-less invocation** (gist bootstrap via `Invoke-RestMethod | Invoke-Expression`, or paste-into-console), the task is not registered at all; the log records an INFO line stating the guard skipped it. This is by design. Do not expect a resume task from a gist-bootstrap run.
 
-**Field status.** The resume task is new in v49. The five persist triggers have not been exercised in the field, and the Ctrl+C trigger in particular (the load-bearing one) is high-signal. If you see the task present, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — include the invocation context, which interruption occurred, and whether the resume run subsequently completed the operation.
+7. **If the log shows `Could not register the Ctrl+C handler for the resume task`**, the compiled Ctrl+C delegate could not be registered on this run. The v49 patch 1 fix replaced the pre-fix `[Console]::CancelKeyPress += { ... }` scriptblock subscription — which always failed on PowerShell 5.1 with `The property 'CancelKeyPress' cannot be found on this object`, causing the `finally` block to read `$false` and delete the resume task on exactly the Ctrl+C interruption it existed for — with a compiled C# delegate (`WinRECancelKeyProbe`) whose callback sets a `volatile static bool`. Registration of the compiled delegate is expected to succeed on both PowerShell 5.1 and 7.x; the WARN is emitted only when the `Add-Type` or `Register()` step throws. When it fires, the Ctrl+C persistence signal is unavailable for this run, and the resume task is deleted on a Ctrl+C interruption; the other persist signals (the outer catch, and the two mid-transformation restore failure paths) continue to work normally. A hard kill (`taskkill /F`) and a reboot mid-run leave the task registered regardless, because the `finally` block never runs to consult any signal. The WARN is emitted once per Repair or Restore run. The Ctrl+C preservation path has been field-verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09) with the compiled delegate in place; see the v49 patch 1 entry in `CHANGELOG.md`.
+
+**Field status.** The resume task is new in v49 patch 1. Field verification is partially complete: the Ctrl+C preservation path and the clean-completion removal of the resume task were verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09). The other persist and interruption paths — the outer catch, the two `Invoke-RestoreAction` mid-transformation failure paths, a hard kill, and a reboot mid-run — have not been exercised in the field. If you see the task present, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — include the invocation context, which interruption occurred, and whether the resume run subsequently completed the operation.
 
 ## The wrapper's install step refused because the copy hash did not match (v49)
 

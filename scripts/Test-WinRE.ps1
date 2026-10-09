@@ -14,10 +14,10 @@
 
     Mirrored from production (kept in lockstep):
       - Get-IntelProcessorGeneration
-      - Get-DesiredStateId (seven-field recipe, production ScriptVersion
-        - the $ProductionScriptVersion default tracks production's
-        $ScriptVersion and must be bumped whenever production bumps;
-        currently 49)
+      - Get-DesiredStateId (seven-field recipe; production's
+        $ScriptVersion is read from an adjacent WinRE.ps1 by
+        Get-ProductionScriptVersion; the harness reports the DSI
+        comparison as SKIP when the reader cannot resolve it)
       - Get-LocalInputsId (v48 three-field locally-computable hash)
       - Get-StorageControllerDevices (v49 SCSIAdapter-class device
         enumeration, mirroring production's software-device filter)
@@ -52,7 +52,21 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 28
+    Version : 29
+
+    v29 changes vs v28:
+    1. Replaced the hardcoded $ProductionScriptVersion default
+       (previously 49) with Get-ProductionScriptVersion, which
+       reads production's $ScriptVersion from an adjacent
+       WinRE.ps1. The prior default drifted from production on
+       five consecutive releases (v21-v28); the reader ends that
+       family. When production's script is not adjacent (harness
+       run standalone from a gist), Get-DesiredStateId returns
+       $null and Option S reports the DSI comparison as SKIP with
+       an explicit "place WinRE.ps1 beside Test-WinRE.ps1" hint,
+       rather than silently substituting a stale default and
+       reporting a false MISMATCH.
+    2. Menu title and startup Rule bumped 28 -> 29.
 
     v28 changes vs v27:
     1. $ProductionScriptVersion default bumped 48 -> 49 to track
@@ -859,20 +873,48 @@ function Get-IntelProcessorGeneration {
     }
 }
 
+# v29: read production's $ScriptVersion from the adjacent WinRE.ps1.
+# The harness's DSI mirror MUST use the same value production hashes
+# with; a hardcoded default silently drifts and reports a false
+# MISMATCH on every state file a newer production writes. Returns
+# $null when the adjacent script is missing or unparseable, so the
+# caller can report the comparison as indeterminate rather than
+# substituting a stale default.
+function Get-ProductionScriptVersion {
+    $productionPath = Join-Path $PSScriptRoot "WinRE.ps1"
+    if (-not (Test-Path -LiteralPath $productionPath -PathType Leaf)) { return $null }
+    try {
+        $match = [regex]::Match(
+            (Get-Content -LiteralPath $productionPath -Raw),
+            '(?m)^\s*\$ScriptVersion\s*=\s*(\d+)'
+        )
+        if ($match.Success) { return [int]$match.Groups[1].Value }
+    } catch { }
+    return $null
+}
+
 function Get-DesiredStateId {
-    # Mirror of production's Get-DesiredStateId. The
-    # $ProductionScriptVersion default MUST track production's
-    # $ScriptVersion. If it falls behind, Show-StateFileParity reports
-    # a false DSI MISMATCH for every state file production has written.
-    # If production ever adds or removes a DSI component, mirror the
-    # change here AND in Show-StateFileParity mismatch detail.
+    # Mirror of production's Get-DesiredStateId. Production's
+    # $ScriptVersion is read from the adjacent WinRE.ps1 via
+    # Get-ProductionScriptVersion. When it cannot be resolved this
+    # function returns $null and the caller reports the DSI
+    # comparison as indeterminate rather than reporting a false
+    # MISMATCH against a stale default. If production ever adds or
+    # removes a DSI component, mirror the change here AND in
+    # Show-StateFileParity mismatch detail.
     param(
         [Parameter(Mandatory)]$Hardware,
         $OEMPackage,
         [Parameter(Mandatory)][string]$ExpectedDriverSetVersion,
         [bool]$VMDPresent = $false,
-        [int]$ProductionScriptVersion = 49
+        [Nullable[int]]$ProductionScriptVersion = $null
     )
+    if ($null -eq $ProductionScriptVersion) {
+        $ProductionScriptVersion = Get-ProductionScriptVersion
+    }
+    if ($null -eq $ProductionScriptVersion) {
+        return $null
+    }
     $oemVersion = if ($OEMPackage -and $OEMPackage.Version) { $OEMPackage.Version } else { "NONE" }
     $cpuGen = if ($Hardware.CPUGeneration) { $Hardware.CPUGeneration } else { "N" }
     $parts = @(
@@ -2568,6 +2610,16 @@ function Show-StateFileParity {
     $computedDsi = Get-DesiredStateId -Hardware $profile -OEMPackage $oemPackage `
                                        -ExpectedDriverSetVersion $manifest.version `
                                        -VMDPresent $vmdPresent
+    if ($null -eq $computedDsi) {
+        Write-Diag ""
+        Write-KV "Computed DesiredStateId" "(unavailable)" "Yellow"
+        Write-Diag "           Production's \$ScriptVersion could not be read from an adjacent" "Yellow"
+        Write-Diag "           WinRE.ps1, so the DSI mirror cannot be computed. Place WinRE.ps1" "Yellow"
+        Write-Diag "           beside Test-WinRE.ps1 and re-run, or use the harness in the same" "Yellow"
+        Write-Diag "           repository layout as production." "Yellow"
+        Record "State file parity" $false -State "SKIP" -Detail "production ScriptVersion unavailable"
+        return
+    }
     Write-Diag ""
     Write-KV "Computed DesiredStateId" "$computedDsi" "Magenta"
     if (-not $vmdQueryOk) {
@@ -3246,7 +3298,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v28)"
+    $titleContent = "WinRE Manager Test Harness (v29)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -3294,7 +3346,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v28"
+Rule "WinRE Manager test harness v29"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

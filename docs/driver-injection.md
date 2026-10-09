@@ -227,7 +227,7 @@ The Step 3 block runs in this order. The v49 additions are **bolded**:
 6. Download, extract, and inject the VMD packages (if VMD hardware is present).
 7. **Never-downgrade storage-driver check (v49).** Compare each storage-class driver in the final image against the pre-strip inventory, by INF basename. If any post-injection driver would be older, the candidate is discarded — dismounted with `-Discard`, the source preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`.
 8. Verify the injection success gate (`$Script:ImageInjectionComplete`).
-9. **Pre-deployment storage-applicability gate (v49).** The candidate must contain an INF matching one of the machine's present SCSIAdapter-class devices. A candidate that does not match is refused, dismounted with `-Discard`, and deferred.
+9. **Pre-deployment storage-applicability gate (v49).** Every present SCSIAdapter-class device on the machine must have at least one matching INF in the candidate. A candidate that leaves any controller unmatched is refused, dismounted with `-Discard`, and deferred.
 10. ResetBase (only if injection succeeded).
 11. **Provenance marker write (v49).** If the `LineageId` is not yet set, generate one; write the marker into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. The marker is not load-bearing in v49 — no gate in the current run reads it, and a write failure is logged and the pipeline continues — but it is read on subsequent runs by the source-ownership classifier.
 12. Dismount with `-Save`.
@@ -398,7 +398,7 @@ This is **diagnostic only, not a gate**. The filterless `Get-WindowsDriver` form
 
 ## The pre-deployment storage-applicability gate (v49)
 
-The gate runs inside Step 3, after injection is confirmed complete and after the never-downgrade check, before ResetBase and before the dismount. The manager verifies that the mounted candidate image contains an INF whose `HardwareID` or `CompatibleID` matches one of the machine's present SCSIAdapter-class devices.
+The gate runs inside Step 3, after injection is confirmed complete and after the never-downgrade check, before ResetBase and before the dismount. The manager verifies that every present SCSIAdapter-class device on the machine has at least one INF in the candidate image whose `HardwareID` or `CompatibleID` prefix-matches one of the device's IDs.
 
 The gate is the last refusal before the candidate is committed by the dismount and the pipeline advances to the deploy stage. A candidate that does not match the machine's controller is refused: the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, the checkpoint rolls back to Step 2, and the run exits `EXIT_WARNING`. No WIM is deployed, no partition is touched, WinRE is not disabled.
 
@@ -406,13 +406,13 @@ The gate is the last refusal before the candidate is committed by the dismount a
 
 The gate was added after the ASUS-incident field case. A machine's controller (`PCI\VEN_8086&DEV_7D0B`) was not in the manifest's VMD patterns. Under the v47 pipeline the machine's VMD hardware presence was classified as absent (because the manifest did not recognize the controller), the VMD driver package was not selected for injection, and the machine would have received a candidate with no driver for its actual storage controller — a recovery environment that boots but cannot see the OS disk.
 
-The manifest's VMD patterns are an incomplete signal. The gate closes the gap by verifying the actual outcome: does the candidate's INF set match the machine's actual controllers? A candidate that does not match is refused.
+The manifest's VMD patterns are an incomplete signal. The gate closes the gap by verifying the actual outcome: does the candidate's INF set cover every one of the machine's actual storage controllers? A candidate that leaves any controller without a matching INF is refused.
 
 ### What the gate reads
 
 - **The candidate image's INFs.** The gate enumerates the driver INFs in the candidate image and extracts each one's `HardwareID` and `CompatibleID` entries.
 - **The machine's present SCSIAdapter-class devices.** The gate enumerates the machine's present SCSIAdapter-class devices and extracts each device's `HardwareID` and `CompatibleID` entries.
-- **The match.** The gate requires at least one INF-to-device match. A candidate that contains no INF whose `HardwareID` or `CompatibleID` matches any of the machine's present SCSIAdapter-class devices is refused.
+- **The match.** The gate requires a match for every present SCSIAdapter-class device. A candidate in which any one of the machine's present SCSIAdapter-class devices has no matching INF is refused. The refusal reason names how many controllers were unmatched and how many were considered (e.g. `2 of 4 storage controller(s) have no matching INF in the candidate image`).
 
 Software and virtual controllers (`InstanceId` starting with `{GUID}\` or `SWD\`) are excluded from the device enumeration, mirroring the v28 harness diagnostic. A machine whose only SCSIAdapter-class devices are Windows-component software controllers is treated as having no relevant controller; the gate does not refuse on that basis, because such a machine has no physical storage controller the candidate image needs to match.
 
@@ -528,7 +528,7 @@ The machine is left exactly as it was before the run — WinRE is still in whate
 
 **Related to the v49 never-downgrade check.** The never-downgrade check runs after injection is confirmed complete. When it detects a downgrade, the whole candidate is discarded — dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` removed, checkpoint rolled back to Step 2, `ForeignSourceAcceptedHash` recorded. The pipeline does not continue with a retained driver; there is no partial-normalize path in v49. See "The never-downgrade storage-driver check (v49)" above.
 
-**Related to the v49 pre-deployment storage-applicability gate.** The gate runs on every candidate the pipeline is prepared to deploy. A candidate that does not contain an INF matching one of the machine's present SCSIAdapter-class devices is refused and discarded. The gate has never fired in the field; a field log of the refusal is high-signal. See "The pre-deployment storage-applicability gate (v49)" above.
+**Related to the v49 pre-deployment storage-applicability gate.** The gate runs on every candidate the pipeline is prepared to deploy. A candidate that leaves any one of the machine's present SCSIAdapter-class devices without a matching INF is refused and discarded. The gate has never fired in the field; a field log of the refusal is high-signal. See "The pre-deployment storage-applicability gate (v49)" above.
 
 **Related to the v49 provenance marker write.** After the applicability gate passes and after ResetBase, the pipeline writes the provenance marker (if the `LineageId` is not yet set, it generates one) into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. The marker is not load-bearing in v49 — no gate in the current run reads it, and a write failure is logged and the pipeline continues — but it is read on subsequent runs by the source-ownership classifier via `Read-ProvenanceMarker`, which classifies a source carrying a matching marker as `Manager-Lineage`.
 

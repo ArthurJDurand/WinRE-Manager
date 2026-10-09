@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Current status
 
-**Production:** `WinRE.ps1` **v49 patch 1** (`ScriptVersion = 49`, `ScriptPatchLevel = "1"`). v49-specific field verification is pending; the field verification carried forward from v48 patch 2 covers Windows 11 (builds 26200 and 26300) and Windows 10 22H2 (19045). The WinRE servicing metadata recorded in the field logs — for example `10.0.26100.9545` — is the WinRE base version, not the OS build number, and the two must not be conflated.
-**Harness:** `Test-WinRE.ps1` **v28**.
+**Production:** `WinRE.ps1` **v49 patch 1** (`ScriptVersion = 49`, `ScriptPatchLevel = "1"`). Field verification of the v49 pipeline is in progress. The temporary resume task's Ctrl+C preservation path and the harness's Option S DSI mirror have been exercised on physical hardware (see the Field verification section below). The source-ownership classification, the storage-applicability gate, the native-boot VHDX gate's refusal path, and the backup and restore actions all require a full-update pass or an explicit action invocation and remain pending field verification. The v49 pipeline inherits the v48 patch 2 field-verification baseline, which covers Windows 11 (builds 26200 and 26300) and Windows 10 22H2 (19045). The WinRE servicing metadata recorded in the field logs — for example `10.0.26100.9545` — is the WinRE base version, not the OS build number, and the two must not be conflated.
+**Harness:** `Test-WinRE.ps1` **v29**.
 
 The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker. Production and harness are deliberately decoupled: a harness move never forces a managed-machine rebuild.
 
@@ -76,7 +76,7 @@ The release was driven by two converging lines of work. First, the ASUS-incident
 
 - **Human-readable narration and run summary.** A narration layer (`Write-Narration`) emits operator-facing status lines alongside the technical log, at points such as `Starting WinRE Manager...`, `Checking this machine's hardware...`, `Nothing to do. The Windows recovery environment is already healthy.`, `Preparing to service the recovery image.`, `Mounting and customizing the recovery image.`, and `Deploying the recovery image.` A run-summary layer (`Initialize-RunSummary`, `Set-RunSummaryField`, `Add-RunSummaryLine`, `Write-RunSummary`) records the run outcome in a structured block with fields: `Result`, `Decision`, `Why`, `Work performed`, `Changes made`, `Changes NOT made`, `Operating mode`, `Next action`, `Runtime`. The `Decision` field is one of `FAST PATH`, `ENABLE-ONLY`, `FULL UPDATE`, `DEFERRED`, `BACKUP`, `RESTORE`, `PREFLIGHT`, `PRESERVED`, or `REPAIR`; `Operating mode` distinguishes `DEDICATED`, `OS-FALLBACK`, and `PRESERVED`. Both layers are additive; the technical log format is preserved.
 
-- **Temporary crash-recovery scheduled task (`WinRE Manager - Resume`).** v49 patch 1. Every Repair or Restore run registers a task named `WinRE Manager - Resume` that fires at boot+1m and as a one-shot at T+1h. The task invokes the production script with its default `-Action Repair`; there is no separate resume mode. An interrupted Restore is recovered by routing back through the Repair pipeline, which re-evaluates the machine state and re-establishes the route. The task is deleted on clean completion and preserved on interruption. The persist flag is set in three cases: the outer catch (unhandled exception); the `CancelKeyPress` handler (Ctrl+C — the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C); and `Invoke-RestoreAction`'s two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place). Two further interruption classes leave the task registered without setting the flag, because the `finally` block never runs to consult it: a hard kill (e.g. `taskkill /F`) and a reboot mid-run (the OS terminates PowerShell). The task profile is SYSTEM / Highest, startup+1m plus one-shot T+1h, `StartWhenAvailable`, battery-allowed, no idle requirement, network not required, 24-hour execution limit. `Invoke-RestoreAction` has been moved after resume-task registration so an interrupted Restore is recoverable.
+- **Temporary crash-recovery scheduled task (`WinRE Manager - Resume`).** v49 patch 1. Every Repair or Restore run registers a task named `WinRE Manager - Resume` that fires at boot+1m and as a one-shot at T+1h. The task invokes the production script with its default `-Action Repair`; there is no separate resume mode. An interrupted Restore is recovered by routing back through the Repair pipeline, which re-evaluates the machine state and re-establishes the route. The task is deleted on clean completion and preserved on interruption. Two independent persistence signals are read by the `finally` block and OR-merged into a single `$persist` boolean. First, `$Script:ResumeTaskShouldPersist` is set by the outer catch (unhandled exception) and by `Invoke-RestoreAction`'s two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place). Second, `[WinRECancelKeyProbe]::ShouldPersist` is set by a compiled `ConsoleCancelKeyPress` delegate — the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C, and because the event callback runs on a thread-pool thread that cannot safely mutate PowerShell session state. The delegate is unregistered in `finally` after the persistence decision is made. Two further interruption classes leave the task registered without setting either signal, because the `finally` block never runs to consult them: a hard kill (e.g. `taskkill /F`) and a reboot mid-run (the OS terminates PowerShell). The task profile is SYSTEM / Highest, startup+1m plus one-shot T+1h, `StartWhenAvailable`, battery-allowed, no idle requirement, network not required, 24-hour execution limit. `Invoke-RestoreAction` has been moved after resume-task registration so an interrupted Restore is recoverable.
 
 - **`$PSCommandPath` guard on `Register-ResumeTask`.** v49 patch 1. Under `Invoke-RestMethod | Invoke-Expression` (gist bootstrap) or paste-into-console invocation, `$PSCommandPath` is `$null`. In that case the function logs at INFO and returns `$false`. The task is a per-run safety net, not machine state, so its absence does not set `nonFatalWarning`.
 
@@ -86,6 +86,8 @@ The release was driven by two converging lines of work. First, the ASUS-incident
 
 ### Fixed
 
+- **The Ctrl+C resume-task preservation path now works.** The prior implementation attempted `[Console]::CancelKeyPress += { $Script:ResumeTaskShouldPersist = $true }`. In PowerShell 5.1, `CancelKeyPress` is a .NET event, not a settable property; the `+=` subscription expression failed at runtime with `The property 'CancelKeyPress' cannot be found on this object`, and the handler was never registered. Because PowerShell runs `finally` blocks on Ctrl+C but bypasses `catch` blocks, the intended Ctrl+C handler was the only mechanism that could preserve the resume task on a mid-run Ctrl+C; with the handler broken, the `finally` block read `$false` and deleted the resume task on exactly the interruption it existed for. The fix replaces the failing subscription expression with a compiled `ConsoleCancelKeyPress` delegate — a new C# type `WinRECancelKeyProbe` added via `Add-Type` whose callback sets a `volatile static bool` — and the `finally` block reads that static field alongside `$Script:ResumeTaskShouldPersist`. The compiled-delegate pattern is required because the event callback runs on a thread-pool thread and cannot safely mutate PowerShell session state. The delegate is unregistered in `finally` after the persist decision is made. Field verification: see the Field verification section below.
+
 - **Dead script state removed.** `$Script:SourceOwnershipClass` and `$Script:StorageApplicabilityOk` were declared and assigned but never read. Both the declarations and the assignments have been removed. No behaviour change.
 
 - **Stale "Part 2" reference removed from `Test-NativeBootVirtualTopology`'s header.** A comment referenced a document section that no longer exists.
@@ -94,7 +96,7 @@ The release was driven by two converging lines of work. First, the ASUS-incident
 
 - **`.NOTES` source-ownership class list corrected.** The source-ownership invariant now lists four classes (`Manager-Owned`, `Manager-Lineage`, `Foreign-No-Drivers`, `Foreign-With-Drivers`), with `Foreign-With-Drivers` described and the obsolete `Microsoft-Baseline` class removed.
 
-- **`.NOTES` resume-task documentation added.** The block describes the temporary resume task, including the three cases that set the persist flag (outer catch, Ctrl+C, and `Invoke-RestoreAction`'s mid-transformation failure paths) and the two interruption classes that leave the task registered without setting the flag because the `finally` block never runs (hard kill, reboot).
+- **`.NOTES` resume-task documentation updated.** The block now distinguishes the two independent persistence signals the `finally` block reads and OR-merges: `$Script:ResumeTaskShouldPersist` (set by the outer catch on an unhandled exception, and by `Invoke-RestoreAction`'s mid-transformation failure paths) and `[WinRECancelKeyProbe]::ShouldPersist` (set by the compiled `ConsoleCancelKeyPress` delegate). It also names the two interruption classes that leave the task registered without setting either signal, because the `finally` block never runs: a hard kill and a reboot mid-run.
 
 ### Changed (wrapper)
 
@@ -126,9 +128,15 @@ The release was driven by two converging lines of work. First, the ASUS-incident
 
 ### Changed (harness)
 
-- **`Test-WinRE.ps1` moved to v28.** Six changes:
+- **`Test-WinRE.ps1` moved to v29.** Seven changes total: six from the v28 baseline (documented below) and one new in v29.
 
-  - **`$ProductionScriptVersion` default bumped 48 -> 49.** Tracks production's `$ScriptVersion`. Without the bump, Option S reports a false DSI MISMATCH for every state file v49 production writes. This is the fifth correction in the same family (v21, v22, v23, v27, v28).
+  The v29 change:
+
+  - **Version-drift family closed by `Get-ProductionScriptVersion`.** A new reader extracts production's `$ScriptVersion` from the adjacent `WinRE.ps1` at call time, using a regex match against the source. `Get-DesiredStateId`'s `$ProductionScriptVersion` parameter is now `[Nullable[int]]` with a `$null` default; when the caller does not supply a value, the function invokes the reader; when the reader returns `$null` (production file absent, unparseable, or lacking the declaration), the function returns `$null` and the caller records `State file parity` as SKIP rather than substituting a stale default. This closes the version-drift family permanently: the harness no longer needs a manual bump whenever production bumps `$ScriptVersion`. The `49` default is retained as an explicit override path for the parser self-test (Check 15 passes `44` and `43` explicitly to prove version-sensitivity), but is no longer the load-bearing value on the live Option S path. The five prior corrections in the family (v21 `44→45`, v22 `45→46`, v23 `46→47`, v27 `47→48`, v28 `48→49`) were each the same defect class.
+
+  The v28 baseline changes (retained in this release):
+
+  - **`$ProductionScriptVersion` default bumped 48 -> 49.** Retained as an override path for the parser self-test, but no longer load-bearing — the v29 reader supplies the value on the live Option S path.
 
   - **`Get-StorageControllerDevices` mirror added.** Enumerates SCSIAdapter-class devices present on the machine and extracts the union of `HardwareID`, `CompatibleID`, and the `InstanceId` prefix up to the last backslash. Software and virtual controllers (`InstanceId` starting with `{GUID}\` or `SWD\`) are skipped, mirroring production's software-device filter.
 
@@ -138,7 +146,7 @@ The release was driven by two converging lines of work. First, the ASUS-incident
 
   - **Stale "v48" references rewritten version-agnostically.** The architecture warning and the `Get-DesiredStateId` header comment no longer name a specific past version. Over-indented `try {` in the `Compare-WimServicingMetadata` self-test fixed.
 
-  - **Menu title and startup `Rule` bumped to v28.**
+  - **Menu title and startup `Rule` bumped to v28** (and subsequently to v29 in the same release).
 
 ### Migration Note
 
@@ -148,19 +156,25 @@ A machine whose state file records a v48 `DesiredStateId` will see it rejected a
 
 Rollback: change `$ScriptVersion` back to 48 and revert the v49 changes (source-ownership classification, never-downgrade, applicability gate, native-boot VHDX gate, backup and restore actions, narration, run summary, resume task). Another fleet-wide rebuild occurs on the next run.
 
-The read-only harness `Test-WinRE.ps1` moves from v27 to v28 in the same window. The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker.
+The read-only harness `Test-WinRE.ps1` moves from v28 to v29 in the same window. The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker.
 
 ### Field verification
 
-Pending. The v49 features most in need of field verification are:
+The following features have been exercised on physical hardware on 2026-10-09 on an ASUS desktop (PRIME H510M-D, i5-11400, Win 11 build 26300):
 
-- Provenance-marker survival across a real Windows Update WinRE servicing event.
-- Two-version `iastorvd.inf` coexistence behaviour.
-- Storage-applicability check false-negative rate (has never fired in the field).
-- The deliberate post-deletion failure test on a disposable VM with an intervening partition (the v48 known gap).
-- The temporary resume task's persist behaviour across the three flag-setting cases (outer catch, Ctrl+C, and `Invoke-RestoreAction`'s mid-transformation failures) and the two `finally`-never-runs interruption classes (hard kill, reboot), plus its clean-completion removal. Ctrl+C is the load-bearing case.
-- The wrapper's backup and restore menu options with paths containing spaces.
-- The wrapper's install / reinstall of the permanent maintenance task, with the installed copy verified after the local script is renamed.
+- **Ctrl+C resume-task preservation.** The pre-fix runs (03:11, 03:19, 03:27) each logged `Could not register the Ctrl+C handler for the resume task: The property 'CancelKeyPress' cannot be found on this object`. The post-fix runs (20:45:42, 20:45:51, 20:45:58) logged no such warning. An interactive Ctrl+C at 20:45:42 terminated the script but left the resume task in place — the 20:45:58 run then logged `Found an existing 'WinRE Manager - Resume' task; re-registering with -Force (this is expected when the resume task re-registers itself, and is the recovery path when a previous run was interrupted)`. This is the P1 case the fix exists for, verified end-to-end. The clean-completion removal of the resume task was verified on the same machine across every non-interrupted 2026-10-09 run: each run that reached the `finally` block without a Ctrl+C logged `Removed temporary resume task 'WinRE Manager - Resume'`, and each interrupted run correctly did not.
+
+- **Option S DSI MATCH against production on the same machine.** The harness (v29) computed `DesiredStateId: 2A6A14DB585A3A1191BA2752AFA0F4F25696432979F878948D2EE78D22BFC68A` and `LocalInputsId: 039594243489985F237CEB1EA39D63D56DC727C10A11C2E6BB4FBBD2AE0A3152`; both matched the values production (v49 patch 1) logged on every run of 2026-10-09. `Verdict: DSI MATCH`. This is the first field validation of the harness DSI mirror against production on the same machine.
+
+The following v49 features remain pending field verification:
+
+- **Provenance-marker survival across a real Windows Update WinRE servicing event.** Not yet exercised.
+- **Two-version `iastorvd.inf` coexistence behaviour.** Not yet exercised.
+- **Storage-applicability check false-negative rate.** Has never fired in the field.
+- **The deliberate post-deletion failure test on a disposable VM with an intervening partition** (the v48 known gap). Not yet exercised.
+- **The temporary resume task's persist behaviour on the outer-catch, `Invoke-RestoreAction` mid-transformation, hard-kill, and reboot cases.** Only the Ctrl+C case and the clean-completion case have been verified. The outer-catch and `Invoke-RestoreAction` paths are structurally identical to Ctrl+C (all three signals are OR-merged into `$persist` before the `Unregister-ResumeTask` call), and hard-kill / reboot are expected to leave the task registered for the same observable reason the ASUS run's leftover task did, but neither has been exercised end-to-end.
+- **The wrapper's backup and restore menu options with paths containing spaces.** Not yet exercised.
+- **The wrapper's install / reinstall of the permanent maintenance task, with the installed copy verified after the local script is renamed.** Not yet exercised.
 
 ### Known limitations
 
