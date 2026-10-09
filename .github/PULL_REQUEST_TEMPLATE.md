@@ -39,7 +39,7 @@ The v49 release added a family of gates that run **before** the destructive sequ
 
 - The **source-ownership classification** (the four classes `Manager-Owned`, `Manager-Lineage`, `Foreign-No-Drivers`, `Foreign-With-Drivers`; the rule that a `Foreign-With-Drivers` WIM is preserved as-is and not stripped and re-injected over).
 - The **never-downgrade storage-driver check** (a driver that would be a version downgrade against one already present in the mounted image is not injected; the existing driver is retained).
-- The **pre-deployment storage-applicability gate** (the last refusal before the WIM is written to the active route: the candidate must contain an INF matching one of the machine's present SCSIAdapter-class devices).
+- The **pre-deployment storage-applicability gate** (the last refusal before the WIM is written to the active route: every present SCSIAdapter-class device on the machine must have at least one matching INF in the candidate).
 - The **native-boot VHDX fail-closed gate** (refuses destructive operations on a VHDX-boot OS volume).
 - The **backup and restore actions** (`-Action Backup` and `-Action Restore`; the sidecar `backup.json` format; the transactional restore path).
 - The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its two independent persist signals — the `$Script:ResumeTaskShouldPersist` flag, set by the outer catch and by `Invoke-RestoreAction`'s two mid-transformation failure paths, and the `[WinRECancelKeyProbe]::ShouldPersist` static field, set by the compiled Ctrl+C delegate — plus its two finally-never-runs interruption classes, its clean-completion removal, and its `$PSCommandPath` guard).
