@@ -161,7 +161,7 @@ This gives you OS-fallback WinRE — functional but not the design goal. The ded
 [ERROR] FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session. Re-run from an elevated prompt, or launch via the scheduled task's SYSTEM context. No changes have been made to WinRE, partitions, BitLocker, drive letters, the workspace, or the state file.
 ```
 
-**Cause.** The v48 patch 2 elevation guard runs as the very first statement inside the outer `try` block, before the program lock, before hardware probes, before the manifest fetch, and before any state-modifying action. On refusal it creates the log directory itself so its FATAL message has somewhere to be written. It checks whether the current process has the Administrator role; if not, it refuses in milliseconds rather than proceeding through several minutes of setup work before failing at `Mount-WindowsImage` with an ambiguous FATAL.
+**Cause.** The v48 patch 2 elevation guard runs inside the outer `try` block, immediately after `Initialize-RunSummary` and before the program lock, before hardware probes, before the manifest fetch, and before any state-modifying action. On refusal it creates the log directory itself so its FATAL message has somewhere to be written. It checks whether the current process has the Administrator role; if not, it refuses in milliseconds rather than proceeding through several minutes of setup work before failing at `Mount-WindowsImage` with an ambiguous FATAL.
 
 **This is expected behavior, not a bug.** The guard exists precisely to convert an expensive, ambiguous failure into a fast, clear one. Do not file a bug for this signature.
 
@@ -1251,7 +1251,7 @@ or the analogous sequence for `Format-Volume`:
 
 ```
 [ERROR] Format-Volume failed: …
-[INFO] Removing orphan partition <disk>/<part> after Format-Volume failure (main path)
+[INFO] Removed orphan partition <disk>/<part> after Format-Volume failure (main path)
 …
 [WARN] ================================================================================
 [WARN] Dedicated recovery partition creation failed after all attempts.
@@ -1906,14 +1906,14 @@ If the label-only partition is genuinely a stale recovery partition from a prior
 **Log lines.**
 
 ```
-VMD hardware present: True
+VMD hardware present: True (N matching device(s) out of M pattern(s))
 Required drivers (VMD): 0
 ```
 
 or
 
 ```
-Skipping <name>: CPU gen <n> outside <min>-<max>
+Skipping <name>: CPU gen <n> outside <min>-<max>  (harness `Test-VmdDrivers` line; production logs `Skipping <name>: no matching VMD hardware detected` instead)
 ```
 
 **Cause.** The manifest's `cpuGenMin` / `cpuGenMax` does not cover the machine's Intel generation, or the machine's CPU generation could not be parsed.
@@ -1991,7 +1991,7 @@ None of the v49 pipeline refinements — the source-ownership classification, th
 
 The `-Action Backup` and `-Action Restore` actions do not have a DryRun mode. They are standalone actions invoked by the wrapper's SAFETY options, not pipeline stages; the DryRun contract applies to the Repair path (the default action). Running `-Action Backup` without a `-DryRun` flag is the correct invocation; adding `-DryRun` to a backup action is undefined. If a wrapper menu path is unclear, check the wrapper's screen — the backup and restore options state what they will do.
 
-The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the reasons evaluated before the DryRun choke point are surfaced exactly as in a live run, while the reasons only reachable after the choke point or gated on `-not $Script:DryRun` are not. The surfaced group is the plan-rejection reasons (all thirteen, including the intervening-anchor validation failures), `partition geometry unavailable`, `C: volume could not be read for free-space check`, `post-shrink free space below minimum`, and `active WinRE location could not be resolved`. The unsurfaced group is the pre-shrink execution paths (`pre-shrink failed`, `pre-shrink verification failed`, `resize rounding reduced planned extent`), the two disable-failure paths, the deletion-failure path, and the registered-source-changed abort. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN]   - Disk …` lines.
+The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the reasons evaluated before the DryRun choke point are surfaced exactly as in a live run, while the reasons only reachable after the choke point or gated on `-not $Script:DryRun` are not. The surfaced group is the plan-rejection reasons (both the base set and the intervening-anchor validation failures), `partition geometry unavailable`, `C: volume could not be read for free-space check`, `post-shrink free space below minimum`, and `active WinRE location could not be resolved`. The unsurfaced group is the pre-shrink execution paths (`pre-shrink failed`, `pre-shrink verification failed`, `resize rounding reduced planned extent`), the two disable-failure paths, the deletion-failure path, and the registered-source-changed abort. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN]   - Disk …` lines.
 
 Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable …` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
 

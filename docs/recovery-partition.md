@@ -260,7 +260,7 @@ At this site the abort must first restore the resize target to its captured size
 
 This is a **race detector, not a lock**. Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update, so the microseconds between the re-read and the disable returning cannot be eliminated without moving work into the disable→enable window (which would violate invariant 3). The detector narrows the window from minutes to that residual. See [architecture.md](architecture.md) for the full rationale and [state-and-idempotency.md](state-and-idempotency.md) for the two capture states and their handling.
 
-### 3a. Pre-deletion resolver guard (v46 patch 2; v48 patch 1 moved this guard before the pre-shrink)
+### 3a. Pre-deletion resolver guard (v46 patch 2; v48 patch 1 moved this guard before the pre-shrink — the guard now runs before steps 2 and 3, and is presented here for continuity)
 
 Immediately after `$stateBefore` is captured, and before the pre-shrink and before `reagentc /disable`, the script resolves the previously-active WinRE location to a partition. If WinRE was `Enabled` before the disable and the location cannot be resolved, the function returns `Deferred` with `Reason = "active WinRE location could not be resolved"`. As of v48 patch 1, the same fail-closed treatment applies when reagentc reports **no registered location at all** (empty `Location`): the function returns `Deferred` with `Reason = "active WinRE location is empty"`. Both cases refuse to begin the destructive sequence rather than proceed with an unprotected active route; both fire ahead of the pre-shrink and ahead of `reagentc /disable`, so the machine is left with WinRE still `Enabled` and the old recovery partition intact.
 
