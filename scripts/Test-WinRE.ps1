@@ -42,6 +42,55 @@
     in production code paths; the harness is a separate UI and is not
     subject to that rule.
 
+    Mirror discipline (v31). Every function named in the "Mirrored from
+    production" list above, and every function under a "based on
+    WinRE.ps1" section header, matches its production counterpart
+    line-for-line in logic and in functional calls. The only permitted
+    differences are:
+
+      (a) The log sink. The harness emits through Say; production emits
+          through Write-Log. Both take a message and a level; Say
+          additionally takes a console colour. Same decision points,
+          same control flow; different sink.
+
+      (b) Diagnostics layered around the mirror. The harness may add
+          additional informational output that helps an operator
+          understand what the mirror is doing - for example, an extra
+          print of a raw command's output, or an explicit hypothesis
+          when a regex fails to match. Diagnostics observe the mirror;
+          they do not change its control flow.
+
+      (c) An explicit, documented functional difference. Where the
+          harness deliberately differs from production - for example,
+          Test-VmdDrivers downloads every OS- and CPU-eligible driver
+          to exercise the download path, whereas production further
+          filters on VMD hardware presence - the difference is stated
+          in the function's header comment.
+
+      (d) An output-shape-aligned helper whose implementation may
+          differ. Two functions produce output that is deliberately
+          aligned with production's equivalent so the harness's
+          computation matches, but their implementation is
+          harness-specific and not line-for-line:
+            - Get-ThisMachineProfile: aligned with production's
+              Get-HardwareObject in output fields, but a harness-
+              specific read-only implementation (documented in the
+              .SYNOPSIS).
+            - Get-HarnessPartitionRef: aligned with production's
+              Format-PartitionRef in disk/part/size/label form, but
+              uses the harness's Get-PartitionTypeName for the type
+              name rather than production's inline switch.
+          A change to (d) helpers does not by itself indicate a
+          mirror gap; a change that alters the output shape or field
+          names does, because those are what the DSI mirror depends
+          on.
+
+    Any deviation outside (a)-(d) is a mirror gap and should be treated
+    as a defect: it means the harness is no longer a reliable stand-in
+    for production. Two mirror-gap corrections have shipped: the
+    v49 patch 2 return-value fix (v30) and the Invoke-CabExtraction
+    7-Zip argument list (v31).
+
 .PARAMETER TestDir
     Working directory. Default C:\Temp\WinRETest.
 
@@ -52,7 +101,100 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 29
+    Version : 32
+
+    v32 changes vs v31:
+    1. Hardened Record's -Ok parameter with a default of $false. The
+       parameter previously had no default and was not marked
+       mandatory, so a future call site writing "Record <name> -State
+       <state>" without -Ok would have silently bound $Ok = $false.
+       The behavior was already correct (State is authoritative when
+       supplied), so the change is defensive only: it makes the
+       implicit default explicit. No observable behavior change; every
+       current call site supplies -Ok.
+    2. Added a design note to Get-DriverManifest's header explaining
+       why the function is called afresh by each of the four
+       interactive entry points that need the manifest (Options 1, 2,
+       9, and S) rather than caching the result. The choice is
+       deliberate: production fetches once in Main and passes the
+       manifest down, so there is no production function to mirror
+       that would hold a cache; and a cached manifest would hide a
+       mid-session network failure from a later entry point.
+       Documentation only.
+    3. Menu title and startup Rule bumped 31 -> 32.
+
+    v31 changes vs v30:
+    1. Documented the mirror-discipline principle in .DESCRIPTION. Every
+       mirrored function matches its production counterpart line-for-line
+       in logic and functional calls. The only permitted differences are:
+       (a) the log sink (Say vs Write-Log); (b) diagnostics layered
+       around the mirror (observational, no control-flow change); (c) an
+       explicit, documented functional difference; (d) an output-shape-
+       aligned helper (Get-ThisMachineProfile, Get-HarnessPartitionRef)
+       whose implementation may differ while its output shape stays
+       aligned with production's. Any deviation outside these four is a
+       mirror gap. Two mirror-gap corrections have shipped: the v49
+       patch 2 return-value fix (v30) and the Invoke-CabExtraction
+       7-Zip argument list (v31).
+    2. Corrected one mirror gap: Invoke-CabExtraction's 7-Zip argument
+       list was missing -w"$DestinationDir", which production passes.
+       Without it 7-Zip uses the process's current directory for
+       temporary files rather than the extraction destination. Not a
+       functional defect in practice (both invocations succeed), but a
+       genuine divergence from production that the newly-documented
+       mirror discipline names as a defect class.
+    3. Enriched the parser self-test's failure output for the two
+       regexes whose match target is English-language-dependent:
+       check 1 (reagentc status, matching "Enabled"/"Disabled") and
+       check 2b (reagentc Windows RE Version, anchored on the label
+       "Windows RE Version:"). On a non-match, each check now reports
+       the current OS locale and a two-cause hypothesis: structural
+       reagentc format drift, or a non-English OS whose reagentc emits
+       a translated status value or version label. In the check-1
+       localization case production returns Status='Unknown'; the
+       response depends on the machine state. If the machine needs
+       a rebuild, the v49 patch 2 fail-closed guard in
+       Ensure-AdequateRecoveryPartition refuses the destructive
+       sequence with a named deferral. Other paths (pending-reboot,
+       enable-only, loop-breaker) may fire first on a machine that
+       does not need a rebuild; none of them is a silent success on
+       Unknown status. In the check-2b case production logs version
+       as 'unknown', which is informational only. Both diagnostics
+       are observation-only; the recorded test result (FAIL) is
+       unchanged. Check 2 (location regex) matches the location value
+       itself, not a label, and is not language-dependent; no
+       enrichment was added there.
+    4. Menu title and startup Rule bumped 30 -> 31.
+
+    v30 changes vs v29:
+    1. Mirrored production v49 patch 2's Get-StorageControllerDevices
+       return-value fix. Production's v49 patch 2 changed
+       `return @($result)` to `return ,$result` so that an empty result
+       set survives as an empty array rather than being enumerated into
+       zero pipeline objects. The harness carried the same defect: the
+       caller in the Option 1 diagnostic mis-reported "INDETERMINATE
+       (PnP enumeration failed)" for a successfully-empty enumeration,
+       and the parser self-test at check 17 recorded FAIL instead of
+       the intended SKIP. Both sites now reach their intended branches.
+    2. Added a Say log line when a software/virtual device is filtered
+       out of the SCSIAdapter-class enumeration, matching production's
+       "skipping software/virtual storage device" log line. The
+       harness previously dropped filtered devices silently, so an
+       operator who ran Get-PnpDevice -Class SCSIAdapter themselves
+       and saw more devices than the harness displayed had no visible
+       explanation. The Say line surfaces the filter's effect.
+    3. NonInteractive exit-code effect. On a machine whose
+       SCSIAdapter-class enumeration legitimately returns zero
+       devices, check 17 now records SKIP instead of FAIL, so
+       -NonInteractive returns exit code 0 for that case. Before
+       the fix, the return-value defect collapsed the empty array
+       to $null, check 17 falsely recorded FAIL, and the FAIL
+       counted toward a non-zero exit code - contradicting the
+       v28 design intent recorded at the check ("SKIP when zero
+       devices are present: that is legitimate on some VMs"). A
+       CI consumer treating "any FAIL means something is broken"
+       now receives a truthful signal.
+    4. Menu title and startup Rule bumped 29 -> 30.
 
     v29 changes vs v28:
     1. Replaced the hardcoded $ProductionScriptVersion default
@@ -566,7 +708,7 @@ function Record {
     # authoritative, and OK is set to $true only for PASS.
     param(
         [string]$Test,
-        [bool]$Ok,
+        [bool]$Ok = $false,
         [string]$Detail = "",
         [ValidateSet("PASS","FAIL","SKIP")][string]$State = ""
     )
@@ -585,6 +727,15 @@ function Record {
 # Mirrors production v44 patch 6's manifest fetch loop: two attempts,
 # 2-second sleep between them, WARN log on each failure. Returns $null
 # if the manifest is unavailable after both attempts.
+#
+# Design note (harness-only, not a mirror gap): the manifest is fetched
+# afresh by each entry point that needs it (Options 1, 2, 9, and S).
+# There is deliberately no cross-call cache. Production fetches once in
+# Main and passes the manifest down; there is no production function to
+# mirror that would hold a cache. And a cached manifest would hide a
+# mid-session network failure from a later entry point. The cost is at
+# most three extra HTTP round-trips per session, each bounded by
+# -TimeoutSec 15 and the 2-attempt retry.
 function Get-DriverManifest {
     $manifest = $null
     for ($retry = 1; $retry -le 2; $retry++) {
@@ -834,7 +985,7 @@ function Invoke-CabExtraction {
     }
 
     try {
-        $proc = Start-Process -FilePath $7Zip -ArgumentList @("x", "`"$CabPath`"", "-o`"$DestinationDir`"", "-y") -Wait -PassThru -NoNewWindow -ErrorAction Stop
+        $proc = Start-Process -FilePath $7Zip -ArgumentList @("x", "`"$CabPath`"", "-o`"$DestinationDir`"", "-w`"$DestinationDir`"", "-y") -Wait -PassThru -NoNewWindow -ErrorAction Stop
         Say "7-Zip CAB extraction exit code: $($proc.ExitCode)"
         if ($proc.ExitCode -ne 0) {
             Say "7-Zip CAB extraction failed with exit code $($proc.ExitCode)" -Level WARN
@@ -1133,6 +1284,14 @@ function Get-RecoveryPartitions {
 # Returns $null when the enumeration itself fails (indeterminate) and
 # an empty array when the enumeration succeeds but finds no such
 # devices. The VMD diagnostic distinguishes the two cases.
+#
+# v30: uses `return ,$result` (unary comma) so an empty array survives
+# as a single object rather than being enumerated into zero pipeline
+# objects; the caller's $null-vs-empty distinction depends on this.
+# Software/virtual devices that are filtered out are logged via Say,
+# mirroring production's equivalent line, so an operator comparing the
+# harness's controller list against their own Get-PnpDevice query can
+# see why the counts differ.
 function Get-StorageControllerDevices {
     $devs = $null
     try {
@@ -1143,6 +1302,7 @@ function Get-StorageControllerDevices {
     $result = @()
     foreach ($dev in $devs) {
         if ($dev.InstanceId -match '^\{[0-9A-Fa-f-]+\}\\' -or $dev.InstanceId -match '^SWD\\') {
+            Say "Skipping software/virtual storage device '$($dev.FriendlyName)' (InstanceId $($dev.InstanceId))"
             continue
         }
         $ids = [System.Collections.Generic.List[string]]::new()
@@ -1167,7 +1327,18 @@ function Get-StorageControllerDevices {
             Ids          = @($ids)
         }
     }
-    return @($result)
+    # v49 patch 2 mirror: return the array as a single object using the
+    # unary comma operator so PowerShell does not enumerate an empty
+    # array into zero pipeline objects. A bare `return @($emptyArray)`
+    # emits nothing, which the caller receives as $null --
+    # indistinguishable from the "enumeration failed" return above.
+    # The caller's `if ($null -eq $controllers)` branch then fires for a
+    # successfully-empty enumeration, mis-reporting the state as
+    # INDETERMINATE in the Option 1 diagnostic and FAIL in the parser
+    # self-test at check 17, when the correct outcomes are "none
+    # present" and SKIP respectively. Production fixed this in v49
+    # patch 2 (see Get-StorageControllerDevices in WinRE.ps1).
+    return ,$result
 }
 
 # Render a partition as disk/part/size/label/type for diagnostic output.
@@ -2035,6 +2206,30 @@ function Show-SystemDiagnostic {
         Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
         Write-Host " reagentc status regex '$statusPattern' did not match any line" -ForegroundColor Gray
         Record "Parser: reagentc status" $false "no match"
+        # v31 localization hypothesis. Production's regex matches the
+        # English words "Enabled" and "Disabled". A non-match has two
+        # plausible causes that look identical from here: (a) the
+        # reagentc output format changed structurally, or (b) the OS
+        # runs a localized reagentc whose status value is a translated
+        # word rather than "Enabled"/"Disabled". In case (b) production
+        # returns Status='Unknown'; the response depends on the
+        # machine state. If a rebuild is needed, the v49 patch 2
+        # fail-closed guard in Ensure-AdequateRecoveryPartition
+        # refuses the destructive sequence with a named deferral.
+        # Other paths (pending-reboot, enable-only, loop-breaker) may
+        # fire first on a machine that does not need a rebuild; none
+        # of them is a silent success on Unknown status. The current
+        # OS locale below strengthens hypothesis (b) when it is not
+        # an English locale; the raw reagentc output printed earlier
+        # in this diagnostic is the ground truth either way.
+        $localeName = try { (Get-Culture).Name } catch { 'unknown' }
+        Write-Diag "          Locale: $localeName" "Yellow"
+        Write-Diag "          Two possible causes: structural reagentc format drift," "Yellow"
+        Write-Diag "          or a non-English OS. On a non-match production returns" "Yellow"
+        Write-Diag "          Status='Unknown'; if the machine needs a rebuild, the" "Yellow"
+        Write-Diag "          v49 patch 2 fail-closed guard in" "Yellow"
+        Write-Diag "          Ensure-AdequateRecoveryPartition defers before any" "Yellow"
+        Write-Diag "          partition change. See the raw reagentc output above." "Yellow"
     }
 
     # Check 2: reagentc /info location regex
@@ -2074,6 +2269,23 @@ function Show-SystemDiagnostic {
         Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
         Write-Host " reagentc version regex did not match any line (WinRE is Enabled)" -ForegroundColor Gray
         Record "Parser: reagentc version" $false "no match while Enabled"
+        # v31 localization hypothesis. The version regex is anchored on
+        # the English label "Windows RE Version:". A non-match while
+        # WinRE is Enabled has two plausible causes: (a) structural
+        # format drift, or (b) a non-English OS whose reagentc emits a
+        # translated version label. Production uses the same regex in
+        # Get-WinREState; a non-match there leaves the logged version
+        # as 'unknown', which is informational only (not a gate). But
+        # a FAIL here still indicates that the harness's mirror and
+        # production's parser have both stopped recognizing the label,
+        # which is worth investigating before running production.
+        $localeName = try { (Get-Culture).Name } catch { 'unknown' }
+        Write-Diag "          Locale: $localeName" "Yellow"
+        Write-Diag "          The version regex is anchored on the English label" "Yellow"
+        Write-Diag "          'Windows RE Version:'. Non-match suggests structural drift" "Yellow"
+        Write-Diag "          or a non-English OS with a translated label. Production" "Yellow"
+        Write-Diag "          logs version as 'unknown' on a non-match; informational," "Yellow"
+        Write-Diag "          not a gate. See the raw output above." "Yellow"
     } else {
         Write-Host "  " -NoNewline
         Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
@@ -2501,7 +2713,10 @@ function Show-SystemDiagnostic {
     # a change to the software-device filter would silently degrade the
     # harness's ability to show the operator which controllers exist.
     # SKIP when zero devices are present: that is legitimate on some VMs
-    # and does not indicate a broken enumeration.
+    # and does not indicate a broken enumeration. This branch became
+    # reachable in v30; before the return-value fix in
+    # Get-StorageControllerDevices, an empty result set collapsed to
+    # $null and the FAIL branch above fired instead.
     try {
         $scDevices = Get-StorageControllerDevices
         if ($null -eq $scDevices) {
@@ -3097,6 +3312,13 @@ function Test-LenovoPack {
     return $ok
 }
 
+# Test-VmdDrivers deliberately differs from production's required-driver
+# resolution. Production filters the manifest's drivers by both OS/CPU
+# eligibility AND VMD hardware presence, then downloads only the resolved
+# set. This test downloads every OS- and CPU-eligible driver regardless
+# of VMD presence, to exercise the download-and-extract path against a
+# wider set of packages than production would ever fetch. The runtime
+# Write-Diag note inside the function repeats this to the operator.
 function Test-VmdDrivers {
     Rule "VMD drivers (per manifest, filtered for this machine)"
     $m = Get-DriverManifest
@@ -3298,7 +3520,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v29)"
+    $titleContent = "WinRE Manager Test Harness (v32)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -3346,7 +3568,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v29"
+Rule "WinRE Manager test harness v32"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

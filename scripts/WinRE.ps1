@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 49.1 (v49 patch 1)
+    Version : 49.2 (v49 patch 2)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -223,15 +223,19 @@
                 which unconditional strip removed an OEM-injected
                 storage driver the manifest did not reinject.
 
-            - Never downgrade a storage driver (v49). If the source
-                image contains a storage-class driver whose version
-                is equal to or newer than the candidate the manifest
-                would inject for the same hardware, injection of that
-                candidate is refused. The conservative response in
-                v49 is to preserve the entire image and exit
-                EXIT_WARNING rather than attempt a partial normalize;
-                finer-grained coexistence handling awaits the
-                two-version experiment described in the known gaps.
+            - Never downgrade a storage driver (v49). After strip and
+                injection, the candidate image's storage-class drivers
+                are compared against the source image's pre-strip
+                drivers by INF basename. If any candidate version is
+                older than the source version, the injected changes
+                are discarded and the entire source is preserved. The
+                state file records the accepted foreign hash so
+                subsequent runs recognize the preserved source and
+                exit cleanly. The conservative response is to preserve
+                the entire image and exit EXIT_WARNING rather than
+                attempt a partial normalize; finer-grained coexistence
+                handling awaits the two-version experiment described
+                in the known gaps.
 
             - Storage-driver applicability is a pre-deployment gate
                 (v49). Before deploying a candidate WIM, every
@@ -294,6 +298,25 @@
                 run's registration step is logged as evidence that
                 the previous run was interrupted; the registration
                 step then overwrites it via -Force.
+
+            - Fail-closed principle (v49 patch 2). A safety check that
+                cannot complete is never interpreted as a safe result.
+                Every guard either positively confirms the safe state
+                or refuses. This principle was made explicit in v49
+                patch 2 after a review identified the same defect class
+                in four separate guards: the native-boot VHDX disk
+                enumeration (an enumeration failure produced an empty
+                result indistinguishable from "no other disks"); the
+                post-deletion partition verification (a thrown query,
+                suppressed by -ErrorAction SilentlyContinue, was read
+                as "partition deleted"); the WinRE status determination
+                (the "Enabled" branch was skipped when status was
+                Unknown); and the storage-controller enumeration
+                (return @($empty) emits nothing, so the caller received
+                $null and could not distinguish "successfully empty"
+                from "enumeration failed"). Each site was fixed to fail
+                closed independently, and the principle is stated here
+                so future guards are written against it from the start.
 
         Known gap:
             - The intervening-partition handling added in v48 has not been
@@ -398,6 +421,19 @@
         deleted the host physical disk's recovery partition when the
         running OS was natively booted from a VHDX. The correct
         response is the v49 native-VHDX fail-closed gate.
+      - A safety check that fails or returns indeterminate is treated
+        as unsafe, never as safe. This is the fail-open class. v49
+        patch 2 closed four instances of the same defect shape: VHDX
+        disk enumeration (an error suppressed by -ErrorAction
+        SilentlyContinue produced an empty result read as "no other
+        disks present"); post-deletion partition verification (a
+        thrown query was suppressed and read as "partition deleted");
+        WinRE status determination (the "Enabled" branch was skipped
+        when status was Unknown); and storage-controller enumeration
+        (return @($empty) emits nothing, so the caller received $null
+        and could not distinguish "successfully empty" from
+        "enumeration failed"). The principle: positively confirm the
+        safe state, or refuse.
 #>
 
 [CmdletBinding()]
@@ -431,7 +467,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 49
-$ScriptPatchLevel = "1"
+$ScriptPatchLevel = "2"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -871,9 +907,36 @@ function Test-NativeBootVirtualTopology {
     # OS disk is File Backed Virtual. Now determine whether any other
     # disk is on a physical bus. If yes: native-boot VHDX. If no:
     # hypervisor guest, safe.
+    #
+    # v49 patch 2: the unfiltered disk inventory is fail-closed. If the
+    # enumeration itself throws, the topology is indeterminate and the
+    # gate must refuse rather than interpret an empty result as "no
+    # other disks present." The prior code used
+    # -ErrorAction SilentlyContinue; an enumeration failure produced an
+    # empty $otherDisks array, which the loop skipped, which left both
+    # $hostBusTypes and $unreadableOtherDisks empty, which fell through
+    # to the "every other disk is virtual" verdict -- the safe
+    # hypervisor-guest classification that permits destructive
+    # partition operations. That is exactly the fail-open this gate
+    # exists to prevent: on a native-boot VHD/VHDX machine whose
+    # Storage-module enumeration transiently failed, the host physical
+    # disk would not have been detected, and its recovery partition
+    # would have been exposed to the stray-recovery cleanup.
+    #
+    # The function's other reads (OS partition, OS disk, OS disk
+    # BusType) were already fail-closed. This closes the last one.
     $hostBusTypes = @()
     $unreadableOtherDisks = @()
-    $otherDisks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Number -ne $osDisk.Number })
+    try {
+        $otherDisks = @(
+            Get-Disk -ErrorAction Stop |
+                Where-Object { $_.Number -ne $osDisk.Number }
+        )
+    } catch {
+        $result.IsNativeBootVirtual = $true
+        $result.Reason = "Could not enumerate all disks to verify the storage topology. The topology is indeterminate; refusing destructive partition operations. Error: $($_.Exception.Message)"
+        return $result
+    }
     foreach ($d in $otherDisks) {
         $bt = ''
         $btReadable = $true
@@ -2034,9 +2097,27 @@ function Remove-OrphanPartition {
         } catch { }
     }
     Start-Sleep 2
-    $stillThere = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
-    if ($stillThere) {
-        Write-Log "Orphan partition $DiskNumber/$PartitionNumber could not be removed after $Reason - manual cleanup may be required" -Level WARN
+    # v49 patch 2: positive deletion verification, same fail-closed
+    # pattern as the main deletion loop. Enumerate the disk with a
+    # terminating query; a query failure is treated as "not confirmed
+    # removed." Without this, a thrown enumeration error suppressed by
+    # -ErrorAction SilentlyContinue produced a $null result that was
+    # indistinguishable from "partition is gone," allowing the caller
+    # to believe the orphan was cleaned up (and to restore geometry
+    # via the subsequent Restore-OSPartitionSize call) when the
+    # partition may have survived.
+    $verificationOk = $false
+    $stillThere = $true
+    try {
+        $remainingParts = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction Stop)
+        $stillThere = (@($remainingParts | Where-Object { $_.PartitionNumber -eq $PartitionNumber }).Count -gt 0)
+        $verificationOk = $true
+    } catch {
+        Write-Log "Orphan-partition verification query failed for disk $DiskNumber part $PartitionNumber after $Reason : $_ - treating as not-confirmed-removed (fail closed)" -Level WARN
+    }
+    if (-not $verificationOk -or $stillThere) {
+        $failDesc = if (-not $verificationOk) { "could not be verified as removed (query failed)" } else { "could not be removed" }
+        Write-Log "Orphan partition $DiskNumber/$PartitionNumber $failDesc after $Reason - manual cleanup may be required" -Level WARN
         $Script:nonFatalWarning = $true
         $Script:GeometryRestoreFailed = $true
         return $false
@@ -2669,6 +2750,19 @@ function Ensure-AdequateRecoveryPartition {
     # partition, and route restoration cannot be attempted if a later
     # deletion fails. v47 silently fell through in this case.
     $stateBefore = Get-WinREState
+    # v49 patch 2: fail closed on an indeterminate WinRE status. The
+    # subsequent guards in this function are conditional on
+    # $stateBefore.Status being exactly "Enabled"; an Unknown status
+    # would skip both the location-resolution guard below and the
+    # reagentc /disable block further down, allowing the destructive
+    # sequence to proceed without the normal assurance that the
+    # active route has been identified and WinRE disabled. This guard
+    # runs before the pre-shrink, so on the refusal path no partition
+    # or WinRE changes have been made.
+    if ($stateBefore.Status -ne "Enabled" -and $stateBefore.Status -ne "Disabled") {
+        Write-Log "WinRE status could not be determined (reagentc /info reported '$($stateBefore.Status)'). Refusing to begin the destructive sequence without positive confirmation of the current WinRE state. No partition or WinRE changes were made." -Level ERROR
+        return @{ Status = "Deferred"; Reason = "WinRE status is indeterminate ($($stateBefore.Status))" }
+    }
     $activePartForInventory = $null
     if ($stateBefore.Location) {
         $activePartForInventory = Resolve-WinRELocationToPartition -Location $stateBefore.Location
@@ -2939,9 +3033,29 @@ function Ensure-AdequateRecoveryPartition {
             $dp | diskpart | Out-Null
         }
         Start-Sleep 2
-        $stillThere = Get-Partition -DiskNumber $rp.DiskNumber -PartitionNumber $rp.PartitionNumber -ErrorAction SilentlyContinue
-        if ($stillThere) {
-            Write-Log "FATAL: recovery partition $($rp.DiskNumber)/$($rp.PartitionNumber) could not be deleted" -Level ERROR
+        # v49 patch 2: positive deletion verification. Enumerate the
+        # target disk with a terminating query and confirm the target
+        # partition is not among the results. The prior form queried
+        # the specific partition with -ErrorAction SilentlyContinue;
+        # a thrown enumeration error was suppressed, produced a $null
+        # result, and was indistinguishable from the "partition is
+        # gone" case. Treating an indeterminate query as absence is
+        # the fail-open shape the fail-closed principle names. On any
+        # verification failure the deletion-failure branch below runs,
+        # which restores geometry and attempts route restoration
+        # before returning.
+        $verificationOk = $false
+        $stillThere = $true
+        try {
+            $remainingParts = @(Get-Partition -DiskNumber $rp.DiskNumber -ErrorAction Stop)
+            $stillThere = (@($remainingParts | Where-Object { $_.PartitionNumber -eq $rp.PartitionNumber }).Count -gt 0)
+            $verificationOk = $true
+        } catch {
+            Write-Log "Post-deletion verification query failed for disk $($rp.DiskNumber) part $($rp.PartitionNumber): $_ - treating as not-confirmed-deleted (fail closed)" -Level WARN
+        }
+        if (-not $verificationOk -or $stillThere) {
+            $failureDesc = if (-not $verificationOk) { "could not be verified as deleted (query failed)" } else { "could not be deleted" }
+            Write-Log "FATAL: recovery partition $($rp.DiskNumber)/$($rp.PartitionNumber) $failureDesc" -Level ERROR
             $sizeRestoreOk = Restore-OSPartitionSize -Reason "recovery partition deletion failure" -TargetSizeBytes $resizeTargetInitialSize `
                 -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber
             # WinRE was disabled earlier in this routine. The active
@@ -4860,46 +4974,6 @@ function Get-HardwareIdsFromInf {
     return @($ids)
 }
 
-# Extract the driver version from an INF [Version] section.
-# INF [Version] contains a DriverVer line:
-#     DriverVer=<MM/DD/YYYY>,<Version>
-# where <Version> is typically a four-part dotted version
-# (e.g. 20.2.8.1028). Returns the Version part, or $null when the line
-# is missing or unparseable.
-function Get-DriverVersionFromInf {
-    param([Parameter(Mandatory)][string]$InfPath)
-
-    $content = $null
-    try {
-        $content = Get-Content -LiteralPath $InfPath -ErrorAction Stop
-    } catch {
-        return $null
-    }
-    if (-not $content) { return $null }
-
-    $inVersionSection = $false
-    foreach ($rawLine in $content) {
-        if ($null -eq $rawLine) { continue }
-        $line = ([string]$rawLine).Trim()
-        if ($line.StartsWith(';')) { continue }
-        if ($line.StartsWith('[') -and $line.EndsWith(']')) {
-            $header = $line.Substring(1, $line.Length - 2).Trim()
-            $inVersionSection = ($header -ieq 'Version')
-            continue
-        }
-        if (-not $inVersionSection) { continue }
-        if ($line -match '^DriverVer\s*=\s*(.+)$') {
-            $dvValue = $Matches[1].Trim()
-            $commaIdx = $dvValue.IndexOf(',')
-            if ($commaIdx -ge 0) {
-                return $dvValue.Substring($commaIdx + 1).Trim()
-            }
-            return $dvValue
-        }
-    }
-    return $null
-}
-
 # --- Provenance marker ---
 
 # Read the provenance marker from the root of a mounted image. Returns
@@ -5093,7 +5167,19 @@ function Get-StorageControllerDevices {
             Ids          = @($ids)
         }
     }
-    return @($result)
+    # v49 patch 2: return the array as a single object using the unary
+    # comma operator so PowerShell does not enumerate an empty array
+    # into zero pipeline objects. A bare `return @($emptyArray)` emits
+    # nothing, which the caller receives as $null -- indistinguishable
+    # from the "enumeration failed" return above. The caller's
+    # `if ($null -eq $controllers)` branch then fires for a
+    # successfully-empty enumeration, causing the applicability check
+    # to reject the candidate image on a machine that has no
+    # SCSIAdapter-class devices (or whose controllers are all
+    # software/virtual and get filtered out). The comma operator
+    # preserves the empty array so the caller's `.Count -eq 0` branch
+    # handles it as the documented "nothing to verify" case.
+    return ,$result
 }
 
 # --- Storage-driver applicability check ---
@@ -5989,6 +6075,25 @@ function Invoke-RestoreAction {
 
     # ---- Disable WinRE (if enabled) ----
     $preRestoreState = Get-WinREState
+    # v49 patch 2: refuse on an indeterminate WinRE status. The prior
+    # code treated any non-Enabled status as "no disable step
+    # required," which includes the Unknown case. An Unknown status
+    # means the reagentc /info parser could not identify either
+    # "Enabled" or "Disabled"; proceeding without a disable step
+    # could leave WinRE enabled during a transactional replacement
+    # of its active WIM. Deferring is the correct response: the
+    # machine is not broken, the state is merely indeterminate, and
+    # the next run may resolve it.
+    if ($preRestoreState.Status -ne 'Enabled' -and $preRestoreState.Status -ne 'Disabled') {
+        Write-Log "Restore cannot proceed: WinRE status is indeterminate (reagentc /info reported '$($preRestoreState.Status)'). Refusing to replace the active WIM without positive confirmation of the current WinRE state." -Level ERROR
+        try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value "WinRE status is indeterminate ($($preRestoreState.Status))"
+        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Verify reagentc /info output; re-run when WinRE status is reportable.'
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No restore was performed.'
+        return $EXIT_WARNING
+    }
     if ($preRestoreState.Status -eq 'Enabled') {
         Write-Log "Disabling WinRE before restoring the backup WIM"
         $disOut = cmd /c "reagentc /disable 2>&1"

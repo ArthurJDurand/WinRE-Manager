@@ -37,7 +37,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v29.** The version history is:
+**Current version: v32.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -54,6 +54,9 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v27** mirrors production v48 patch 1: `$ProductionScriptVersion` default bumped 47 -> 48, `Get-LocalInputsId` mirror added and displayed in `Show-StateFileParity`, `Test-PlanAdjacencyReadOnly` extended to mirror v48's intervening-anchor handling, and `Architecture` added to `Get-ThisMachineProfile` and rendered with a red banner when the value is not `x64`. See "v27 changes" below.
 - **v28** mirrors production v49: `$ProductionScriptVersion` default bumped 48 -> 49, `Get-StorageControllerDevices` mirror added, a new VMD storage-controller diagnostic added to Option 1, and a new parser self-test check for the `Get-StorageControllerDevices` shape. See "v28 changes" below.
 - **v29** closes the version-drift family permanently: the hardcoded `$ProductionScriptVersion` default is replaced with `Get-ProductionScriptVersion`, which reads production's `$ScriptVersion` from the adjacent `WinRE.ps1` at call time. When the reader cannot resolve the value (production file absent or unparseable), `Get-DesiredStateId` returns `$null` and Option S records `State file parity` as SKIP rather than substituting a stale default. The `49` default is retained as an override path for the parser self-test (Check 15 passes `44` and `43` explicitly to prove version-sensitivity), but is no longer the load-bearing value on the live Option S path. See "v29 changes" below.
+- **v30** mirrors production v49 patch 2's `Get-StorageControllerDevices` return-value fix (`return ,$result` so an empty array survives as an empty array rather than collapsing to `$null`), adds a `Say` line when a software/virtual device is filtered out of the SCSIAdapter-class enumeration, and documents the NonInteractive exit-code effect on a machine with zero SCSIAdapter-class devices. See "v30 changes" below.
+- **v31** documents the mirror-discipline principle in the `.DESCRIPTION` block, corrects a mirror gap in `Invoke-CabExtraction`'s 7-Zip argument list (missing `-w"$DestinationDir"`), and enriches the parser self-test's failure output for the two English-language-dependent regexes (checks 1 and 2b) with the current OS locale and a two-cause hypothesis. See "v31 changes" below.
+- **v32** hardens `Record`'s `-Ok` parameter with an explicit default of `$false` (defensive only; every current call site supplies `-Ok`) and adds a design note to `Get-DriverManifest`'s header explaining why the function is called afresh by each of the four interactive entry points that need the manifest rather than caching the result. See "v32 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
@@ -68,6 +71,40 @@ Two changes, both closing the version-drift family that has required a manual `$
 **2. Menu title and startup `Rule` bumped 28 -> 29.**
 
 The parser self-test count remains at eighteen — v29 adds no new checks.
+
+### v32 changes
+
+Two changes, both defensive or documentation-only.
+
+**1. `Record`'s `-Ok` parameter hardened with an explicit default.** The parameter previously had no default and was not marked mandatory, so a future call site writing `Record <name> -State <state>` without `-Ok` would have silently bound `$Ok = $false`. The behavior was already correct (when `-State` is supplied it is authoritative), so the change is defensive only: it makes the implicit default explicit. No observable behavior change; every current call site supplies `-Ok`.
+
+**2. Design note added to `Get-DriverManifest`'s header.** Explains why the function is called afresh by each of the four interactive entry points that need the manifest (Options 1, 2, 9, and S) rather than caching the result across the session. The choice is deliberate: production fetches once in `Main` and passes the manifest down, so there is no production function to mirror that would hold a cache; and a cached manifest would hide a mid-session network failure from a later entry point. Documentation only.
+
+The parser self-test count remains at eighteen — v32 adds no new checks.
+
+### v31 changes
+
+Three changes, all downstream of the v31 cycle.
+
+**1. Mirror-discipline principle documented in `.DESCRIPTION`.** Every function named in the "Mirrored from production" list above, and every function under a "based on WinRE.ps1" section header, matches its production counterpart line-for-line in logic and functional calls. The only permitted differences are: (a) the log sink (`Say` vs `Write-Log`); (b) diagnostics layered around the mirror (observational, no control-flow change); (c) an explicit, documented functional difference; (d) an output-shape-aligned helper whose implementation may differ (`Get-ThisMachineProfile`, `Get-HarnessPartitionRef`). Any deviation outside these four is a mirror gap and is treated as a defect.
+
+**2. Mirror-gap correction: `Invoke-CabExtraction`'s 7-Zip argument list.** The harness was missing `-w"$DestinationDir"`, which production passes. Without it 7-Zip uses the process's current directory for temporary files rather than the extraction destination. Not a functional defect in practice, but a genuine divergence from production that the newly-documented mirror discipline names as a defect class.
+
+**3. Parser self-test failure output enriched for the two English-language-dependent regexes.** Check 1 (reagentc status, matching "Enabled"/"Disabled") and check 2b (reagentc Windows RE Version, anchored on the label "Windows RE Version:") now report the current OS locale and a two-cause hypothesis on a non-match: structural reagentc format drift, or a non-English OS. The recorded test result (FAIL) is unchanged; the added output is observational.
+
+The parser self-test count remains at eighteen — v31 adds no new checks.
+
+### v30 changes
+
+Three changes, all downstream of the v49 patch 2 cycle.
+
+**1. `Get-StorageControllerDevices` mirror corrected.** The harness's copy of the function carried the same defect as production's — `return @($result)` collapsed an empty result to `$null`, so the caller in the Option 1 diagnostic mis-reported "INDETERMINATE (PnP enumeration failed)" for a successfully-empty enumeration, and the parser self-test at check 17 recorded FAIL instead of the intended SKIP. Both sites now use `return ,$result` and reach their intended branches.
+
+**2. `Say` line for filtered software/virtual devices.** The harness now emits a `Say` line when a software or virtual storage device is filtered out of the SCSIAdapter-class enumeration, similar to production's equivalent line but without production's `Storage applicability: ` prefix. Previously the harness dropped filtered devices silently, so an operator comparing the harness's controller list against their own `Get-PnpDevice -Query` had no visible explanation for the difference.
+
+**3. NonInteractive exit-code effect documented.** On a machine whose SCSIAdapter-class enumeration legitimately returns zero devices, check 17 now records SKIP instead of FAIL, so `-NonInteractive` returns exit code 0 for that case.
+
+The parser self-test count remains at eighteen — v30 adds no new checks.
 
 ### v28 changes
 
@@ -480,7 +517,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Eighteen checks as of v28 (seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, and v27 did not change the count or the contents. v28 added the `Get-StorageControllerDevices` shape check. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
+Eighteen checks as of v28 (seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, v27, v29, v30, v31, and v32 did not change the count or the contents. v28 added the `Get-StorageControllerDevices` shape check. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|

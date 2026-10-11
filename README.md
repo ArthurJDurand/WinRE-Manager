@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207.x-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
-[![Version](https://img.shields.io/badge/version-v49%20patch%201-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v49%20patch%202-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ArthurJDurand)
 
@@ -29,16 +29,18 @@ The wrapper opens a menu grouped into sections:
 | Section | Option | What it does |
 |---|---|---|
 | **SAFETY** | **1 — Back up current WinRE** | Captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar metadata file. Non-destructive. Recommended before any live repair. |
+| | **C — Clean up old backups** | Lists every backup under the default backup location, shows per-backup size and total, and lets you delete one, several, or all. Requires typing `DELETE` to confirm. Shown only when at least one valid backup exists. *(v49 patch 2)* |
 | **DIAGNOSTICS** | **2 — Test harness** | Read-only checks of your Windows recovery setup. Does not intentionally modify WinRE, partitions, BitLocker, or Windows system state, but may create and remove its own test artifacts under its working directory. |
 | | **3 — Preview plan (DryRun)** | Shows what the repair would do without making partition or WinRE changes. |
 | | **4 — Show recent log** | Prints the tail of the last run's log and offers to open it in Notepad. |
 | **MAINTENANCE** | **5 — Install automatic maintenance** | Registers a SYSTEM scheduled task that runs WinRE Manager on a schedule. |
 | | **6 — Remove automatic maintenance** | Unregisters the scheduled task. The installed script copy is left in place. |
 | **REPAIR** | **7 — Run WinRE Manager** | Performs the repair after showing a warning and requiring you to type `RUN`. |
-| **RECOVERY** | **8 — Restore WinRE from backup** | Writes a previously captured WIM back to the active route. The menu's recovery row shows whether a backup exists at the default location; the restore screen accepts any directory containing `winre.wim` and `backup.json`, including one on an external disk. |
-| — | **Q — Quit** | Closes the wrapper. Q appears below the RECOVERY section, without its own section header. |
+| **RECOVERY** | **8 — Restore WinRE from backup** | Writes a previously captured WIM back to the active route. Shown only when at least one valid backup exists at the default location. The restore screen accepts any directory containing `winre.wim` and `backup.json`, including one on an external disk. *(v49 patch 2)* |
+| — | **U — Open releases page** | Opens the GitHub Releases page in the default browser. Shown only when a newer version is available (checked by the wrapper on first menu render and cached for 24 hours). Nothing is downloaded by the wrapper. *(v49 patch 2)* |
+| — | **Q — Quit** | Closes the wrapper. U and Q appear below the RECOVERY section, without their own section header. |
 
-The wrapper also shows a status line at the top of the menu with the current backup state and whether the automatic-maintenance task is installed.
+The wrapper also shows two status lines at the top of the menu: one with the current backup state and whether the automatic-maintenance task is installed, and one with the current version comparison against the project's GitHub repository (`Up to date`, `Update available: vX patch Y`, `Dev build (ahead of release)`, or `not available` when the check cannot complete).
 
 **First-run workflow.** On a machine that has never run WinRE Manager, take the options in order: **2** (test harness) to confirm the current state, **3** (preview) to see what a live run would do without doing any of it, **1** (backup) to capture the current WinRE before anything changes, then **7** only after the preview looks reasonable.
 
@@ -174,7 +176,7 @@ flowchart LR
     style Fallback fill:#9e6a03,stroke:#9e6a03,color:#fff
 ```
 
-- **Tier 1 — fast path.** Health checks pass, the state file matches the current inputs, the image is current, the partition is correct. The run completes without mounting the WIM, modifying the OS-disk partition layout, or issuing a `reagentc` mutation. Runtime is dominated by Windows' own CIM and PnP enumeration.
+- **Tier 1 — fast path.** Health checks pass, the state file matches the current inputs, the image is current, the partition is correct. The run completes without mounting the WIM, modifying the OS-disk partition layout, or issuing a `reagentc` mutation. Runtime is dominated by Windows' own CIM and PnP enumeration. A fast-path run that exits 0 and does nothing observable is working as designed, not failing silently. To inspect what the fast path observed, run `Test-WinRE.ps1` Option 1; Option S reports whether the state file's `DesiredStateId` matches the ID production would compute right now, and displays the `DeployedWinREMetadata` anchor that production's drift detector compares against.
 - **Tier 2 — enable-only.** The image is current, but WinRE is disabled. The script prepares the target recovery partition, re-registers the image, and calls `reagentc /enable`. No partition geometry change, no image rebuild, no C: shrink.
 - **Tier 3 — full update.** The image is missing, stale, or the recovery partition is wrong-sized. This is the only path that may perform destructive partition changes — and even here, every preparation completes before the first byte of the recovery partition is touched. If driver download fails, or OEM pack extraction produces zero INFs, or the base WIM cannot be verified, or the strip stage cannot prove zero third-party drivers remain, **the script stops before it touches the recovery partition** and the old recovery route stays intact. If the destructive attempt runs but cannot create a dedicated partition, the machine ends in **OS-fallback** instead: WinRE is functional on `C:\Recovery\WindowsRE`, the run exits `EXIT_WARNING` (code 2), and the state file records `UsedOSFallback = true` so subsequent runs preserve that outcome rather than re-attempting the same destructive sequence.
 
@@ -226,7 +228,7 @@ Full safety model — workspace selection, the pre-shrink window, the transactio
 - **A physical disk for the Windows volume — not a VHDX.** WinRE Manager refuses to run destructive operations on a machine whose Windows volume is on a native-boot VHDX (a virtual hard disk that the PC boots from directly, rather than a disk that only exists inside a virtual machine). The partition operations it performs are not reliable under that setup. This is uncommon — normal PCs boot from a physical disk — but the check exists so the manager never risks damaging a configuration it was not built for. If it applies to your machine, the run exits with a warning and changes nothing. *(v49)*
 - **Elevation or SYSTEM** for production. The read-only test harness runs unelevated when invoked directly; the recommended wrapper (`WinRE-Manager.cmd`) launches it elevated for complete query results. An unelevated launch of `WinRE.ps1` is refused in milliseconds with a clear `FATAL` message, rather than failing several minutes later at `Mount-WindowsImage`.
 - **7-Zip** at `C:\Program Files\7-Zip\7z.exe`. The script attempts installation via `winget` if missing.
-- **Internet access** to `gist.github.com`, `api.github.com`, `downloads.dell.com`, `ftp.ext.hp.com`, and `download.lenovo.com` for the first deployment on a fresh machine. On a machine whose state file is present and whose local safety checks pass, an outage does not prevent the run. All five external artifacts can be self-hosted; see **[Self-hosting](docs/self-hosting.md)**.
+- **Internet access** to `gist.github.com`, `api.github.com`, `raw.githubusercontent.com`, `downloads.dell.com`, `ftp.ext.hp.com`, and `download.lenovo.com` for the first deployment on a fresh machine. On a machine whose state file is present and whose local safety checks pass, an outage does not prevent the run. All five external artifacts can be self-hosted; see **[Self-hosting](docs/self-hosting.md)**.
 - **Windows is in a normal-running state.** The script defers on OOBE and Audit Mode.
 
 There is **no BitLocker precondition on the OS volume**. The policy is target-volume-based: the enable-only and dedicated-partition paths do not depend on C:'s BitLocker state. Only the OS-fallback route does, because there the target volume *is* C:.
@@ -248,6 +250,58 @@ powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1               # ele
 ```
 
 The examples above use Windows PowerShell 5.1 (`powershell.exe`). If you are running PowerShell 7, substitute `pwsh` for `powershell` — the script works with either, and the harness runs unelevated in both when invoked directly. The production script needs elevation or SYSTEM. (The recommended wrapper, `WinRE-Manager.cmd`, launches the harness elevated for complete query results — see the wrapper's menu description above.)
+
+### Reading a dry run
+
+`WinRE.ps1 -DryRun` walks the entire control flow and logs every decision it would make, but modifies nothing. Every log line is prefixed `[DRYRUN-<LEVEL>]` so a dry-run audit can be distinguished from a live run.
+
+Use it to:
+
+- Verify the machine will take the expected control-flow path (fast path, enable-only, full-update, or pending-reboot).
+- Verify the `DesiredStateId` computation.
+- Verify that the resolved OEM pack and VMD drivers are what you expect.
+- Verify that the classifier verdict matches what you believe the machine's state to be.
+- Verify that the Audit Mode guard would not defer a live run.
+- **Not** verify from a dry run whether the v45 pre-shrink deferral would fire on the next live run. The pre-shrink sequence runs inside Step 5; the full-update path's DryRun choke point exits before Step 1. To see the plan's decision, run the script without `-DryRun` on a disposable VM.
+- **Not** verify the v47 source-selection chain from a dry run. The source selection runs inside Step 2; the full-update path's DryRun choke point exits before Step 1. The dry-run plan lists the source-selection step but does not execute it.
+
+The dry run does not write to the state file, the checkpoint file, or the deferral marker. It does not modify partitions, BitLocker, drive letters, or WinRE registration. The guarantee is structural, not per-step:
+
+- **The program lock is skipped.** The lock is a state-modifying action (it opens the lock file with an exclusive handle), and DryRun's contract is to modify nothing. A dry run is safe to run concurrently with a live deployment, and the harness (`scripts\Test-WinRE.ps1`) is safe to run concurrently with either.
+- The Audit Mode guard is read-only and logs `Would defer ...` when the live run would defer.
+- The drive-letter assignment is skipped under DryRun; the caller works with the original `\\?\GLOBALROOT` path.
+- The **full-update pipeline** terminates at a single choke point at the top of the full-update path. It logs a plan for Steps 1 through 7 and exits cleanly without running `dism`, 7-Zip, or any file I/O in WorkDir.
+- The **destructive partition path** in `Ensure-AdequateRecoveryPartition` terminates at a single choke point immediately after the read-only pre-checks and pre-deletion inventory. It logs a plan for the delete, extend, shrink, create, format, and attribute steps. Under v45 patch 1 the plan summary is preceded by a `[DRY RUN] Plan is valid:` line that names the shrink, extend, and no-resize decision and the planned partition offset.
+- Every state-modifying helper handles DryRun internally: `Set-RecoveryPartitionReadyForWinRE`, `Invoke-ReagentcEnable`, `Write-WinREState`, `Write-PartitionDeferral`, `Clear-PartitionDeferral`, `Remove-StrayRecoveryPartitions`, `Remove-ItemIfExist`, `Restore-OSPartitionSize`, `Remove-OrphanPartition`, `Set-RecoveryPartitionAttributes`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, `Invoke-DriveLetterAssignment`, `Invoke-DriveLetterRemoval`, `Invoke-VendorExtraction`, `Invoke-CabExtraction`, `Invoke-OemPackDownload`, `Invoke-DismMount`, `Set-Checkpoint`, `New-DirectoryIfNotExists`.
+
+Two checks run under `-DryRun` in read-only form and log a `Would defer ...` or `Would refuse ...` line when the live run would not proceed:
+
+- **Audit Mode guard.** Reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` and `ImageState`. Logs `Would defer WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=...)` when the value is present and is not `IMAGE_STATE_COMPLETE`. Continues.
+- **Enable-failure loop-breaker.** Logs `Would refuse to retry reagentc /enable: ...` when the live run would fire the loop-breaker. Continues.
+
+A dry run that reports either of these is telling you the machine would be deferred on the next live run. Address the underlying condition before running the script for real.
+
+Under DryRun the OS-fallback BitLocker gate is not reached. The full-update pipeline's DryRun choke point sits above the Step 5 target-preparation block, so a dry run exits before the OS-fallback route is chosen and before the gate is evaluated. If the gate were reachable under DryRun, there is no `-DryRun` check on that exit and it would exit `EXIT_WARNING` unconditionally.
+
+The DryRun contract for the VMD-query-indeterminate deferral (v44 patch 6) is the same: the enumeration error is logged, and the run continues rather than exiting.
+
+Three startup gates that run under `-DryRun` do **not** have a read-only carve-out and exit unconditionally:
+
+- **The elevation guard (v48 patch 2).** An unelevated dry run exits `EXIT_FATAL` in milliseconds with the same FATAL log line as a live run. DryRun avoids destructive operations, but it still reads partition tables, calls `reagentc /info`, and reads DISM metadata; refusing unelevated DryRun keeps the behavior unambiguous.
+- **The architecture gate (v48 patch 1).** A dry run on a non-x64 host exits `EXIT_WARNING` with the same `Unsupported OS architecture` line as a live run. The architecture is a property of the machine, not of the run mode, so the refusal is unconditional.
+- **The native-boot VHDX gate (v49).** A dry run on a VHDX-boot host exits `EXIT_WARNING` with the same refusal line as a live run. The topology is a property of the machine, not of the run mode.
+
+The v48 `LocalInputsId` computation runs under `-DryRun` (the value is logged) but its comparison against the state file does not, because the offline fallback is not reachable in a dry run; the dry run always performs a live manifest fetch and never enters the offline path.
+
+None of the v49 pipeline refinements - the source-ownership classification, the never-downgrade storage-driver check, or the pre-deployment storage-applicability gate - run under `-DryRun`. They all sit inside Step 3, and the full-update path's DryRun choke point exits before Step 1. The dry-run plan's Step 3 line names them as planned steps but does not execute any of them. To see what a live run would decide on any of them, run the script without `-DryRun` on a disposable VM.
+
+The `-Action Backup` and `-Action Restore` actions do not expose a DryRun variant through the wrapper. They are standalone actions invoked by the wrapper's SAFETY options, not pipeline stages; the DryRun contract applies to the Repair path (the default action). Running `-Action Backup` without a `-DryRun` flag is the correct invocation; adding `-DryRun` to a backup action is undefined. If a wrapper menu path is unclear, check the wrapper's screen; the backup and restore options state what they will do.
+
+The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the reasons evaluated before the DryRun choke point are surfaced exactly as in a live run, while the reasons only reachable after the choke point or gated on `-not $Script:DryRun` are not. The surfaced group is the plan-rejection reasons (both the base set and the intervening-anchor validation failures), `partition geometry unavailable`, `C: volume could not be read for free-space check`, `post-shrink free space below minimum`, and `active WinRE location could not be resolved`. The unsurfaced group is the pre-shrink execution paths (`pre-shrink failed`, `pre-shrink verification failed`, `resize rounding reduced planned extent`), the two disable-failure paths, the deletion-failure path, and the registered-source-changed abort. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN] - Disk ...` lines.
+
+Under DryRun, the exact outcome of a live run is not predicted: `Invoke-ReagentcEnable` logs `[DRY RUN] Would call reagentc /enable ...` and returns `"ok"`, and the caller's `"ok"` branch runs normally. The operator reads the plan from the log rather than the exit code. A live run on the same machine may succeed, may require a reboot, or may take the registration-repair path, depending on what `reagentc /enable` actually reports.
+
+The v47 patch 1 race detector is **not** exercised under DryRun. A dry run does not capture a registered-source fingerprint (no `/disable` site is reached, so the SHA256 cost is not justified), and it does not log a recheck. The dry-run's value is in confirming the source-selection chain and the strip-stage plan; the race detector's value is only realized in a live run.
 
 ### Backup and restore actions
 
@@ -299,11 +353,13 @@ Full matrix and orchestration policy: **[Exit codes](docs/exit-codes.md)**.
 
 | Component | Version |
 |---|---|
-| `scripts/WinRE.ps1` | **v49 patch 1** |
-| `scripts/Test-WinRE.ps1` (read-only harness) | **v29** |
+| `scripts/WinRE.ps1` | **v49 patch 2** |
+| `scripts/Test-WinRE.ps1` (read-only harness) | **v32** |
 | `scripts/WinRE-Manager.cmd` | (interactive wrapper; rewritten in v49 patch 1) |
 
-**v49** is the largest single release since v48. It ships the ASUS-incident containment work (source-ownership classification, never-downgrade, storage-applicability gate), the native-boot VHDX fail-closed gate, backup and restore actions, human-readable narration and run-summary output, a temporary crash-recovery scheduled task, and a rewritten interactive wrapper. `ScriptVersion` moves from 48 to 49, so every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path. Full release notes, migration steps, and per-machine field evidence are in **[CHANGELOG.md](CHANGELOG.md)**.
+**v49 patch 1** is the largest single release since v48. It ships the ASUS-incident containment work (source-ownership classification, never-downgrade, storage-applicability gate), the native-boot VHDX fail-closed gate, backup and restore actions, human-readable narration and run-summary output, a temporary crash-recovery scheduled task, and a rewritten interactive wrapper. `ScriptVersion` moves from 48 to 49, so every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path.
+
+**v49 patch 2** is a safety-critical patch on top of v49 patch 1. It corrects four instances of the same defect class — fail-open safety checks that could interpret a failed query as a safe result — in the native-boot VHDX disk enumeration, the post-deletion partition verification, the WinRE status determination, and the storage-controller enumeration. It also ships two wrapper helper scripts (`Check-Update.ps1`, `Cleanup-Backups.ps1`), adds three conditionally-visible menu entries (`[8]` Restore and `[C]` Cleanup appear only when a backup exists; `[U]` appears only when an update is available), makes the wrapper's elevated launcher block until the elevated process exits so the menu state is always fresh on return, and uses a child-process runner for DryRun so its exit code is visible before the wrapper menu re-renders. `ScriptVersion` remains 49; `ScriptPatchLevel` moves from 1 to 2. No fleet-wide rebuild is forced. Full release notes, migration steps, and per-machine field evidence are in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Field-tested hardware
 
@@ -319,7 +375,7 @@ Selected results. Full per-machine evidence is in the [changelog](CHANGELOG.md).
 | Lenovo | IdeaPad 3 15IAU7 (MT 82RK) | Win11 26200 | v46 patch 1 — the machine that motivated the plan-clamp fix; after state-file reset, second full update reached DEDICATED |
 | (VM) | Hyper-V Win11 GPT / Win10 MBR | Win11 26300 / Win10 19045 | v45 patch 1 — destructive path verified on the Win11 GPT VM; MBR attribute-application path verified on the Win10 MBR VM (reuse path, not destructive MBR) |
 
-The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis). **v49-specific field verification is partially complete.** Verified on physical hardware (an ASUS PRIME H510M-D, 2026-10-09): the Ctrl+C resume-task preservation path — an interrupted run left the resume task in place, and the subsequent run detected the leftover task and re-registered it — the clean-completion removal of the resume task, and the harness's Option S DSI mirror producing a `DSI MATCH` against production on the same machine. The outstanding items are documented in the [v49 entry](CHANGELOG.md): provenance-marker survival across a real Windows Update servicing event; two-version `iastorvd.inf` coexistence; the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour on the outer-catch, `Invoke-RestoreAction`, hard-kill, and reboot cases; the wrapper's backup and restore options with paths containing spaces; and the wrapper's install / reinstall of the permanent maintenance task with the installed copy verified after the local script is renamed. The remaining coverage gaps — post-deletion failure on the intervening-anchor path, the v48 multi-intervening and surplus rejections, the transactional-WIM rollback branch, and the architecture gate on ARM64 — are documented in **[Testing](docs/testing.md)**.
+The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis), and three further machines on 2026-10-10 (a Lenovo ThinkCentre neo 50s Gen 5, an HP 250R 15.6 inch G10, and a Dell Precision 3581, all on Win 11 build 26300) ran the full v49 destructive pipeline end-to-end with exit code 0. **v49-specific field verification is partially complete.** Verified on physical hardware: the Ctrl+C resume-task preservation path and the clean-completion removal of the resume task, and the harness's Option S DSI mirror producing a `DSI MATCH` against production on the same machine (ASUS PRIME H510M-D, 2026-10-09); the `-Action Backup` mode capturing a byte-for-byte WIM copy with SHA256 verification and a sidecar (same machine, 2026-10-11); the `Foreign-With-Drivers` preserve branch on a real machine with a third-party driver present (ASUS Zenbook 14 UX3405MA, 2026-10-09); and the full destructive rebuild pipeline on three vendors (Lenovo 12XD with a `no-entry` OEM pack, HP 250R G10 with a SoftPaq extractor that returned exit code 1168 and 195 INFs, and Dell Precision 3581 with a Dell CAB and 64 injected drivers) on 2026-10-10. The outstanding items are documented in the [v49 patch 2 entry](CHANGELOG.md): provenance-marker survival across a real Windows Update servicing event; two-version `iastorvd.inf` coexistence; the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour on the outer-catch, `Invoke-RestoreAction`, hard-kill, and reboot cases; the four fail-open guard paths when their underlying queries actually fail; the wrapper's new conditional menu entries in both visible and hidden states; the wrapper's child-process DryRun runner; the wrapper's `-Wait` on the elevated launcher against a multi-minute backup; `Check-Update.ps1` on a network-unavailable host; `Cleanup-Backups.ps1` with a mixed valid/invalid backup set; and the update-check `[U]` browser launch on a machine where the remote version is newer than the local. The remaining coverage gaps — post-deletion failure on the intervening-anchor path, the v48 multi-intervening and surplus rejections, the transactional-WIM rollback branch, and the architecture gate on ARM64 — are documented in **[Testing](docs/testing.md)**.
 
 ## Documentation
 

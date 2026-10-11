@@ -78,7 +78,7 @@ The script uses two separate free-space thresholds, and it is important not to c
 (partition.SizeRemaining + existingWinreWimSize) >= (sourceWimSize + 250 MiB)
 ```
 
-The 250 MiB is Microsoft's documented WinRE servicing margin (KB5028997). It is the same threshold the OS's own pre-update WinRE check uses. There is no tolerance: 195 MiB is not accepted, and neither is any lower value. The v36 change that introduced a 5 MiB tolerance was reverted in v37 as undocumented and inconsistent with servicing requirements.
+The 250 MiB is Microsoft's documented WinRE servicing margin (KB5028997). It is the same threshold the OS's own pre-update WinRE check uses. There is no tolerance: 195 MiB is not accepted, and neither is any lower value.
 
 **New-partition sizing.** When the script creates a new recovery partition, the size is:
 
@@ -260,7 +260,7 @@ At this site the abort must first restore the resize target to its captured size
 
 This is a **race detector, not a lock**. Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update, so the microseconds between the re-read and the disable returning cannot be eliminated without moving work into the disable→enable window (which would violate Rule 3). The detector narrows the window from minutes to that residual. See [architecture.md](architecture.md) for the full rationale and [state-and-idempotency.md](state-and-idempotency.md) for the two capture states and their handling.
 
-### 3a. Pre-deletion resolver guard (v46 patch 2; v48 patch 1 moved this guard before the pre-shrink — the guard now runs before steps 2 and 3, and is presented here for continuity)
+### Pre-deletion resolver guard (v46 patch 2; v48 patch 1 moved this guard ahead of the pre-shrink — it fires between steps 1 and 2, and is presented here for continuity)
 
 Immediately after `$stateBefore` is captured, and before the pre-shrink and before `reagentc /disable`, the script resolves the previously-active WinRE location to a partition. If WinRE was `Enabled` before the disable and the location cannot be resolved, the function returns `Deferred` with `Reason = "active WinRE location could not be resolved"`. As of v48 patch 1, the same fail-closed treatment applies when reagentc reports **no registered location at all** (empty `Location`): the function returns `Deferred` with `Reason = "active WinRE location is empty"`. Both cases refuse to begin the destructive sequence rather than proceed with an unprotected active route; both fire ahead of the pre-shrink and ahead of `reagentc /disable`, so the machine is left with WinRE still `Enabled` and the old recovery partition intact.
 
@@ -276,7 +276,7 @@ The guard fires ahead of the pre-shrink and ahead of `reagentc /disable`, so a m
 
 For each type-coded recovery partition the plan marked as deletable — GPT GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27` — `Remove-Partition`. If that fails, retry with `diskpart delete partition override`.
 
-**Delete-active-last ordering.** The currently active recovery partition — the one `$stateBefore.Location` resolves to — is moved to the end of the deletion list. If a mid-loop failure occurs, the active partition is still present and `Restore-PreviousWinRERoute` can try to re-enable it. This ordering depends on the pre-deletion resolver guard (step 3a) having successfully identified the active partition; the guard exists precisely to ensure that ordering is meaningful.
+**Delete-active-last ordering.** The currently active recovery partition — the one `$stateBefore.Location` resolves to — is moved to the end of the deletion list. If a mid-loop failure occurs, the active partition is still present and `Restore-PreviousWinRERoute` can try to re-enable it. This ordering depends on the pre-deletion resolver guard having successfully identified the active partition; the guard exists precisely to ensure that ordering is meaningful.
 
 A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is **not** in this loop. The type-code gate is applied in `Get-PartitionPlan`, which builds the `$reclaimable` list from type-coded partitions only; `Ensure-AdequateRecoveryPartition` iterates over `$plan.DeletableRecoveryPartitions`, so a label-only match is filtered out before the deletion list is built and never reaches the loop. The equivalent log line exists on the non-OS-disk path — `Remove-StrayRecoveryPartitions` logs `Stray-recovery cleanup: skipping non-OS-disk partition <disk>/<part> - label matches recovery but type code does not` — but the OS-disk destructive path has no equivalent because the type-code gate has already filtered label-only matches out.
 
@@ -434,7 +434,7 @@ The marker deletion clears the suppression record; the state-file deletion clear
 
 When a recovery partition deletion fails after WinRE has already been disabled, the previous route's target is the only one that can be re-enabled. Three mechanisms protect that outcome:
 
-**Pre-deletion resolver guard (v46 patch 2).** Before any deletion begins, the script resolves the active WinRE location to a partition. If it cannot, the destructive sequence is refused — see step 3a above. Without the guard, the deletion loop would treat every deletable partition as non-active and could destroy the only partition the previous route could be re-enabled on.
+**Pre-deletion resolver guard (v46 patch 2).** Before any deletion begins, the script resolves the active WinRE location to a partition. If it cannot, the destructive sequence is refused — see the pre-deletion resolver guard section above. Without the guard, the deletion loop would treat every deletable partition as non-active and could destroy the only partition the previous route could be re-enabled on.
 
 **Delete-active-last ordering.** The active partition — resolved from `$stateBefore.Location` — is moved to the end of the deletion loop. If a mid-loop failure occurs, the active partition is still present.
 

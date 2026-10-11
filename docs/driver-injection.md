@@ -67,7 +67,7 @@ An indeterminate result means the correct driver set cannot be determined. The r
 
 Why fail-closed and not "assume absent": on a machine that genuinely has VMD hardware, guessing "absent" would select a driver set that omits the VMD package. The deployed WinRE would not be able to see the OS disk. That is the exact failure mode the v44 patch 1 `DesiredStateId` change was designed to prevent, and an empty device list from an errored enumeration is not evidence of absence. The cost of a deferral is one pipeline run; the cost of guessing wrong is a machine with a non-functional recovery environment. See [troubleshooting.md](troubleshooting.md) for the resolution.
 
-The harness's Option 1 diagnostic (v28) surfaces the machine's storage-controller enumeration alongside the manifest's VMD patterns — the latter is what drives VMD detection and, indirectly, which drivers are injected into the candidate; the applicability gate then reads the candidate image's INFs and the machine's present SCSIAdapter-class devices. See [testing.md](testing.md).
+The harness's Option 1 diagnostic surfaces the machine's storage-controller enumeration alongside the manifest's VMD patterns — the latter is what drives VMD detection and, indirectly, which drivers are injected into the candidate; the applicability gate then reads the candidate image's INFs and the machine's present SCSIAdapter-class devices. See [testing.md](testing.md).
 
 ## The OEM pack source
 
