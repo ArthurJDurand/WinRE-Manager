@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and general discussion
+    url: https://github.com/ArthurJDurand/WinRE-Manager/discussions
+    about: Ask a question, share a deployment, or discuss the design. Not for bug reports or security disclosures.
+  - name: Security vulnerability
+    url: https://github.com/ArthurJDurand/WinRE-Manager/security/advisories/new
+    about: Report a security issue privately. Do not file a public issue.
+  - name: Sponsor the project
+    url: https://github.com/sponsors/ArthurJDurand
+    about: Support ongoing maintenance.
+  - name: Documentation
+    url: https://ArthurJDurand.github.io/WinRE-Manager/
+    about: Read the docs before filing a bug.
