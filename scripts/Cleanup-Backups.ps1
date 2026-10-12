@@ -3,14 +3,37 @@
     Interactive backup cleanup for WinRE Manager.
 
 .DESCRIPTION
-    Lists every valid backup under a destination directory (a subdirectory
-    containing both winre.wim and backup.json), shows per-backup size and
-    the total, and lets the operator delete one, several, or all of them.
+    Lists every valid backup under every registered backup root, shows
+    per-backup size and the total, and lets the operator delete one,
+    several, or all of them.
+
+    Root discovery: the manager config file at
+        C:\ProgramData\OEM\WinRE-Manager\manager.json
+    carries the catalogue of backup roots used on this machine. Cleanup
+    reads that catalogue and enumerates every root, and always includes the
+    default C:\Backup\WindowsRE. If -BackupPath is supplied explicitly,
+    only that single root is used.
+
+    The manager config is trusted only when the directory containing it and
+    its immediate parent are owned by SYSTEM or Administrators. An
+    untrusted, unreadable, or unparseable config is treated as absent; the
+    default root is then used alone. This mirrors the trust model in
+    WinRE.ps1's Get-ManagerConfig.
 
     The listing is read-only until the operator confirms deletion with the
     word DELETE. Deletion uses Remove-Item -LiteralPath -Recurse -Force and
     is verified: each deletion is followed by a Test-Path that must return
     false for the operation to be considered successful.
+
+    Empty-directory cleanup after deletion:
+      - Timestamped subdirectories (leaf matches yyyy-MM-dd_HHmmss) that are
+        empty are removed.
+      - The default root C:\Backup\WindowsRE is removed if it is empty.
+      - C:\Backup is then removed if it too is empty.
+      - A drive root is never removed.
+      - A reparse point is never removed (removing it would remove the
+        link, not the target).
+      - A non-empty directory is never removed.
 
     Launched elevated by the wrapper's existing elevated-command mechanism.
 
@@ -18,19 +41,23 @@
     the state file, or anything outside the selected backup directories.
 
 .PARAMETER BackupPath
-    Root directory containing timestamped backup subdirectories.
-    Default: C:\Backup\WindowsRE.
+    Restrict cleanup to this single root directory. When omitted, every root
+    in the manager config catalogue is used, plus the default
+    C:\Backup\WindowsRE.
 
 .PARAMETER NonInteractive
-    When supplied, lists backups and exits without prompting.
+    When supplied, lists backups and exits without prompting or waiting.
 #>
 param(
-    [string]$BackupPath = 'C:\Backup\WindowsRE',
+    [string]$BackupPath,
     [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
+
+$DefaultBackupPath = 'C:\Backup\WindowsRE'
+$ManagerConfigPath = 'C:\ProgramData\OEM\WinRE-Manager\manager.json'
 
 function Format-Size {
     param([int64]$Bytes)
@@ -56,56 +83,173 @@ function Write-Wait {
     [void][System.Console]::ReadKey($true)
 }
 
+# Owner check for the manager config directory. Mirrors
+# WinRE.ps1's Test-DirectoryOwnedByTrustedPrincipal: SYSTEM or
+# Administrators only, fail-closed on any ambiguity. Duplicated here
+# because this script runs standalone and does not dot-source WinRE.ps1
+# (dot-sourcing would execute the production pipeline).
+function Test-DirectoryOwnedByTrustedPrincipal {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not $Path) { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch { return $false }
+    if (-not $acl -or -not $acl.Owner) { return $false }
+    $ownerSid = $null
+    try {
+        $ownerRef = $acl.Owner
+        if ($ownerRef -is [System.Security.Principal.SecurityIdentifier]) {
+            $ownerSid = $ownerRef.Value
+        } elseif ($ownerRef -is [System.Security.Principal.IdentityReference]) {
+            $ownerSid = $ownerRef.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } else {
+            $ownerStr = [string]$ownerRef
+            if ($ownerStr -match '^S-1-') {
+                $ownerSid = $ownerStr
+            } else {
+                $ownerSid = (New-Object System.Security.Principal.NTAccount($ownerStr)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+        }
+    } catch { return $false }
+    $trustedSids = @('S-1-5-18','S-1-5-32-544')
+    return ($trustedSids -contains $ownerSid)
+}
+
+# Resolve the set of roots to enumerate. If -BackupPath is supplied
+# explicitly, use only that. Otherwise read the manager config (owner-
+# checked) and always include the default root.
+function Get-BackupRoots {
+    param([string]$ExplicitPath)
+
+    if ($ExplicitPath) { return @($ExplicitPath) }
+
+    $roots = [System.Collections.Generic.List[string]]::new()
+    $seen  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    if (Test-Path -LiteralPath $ManagerConfigPath -PathType Leaf) {
+        $configDir = Split-Path $ManagerConfigPath -Parent
+        $ancestorsOk = $true
+        foreach ($anc in @($configDir, (Split-Path $configDir -Parent))) {
+            if (-not $anc) { continue }
+            if (-not (Test-Path -LiteralPath $anc -PathType Container)) { continue }
+            if (-not (Test-DirectoryOwnedByTrustedPrincipal -Path $anc)) { $ancestorsOk = $false; break }
+        }
+        if ($ancestorsOk) {
+            try {
+                $raw = Get-Content -LiteralPath $ManagerConfigPath -Raw -ErrorAction Stop
+                if ($raw) {
+                    $cfg = $raw | ConvertFrom-Json -ErrorAction Stop
+                    $catalogRoots = @()
+                    if ($cfg.BackupCatalog -and $cfg.BackupCatalog.Roots) {
+                        $catalogRoots = @($cfg.BackupCatalog.Roots | Where-Object { $_ } | ForEach-Object { [string]$_ })
+                    } elseif ($cfg.BackupRoots) {
+                        $catalogRoots = @($cfg.BackupRoots | Where-Object { $_ } | ForEach-Object { [string]$_ })
+                    }
+                    foreach ($r in $catalogRoots) {
+                        if ($r -and $seen.Add($r)) { [void]$roots.Add($r) }
+                    }
+                }
+            } catch {
+                Write-Host "Could not read the manager config at $ManagerConfigPath : $_" -ForegroundColor DarkGray
+            }
+        } else {
+            Write-Host "Manager config at $ManagerConfigPath has an untrusted ancestor; using the default backup root only." -ForegroundColor DarkGray
+        }
+    }
+
+    if ($seen.Add($DefaultBackupPath)) { [void]$roots.Add($DefaultBackupPath) }
+
+    return @($roots.ToArray())
+}
+
+# Remove a directory if and only if it exists, is a container, is not a
+# drive root, is not a reparse point, and is actually empty. Returns $true
+# only when a removal occurred. Every uncertainty returns $false (the
+# caller interprets that as "left in place").
+function Remove-IfEmptyDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not $Path) { return $false }
+    if ($Path -match '^[A-Za-z]:\\?$') { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    } catch { return $false }
+    try {
+        $inner = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    } catch { return $false }
+    if ($inner.Count -ne 0) { return $false }
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
 Write-Header 'WinRE Manager - Clean Up Backups'
 
-Write-Host "Backup location: $BackupPath" -ForegroundColor Gray
-Write-Host 'A valid backup contains both winre.wim and backup.json.' -ForegroundColor DarkGray
-Write-Host ''
-
-if (-not (Test-Path -LiteralPath $BackupPath -PathType Container)) {
-    Write-Host "No backup directory found at $BackupPath" -ForegroundColor Yellow
-    Write-Wait
+$roots = Get-BackupRoots -ExplicitPath $BackupPath
+if (-not $roots -or $roots.Count -eq 0) {
+    Write-Host 'No backup roots to inspect.' -ForegroundColor Yellow
+    if (-not $NonInteractive) { Write-Wait }
     exit 0
 }
 
-try {
-    $subdirs = @(Get-ChildItem -LiteralPath $BackupPath -Directory -ErrorAction Stop)
-} catch {
-    Write-Host "Could not enumerate $BackupPath : $_" -ForegroundColor Red
-    Write-Wait
-    exit 1
-}
+Write-Host 'Backup roots:' -ForegroundColor Gray
+foreach ($r in $roots) { Write-Host "  $r" -ForegroundColor Gray }
+Write-Host 'A valid backup contains both winre.wim and backup.json.' -ForegroundColor DarkGray
+Write-Host ''
 
+# Enumerate backups across all roots.
 $backups = @()
-foreach ($dir in $subdirs) {
-    $wim  = Join-Path $dir.FullName 'winre.wim'
-    $json = Join-Path $dir.FullName 'backup.json'
-    if (-not (Test-Path -LiteralPath $wim  -PathType Leaf)) { continue }
-    if (-not (Test-Path -LiteralPath $json -PathType Leaf)) { continue }
-
-    $size = 0
-    try { $size = (Get-Item -LiteralPath $wim -Force -ErrorAction Stop).Length } catch { }
-
-    $sidecar = $null
+foreach ($root in $roots) {
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
     try {
-        $sidecar = Get-Content -LiteralPath $json -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    } catch { }
+        $subdirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction Stop)
+    } catch {
+        Write-Host "Could not enumerate $root : $_" -ForegroundColor Red
+        continue
+    }
+    foreach ($dir in $subdirs) {
+        $wim  = Join-Path $dir.FullName 'winre.wim'
+        $json = Join-Path $dir.FullName 'backup.json'
+        if (-not (Test-Path -LiteralPath $wim  -PathType Leaf)) { continue }
+        if (-not (Test-Path -LiteralPath $json -PathType Leaf)) { continue }
 
-    $backups += [PSCustomObject]@{
-        Name         = $dir.Name
-        Path         = $dir.FullName
-        WimSizeBytes = $size
-        WimSize      = Format-Size $size
-        ManagerVer   = if ($sidecar -and $sidecar.ManagerVersion)  { $sidecar.ManagerVersion }  else { $null }
-        BackupTime   = if ($sidecar -and $sidecar.BackupTime)      { $sidecar.BackupTime }      else { $null }
-        SourceHash   = if ($sidecar -and $sidecar.SourceWimHash)   { $sidecar.SourceWimHash }   else { $null }
+        $size = 0
+        try { $size = (Get-Item -LiteralPath $wim -Force -ErrorAction Stop).Length } catch { }
+
+        $sidecar = $null
+        try {
+            $sidecar = Get-Content -LiteralPath $json -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch { }
+
+        $backups += [PSCustomObject]@{
+            Name         = $dir.Name
+            Path         = $dir.FullName
+            Root         = $root
+            WimSizeBytes = $size
+            WimSize      = Format-Size $size
+            ManagerVer   = if ($sidecar -and $sidecar.ManagerVersion)  { $sidecar.ManagerVersion }  else { $null }
+            BackupTime   = if ($sidecar -and $sidecar.BackupTime)      { $sidecar.BackupTime }      else { $null }
+            SourceHash   = if ($sidecar -and $sidecar.SourceWimHash)   { $sidecar.SourceWimHash }   else { $null }
+        }
     }
 }
 
 if ($backups.Count -eq 0) {
     Write-Host 'No valid backups found.' -ForegroundColor Green
     Write-Host 'A valid backup contains both winre.wim and backup.json.' -ForegroundColor DarkGray
-    Write-Wait
+    # Even with no backups to delete, empty default directories left over
+    # from a previous run are cleaned up here.
+    if (Remove-IfEmptyDirectory -Path $DefaultBackupPath) {
+        Write-Host ("  Removed empty default root: {0}" -f $DefaultBackupPath) -ForegroundColor DarkGray
+    }
+    $defaultParent = $null
+    try { $defaultParent = Split-Path -Path $DefaultBackupPath -Parent } catch { }
+    if (Remove-IfEmptyDirectory -Path $defaultParent) {
+        Write-Host ("  Removed empty backup parent: {0}" -f $defaultParent) -ForegroundColor DarkGray
+    }
+    if (-not $NonInteractive) { Write-Wait }
     exit 0
 }
 
@@ -120,6 +264,7 @@ foreach ($b in $backups) {
     Write-Host ("  [{0,2}] " -f $idx) -NoNewline -ForegroundColor Cyan
     Write-Host $b.Name              -NoNewline -ForegroundColor White
     Write-Host ("   {0}" -f $b.WimSize) -NoNewline -ForegroundColor Gray
+    Write-Host ("   " + $b.Root) -NoNewline -ForegroundColor DarkGray
     if ($b.ManagerVer) {
         Write-Host ("   ({0})" -f $b.ManagerVer) -ForegroundColor DarkGray
     } else {
@@ -132,7 +277,6 @@ Write-Host ''
 
 if ($NonInteractive) {
     Write-Host 'Non-interactive mode: listing only.' -ForegroundColor DarkGray
-    Write-Wait
     exit 0
 }
 
@@ -213,6 +357,39 @@ foreach ($b in $toDelete) {
         Write-Host ("  Could not delete {0}: {1}" -f $b.Name, $_.Exception.Message) -ForegroundColor Red
         $failCount++
     }
+}
+
+# Empty-directory cleanup.
+#
+# 1. Timestamped subdirectories under each root that are empty are removed.
+#    Non-timestamped directories are left alone even if empty, because they
+#    may have been created by the operator rather than by a backup run.
+#
+# 2. The default hierarchy is walked bottom-up: C:\Backup\WindowsRE is
+#    removed if empty, then C:\Backup is removed if it too is empty.
+#    Both steps are no-ops if the directory is not empty, does not exist,
+#    is a drive root, or is a reparse point.
+$timestampLeafPattern = '^\d{4}-\d{2}-\d{2}_\d{6}$'
+foreach ($root in $roots) {
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+    try {
+        $subdirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction Stop)
+    } catch { continue }
+    foreach ($dir in $subdirs) {
+        if ($dir.Name -notmatch $timestampLeafPattern) { continue }
+        if (Remove-IfEmptyDirectory -Path $dir.FullName) {
+            Write-Host ("  Removed empty backup directory: {0}" -f $dir.FullName) -ForegroundColor DarkGray
+        }
+    }
+}
+
+if (Remove-IfEmptyDirectory -Path $DefaultBackupPath) {
+    Write-Host ("  Removed empty default root: {0}" -f $DefaultBackupPath) -ForegroundColor DarkGray
+}
+$defaultParent = $null
+try { $defaultParent = Split-Path -Path $DefaultBackupPath -Parent } catch { }
+if (Remove-IfEmptyDirectory -Path $defaultParent) {
+    Write-Host ("  Removed empty backup parent: {0}" -f $defaultParent) -ForegroundColor DarkGray
 }
 
 Write-Host ''

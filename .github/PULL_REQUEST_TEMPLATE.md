@@ -45,6 +45,16 @@ The v49 release added a family of gates that run **before** the destructive sequ
 - The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its two independent persist signals — the `$Script:ResumeTaskShouldPersist` flag, set by the outer catch and by `Invoke-RestoreAction`'s two mid-transformation failure paths, and the `[WinRECancelKeyProbe]::ShouldPersist` static field, set by the compiled Ctrl+C delegate — plus its two finally-never-runs interruption classes, its clean-completion removal, and its `$PSCommandPath` guard).
 - The **stable install location** for the permanent maintenance task (`C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1`; the SHA256-verify-before-register step).
 
+If your PR touches any of the v50 patch 1 additions below, say so explicitly and include the test result that demonstrates the change behaves as claimed:
+
+- The **`manager.json` config file** and its helpers (`Get-ManagerConfig`, `Set-ManagerConfig`, `Add-ManagerBackupRoot`).
+- The **manager config ownership gate** (two-level SYSTEM/Administrators ownership check on both read and write, fail-closed on ambiguity).
+- The **resume-task protected-path guard** (the check that refuses to register the SYSTEM crash-recovery task when the script directory grants write-capable rights to a non-admin principal).
+- The **destination-volume free-space preflight on backup** (100 MiB margin, before destination directory creation).
+- The **UNC resolution for mapped-drive backup paths** in `Add-ManagerBackupRoot`.
+- The **empty-parent cleanup** in `Remove-EmptyWorkspaceParent` and the parallel logic in `Cleanup-Backups.ps1`.
+- The **aggregate summary line** emitted by `Remove-StrayRecoveryPartitions`.
+
 A change to any of these that is not covered by an existing field case still requires a `CHANGELOG.md` entry per the Changelog section above.
 
 ### If this PR touches the destructive sequence
@@ -55,7 +65,7 @@ The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPar
 - [ ] I have named **which of the four design invariants this PR strengthens**.
 - [ ] I confirm this PR **does not weaken any of rules 1–3**.
 - [ ] I have included the **test result that demonstrates the change behaves as claimed** — or, if the required test is the post-deletion failure test described in [`docs/testing.md`](docs/testing.md), I have said so explicitly and noted that this PR is **blocked until that test runs and its result is recorded**.
-- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v49.
+- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v49 patch 2. v50 patch 1 does not touch the destructive sequence and did not modify the gate.
 
 ## Invariants
 

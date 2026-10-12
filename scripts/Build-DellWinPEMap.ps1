@@ -10,7 +10,7 @@ $ErrorActionPreference = "Continue"
 $ProgressPreference    = "SilentlyContinue"
 
 # Output directory: prefer ./Maps next to this script, fall back to C:\Temp\Maps.
-# Created here so the Set-Content at the end of the run cannot fail on a missing parent.
+# Created here so the JSON write at the end of the run cannot fail on a missing parent.
 $MapsDir = $null
 if ($PSScriptRoot) {
     $candidate = Join-Path $PSScriptRoot "Maps"
@@ -186,6 +186,6 @@ $output = @{
     Packs     = $jsonPacks
 }
 
-$output | ConvertTo-Json -Depth 5 | Set-Content -Path $OutputFile -Encoding UTF8
+[System.IO.File]::WriteAllText($OutputFile, ($output | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
 Write-T "Map saved: $OutputFile" -L SUCCESS
 Write-T "Upload to your Dell map gist and set `$DellWinPEMapUrl in WinRE.ps1" -L INFO

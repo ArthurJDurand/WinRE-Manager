@@ -214,4 +214,4 @@ None of these are part of the shipped design. Adding them is a fork-level change
 - [driver-injection.md](driver-injection.md) — the manifest and map schemas that a self-hosted deployment must conform to, including the v49 source-ownership classification, the never-downgrade check, and the pre-deployment storage-applicability gate.
 - [state-and-idempotency.md](state-and-idempotency.md) — the `DesiredStateId` inputs, including which of the artifacts above are DSI inputs and which are not, and the v49 pipeline refinements that the `ScriptVersion` bump converges the fleet onto.
 - [testing.md](testing.md) — how to validate a self-hosted configuration with the read-only harness before pushing it to a fleet, including the v28 storage-controller enumeration that surfaces the applicability gate's inputs.
-- [CHANGELOG.md](../CHANGELOG.md) — the v49 entry's `Migration Note` describes the fleet behaviour on the v48 → v49 boundary and the rollback procedure.
+- [CHANGELOG.md](../CHANGELOG.md) — the `Migration Note` sections in the v49 and v50 entries describe the fleet behaviour on the v48 → v49 and v49 → v50 boundaries, and the corresponding rollback procedures.

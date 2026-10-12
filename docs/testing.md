@@ -37,7 +37,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v32.** The version history is:
+**Current version: v35.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -57,6 +57,9 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v30** mirrors production v49 patch 2's `Get-StorageControllerDevices` return-value fix (`return ,$result` so an empty array survives as an empty array rather than collapsing to `$null`), adds a `Say` line when a software/virtual device is filtered out of the SCSIAdapter-class enumeration, and documents the NonInteractive exit-code effect on a machine with zero SCSIAdapter-class devices. See "v30 changes" below.
 - **v31** documents the mirror-discipline principle in the `.DESCRIPTION` block, corrects a mirror gap in `Invoke-CabExtraction`'s 7-Zip argument list (missing `-w"$DestinationDir"`), and enriches the parser self-test's failure output for the two English-language-dependent regexes (checks 1 and 2b) with the current OS locale and a two-cause hypothesis. See "v31 changes" below.
 - **v32** hardens `Record`'s `-Ok` parameter with an explicit default of `$false` (defensive only; every current call site supplies `-Ok`) and adds a design note to `Get-DriverManifest`'s header explaining why the function is called afresh by each of the four interactive entry points that need the manifest rather than caching the result. See "v32 changes" below.
+- **v33** adds two source-level mirror-binding assertions to the parser self-test (checks 18 and 19). Check 18 verifies that production's `Test-NativeBootVirtualTopology` retains the v49 patch 2 fail-closed shape; check 19 verifies that production's `Get-StorageControllerDevices` retains the unary-comma return and both software-device filter regexes that check 17's harness-side test depends on. Both read the adjacent `WinRE.ps1` and SKIP when it is not present. See "v33 changes" below.
+- **v34** adds `Remove-EmptyTestParent`, mirroring production's v50 `Remove-EmptyWorkspaceParent` invariant. After `Invoke-HarnessCleanup` removes `$TestDir`, the parent directory (typically `C:\Temp` for the default path) is checked and removed if and only if its leaf name is exactly `Temp`, it is completely empty, and it is not a drive root. See "v34 changes" below.
+- **v35** inverts the interactive cleanup prompt. The v34 form (`Keep test artifacts in $TestDir → (y/N)` with y=keep) was the reverse of what most operators read, and an operator who answered `y` expecting deletion got the opposite. The prompt now reads `Delete test artifacts from $TestDir → (Y/n)` with `y`=delete (default) and `n`=keep. See "v35 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
@@ -71,6 +74,40 @@ Two changes, both closing the version-drift family that has required a manual `$
 **2. Menu title and startup `Rule` bumped 28 -> 29.**
 
 The parser self-test count remains at eighteen — v29 adds no new checks.
+
+### v35 changes
+
+Two changes, both affecting the interactive cleanup path.
+
+**1. Interactive cleanup prompt inverted.** v34 shipped the cleanup prompt as `Keep test artifacts in $TestDir → (y/N)` with `y`=keep and `N`=delete. The `y`-as-keep semantics were the reverse of what most operators read ("y to cleanup"), and an operator who answered `y` expecting deletion got the opposite: the keep branch returned before `Remove-EmptyTestParent` ran, so neither `$TestDir` nor its parent was removed. The prompt now reads `Delete test artifacts from $TestDir → (Y/n)` with `y`=delete (default) and `n`=keep. Empty input still deletes. The `-Keep` switch still short-circuits to keep, and the pre-existing-non-empty refusal is unchanged.
+
+**2. Menu title and startup `Rule` bumped 34 -> 35.**
+
+The parser self-test count remains at twenty — v35 adds no new checks.
+
+### v34 changes
+
+One change, mirroring production's v50 `Remove-EmptyWorkspaceParent` invariant.
+
+**1. Added `Remove-EmptyTestParent`.** After `Invoke-HarnessCleanup` removes `$TestDir`, the parent directory (typically `C:\Temp` for the default path) is checked and removed if and only if its leaf name is exactly `Temp`, it is completely empty, and it is not a drive root. Before this change the harness removed `$TestDir` recursively but left an empty `C:\Temp` behind on a machine where the harness had created `C:\Temp` itself. Removal is attempted via `Remove-Item` with a `[System.IO.Directory]::Delete` fallback for provider-layer disagreements, then verified: if the directory still exists afterward (typically because another process holds a handle, or because the invoking session's working directory is inside it), a WARN is logged and the directory is left in place. A user-supplied `-TestDir` whose parent is not named `Temp` (for example `C:\Users\Me\Desktop`) is therefore never touched.
+
+**2. Menu title and startup `Rule` bumped 33 -> 34.**
+
+The parser self-test count remains at twenty — v34 adds no new checks.
+
+### v33 changes
+
+One change, adding two source-level mirror-binding assertions to the parser self-test.
+
+**1. Added two source-level mirror-binding assertions (checks 18 and 19).**
+
+- **Check 18** verifies that production's `Test-NativeBootVirtualTopology` retains the v49 patch 2 fail-closed shape: the unfiltered `Get-Disk` enumeration uses `-ErrorAction Stop`, the gate sets `IsNativeBootVirtual = $true` on the corresponding catch path, and the indeterminate-topology reason text is present.
+- **Check 19** verifies that production's `Get-StorageControllerDevices` retains the mirror contract that check 17's harness-side test depends on: the unary-comma return (`return ,$result`) and both software-device filter regexes (`{GUID}\` and `SWD\`).
+- Both checks read the adjacent `WinRE.ps1` and SKIP when it is not present. Neither is a mirror; they are invariant-level guards against the mirror-drift class the `.DESCRIPTION` names as a defect.
+
+**2. Menu title and startup `Rule` bumped 32 -> 33.**
+
+The parser self-test count moves from eighteen to twenty with the two new checks.
 
 ### v32 changes
 
@@ -264,9 +301,13 @@ The output format is unchanged from v16 in every respect except the new colour t
 
 The default working directory is `C:\Temp\WinRETest`. All downloads and extractions go there.
 
-**Cleanup guard (v18).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
+**Cleanup guard (v18; extended in v34 and v35).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
 
-## Output style (v16; extended in v17 through v28, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, and v28's VMD storage-controller diagnostic section as the departures)
+As of v34, when the harness does remove `$TestDir`, it also removes the parent directory (typically `C:\Temp` for the default path) if and only if its leaf name is exactly `Temp`, it is completely empty, and it is not a drive root — mirroring production's v50 `Remove-EmptyWorkspaceParent` invariant. A user-supplied `-TestDir` whose parent is not named `Temp` (for example `C:\Users\Me\Desktop`) is therefore never touched.
+
+As of v35, the interactive cleanup prompt reads `Delete test artifacts from $TestDir → (Y/n)` with `y`=delete (default) and `n`=keep. The v34 form was `Keep test artifacts in $TestDir → (y/N)` with `y`=keep, and operators read "y to cleanup" and answered `y` expecting deletion — the keep branch returned before `Remove-EmptyTestParent` ran. Empty input still deletes. The `-Keep` switch still short-circuits to keep, and the pre-existing-non-empty refusal is unchanged.
+
+## Output style (v16; extended in v17 through v35, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, v28's VMD storage-controller diagnostic section, v33's two source-level mirror-binding assertions in the parser self-test, v34's empty-test-parent cleanup, and v35's inverted cleanup prompt as the departures)
 
 As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. The rest of the output format is unchanged from v16.
 
@@ -517,7 +558,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Eighteen checks as of v28 (seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, v27, v29, v30, v31, and v32 did not change the count or the contents. v28 added the `Get-StorageControllerDevices` shape check. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
+Twenty checks as of v35 (eighteen as of v28, seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, v27, v29, v30, v31, v32, and v34 did not change the count or the contents. v28 added the `Get-StorageControllerDevices` shape check; v33 added the two source-level mirror-binding assertions (checks 18 and 19). Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -539,6 +580,8 @@ Eighteen checks as of v28 (seventeen as of v25, sixteen as of v22, fifteen as of
 | 15 | DesiredStateId | 64-hex, deterministic across repeat calls, VMD-sensitive, ScriptVersion-sensitive. | v18 |
 | 16 | Compare-WimServicingMetadata | Eight regression cases covering the DISM servicing-metadata comparison rules. | v25 |
 | 17 | Get-StorageControllerDevices shape | Handles the enumeration's three outcomes: a NULL return (indeterminate PnP enumeration) records FAIL, an empty array records SKIP, and a populated array is verified to have objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. | v28 |
+| 18 | VHDX gate fail-closed | Production's `Test-NativeBootVirtualTopology` retains the v49 patch 2 fail-closed shape: the unfiltered `Get-Disk` enumeration uses `-ErrorAction Stop`, the gate sets `IsNativeBootVirtual = $true` on the corresponding catch path, and the indeterminate-topology reason text is present. SKIP when `WinRE.ps1` is not adjacent. | v33 |
+| 19 | StorageControllerDevices mirror binding | Production's `Get-StorageControllerDevices` retains the unary-comma return (`return ,$result`) and both software-device filter regexes (`{GUID}\` and `SWD\`). SKIP when `WinRE.ps1` is not adjacent. | v33 |
 
 ### What a FAIL means
 
@@ -555,6 +598,8 @@ The most likely FAILs and their implications:
 - **Check 14 (CPU generation parser).** A CPU string no longer parses to the expected generation. `DesiredStateId` will contain a different `CPU=` value than intended, which will force a rebuild on machines whose state file was written under the previous parse. Investigate the raw CPU string (the diagnostic's Hardware section reports it) and extend the parser.
 - **Check 15 (DesiredStateId).** The DSI recipe has changed silently — a field dropped from the hash, or the output is no longer deterministic. This is a production correctness bug; do not deploy production to a fleet until the recipe is fixed.
 - **Check 17 (Get-StorageControllerDevices shape).** One of: the enumeration returned NULL (a transient PnP failure — re-run or investigate PnP service state); the `Get-PnpDevice` result shape has changed; the software-device filter (`{GUID}\` and `SWD\` prefixes) has stopped matching; or an unexpected exception was thrown during the enumeration. Production v49's storage-applicability gate uses this enumeration to decide whether the candidate image contains an INF matching the machine's controller; a shape change that removed or renamed `FriendlyName`, `InstanceId`, or `Ids` would silently degrade the harness's diagnostic output, and a change to the filter would change which devices count as the machine's storage controllers. Investigate the raw `Get-PnpDevice -Class 'SCSIAdapter' -PresentOnly` output.
+- **Check 18 (VHDX gate fail-closed).** Production's `Test-NativeBootVirtualTopology` no longer has the v49 patch 2 fail-closed shape (the unfiltered `Get-Disk` enumeration using `-ErrorAction Stop`; the `IsNativeBootVirtual = $true` assignment on the catch path; the indeterminate-topology reason text). This is a source-level assertion, not a machine-tooling check — it means production's source has drifted from the shape the harness asserts against. Update the assertion if the shape has legitimately changed, or restore the fail-closed shape if it was removed by accident; the assertion exists to catch exactly this class of regression. This is not a machine-specific failure — the same FAIL would appear on any machine.
+- **Check 19 (StorageControllerDevices mirror binding).** Production's `Get-StorageControllerDevices` no longer has the unary-comma return (`return ,$result`) or the two software-device filter regexes (`{GUID}\` and `SWD\`) that the harness's mirror of the function depends on. Same reasoning as check 18 — a source-level drift, not a machine-tooling issue. A change to either is a change to the mirror contract that check 17's harness-side test depends on.
 
 ### What a SKIP means
 
@@ -564,6 +609,7 @@ A SKIP means the check could not run in the current context. The reasons:
 - **The state it inspects is absent.** WinRE location is empty, no OS partition, no lettered volume to sample, or similar. The check has nothing to inspect.
 - **Zero devices present (Check 17).** The `Get-StorageControllerDevices` enumeration returns an empty array on some VMs (no SCSIAdapter-class devices). A zero-device result is legitimate; the check SKIPs rather than FAILing. The distinction matters: NULL means the enumeration failed (indeterminate), and an empty array means the enumeration succeeded but found nothing (legitimate). The check verifies both cases.
 - **A precondition was not met.** `Test-VmdDrivers` (not a parser check) records SKIP when the Intel CPU generation cannot be parsed, because driver applicability was not evaluated. Option S records SKIP when the VMD query is indeterminate, because the DSI parity verdict cannot be computed from an indeterminate driver-set determination. Check 2b records SKIP when WinRE is Disabled or reagentc suppressed the version line.
+- **Production's source is not adjacent (checks 18 and 19).** Both source-level mirror-binding assertions SKIP when `WinRE.ps1` is not beside `Test-WinRE.ps1`. The SKIP is the correct outcome — the assertion cannot run without the source — and it does not indicate a defect. Place `WinRE.ps1` beside `Test-WinRE.ps1` and re-run to exercise them.
 
 A SKIP does not indicate a defect.
 

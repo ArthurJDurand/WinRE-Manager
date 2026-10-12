@@ -29,20 +29,20 @@ title WinRE Manager - Menu
 ::     presses any key to continue or Ctrl+C to abort.
 ::   * The elevated launcher blocks until the elevated process exits, so
 ::     the menu re-renders against current disk state on return. A
-::     completed backup makes Restore [8] and Clean up backups [C]
-::     appear; deleting the last backup hides both; installing or
+::     completed backup makes the backup status indicator flip to
+::     "Available"; deleting the last backup flips it back; installing or
 ::     removing the task updates the task-status indicator.
 ::
-:: Conditional menu entries:
-::   Restore [8] and Clean up backups [C] are shown only when at least
-::   one default-location backup is present.
+:: Menu entries:
+::   Restore [8] and Clean up backups [C] are always shown. When no
+::   backup exists, the elevated screens explain that and require an
+::   explicit path rather than silently hiding the action.
 ::   Update [U] is shown only when a newer version is available.
-::   All three entries, when visible, are dynamically assigned their
-::   choice positions so the menu always matches the choice set exactly.
 ::
-:: Update status is read from Check-Update.ps1, which caches the remote
-:: version string for 24 hours. To force a fresh check, delete
-:: %TEMP%\WinRE-Manager-remote-version.txt and re-open the wrapper.
+:: Update status is read from Check-Update.ps1, which performs a live
+:: network check (GitHub Releases API, with a CHANGELOG.md fallback).
+:: No cache is written. The check runs at most once per wrapper session;
+:: the result is held in UPDATE_STATUS for the life of the session.
 :: ========================================================================
 
 :: ------------------------------------------------------------------------
@@ -93,15 +93,6 @@ set "INSTALL_DIR=C:\ProgramData\OEM\WinRE-Manager"
 set "INSTALLED_SCRIPT=%INSTALL_DIR%\WinRE.ps1"
 
 :: ------------------------------------------------------------------------
-:: Behaviour toggles
-:: ------------------------------------------------------------------------
-:: Controls visibility of the backup-related menu entries - Restore [8]
-:: and Clean up backups [C]. Default 1 = show only when a default-location
-:: backup is present. Set to 0 to always show both entries, even when no
-:: default-location backup exists.
-set "HIDE_BACKUP_ACTIONS_WHEN_NONE=1"
-
-:: ------------------------------------------------------------------------
 :: PowerShell single-quoted-literal escaping
 :: ------------------------------------------------------------------------
 :: Values embedded inside single-quoted PowerShell string literals within
@@ -128,8 +119,7 @@ if not exist "%TEST_SCRIPT%" (
 )
 
 :: The update-check and cleanup helpers are optional. When missing, the
-:: corresponding menu entries are hidden and the wrapper continues to
-:: function normally.
+:: corresponding screens report that and the wrapper continues to function.
 
 goto menu
 
@@ -141,7 +131,7 @@ goto menu
 cls
 title WinRE Manager - Menu
 
-:: ---- Backup presence ----
+:: ---- Backup presence (display only) ----
 set "BACKUP_PRESENT=0"
 if exist "%BACKUP_DEFAULT%\" (
     for /d %%D in ("%BACKUP_DEFAULT%\*") do (
@@ -157,37 +147,18 @@ if not errorlevel 1 set "TASK_STATUS=%GREEN%Installed%RESET%"
 :: ---- Update status (session-cached) ----
 if not defined UPDATE_STATUS_SET call :check_update_status
 
-:: ---- Determine which conditional options are visible ----
-:: Restore [8] and Clean up backups [C] share one condition: at least one
-:: default-location backup exists. The toggle overrides it to always-show.
-set "SHOW_BACKUP_ACTIONS=0"
-if "%BACKUP_PRESENT%"=="1" set "SHOW_BACKUP_ACTIONS=1"
-if "%HIDE_BACKUP_ACTIONS_WHEN_NONE%"=="0" set "SHOW_BACKUP_ACTIONS=1"
-
-set "SHOW_UPDATE=0"
-if /I "%UPD_KIND%"=="UPDATE" set "SHOW_UPDATE=1"
-
-:: ---- Build the choice set dynamically ----
-:: MENU_CHARS is the string choice.exe matches against; each character is
-:: one acceptable keypress. The corresponding errorlevel is the character's
-:: 1-based position in the string. We track positions as we build.
-set "MENU_CHARS=1234567"
-set "NEXT_EL=8"
-set "RESTORE_EL=0"
-set "CLEANUP_EL=0"
+:: ---- Build the choice set ----
+:: 1..8 fixed; C (clean up backups) fixed; U optional; Q fixed. The
+:: errorlevel from choice.exe is the 1-based position in MENU_CHARS.
+set "MENU_CHARS=12345678C"
+set "RESTORE_EL=8"
+set "CLEANUP_EL=9"
+set "NEXT_EL=10"
 set "UPDATE_EL=0"
 
-if "%SHOW_BACKUP_ACTIONS%"=="1" set "MENU_CHARS=%MENU_CHARS%8"
-if "%SHOW_BACKUP_ACTIONS%"=="1" set "RESTORE_EL=%NEXT_EL%"
-if "%SHOW_BACKUP_ACTIONS%"=="1" set /a NEXT_EL+=1
-
-if "%SHOW_BACKUP_ACTIONS%"=="1" set "MENU_CHARS=%MENU_CHARS%C"
-if "%SHOW_BACKUP_ACTIONS%"=="1" set "CLEANUP_EL=%NEXT_EL%"
-if "%SHOW_BACKUP_ACTIONS%"=="1" set /a NEXT_EL+=1
-
-if "%SHOW_UPDATE%"=="1" set "MENU_CHARS=%MENU_CHARS%U"
-if "%SHOW_UPDATE%"=="1" set "UPDATE_EL=%NEXT_EL%"
-if "%SHOW_UPDATE%"=="1" set /a NEXT_EL+=1
+if /I "%UPD_KIND%"=="UPDATE" set "MENU_CHARS=%MENU_CHARS%U"
+if /I "%UPD_KIND%"=="UPDATE" set "UPDATE_EL=%NEXT_EL%"
+if /I "%UPD_KIND%"=="UPDATE" set /a NEXT_EL+=1
 
 set "MENU_CHARS=%MENU_CHARS%Q"
 set "QUIT_EL=%NEXT_EL%"
@@ -207,7 +178,7 @@ echo.
 
 echo  %GREEN%%BOLD%SAFETY%RESET% %GRAY%recommended before a live repair%RESET%
 echo   %GREEN%%BOLD%[1]%RESET%  %WHITE%Back up current WinRE%RESET%                 %GRAY%preserve the active WIM%RESET%
-if "%SHOW_BACKUP_ACTIONS%"=="1" echo   %GREEN%%BOLD%[C]%RESET%  %WHITE%Clean up old backups%RESET%                 %GRAY%delete saved WinRE images%RESET%
+echo   %GREEN%%BOLD%[C]%RESET%  %WHITE%Clean up old backups%RESET%                 %GRAY%delete saved WinRE images%RESET%
 echo.
 echo  %CYAN%%BOLD%DIAGNOSTICS%RESET% %GRAY%read-only / preview%RESET%
 echo   [2]  %WHITE%Test harness%RESET%                         %GRAY%diagnostics and self-tests%RESET%
@@ -221,21 +192,18 @@ echo.
 echo  %YELLOW%%BOLD%REPAIR%RESET% %GRAY%live WinRE operation%RESET%
 echo   %YELLOWBG%%BLACK% LIVE %RESET% %YELLOW%%BOLD%[7]%RESET% %WHITE%Run WinRE Manager%RESET%                  %GRAY%real repair operation%RESET%
 echo.
+echo  %CYAN%%BOLD%RECOVERY%RESET% %GRAY%restore a saved WinRE image%RESET%
+echo   %CYANBG%%BLACK% RESTORE %RESET% [8] %WHITE%Restore WinRE from backup%RESET%  %GRAY%select a saved image%RESET%
+echo.
 
-if "%SHOW_BACKUP_ACTIONS%"=="1" (
-    echo  %CYAN%%BOLD%RECOVERY%RESET% %GRAY%restore a saved WinRE image%RESET%
-    echo   %CYANBG%%BLACK% RESTORE %RESET% [8] %WHITE%Restore WinRE from backup%RESET%  %GREEN%default backup available%RESET%
-    echo.
-)
-
-if "%SHOW_UPDATE%"=="1" (
+if /I "%UPD_KIND%"=="UPDATE" (
     echo  %YELLOW%%BOLD%UPDATE AVAILABLE%RESET% %GRAY%a newer version of WinRE Manager is available%RESET%
     echo   %YELLOWBG%%BLACK% GET %RESET% %YELLOW%%BOLD%[U]%RESET% %WHITE%Open releases page%RESET%        %GRAY%download the latest version%RESET%
     echo.
 )
 
 echo  %MAGENTA%%BOLD%[Q]%RESET%  %WHITE%Quit%RESET%                                      %GRAY%Backup default: %BACKUP_DEFAULT%%RESET%
-if "%SHOW_BACKUP_ACTIONS%"=="1" echo %DIM%%GRAY%  Restore accepts any directory containing winre.wim and backup.json.%RESET%
+echo %DIM%%GRAY%  Restore and Clean up accept any directory containing winre.wim and backup.json.%RESET%
 choice /C %MENU_CHARS% /N /M "  Select an option: "
 set "SEL=%errorlevel%"
 
@@ -248,8 +216,8 @@ if "%SEL%"=="4" goto show_log
 if "%SEL%"=="5" goto install_task
 if "%SEL%"=="6" goto remove_task
 if "%SEL%"=="7" goto run_live_warning
-if not "%RESTORE_EL%"=="0" if "%SEL%"=="%RESTORE_EL%" goto run_restore
-if not "%CLEANUP_EL%"=="0" if "%SEL%"=="%CLEANUP_EL%" goto cleanup_backups
+if "%SEL%"=="%RESTORE_EL%" goto run_restore
+if "%SEL%"=="%CLEANUP_EL%" goto cleanup_backups
 if not "%UPDATE_EL%"=="0" if "%SEL%"=="%UPDATE_EL%" goto open_releases
 goto menu
 
@@ -257,6 +225,10 @@ goto menu
 :: ========================================================================
 :: BACKUP
 :: ========================================================================
+:: Destination is entered in the elevated PowerShell session, not here.
+:: A path typed at a CMD prompt and later echoed is vulnerable to CMD's
+:: '&' command-separator parsing; moving the prompt into PowerShell
+:: eliminates that hazard entirely.
 :run_backup
 cls
 title WinRE Manager - Backup
@@ -276,23 +248,15 @@ echo %GRAY%Default destination:%RESET% %WHITE%%BACKUP_DEFAULT%%RESET%
 echo %YELLOW%For stronger protection, another physical disk, external drive,%RESET%
 echo %YELLOW%or network storage is preferable to storing the backup only on C:.%RESET%
 echo.
-echo %BOLD%Press Enter to use the default, or type another destination path.%RESET%
-echo.
-
-set "BACKUP_DEST="
-set /p "BACKUP_DEST=  Destination: "
-if "%BACKUP_DEST%"=="" set "BACKUP_DEST=%BACKUP_DEFAULT%"
-
-echo.
-echo %CYAN%Selected destination:%RESET% %WHITE%%BACKUP_DEST%%RESET%
+echo %WHITE%The destination is entered in the elevated PowerShell session.%RESET%
+echo %WHITE%Press Enter there to use the default; type any other path to override.%RESET%
 echo.
 echo %YELLOWBG%%BLACK% UAC %RESET% %WHITE%Approve the Windows UAC prompt to begin.%RESET%
 echo %GRAY%Press any key to continue, or press Ctrl+C to abort.%RESET%
 echo.
 pause
 
-set "BACKUP_DEST_ESC=%BACKUP_DEST:'=''%"
-set "TARGET_COMMAND=& '%PROD_SCRIPT_ESC%' -Action Backup -BackupPath '%BACKUP_DEST_ESC%'"
+set "TARGET_COMMAND=$src='%PROD_SCRIPT_ESC%'; $q=[char]34; $default='%BACKUP_DEFAULT%'; Write-Host ''; Write-Host 'Backup destination' -ForegroundColor White; Write-Host ('  Press Enter for default: '+$default) -ForegroundColor DarkGray; Write-Host '  Or type a full path; another disk, external drive, or network share is preferred to C:.' -ForegroundColor DarkGray; Write-Host ''; $dest=Read-Host 'Destination'; if(-not $dest){ $dest=$default }; $dest=$dest.Trim(); Write-Host ''; Write-Host ('Using destination: '+$dest) -ForegroundColor Cyan; Write-Host ''; Write-Host 'Starting Backup as a child process...' -ForegroundColor Cyan; Write-Host ''; $argLine='-NoProfile -ExecutionPolicy Bypass -File '+$q+$src+$q+' -Action Backup -BackupPath '+$q+$dest+$q; try { $p=Start-Process -FilePath 'powershell.exe' -ArgumentList $argLine -NoNewWindow -PassThru -Wait -ErrorAction Stop } catch { Write-Host ('Could not start Backup: '+$_.Exception.Message) -ForegroundColor Red; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true); exit 1 }; Write-Host ''; $code=$p.ExitCode; $color=if($code -eq 0){'Green'}elseif($code -eq 2){'Yellow'}elseif($code -eq 3){'Red'}else{'Yellow'}; Write-Host ('Backup finished. Exit code: '+$code) -ForegroundColor $color; Write-Host ''; Write-Host '  0 = success   1 = reboot required   2 = warning   3 = fatal' -ForegroundColor DarkGray; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true)"
 call :launch_elevated_command
 goto menu
 
@@ -309,10 +273,12 @@ echo %MAGENTA%%BOLD%============================================================
 echo %MAGENTA%%BOLD%                                  CLEAN UP BACKUPS%RESET%
 echo %MAGENTA%%BOLD%==============================================================================================%RESET%
 echo.
-echo %WHITE%Lists every valid backup under the default location, shows per-backup%RESET%
-echo %WHITE%size and the total, and lets you delete one, several, or all of them.%RESET%
+echo %WHITE%Lists every valid backup under every registered backup location,%RESET%
+echo %WHITE%shows per-backup size and the total, and lets you delete one,%RESET%
+echo %WHITE%several, or all of them.%RESET%
 echo.
 echo %GRAY%Default location:%RESET% %WHITE%%BACKUP_DEFAULT%%RESET%
+echo %GRAY%Additional roots are read from the manager config, if present.%RESET%
 echo %GRAY%The listing is read-only until you type DELETE at the confirmation.%RESET%
 echo.
 
@@ -326,12 +292,19 @@ if not exist "%CLEANUP_SCRIPT%" (
     goto menu
 )
 
+if "%BACKUP_PRESENT%"=="1" (
+    echo %GREEN%At least one backup is present under the default location.%RESET%
+) else (
+    echo %YELLOW%No backup found under the default location.%RESET%
+    echo %YELLOW%The elevated session will report this and exit cleanly.%RESET%
+)
+echo.
 echo %YELLOWBG%%BLACK% UAC %RESET% %WHITE%Approve the Windows UAC prompt to continue.%RESET%
 echo %GRAY%Press any key to continue, or press Ctrl+C to abort.%RESET%
 echo.
 pause
 
-set "TARGET_COMMAND=& '%CLEANUP_SCRIPT_ESC%'"
+set "TARGET_COMMAND=$cleanup='%CLEANUP_SCRIPT_ESC%'; $q=[char]34; Write-Host ''; Write-Host 'Starting cleanup as a child process...' -ForegroundColor Cyan; Write-Host ''; $argLine='-NoProfile -ExecutionPolicy Bypass -File '+$q+$cleanup+$q; try { $p=Start-Process -FilePath 'powershell.exe' -ArgumentList $argLine -NoNewWindow -PassThru -Wait -ErrorAction Stop } catch { Write-Host ('Could not start cleanup: '+$_.Exception.Message) -ForegroundColor Red; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true); exit 1 }; Write-Host ''; $code=$p.ExitCode; $color=if($code -eq 0){'Green'}else{'Yellow'}; Write-Host ('Cleanup finished. Exit code: '+$code) -ForegroundColor $color; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true)"
 call :launch_elevated_command
 goto menu
 
@@ -339,6 +312,9 @@ goto menu
 :: ========================================================================
 :: RESTORE
 :: ========================================================================
+:: The backup directory is entered in the elevated PowerShell session, for
+:: the same '&'-in-path reason as Backup. The pre-flight validity checks
+:: (winre.wim + backup.json present) also run there.
 :run_restore
 cls
 title WinRE Manager - Restore
@@ -357,61 +333,15 @@ echo %YELLOW%Restore does not recreate a deleted recovery partition or invent a%
 echo %YELLOW%replacement route. A usable current WinRE route must already exist.%RESET%
 echo.
 
-:: Newest valid backup under the default location. Names are
-:: yyyy-MM-dd_HHmmss, which sort lexicographically equal to chronologically.
-set "LATEST_BACKUP="
-for /f "delims=" %%D in ('dir /b /ad /o-n "%BACKUP_DEFAULT%" 2^>nul') do (
-    if not defined LATEST_BACKUP if exist "%BACKUP_DEFAULT%\%%D\winre.wim" if exist "%BACKUP_DEFAULT%\%%D\backup.json" set "LATEST_BACKUP=%BACKUP_DEFAULT%\%%D"
-)
-
-if defined LATEST_BACKUP (
-    echo %BOLD%Enter a backup directory, or press Enter for the newest.%RESET%
-    echo %GRAY%Newest backup:%RESET% %WHITE%%LATEST_BACKUP%%RESET%
+if "%BACKUP_PRESENT%"=="1" (
+    echo %GRAY%At least one backup is present under the default location.%RESET%
+    echo %GRAY%The elevated session will offer the newest backup as the default.%RESET%
 ) else (
-    echo %BOLD%Enter the full path to a backup directory.%RESET%
     echo %YELLOW%No backup found under %BACKUP_DEFAULT%.%RESET%
+    echo %YELLOW%The elevated session will require an explicit backup directory.%RESET%
 )
 echo.
-
-set "RESTORE_SRC="
-set /p "RESTORE_SRC=  Backup directory: "
-if "%RESTORE_SRC%"=="" if defined LATEST_BACKUP set "RESTORE_SRC=%LATEST_BACKUP%"
-if "%RESTORE_SRC%"=="" (
-    echo.
-    echo %RED%%BOLD%No backup directory specified.%RESET%
-    echo.
-    pause
-    goto menu
-)
-
-if not exist "%RESTORE_SRC%\winre.wim" (
-    echo.
-    echo %RED%%BOLD%Backup WIM not found.%RESET%
-    echo   %WHITE%%RESTORE_SRC%\winre.wim%RESET%
-    echo.
-    echo %YELLOW%Nothing was launched. Check the backup directory and try again.%RESET%
-    echo.
-    pause
-    goto menu
-)
-
-if not exist "%RESTORE_SRC%\backup.json" (
-    echo.
-    echo %RED%%BOLD%Backup metadata not found.%RESET%
-    echo   %WHITE%%RESTORE_SRC%\backup.json%RESET%
-    echo.
-    echo %YELLOW%Nothing was launched. Check the backup directory and try again.%RESET%
-    echo.
-    pause
-    goto menu
-)
-
-echo.
-echo %YELLOW%%BOLD%RESTORE CONFIRMATION%RESET%
-echo %WHITE%The current registered WinRE WIM will be replaced only after the%RESET%
-echo %WHITE%PowerShell validation succeeds.%RESET%
-echo.
-echo %CYAN%Selected source:%RESET% %WHITE%%RESTORE_SRC%%RESET%
+echo %WHITE%The backup directory is entered in the elevated PowerShell session.%RESET%
 echo.
 echo %BOLD%Type RESTORE exactly to continue. Anything else cancels.%RESET%
 echo.
@@ -433,8 +363,7 @@ echo %GRAY%Press any key to continue, or press Ctrl+C to abort.%RESET%
 echo.
 pause
 
-set "RESTORE_SRC_ESC=%RESTORE_SRC:'=''%"
-set "TARGET_COMMAND=& '%PROD_SCRIPT_ESC%' -Action Restore -BackupPath '%RESTORE_SRC_ESC%'"
+set "TARGET_COMMAND=$src='%PROD_SCRIPT_ESC%'; $q=[char]34; $default='%BACKUP_DEFAULT%'; $latest=$null; if(Test-Path -LiteralPath $default -PathType Container){ $subs=@(Get-ChildItem -LiteralPath $default -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending); foreach($d in $subs){ if((Test-Path -LiteralPath (Join-Path $d.FullName 'winre.wim') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $d.FullName 'backup.json') -PathType Leaf)){ $latest=$d.FullName; break } } }; Write-Host ''; Write-Host 'Backup directory' -ForegroundColor White; if($latest){ Write-Host ('  Press Enter for newest: '+$latest) -ForegroundColor DarkGray; Write-Host '  Or type a full path to another backup.' -ForegroundColor DarkGray } else { Write-Host ('  No backup found under '+$default+'.') -ForegroundColor Yellow; Write-Host '  Type the full path to a backup directory.' -ForegroundColor DarkGray }; Write-Host ''; $path=Read-Host 'Path'; if(-not $path -and $latest){ $path=$latest }; if(-not $path){ Write-Host ''; Write-Host 'No backup directory specified. Nothing was launched.' -ForegroundColor Red; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true); exit 1 }; $path=$path.Trim(); if(-not (Test-Path -LiteralPath (Join-Path $path 'winre.wim') -PathType Leaf)){ Write-Host ''; Write-Host ('winre.wim not found at '+$path) -ForegroundColor Red; Write-Host ''; Write-Host 'Nothing was launched.' -ForegroundColor Yellow; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true); exit 1 }; if(-not (Test-Path -LiteralPath (Join-Path $path 'backup.json') -PathType Leaf)){ Write-Host ''; Write-Host ('backup.json not found at '+$path) -ForegroundColor Red; Write-Host ''; Write-Host 'Nothing was launched.' -ForegroundColor Yellow; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true); exit 1 }; Write-Host ''; Write-Host ('Selected source: '+$path) -ForegroundColor Cyan; Write-Host ''; Write-Host 'Starting Restore as a child process...' -ForegroundColor Cyan; Write-Host ''; $argLine='-NoProfile -ExecutionPolicy Bypass -File '+$q+$src+$q+' -Action Restore -BackupPath '+$q+$path+$q; try { $p=Start-Process -FilePath 'powershell.exe' -ArgumentList $argLine -NoNewWindow -PassThru -Wait -ErrorAction Stop } catch { Write-Host ('Could not start Restore: '+$_.Exception.Message) -ForegroundColor Red; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true); exit 1 }; Write-Host ''; $code=$p.ExitCode; $color=if($code -eq 0){'Green'}elseif($code -eq 2){'Yellow'}elseif($code -eq 3){'Red'}else{'Yellow'}; Write-Host ('Restore finished. Exit code: '+$code) -ForegroundColor $color; Write-Host ''; Write-Host '  0 = success   1 = reboot required   2 = warning   3 = fatal' -ForegroundColor DarkGray; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true)"
 call :launch_elevated_command
 goto menu
 
@@ -581,7 +510,7 @@ echo %GRAY%Press any key to continue, or press Ctrl+C to abort.%RESET%
 echo.
 pause
 
-set "TARGET_COMMAND=& '%PROD_SCRIPT_ESC%'"
+set "TARGET_COMMAND=$src='%PROD_SCRIPT_ESC%'; $q=[char]34; Write-Host ''; Write-Host 'Starting live WinRE repair as a child process...' -ForegroundColor Cyan; Write-Host ''; $argLine='-NoProfile -ExecutionPolicy Bypass -File '+$q+$src+$q; try { $p=Start-Process -FilePath 'powershell.exe' -ArgumentList $argLine -NoNewWindow -PassThru -Wait -ErrorAction Stop } catch { Write-Host ('Could not start WinRE Manager: '+$_.Exception.Message) -ForegroundColor Red; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true); exit 1 }; Write-Host ''; $code=$p.ExitCode; $color=if($code -eq 0){'Green'}elseif($code -eq 1){'Cyan'}elseif($code -eq 2){'Yellow'}elseif($code -eq 3){'Red'}else{'Yellow'}; Write-Host ('Live repair finished. Exit code: '+$code) -ForegroundColor $color; Write-Host ''; Write-Host '  0 = success   1 = reboot required   2 = warning   3 = fatal' -ForegroundColor DarkGray; Write-Host ''; Write-Host 'Press any key to close this window...'; [void][System.Console]::ReadKey($true)"
 call :launch_elevated_command
 goto menu
 
@@ -722,11 +651,11 @@ goto menu
 :: ========================================================================
 :: UPDATE STATUS SUBROUTINE
 :: ========================================================================
-:: Reads the cached update status from Check-Update.ps1 (or fetches if the
-:: cache is stale) and maps it to a coloured display string. Result is
-:: stored in UPDATE_STATUS for the menu; UPD_KIND carries the raw kind
-:: ("UPDATE" / "CURRENT" / "AHEAD" / "ERROR") for the caller to decide
-:: whether to show the [U] entry.
+:: Reads the live update status from Check-Update.ps1 and maps it to a
+:: coloured display string. Result is stored in UPDATE_STATUS for the menu;
+:: UPD_KIND carries the raw kind ("UPDATE" / "CURRENT" / "AHEAD" /
+:: "ERROR") for the caller to decide whether to show the [U] entry.
+:: No cache file is involved; the check runs once per wrapper session.
 :check_update_status
 set "UPDATE_STATUS=%GRAY%checking...%RESET%"
 set "UPD_KIND="
@@ -781,11 +710,8 @@ goto :eof
 ::
 :: -Wait makes the launcher block until the elevated process (and any
 :: children it spawns) exits. The wrapper then returns to the menu, which
-:: recomputes BACKUP_PRESENT, TASK_STATUS, and the conditional entries
-:: against the current disk state. A completed backup therefore makes
-:: Restore [8] and Clean up backups [C] appear; deleting the last backup
-:: hides both; installing or removing the task updates the task-status
-:: indicator.
+:: recomputes BACKUP_PRESENT, TASK_STATUS, and the update indicator
+:: against the current disk state.
 :launch_elevated_command
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$b64=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes([string]$env:TARGET_COMMAND)); if(-not $b64){exit 1}; try { Start-Process -FilePath 'powershell.exe' -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + $b64) -Verb RunAs -Wait -ErrorAction Stop; exit 0 } catch { exit 1 }"

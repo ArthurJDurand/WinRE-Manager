@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 49.2 (v49 patch 2)
+    Version : 50.1 (v50 patch 1)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -206,22 +206,27 @@
                 rely on user-configured SAN policy as the safety
                 mechanism; the application fails closed on its own.
 
-            - Source ownership gates destructive normalization (v49).
-                Strip and injection run only when the source WIM is
-                positively classified into one of: Manager-Owned
-                (staged source hash matches state.CurrentImageHash),
-                Manager-Lineage (valid provenance marker present),
-                or Foreign-No-Drivers (no positive ownership evidence,
-                but the source contains zero third-party drivers to
-                strip). A source classified Foreign-With-Drivers (no
-                positive ownership evidence and third-party drivers
-                present) is preserved: no strip, no injection, no
-                deployment; the state file records
-                ForeignSourceAcceptedHash so subsequent runs
-                recognize the accepted foreign source and exit
-                cleanly. This closes the ASUS class of failure, in
-                which unconditional strip removed an OEM-injected
-                storage driver the manifest did not reinject.
+            - Source ownership gates destructive normalization (v49;
+                ownership bridge tightened in v50). Strip and injection
+                run only when the source WIM is positively classified
+                into one of: Manager-Owned (staged source hash matches
+                state.CurrentImageHash, or a historical CurrentImageHash
+                read from a stale state file across a version boundary),
+                Manager-Lineage (valid provenance marker whose LineageId
+                matches a known current or historical lineage
+                identifier), or Foreign-No-Drivers (no positive
+                ownership evidence, but the source contains zero
+                third-party drivers to strip). A source classified
+                Foreign-With-Drivers (no positive ownership evidence and
+                third-party drivers present) is preserved: no strip, no
+                injection, no deployment; the state file records
+                ForeignSourceAcceptedHash so subsequent runs recognize
+                the accepted foreign source and exit cleanly. A marker
+                whose LineageId matches no known value is treated as
+                absent: the source is preserved rather than stripped.
+                This closes the ASUS class of failure, in which
+                unconditional strip removed an OEM-injected storage
+                driver the manifest did not reinject.
 
             - Never downgrade a storage driver (v49). After strip and
                 injection, the candidate image's storage-class drivers
@@ -318,6 +323,56 @@
                 closed independently, and the principle is stated here
                 so future guards are written against it from the start.
 
+            - Manager config ownership gate (v50). The single durable
+                machine-wide config file at
+                C:\ProgramData\OEM\WinRE-Manager\manager.json holds
+                settings that must survive across runs but are not
+                operational state (currently the backup-location
+                catalogue). Both the read path (Get-ManagerConfig)
+                and the write path (Set-ManagerConfig) verify that
+                the directory containing manager.json and its
+                immediate parent are owned by SYSTEM (S-1-5-18) or
+                Administrators (S-1-5-32-544), fail-closed on any
+                ambiguity. Two levels are checked, not one: an
+                attacker who owns the parent can delete-and-recreate
+                the child to steal ownership of that child between
+                runs. An untrusted or unparseable config is treated
+                as the empty default, so a config read failure never
+                blocks a Backup and never causes a Restore or Cleanup
+                to assume a root exists. Writes are atomic via
+                Write-FileAtomically.
+
+            - Resume-task protected-path guard (v50). The crash-recovery
+                resume task runs as SYSTEM. Register-ResumeTask refuses
+                to register the task when the directory containing the
+                invoking script grants any write-capable right
+                (WriteData, Delete, DeleteSubdirectoriesAndFiles,
+                TakeOwnership, or ChangePermissions) to a non-admin
+                principal (Everyone, BUILTIN\Users, Authenticated
+                Users, or INTERACTIVE), because such access would
+                allow a non-admin to modify the script before the task
+                fires and gain SYSTEM-level execution. The mask is
+                WriteData-and-up, not the composite Write bit, which
+                would false-positive on the stock C:\ProgramData ACL:
+                BUILTIN\Users holds a container-inherited AppendData
+                ACE, which alone does not permit modifying a file
+                directly in the directory. Fail-closed on unreadable
+                ACL. Registration failure is non-fatal: the repair
+                pipeline proceeds without the self-healing hook.
+
+            - Empty-parent cleanup (v50). After workspace cleanup,
+                Remove-EmptyWorkspaceParent removes the now-empty
+                parent directory left behind by the workspace
+                convention <volume>:\Temp\WinREWork. Only removes the
+                parent when (a) the parent's leaf name is exactly
+                "Temp", (b) the parent is completely empty, and (c)
+                the parent is not a drive root. An arbitrary empty
+                parent directory is never removed. Cleanup-Backups.ps1
+                applies the same pattern to C:\Backup\WindowsRE and
+                its parent C:\Backup, with the additional constraint
+                that the child's leaf must match the timestamped-backup
+                convention (yyyy-MM-dd_HHmmss) before removal.
+
         Known gap:
             - The intervening-partition handling added in v48 has not been
                 exercised under a deliberate post-deletion failure on a
@@ -379,6 +434,12 @@
         cross-reference.
       - manage-bde -status "could not be opened by BitLocker" means
         unmanaged (unencrypted), not unknown.
+      - Provider-based path checks (Test-Path -PathType Container) can
+        return $false for a directory the process is demonstrably
+        reading from. When a path's provider semantics are uncertain
+        (OneDrive, network redirectors, non-FileSystem providers),
+        prefer direct .NET APIs: [System.IO.Path]::GetDirectoryName for
+        parsing, [System.IO.Directory]::Exists or Get-Acl for access.
             - Self-referential file ops guard with GetFullPath.
             - Recovery offsets round UP to 1 MiB. The plan computes the aligned
                 managed extent end and places the recovery partition as the last
@@ -466,8 +527,8 @@ $EXIT_REBOOT_REQUIRED  = 1
 $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
-$ScriptVersion    = 49
-$ScriptPatchLevel = "2"
+$ScriptVersion    = 50
+$ScriptPatchLevel = "1"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -485,6 +546,14 @@ $WorkDirResumeMinFreeMB    = 200
 # DriveType=Fixed also includes USB hard drives; require a known internal bus.
 $InternalWorkspaceBusTypes = @('ATA', 'SATA', 'NVMe', 'RAID', 'SAS', 'Spaces', 'Virtual', 'File Backed Virtual', 'SCM')
 $LogDir                    = "C:\ProgramData\OEM\Logs"
+# v50: single durable machine-wide settings file. Holds settings that
+# must survive across runs but are not operational state: currently the
+# backup-location catalogue. Distinct from the state file (operational
+# state), the partition deferral marker (retry suppression), the
+# checkpoint (resumable work), and each backup's backup.json (per-
+# backup metadata). Writes are atomic via Write-FileAtomically.
+$ManagerConfigDir          = "C:\ProgramData\OEM\WinRE-Manager"
+$ManagerConfigPath         = "$ManagerConfigDir\manager.json"
 $StateFileName             = "winre_state.json"
 $PartitionDeferralFileName = "winre_partition_deferred.json"
 $CheckpointFile            = "$LogDir\winre_checkpoint.txt"
@@ -509,9 +578,13 @@ $BackupDefaultPath         = "C:\Backup\WindowsRE"
 # during Step 3 injection. Microsoft documents that Sources\Recovery
 # customizations are migrated into a replacement WinRE during
 # servicing, so this subtree is the strongest candidate for a
-# persistent lineage signal. It is written in v49 but no gate reads
-# it yet: exact-hash ownership (state.CurrentImageHash) is the
-# load-bearing control until the marker-survival experiment succeeds.
+# persistent lineage signal. The marker is read by
+# Get-SourceOwnershipClassification to authorize the Manager-Lineage
+# class when its LineageId matches a known current or historical
+# lineage identifier (v50 tightened this from the v49 behaviour, where
+# a marker with no expected identity to check against was accepted).
+# Marker survival through a real Windows Update WinRE servicing event
+# has not yet been field-verified.
 $ProvenanceMarkerRelativePath = "Sources\Recovery\WinRE-Manager\provenance.json"
 
 $GitHubHeaders = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' }
@@ -607,6 +680,42 @@ $Script:ResumeTaskShouldPersist = $false
 # It exists so that, once marker survival is proven, a serviced WIM
 # carrying the marker can be recognized as this manager's lineage.
 $Script:LineageId              = $null
+
+# =========================== EMPTY-PARENT CLEANUP (v50) ===========================
+# Remove the now-empty parent directory left behind by workspace
+# cleanup. Called after the workspace directory itself has been removed
+# (or was not present). Only removes the parent when:
+#   - the parent's leaf name matches "Temp" (the workspace convention),
+#     so an arbitrary empty parent is never removed, and
+#   - the parent is completely empty, and
+#   - the parent is not a drive root.
+# This is how `<volume>:\Temp\WinREWork` removal cleans up the
+# `<volume>:\Temp` directory that we created but that should not be
+# left behind empty.
+function Remove-EmptyWorkspaceParent {
+    param([Parameter(Mandatory)][string]$WorkspacePath)
+    if ($Script:DryRun) { return }
+    if (-not $WorkspacePath) { return }
+    $parent = $null
+    try { $parent = Split-Path -LiteralPath $WorkspacePath -Parent } catch { return }
+    if (-not $parent) { return }
+    if ($parent -match '^[A-Za-z]:\\?$') { return }
+    $leaf = $null
+    try { $leaf = Split-Path -LiteralPath $parent -Leaf } catch { return }
+    if (-not $leaf) { return }
+    if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($leaf, 'Temp')) { return }
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) { return }
+    $entries = $null
+    try {
+        $entries = @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop)
+    } catch {
+        Write-Log "Could not enumerate '$parent' to decide whether to remove it: $_" -Level WARN
+        return
+    }
+    if ($entries.Count -ne 0) { return }
+    Write-Log "Removing empty workspace parent: $parent"
+    Remove-ItemIfExist $parent
+}
 
 # =========================== LOGGING ===========================
 function Write-Log {
@@ -732,22 +841,31 @@ function Write-RunSummary {
 # =========================== FILE HELPERS ===========================
 function New-DirectoryIfNotExists {
     param([string]$Path)
-    if ($Script:DryRun) { Write-Log "[DRY RUN] Would create: $Path"; return }
-    if ($Path -and -not (Test-Path $Path)) { New-Item -Path $Path -ItemType Directory -Force | Out-Null }
+    if (-not $Path) { return }
+    $exists = Test-Path -LiteralPath $Path -PathType Container
+    if ($Script:DryRun) {
+        if (-not $exists) { Write-Log "[DRY RUN] Would create: $Path" }
+        return
+    }
+    if (-not $exists) { New-Item -Path $Path -ItemType Directory -Force | Out-Null }
 }
 
 function Remove-ItemIfExist {
     param([string]$Path, [switch]$Recurse)
-    if ($Script:DryRun) { Write-Log "[DRY RUN] Would remove: $Path"; return }
     if (-not $Path) { return }
-    if (-not (Test-Path $Path)) { return }
-    if (Test-Path $Path -PathType Container) {
-        if ($Recurse) { Remove-Item $Path -Force -Recurse -ErrorAction SilentlyContinue }
-        else          { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
-    } else {
-        Remove-Item $Path -Force -ErrorAction SilentlyContinue
+    $exists = Test-Path -LiteralPath $Path
+    if ($Script:DryRun) {
+        if ($exists) { Write-Log "[DRY RUN] Would remove: $Path" }
+        return
     }
-    if (-not (Test-Path $Path)) {
+    if (-not $exists) { return }
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        if ($Recurse) { Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue }
+        else          { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+    } else {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
         Write-Log "Removed: $Path"
     } else {
         Write-Log "Could not confirm removal: $Path" -Level WARN
@@ -1017,6 +1135,82 @@ function Register-ResumeTask {
     if (-not $PSCommandPath) {
         Write-Log "Register-ResumeTask: script was not invoked from a file (`$PSCommandPath is not populated; this is the gist-bootstrap or paste-into-console case). Skipping the temporary resume task - the repair pipeline itself is unaffected." -Level INFO
         Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Temporary resume task not registered: script was not invoked from a file.'
+        return $false
+    }
+
+    # v50: protected-path guard. The resume task runs as SYSTEM. If the
+    # script file it points at lives in a directory that grants
+    # write-capable access to a non-administrator principal, that
+    # principal could modify the script before the task fires and gain
+    # SYSTEM-level code execution. Fail closed: refuse to register the
+    # task from such a location. The repair pipeline itself proceeds
+    # without the self-healing hook; the resume task is a safety net,
+    # not a machine-state condition.
+    # [System.IO.Path]::GetDirectoryName is pure .NET path manipulation,
+    # no PowerShell provider layer involved. The previous form combined
+    # Split-Path with Test-Path -PathType Container; on a OneDrive-hosted
+    # path the FileSystem provider's container check returned $false for a
+    # directory the process is demonstrably reading, which skipped the
+    # task on a machine that should have had it. The existence and
+    # accessibility of the directory is now confirmed by the Get-Acl
+    # call below, which is the operation this function actually needs
+    # and which fails closed via its own try/catch.
+    $scriptDir = $null
+    try { $scriptDir = [System.IO.Path]::GetDirectoryName($PSCommandPath) } catch { }
+    if (-not $scriptDir) {
+        Write-Log "Register-ResumeTask: could not determine the directory containing '$PSCommandPath' - skipping the temporary resume task (the repair pipeline itself is unaffected)" -Level WARN
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Temporary resume task not registered: script directory could not be determined.'
+        return $false
+    }
+    $scriptDirAcl = $null
+    try {
+        $scriptDirAcl = Get-Acl -LiteralPath $scriptDir -ErrorAction Stop
+    } catch {
+        Write-Log "Register-ResumeTask: could not read the ACL of '$scriptDir': $_ - skipping the temporary resume task (fail closed; the repair pipeline itself is unaffected)" -Level WARN
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line "Temporary resume task not registered: ACL of '$scriptDir' could not be read."
+        return $false
+    }
+    # Principals whose write access represents a non-administrator risk:
+    #   S-1-1-0        Everyone
+    #   S-1-5-32-545   BUILTIN\Users
+    #   S-1-5-11       Authenticated Users
+    #   S-1-5-4        INTERACTIVE
+    # An Allow ACE for any of these that carries any write-capable right
+    # on the directory means a non-admin can modify the script file
+    # (write it, delete-and-recreate it, take ownership, or change its
+    # permissions). Any of those paths leads to SYSTEM execution of
+    # non-admin-controlled bytes.
+    $unsafeScriptDirSids = @('S-1-1-0','S-1-5-32-545','S-1-5-11','S-1-5-4')
+    # WriteData (0x2) is the minimum right that permits a principal to
+    # create or modify a file directly in the directory. The composite
+    # Write (0x116), Modify, and FullControl grants all include
+    # WriteData, so an ACE granting any of them is still caught.
+    # AppendData (0x4) alone is deliberately NOT in the mask: for a
+    # directory it only permits creating subdirectories, which does not
+    # let a non-admin modify or replace the script file. Including it
+    # would false-positive on the stock C:\ProgramData ACL, which
+    # grants BUILTIN\Users a container-inherited AppendData ACE.
+    $writeCapableMask = ([int][System.Security.AccessControl.FileSystemRights]::WriteData) -bor
+                        ([int][System.Security.AccessControl.FileSystemRights]::Delete) -bor
+                        ([int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+                        ([int][System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
+                        ([int][System.Security.AccessControl.FileSystemRights]::ChangePermissions)
+    $unsafeGrant = $null
+    foreach ($ace in $scriptDirAcl.Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        $aceSid = $null
+        try {
+            $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } catch { continue }
+        if ($unsafeScriptDirSids -notcontains $aceSid) { continue }
+        if (((([int]$ace.FileSystemRights) -band $writeCapableMask)) -ne 0) {
+            $unsafeGrant = $ace
+            break
+        }
+    }
+    if ($unsafeGrant) {
+        Write-Log "Register-ResumeTask: '$scriptDir' grants write-capable access to '$($unsafeGrant.IdentityReference)' (FileSystemRights=$($unsafeGrant.FileSystemRights)). Registering the resume task against a script in a non-admin-writable location would allow a non-administrator to modify the file and have it execute as SYSTEM on the next boot. Skipping the temporary resume task; the repair pipeline itself is unaffected." -Level WARN
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line "Temporary resume task not registered: script directory is writable by $($unsafeGrant.IdentityReference)."
         return $false
     }
 
@@ -1703,31 +1897,71 @@ function Remove-StrayRecoveryPartitions {
     param([Parameter(Mandatory)][int]$OSDiskNumber)
 
     $anyFailed = $false
+    $deletedList          = [System.Collections.Generic.List[string]]::new()
+    $wouldDeleteList      = [System.Collections.Generic.List[string]]::new()
+    $preservedOversized   = [System.Collections.Generic.List[string]]::new()
+    $skippedNonTyped      = [System.Collections.Generic.List[string]]::new()
+    $failedToDelete       = [System.Collections.Generic.List[string]]::new()
+
     foreach ($disk in Get-Disk) {
         if ($disk.Number -eq $OSDiskNumber) { continue }
         foreach ($rp in @(Get-RecoveryPartitions -DiskNumber $disk.Number)) {
+            $ref = "disk $($disk.Number) part $($rp.PartitionNumber)"
             $isTyped = ($rp.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($rp.MbrType -eq 0x27)
             if (-not $isTyped) {
-                Write-Log "Stray-recovery cleanup: skipping non-OS-disk partition $($disk.Number)/$($rp.PartitionNumber) - label matches recovery but type code does not" -Level WARN
+                Write-Log "Stray-recovery cleanup: skipping non-OS-disk partition $ref - label matches recovery but type code does not" -Level WARN
+                $skippedNonTyped.Add($ref) | Out-Null
                 continue
             }
             if ([int64]$rp.Size -gt [int64]($MaxManagedRecoveryPartitionMiB * 1MB)) {
-                Write-Log "Stray-recovery cleanup: preserving oversized recovery-typed partition $($disk.Number)/$($rp.PartitionNumber) ($([math]::Round($rp.Size/1MB,1)) MiB > $MaxManagedRecoveryPartitionMiB MiB safety ceiling) for operator review" -Level WARN
+                Write-Log "Stray-recovery cleanup: preserving oversized recovery-typed partition $ref ($([math]::Round($rp.Size/1MB,1)) MiB > $MaxManagedRecoveryPartitionMiB MiB safety ceiling) for operator review" -Level WARN
+                $preservedOversized.Add($ref) | Out-Null
                 $Script:nonFatalWarning = $true
                 continue
             }
             if ($Script:DryRun) {
-                Write-Log "[DRY RUN] Would delete stray recovery partition $($disk.Number)/$($rp.PartitionNumber)"
+                Write-Log "[DRY RUN] Would delete stray recovery partition $ref"
+                $wouldDeleteList.Add($ref) | Out-Null
                 continue
             }
             try {
                 $rp | Remove-Partition -Confirm:$false -ErrorAction Stop
-                Write-Log "Stray-recovery cleanup: deleted stray recovery partition $($disk.Number)/$($rp.PartitionNumber)"
+                Write-Log "Stray-recovery cleanup: deleted stray recovery partition $ref"
+                $deletedList.Add($ref) | Out-Null
             } catch {
-                Write-Log "Stray-recovery cleanup: failed to delete stray recovery partition $($disk.Number)/$($rp.PartitionNumber): $_" -Level WARN
+                Write-Log "Stray-recovery cleanup: failed to delete stray recovery partition $ref : $_" -Level WARN
+                $failedToDelete.Add($ref) | Out-Null
                 $Script:nonFatalWarning = $true
                 $anyFailed = $true
             }
+        }
+    }
+
+    # v50: aggregate summary line. The per-partition lines above are
+    # detailed; this one line lets an operator see the total stray-
+    # partition impact of the run at a glance rather than scanning the
+    # surrounding log for it. Emitted in both DryRun and live so the
+    # DryRun preview names exactly what a live run would do.
+    if ($Script:DryRun) {
+        $parts = @()
+        if ($wouldDeleteList.Count -gt 0)    { $parts += "would delete: $($wouldDeleteList -join ', ')" }
+        if ($preservedOversized.Count -gt 0) { $parts += "preserved oversized: $($preservedOversized -join ', ')" }
+        if ($skippedNonTyped.Count -gt 0)    { $parts += "skipped non-typed: $($skippedNonTyped -join ', ')" }
+        if ($parts.Count -gt 0) {
+            Write-Log "Stray-recovery cleanup summary (DRY RUN): $($parts -join '; ')"
+        } else {
+            Write-Log "Stray-recovery cleanup summary (DRY RUN): no stray recovery partitions on non-OS disks"
+        }
+    } else {
+        $parts = @()
+        if ($deletedList.Count -gt 0)        { $parts += "deleted: $($deletedList -join ', ')" }
+        if ($failedToDelete.Count -gt 0)     { $parts += "failed: $($failedToDelete -join ', ')" }
+        if ($preservedOversized.Count -gt 0) { $parts += "preserved oversized: $($preservedOversized -join ', ')" }
+        if ($skippedNonTyped.Count -gt 0)    { $parts += "skipped non-typed: $($skippedNonTyped -join ', ')" }
+        if ($parts.Count -gt 0) {
+            Write-Log "Stray-recovery cleanup summary: $($parts -join '; ')"
+        } else {
+            Write-Log "Stray-recovery cleanup summary: no stray recovery partitions on non-OS disks"
         }
     }
     return (-not $anyFailed)
@@ -4515,34 +4749,22 @@ function Get-LocalInputsId {
 }
 
 # =========================== STATE FILE ===========================
-# v47: narrow read of a stale state file's CurrentImageHash, used only
-# for LKG validation during the v46 -> v47 migration.
-#
-# Read-WinREState correctly refuses to accept a state file whose
-# DesiredStateId does not match the current one. On the first v47 run on
-# a machine whose state file was written by v46 or earlier, that refusal
-# turns $storedHash into $null, which makes Get-LKGWinREImagePath refuse
-# to promote C:\Recovery\WindowsRE\winre.wim to LKG status even though the
-# file is the manager's own last-known-good copy from the prior
-# deployment.
-#
-# The CurrentImageHash field records a fact about the machine that
-# survives a version boundary: the hash of the last successfully deployed
-# WIM. Reading it in isolation lets the LKG validation work across the
-# boundary without weakening the DSI gate on operational state.
-#
-# The value returned here is advisory only. It does NOT make the stale
-# state file authoritative and it does NOT enter any gate other than LKG
-# validation. Callers must not use it as operational state.
-function Get-StaleWinREStateImageHash {
+# v50: sibling of Get-StaleWinREStateImageHash that also returns the
+# stale state file's LineageId. Read in isolation, used only by the
+# source-ownership classifier to extend Manager-Owned recognition and
+# marker trust across a version boundary. Does not make the stale state
+# operationally authoritative; no other gate reads these values.
+function Get-StaleWinREStateFields {
     $path = "$env:SystemDrive\Recovery\OEM\$StateFileName"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     try {
         $stale = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        if ($stale.CurrentImageHash) { return [string]$stale.CurrentImageHash }
-        return $null
+        return @{
+            ImageHash = if ($stale.CurrentImageHash) { [string]$stale.CurrentImageHash } else { $null }
+            LineageId = if ($stale.LineageId)         { [string]$stale.LineageId }         else { $null }
+        }
     } catch {
-        Write-Log "Get-StaleWinREStateImageHash: could not read $path - $_" -Level WARN
+        Write-Log "Get-StaleWinREStateFields: could not read $path - $_" -Level WARN
         return $null
     }
 }
@@ -4743,6 +4965,214 @@ function Clear-PartitionDeferral {
     Remove-ItemIfExist $path
 }
 
+# =========================== MANAGER CONFIG (v50) ===========================
+# Single durable machine-wide settings file at $ManagerConfigPath.
+# Currently holds only the backup-location catalogue; if a second
+# durable setting appears, it lives here rather than in its own file.
+# Read/write are atomic. A missing or unparseable file is treated as
+# the default empty config: a config read failure never blocks a
+# backup, and never causes a Restore or Cleanup to incorrectly assume
+# a root exists.
+#
+# The directory containing manager.json, and its immediate parent,
+# must be owned by SYSTEM or Administrators. A non-admin can
+# pre-create a subdirectory under C:\ProgramData (the default ACL
+# grants Create Folders to Authenticated Users) and become its owner;
+# the same non-admin can later delete-and-recreate a child directory
+# to steal ownership of that child. Both the read and write paths
+# verify the chain via Test-DirectoryOwnedByTrustedPrincipal and
+# treat any failure as an empty config. This blocks both the initial
+# pre-creation attack and the delete-and-recreate swap.
+
+# Return $true when the given directory is owned by SYSTEM
+# (S-1-5-18) or Administrators (S-1-5-32-544). Fail-closed: a missing
+# directory, unreadable ACL, unknown owner, or unresolvable owner SID
+# returns $false. Used by Get-ManagerConfig and Set-ManagerConfig to
+# gate reads and writes of the machine-wide config file.
+function Test-DirectoryOwnedByTrustedPrincipal {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not $Path) { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
+        Write-Log "Test-DirectoryOwnedByTrustedPrincipal: could not read ACL of '$Path' : $_ - fail closed" -Level WARN
+        return $false
+    }
+    if (-not $acl -or -not $acl.Owner) {
+        Write-Log "Test-DirectoryOwnedByTrustedPrincipal: could not determine owner of '$Path' - fail closed" -Level WARN
+        return $false
+    }
+    # $acl.Owner is an IdentityReference. Depending on how the Security
+    # Descriptor was stored and how the .NET runtime reads it, the
+    # object handed back may be a SecurityIdentifier (the SID string
+    # form, e.g. "S-1-5-18") or an NTAccount (the account-name form,
+    # e.g. "NT AUTHORITY\SYSTEM"). Translate to a canonical SID string
+    # before comparing against the trusted-principal list.
+    $ownerSid = $null
+    try {
+        $ownerRef = $acl.Owner
+        if ($ownerRef -is [System.Security.Principal.SecurityIdentifier]) {
+            $ownerSid = $ownerRef.Value
+        } elseif ($ownerRef -is [System.Security.Principal.IdentityReference]) {
+            $ownerSid = $ownerRef.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } else {
+            $ownerStr = [string]$ownerRef
+            if ($ownerStr -match '^S-1-') {
+                $ownerSid = $ownerStr
+            } else {
+                $ownerSid = (New-Object System.Security.Principal.NTAccount($ownerStr)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+        }
+    } catch {
+        Write-Log "Test-DirectoryOwnedByTrustedPrincipal: could not resolve owner '$($acl.Owner)' of '$Path' to a SID: $_ - fail closed" -Level WARN
+        return $false
+    }
+    $trustedSids = @('S-1-5-18','S-1-5-32-544')
+    return ($trustedSids -contains $ownerSid)
+}
+
+function Get-ManagerConfig {
+    $default = @{
+        SchemaVersion = 1
+        BackupRoots   = @()
+    }
+    $path = $ManagerConfigPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $default }
+    # v50: refuse to read a config whose containing directory or its
+    # immediate parent is not owned by SYSTEM or Administrators.
+    # Untrusted config is treated as absent: the caller gets the safe
+    # empty default, and an attacker who swapped the directory cannot
+    # inject roots for a later Restore or Cleanup to use.
+    $configDir = Split-Path $path -Parent
+    foreach ($anc in @($configDir, (Split-Path $configDir -Parent))) {
+        if (-not $anc) { continue }
+        if (-not (Test-Path -LiteralPath $anc -PathType Container)) { continue }
+        if (-not (Test-DirectoryOwnedByTrustedPrincipal -Path $anc)) {
+            Write-Log "Get-ManagerConfig: ancestor directory '$anc' is not owned by SYSTEM or Administrators - treating config as empty" -Level WARN
+            return $default
+        }
+    }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        if (-not $raw) { return $default }
+        $cfg = $raw | ConvertFrom-Json -ErrorAction Stop
+        $roots = @()
+        if ($cfg.BackupCatalog -and $cfg.BackupCatalog.Roots) {
+            $roots = @($cfg.BackupCatalog.Roots | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        } elseif ($cfg.BackupRoots) {
+            $roots = @($cfg.BackupRoots | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        }
+        return @{
+            SchemaVersion = if ($cfg.SchemaVersion) { [int]$cfg.SchemaVersion } else { 1 }
+            BackupRoots   = $roots
+        }
+    } catch {
+        Write-Log "Get-ManagerConfig: could not parse $path : $_ - treating as empty" -Level WARN
+        return $default
+    }
+}
+
+function Set-ManagerConfig {
+    param([Parameter(Mandatory)][hashtable]$Config)
+
+    $path = $ManagerConfigPath
+    $dir = Split-Path $path -Parent
+    $rootsList = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in @($Config.BackupRoots)) {
+        if (-not $r) { continue }
+        $rr = [string]$r
+        if ($seen.Add($rr)) { $rootsList.Add($rr) | Out-Null }
+    }
+    $obj = @{
+        SchemaVersion = if ($Config.SchemaVersion) { [int]$Config.SchemaVersion } else { 1 }
+        LastUpdated   = (Get-Date -Format 'o')
+        BackupCatalog = @{ Roots = @($rootsList.ToArray()) }
+    }
+    $json = $obj | ConvertTo-Json -Depth 4
+
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would write manager config to $path ($($rootsList.Count) backup root(s))"
+        return $true
+    }
+
+    try {
+        # v50: verify the containing directory and its immediate parent
+        # are owned by a trusted principal BEFORE creating or writing
+        # anything. Two levels are checked, not one:
+        #
+        #   - The containing directory (WinRE-Manager) must be owned by
+        #     SYSTEM or Administrators so that manager.json inherits a
+        #     safe ACL.
+        #   - The immediate parent (OEM) must also be owned by SYSTEM
+        #     or Administrators, because an attacker who owns OEM can
+        #     delete-and-recreate WinRE-Manager between runs to become
+        #     the owner of the recreated directory. Checking only the
+        #     immediate parent would permit that swap on a subsequent
+        #     run before the write.
+        #
+        # Directories that do not yet exist are skipped: they will be
+        # created by this elevated process and will inherit the caller's
+        # principal as owner, which is trusted by construction. The
+        # creation happens after the checks so a pre-created
+        # attacker-owned parent is caught before we add a child to it.
+        $ancestors = @($dir, (Split-Path $dir -Parent))
+        foreach ($anc in $ancestors) {
+            if (-not $anc) { continue }
+            if (-not (Test-Path -LiteralPath $anc -PathType Container)) { continue }
+            if (-not (Test-DirectoryOwnedByTrustedPrincipal -Path $anc)) {
+                Write-Log "Refusing to write manager config: ancestor directory '$anc' is not owned by SYSTEM or Administrators. The config remains the empty default." -Level WARN
+                return $false
+            }
+        }
+        if ($dir -and -not (Test-Path -LiteralPath $dir -PathType Container)) {
+            New-Item -Path $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        Write-FileAtomically -Path $path -Content $json
+        Write-Log "Wrote manager config: $path (BackupRoots count=$($rootsList.Count))"
+        return $true
+    } catch {
+        Write-Log "Could not write manager config at $path : $_" -Level WARN
+        return $false
+    }
+}
+
+function Add-ManagerBackupRoot {
+    param([Parameter(Mandatory)][string]$Root)
+    if (-not $Root) { return $false }
+    $normalized = $null
+    try { $normalized = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') } catch { $normalized = ([string]$Root).TrimEnd('\') }
+    if (-not $normalized) { return $false }
+    # v50: resolve a mapped drive letter to its UNC path when possible.
+    # A mapped drive is a session-specific DOS device mapping; a later
+    # run may map the same letter to a different share, making the
+    # catalogue entry point at the wrong location. Get-PSDrive
+    # exposes the UNC path of a system-known mapped drive via
+    # .DisplayRoot. If DisplayRoot is empty (local drive, subst, or a
+    # mapping not visible to this process), the drive-letter path is
+    # kept: it is no worse than the pre-v50 behaviour.
+    if ($normalized -match '^([A-Za-z]):\\(.*)$') {
+        $letter = $Matches[1]
+        $relative = $Matches[2]
+        $psDrive = $null
+        try { $psDrive = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue } catch { }
+        if ($psDrive -and $psDrive.DisplayRoot) {
+            $uncRoot = ([string]$psDrive.DisplayRoot).TrimEnd('\')
+            if ($uncRoot -match '^\\\\') {
+                $normalized = "$uncRoot\$relative"
+                Write-Log "Add-ManagerBackupRoot: resolved mapped drive ${letter}: to UNC path $uncRoot for catalogue storage"
+            }
+        }
+    }
+    $cfg = Get-ManagerConfig
+    $already = @($cfg.BackupRoots | Where-Object { $_ -and ([System.StringComparer]::OrdinalIgnoreCase.Equals(([string]$_).TrimEnd('\'), $normalized)) })
+    if ($already.Count -gt 0) { return $true }
+    $newRoots = @($cfg.BackupRoots) + @($normalized)
+    $ok = Set-ManagerConfig -Config @{ SchemaVersion = 1; BackupRoots = $newRoots }
+    if ($ok) { Write-Log "Registered backup root in manager config: $normalized" }
+    return $ok
+}
+
 # =========================== THIRD-PARTY DRIVER STRIP ===========================
 # v47: Remove every third-party driver from a mounted image. Hard-gated:
 # any failure to enumerate, remove, or re-verify returns $false, and the
@@ -4856,11 +5286,15 @@ function Remove-AllThirdPartyDrivers {
 #
 # The provenance marker is written into the mounted image during Step 3
 # (post-injection, pre-dismount-Save) under $ProvenanceMarkerRelativePath.
-# It is NOT load-bearing in v49: exact-hash ownership is the only
-# authorization the manager trusts beyond the content rule. The marker
-# is written so that a future release, after a field experiment confirms
-# the marker survives a real WU WinRE servicing event, can promote it to
-# a load-bearing lineage signal.
+# In v49 it was written but not load-bearing: exact-hash ownership was
+# the only authorization the manager trusted beyond the content rule.
+# v50 makes it partially load-bearing: a marker whose LineageId matches
+# a known current or historical lineage identifier authorizes the
+# Manager-Lineage class, which is one of the three classes that permit
+# strip and injection. A marker whose LineageId matches no known value
+# is treated as absent, so a foreign image carrying a marker from
+# another machine (or a state-lost image whose lineage cannot be
+# re-established) is preserved rather than stripped.
 
 # --- INF parsing ---
 # Extract hardware IDs from an INF file. Microsoft INF model sections
@@ -5014,9 +5448,10 @@ function Read-ProvenanceMarker {
 
 # Write the provenance marker into the root of a mounted image. Called
 # after successful injection, before dismount -Save. Returns $true on
-# success; $false on any write failure. Failure is non-fatal to the
-# deployment (the marker is not load-bearing in v49); the caller logs
-# and continues.
+# success; $false on any write failure. Failure is non-fatal: a marker
+# write failure falls through to content-based classification on the
+# next run, which may preserve a source that would otherwise have been
+# recognized as Manager-Lineage. The caller logs and continues.
 function Write-ProvenanceMarker {
     param(
         [Parameter(Mandatory)][string]$MountDir,
@@ -5039,11 +5474,12 @@ function Write-ProvenanceMarker {
             LineageId       = $LineageId
             DeployedAt      = (Get-Date -Format "o")
             DeployedStateId = $DesiredStateId
-            # ManagedDrivers: reserved for a future release. In v49 the
-            # marker identifies lineage only; the driver inventory is
-            # not recorded here because the marker is not yet
-            # load-bearing and the inventory would need its own schema
-            # design (stable identity, upgrade semantics, tamper model).
+            # ManagedDrivers: reserved for a future release. In v50 the
+            # lineage portion of the marker is load-bearing (it
+            # authorizes the Manager-Lineage ownership class); the
+            # driver inventory is not recorded here because it would
+            # need its own schema design (stable identity, upgrade
+            # semantics, tamper model) before it can be trusted.
             ManagedDrivers  = @()
         }
         $json = $markerData | ConvertTo-Json -Depth 4
@@ -5051,7 +5487,7 @@ function Write-ProvenanceMarker {
         Write-Log "Wrote provenance marker to $markerPath (LineageId=$LineageId)"
         return $true
     } catch {
-        Write-Log "Could not write provenance marker at $markerPath : $_ - deployment continues (marker is not load-bearing in v49)" -Level WARN
+        Write-Log "Could not write provenance marker at $markerPath : $_ - deployment continues; the source will fall through to content-based classification on the next run" -Level WARN
         return $false
     }
 }
@@ -5064,11 +5500,16 @@ function Write-ProvenanceMarker {
 #
 # Classes:
 #   Manager-Owned        - staged source hash exactly matches
-#                          state.CurrentImageHash. The bytes are
-#                          identical to what Manager last deployed.
+#                          state.CurrentImageHash, or a historical
+#                          CurrentImageHash read from a stale state
+#                          file across a version boundary (v50 bridge).
+#                          The bytes are identical to what Manager last
+#                          deployed.
 #   Manager-Lineage      - a valid provenance marker is present in the
-#                          mounted image and its LineageId is either
-#                          unset in state or matches the state's value.
+#                          mounted image and its LineageId matches a
+#                          known current or historical lineage
+#                          identifier. A marker whose LineageId matches
+#                          no known value is treated as absent.
 #   Foreign-No-Drivers   - no positive ownership evidence, but the
 #                          source contains zero third-party drivers.
 #                          Strip is a no-op; injection can proceed.
@@ -5081,20 +5522,42 @@ function Get-SourceOwnershipClassification {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PreStripDrivers,
         [Parameter(Mandatory)][hashtable]$State,
         [AllowNull()][string]$StagedSourceHash,
-        [AllowNull()][string]$CurrentLineageId
+        [AllowNull()][string]$CurrentLineageId,
+        # v50: narrow ownership bridge across a version boundary. When the
+        # state file is stale (DesiredStateId mismatch), Read-WinREState
+        # returns the empty state, so CurrentImageHash and LineageId are
+        # null even though the machine was previously manager-managed. The
+        # historical values come from a separate narrow read of the stale
+        # state file and are used ONLY for this classifier's recognition
+        # logic. They do not make the stale state operationally
+        # authoritative and are not read by any other gate.
+        [AllowNull()][string]$HistoricalImageHash,
+        [AllowNull()][string]$HistoricalLineageId
     )
-    if ($StagedSourceHash -and $State.CurrentImageHash -and $StagedSourceHash -eq $State.CurrentImageHash) {
+
+    $knownHashes = @($State.CurrentImageHash, $HistoricalImageHash) | Where-Object { $_ }
+    if ($StagedSourceHash -and $knownHashes.Count -gt 0 -and $knownHashes -contains $StagedSourceHash) {
+        $matchedSource = if ($State.CurrentImageHash -eq $StagedSourceHash) { 'state.CurrentImageHash' } else { 'historical CurrentImageHash' }
         return @{
             Class  = 'Manager-Owned'
-            Reason = "staged source hash matches state.CurrentImageHash ($StagedSourceHash)"
+            Reason = "staged source hash matches $matchedSource ($StagedSourceHash)"
         }
     }
 
-    $marker = Read-ProvenanceMarker -MountDir $MountDir -ExpectedLineageId $CurrentLineageId
-    if ($marker) {
-        return @{
-            Class  = 'Manager-Lineage'
-            Reason = "valid provenance marker present (LineageId=$($marker.LineageId))"
+    # v50: marker trust tightened. The marker proves lineage only when its
+    # LineageId matches a known current or historical lineage identifier.
+    # A marker with no expected value to check against is treated as
+    # absent, so a foreign image that happens to carry a marker from
+    # another machine (or a state-lost image whose lineage cannot be
+    # re-established) is preserved rather than stripped.
+    $knownLineages = @($CurrentLineageId, $HistoricalLineageId) | Where-Object { $_ }
+    foreach ($knownLineage in $knownLineages) {
+        $marker = Read-ProvenanceMarker -MountDir $MountDir -ExpectedLineageId $knownLineage
+        if ($marker) {
+            return @{
+                Class  = 'Manager-Lineage'
+                Reason = "valid provenance marker present (LineageId=$($marker.LineageId), matched known lineage)"
+            }
         }
     }
 
@@ -5777,6 +6240,68 @@ function Invoke-BackupAction {
         return $EXIT_SUCCESS
     }
 
+    # v50: destination-volume free-space preflight. The source size is
+    # known (read above); verify the DESTINATION volume (not C:) has
+    # room for the WIM plus a small margin BEFORE creating the
+    # destination directory or starting the copy. A destination whose
+    # root is not a local drive-letter path (a UNC path, a mount point
+    # without a drive letter, a virtual volume not exposed to the
+    # Storage module) is reported and the copy proceeds: the operator
+    # explicitly chose the destination, and Copy-Item will surface any
+    # space-related failure.
+    $destRoot = $null
+    try { $destRoot = [System.IO.Path]::GetPathRoot($BackupPath) } catch { }
+    if ($destRoot -and $destRoot -match '^[A-Za-z]:\\?$') {
+        $destLetter = $destRoot.TrimEnd('\').TrimEnd(':')
+        # v50: free-space preflight runs only when the destination
+        # drive letter resolves to a local volume (via Get-Volume). A
+        # mapped network drive does not appear in Get-Volume (it is a
+        # DOS device mapping, not an MSFT_Volume), so we fall back to
+        # Get-PSDrive, which resolves all filesystem-provider drives.
+        # If the drive resolves to a PowerShell provider with a Free
+        # value, use that value; otherwise (UNC-style drive, or a
+        # provider that does not expose Free) log and proceed without
+        # preflighting. A drive letter that resolves to nothing is
+        # treated as a genuine error: the destination cannot exist.
+        $destFree = $null
+        $destVol = Get-Volume -DriveLetter $destLetter -ErrorAction SilentlyContinue
+        if ($destVol) {
+            $destFree = [int64]$destVol.SizeRemaining
+        } else {
+            $destPsDrive = $null
+            try { $destPsDrive = Get-PSDrive -Name $destLetter -ErrorAction SilentlyContinue } catch { }
+            if (-not $destPsDrive) {
+                Write-Log "Backup cannot proceed: destination drive letter $destLetter in $BackupPath does not resolve to a known local or mapped drive." -Level ERROR
+                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                Set-RunSummaryField -Field 'Why' -Value 'Destination drive letter does not resolve'
+                Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No backup was written.'
+                return $EXIT_FATAL
+            }
+            if ($null -ne $destPsDrive.Free) {
+                try { $destFree = [int64]$destPsDrive.Free } catch { $destFree = $null }
+            }
+        }
+        if ($null -ne $destFree) {
+            $freeSpaceMarginBytes = [int64]104857600
+            $requiredBytes = [int64]$sourceSize + $freeSpaceMarginBytes
+            Write-Log "Backup free-space check: destination $destRoot has $([math]::Round($destFree/1MB,1)) MiB free; required $([math]::Round($requiredBytes/1MB,1)) MiB (WIM $([math]::Round($sourceSize/1MB,1)) MiB + 100 MiB margin)"
+            if ($destFree -lt $requiredBytes) {
+                Write-Log "Backup cannot proceed: destination $destRoot has insufficient free space ($([math]::Round($destFree/1MB,1)) MiB free, need $([math]::Round($requiredBytes/1MB,1)) MiB). No backup was written." -Level ERROR
+                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                Set-RunSummaryField -Field 'Why' -Value "Destination $destRoot has insufficient free space"
+                Set-RunSummaryField -Field 'NextAction' -Value 'Free space on the destination volume, or choose a different -BackupPath.'
+                Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No backup was written.'
+                return $EXIT_FATAL
+            }
+        } else {
+            Write-Log "Backup free-space check: destination $destRoot free space could not be determined (not a local volume, and Get-PSDrive returned no Free value); the copy will proceed and any space-related failure will be reported by Copy-Item." -Level WARN
+        }
+    } elseif ($destRoot) {
+        Write-Log "Backup free-space check: destination '$destRoot' is not a local drive-letter path; free space cannot be preflighted. The copy will proceed and any space-related failure will be reported by Copy-Item." -Level WARN
+    } else {
+        Write-Log "Backup free-space check: could not determine a destination root for '$BackupPath'; free space cannot be preflighted. The copy will proceed and any space-related failure will be reported by Copy-Item." -Level WARN
+    }
+
     try {
         if (-not (Test-Path -LiteralPath $BackupPath -PathType Container)) {
             New-Item -Path $BackupPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
@@ -5816,6 +6341,18 @@ function Invoke-BackupAction {
         return $EXIT_FATAL
     }
     Write-Log "Backup copy hash verified: $destHash"
+
+    # v50: register the destination root in the manager config so a
+    # later Restore or Cleanup can discover this backup without the
+    # operator re-specifying the path. Registered here, after the WIM
+    # hash has been verified in place, and BEFORE the sidecar write, so
+    # the root is recorded even if the sidecar write subsequently
+    # fails. Failure to register is a non-fatal warning: the backup
+    # WIM is present and usable, and the operator can still supply the
+    # path manually.
+    if (-not (Add-ManagerBackupRoot -Root $BackupPath)) {
+        Write-Log "Backup WIM is verified and in place, but the destination root could not be registered in the manager config; a later Restore or Cleanup will need the path supplied manually." -Level WARN
+    }
 
     # ---- Sidecar ----
     $sidecar = @{
@@ -6709,10 +7246,18 @@ public static class WinRECancelKeyProbe {
     # fallback is used only at LKG-validation call sites and does not make
     # the stale state operationally authoritative.
     $lkgStoredHash = $storedHash
+    $historicalLineageId = $null
     if (-not $lkgStoredHash) {
-        $lkgStoredHash = Get-StaleWinREStateImageHash
-        if ($lkgStoredHash) {
-            Write-Log "LKG validation: using historical CurrentImageHash from stale state file ($lkgStoredHash) so the last-known-good copy is recognized across a version boundary"
+        $staleFields = Get-StaleWinREStateFields
+        if ($staleFields) {
+            $lkgStoredHash = $staleFields.ImageHash
+            $historicalLineageId = $staleFields.LineageId
+            if ($lkgStoredHash) {
+                Write-Log "LKG validation: using historical CurrentImageHash from stale state file ($lkgStoredHash) so the last-known-good copy is recognized across a version boundary"
+            }
+            if ($historicalLineageId) {
+                Write-Log "Ownership migration bridge: using historical LineageId from stale state file ($historicalLineageId) so the source-ownership classifier can validate a marker across a version boundary"
+            }
         }
     }
 
@@ -7529,6 +8074,7 @@ public static class WinRECancelKeyProbe {
             if (-not (Test-Path -LiteralPath $candidate.Path -PathType Container)) { continue }
             Write-Log "Removing uncheckpointed or stale workspace before capacity planning: $($candidate.Path)"
             Remove-ItemIfExist $candidate.Path -Recurse
+            Remove-EmptyWorkspaceParent -WorkspacePath $candidate.Path
         }
         $workDirCandidates = @(Get-WorkDirCandidates)
         $checkpointCandidate = $workDirCandidates | Where-Object {
@@ -7568,12 +8114,14 @@ public static class WinRECancelKeyProbe {
             Write-Log "Checkpoint workspace '$checkpointPath' is unavailable or below the free-space requirement; restarting from step 1 in $WorkDir" -Level WARN
             if ($checkpointCandidate -and (Test-Path -LiteralPath $checkpointCandidate.Path -PathType Container)) {
                 Remove-ItemIfExist $checkpointCandidate.Path -Recurse
+                Remove-EmptyWorkspaceParent -WorkspacePath $checkpointCandidate.Path
             }
         } elseif (-not $cp.Valid) {
             Write-Log "Checkpoint invalidated - restarting from step 1 in $WorkDir" -Level WARN
         }
         $step = 0
         if (Test-Path -LiteralPath $WorkDir -PathType Container) { Remove-ItemIfExist $WorkDir -Recurse }
+        Remove-EmptyWorkspaceParent -WorkspacePath $WorkDir
     }
 
     Write-Log "Workspace selected: $WorkDir ($([math]::Round($workDirPlan.Candidate.FreeBytes/1GB,2)) GiB free; minimum $minimumWorkDirDisplay)"
@@ -7838,7 +8386,8 @@ public static class WinRECancelKeyProbe {
         Write-Log "Source-ownership decision: pre-strip third-party inventory: $($preStripDrivers.Count) package(s)"
 
         $ownership = Get-SourceOwnershipClassification -MountDir $MountDir -PreStripDrivers $preStripDrivers `
-                        -State $state -StagedSourceHash $Script:StagedWimSourceHash -CurrentLineageId $Script:LineageId
+                        -State $state -StagedSourceHash $Script:StagedWimSourceHash -CurrentLineageId $Script:LineageId `
+                        -HistoricalImageHash $lkgStoredHash -HistoricalLineageId $historicalLineageId
         Write-Log "Source-ownership classification: $($ownership.Class) - $($ownership.Reason)"
 
         if ($ownership.Class -eq 'Foreign-With-Drivers') {
@@ -8617,6 +9166,7 @@ public static class WinRECancelKeyProbe {
 
     Write-Log "Step 6: Cleanup"
     Remove-ItemIfExist $WorkDir -Recurse; Remove-ItemIfExist $CheckpointFile
+    Remove-EmptyWorkspaceParent -WorkspacePath $WorkDir
 
     # Step 7: enforce "no type-coded recovery partition on any non-OS disk".
     Write-Log "Step 7: Removing stray recovery partitions on non-OS disks"

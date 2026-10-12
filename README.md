@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207.x-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue.svg)](https://github.com/ArthurJDurand/WinRE-Manager)
-[![Version](https://img.shields.io/badge/version-v49%20patch%202-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v50%20patch%201-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ArthurJDurand)
 
@@ -29,15 +29,15 @@ The wrapper opens a menu grouped into sections:
 | Section | Option | What it does |
 |---|---|---|
 | **SAFETY** | **1 — Back up current WinRE** | Captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar metadata file. Non-destructive. Recommended before any live repair. |
-| | **C — Clean up old backups** | Lists every backup under the default backup location, shows per-backup size and total, and lets you delete one, several, or all. Requires typing `DELETE` to confirm. Shown only when at least one valid backup exists. *(v49 patch 2)* |
+| | **C — Clean up old backups** | Lists every backup under every registered backup location, shows per-backup size and total, and lets you delete one, several, or all. Requires typing `DELETE` to confirm. Always shown; when no backup exists the elevated screen explains that and exits cleanly. |
 | **DIAGNOSTICS** | **2 — Test harness** | Read-only checks of your Windows recovery setup. Does not intentionally modify WinRE, partitions, BitLocker, or Windows system state, but may create and remove its own test artifacts under its working directory. |
 | | **3 — Preview plan (DryRun)** | Shows what the repair would do without making partition or WinRE changes. |
 | | **4 — Show recent log** | Prints the tail of the last run's log and offers to open it in Notepad. |
 | **MAINTENANCE** | **5 — Install automatic maintenance** | Registers a SYSTEM scheduled task that runs WinRE Manager on a schedule. |
 | | **6 — Remove automatic maintenance** | Unregisters the scheduled task. The installed script copy is left in place. |
 | **REPAIR** | **7 — Run WinRE Manager** | Performs the repair after showing a warning and requiring you to type `RUN`. |
-| **RECOVERY** | **8 — Restore WinRE from backup** | Writes a previously captured WIM back to the active route. Shown only when at least one valid backup exists at the default location. The restore screen accepts any directory containing `winre.wim` and `backup.json`, including one on an external disk. *(v49 patch 2)* |
-| — | **U — Open releases page** | Opens the GitHub Releases page in the default browser. Shown only when a newer version is available (checked by the wrapper on first menu render and cached for 24 hours). Nothing is downloaded by the wrapper. *(v49 patch 2)* |
+| **RECOVERY** | **8 — Restore WinRE from backup** | Writes a previously captured WIM back to the active route. Always shown; the restore screen accepts any directory containing `winre.wim` and `backup.json`, including one on an external disk. When no backup exists at the default location, the screen reports that and requires an explicit path. |
+| — | **U — Open releases page** | Opens the GitHub Releases page in the default browser. Shown only when a newer version is available (checked live by the wrapper on first menu render, held for the life of the wrapper session). Nothing is downloaded by the wrapper. |
 | — | **Q — Quit** | Closes the wrapper. U and Q appear below the RECOVERY section, without their own section header. |
 
 The wrapper also shows two status lines at the top of the menu: one with the current backup state and whether the automatic-maintenance task is installed, and one with the current version comparison against the project's GitHub repository (`Up to date`, `Update available: vX patch Y`, `Dev build (ahead of release)`, or `not available` when the check cannot complete).
@@ -50,7 +50,11 @@ The wrapper also shows two status lines at the top of the menu: one with the cur
 
 ## Before you run a live repair
 
-WinRE Manager is designed to fail closed and refuses layouts it cannot prove safe. But a live repair can modify Windows disk partitions. **Back up important files before your first live repair.** If BitLocker or Windows Device Encryption is enabled, make sure you know where your **BitLocker / device-encryption recovery key** is stored.
+WinRE Manager is designed to fail closed and refuses layouts it cannot prove safe. But a live repair can modify Windows disk partitions, and it can remove type-coded recovery partitions on disks that are not the OS disk. **Back up important files before your first live repair.** If BitLocker or Windows Device Encryption is enabled, make sure you know where your **BitLocker / device-encryption recovery key** is stored.
+
+**Run a dry run first.** Option **3 — Preview plan (DryRun)** walks the entire control flow and logs every decision it would make without modifying anything. Read the plan before your first live repair; it names the shrink, extend, or no-resize decision, the planned partition offset, and the exact set of recovery partitions that would be deleted.
+
+**Watch for recovery partitions on non-OS disks.** WinRE Manager removes type-coded recovery partitions on non-OS disks during any destructive run, because a stray recovery partition on a secondary disk can cause Startup Repair to point the BCD at the wrong image. Partitions over 2 GiB are preserved for operator review; see [Recovery partition geometry](#recovery-partition-geometry) for the ceiling and the factory-restore-volume exception. If a secondary disk has a small recovery partition you want to keep, disconnect that disk before running a live repair, or accept that it may be removed.
 
 ---
 
@@ -82,10 +86,10 @@ flowchart TD
     RunFleet --> Flow
     RunHost --> Flow
 
-    Flow --> Fast{"What does it find?"}
-    Fast -->|"Nothing to fix"| FP["Tier 1 · fast path<br/>no OS-disk changes"]
-    Fast -->|"WinRE registered, disabled"| EO["Tier 2 · enable-only<br/>prepare volume · re-register"]
-    Fast -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
+    Flow --> Check{"What does it find?"}
+    Check -->|"Nothing to fix"| FP["Tier 1 · fast path<br/>no OS-disk changes"]
+    Check -->|"WinRE registered, disabled"| EO["Tier 2 · enable-only<br/>prepare volume · re-register"]
+    Check -->|"WinRE missing or broken"| FU["Tier 3 · full update<br/>plan · shrink · rebuild · deploy"]
 
     FP --> Dedicated["DEDICATED WinRE<br/>on a dedicated recovery partition"]
     FP --> Fallback
@@ -210,6 +214,8 @@ WinRE Manager's safety measures are implemented in the code rather than relying 
 - **Native-boot VHDX fail-closed gate (v49).** The manager refuses to run destructive operations on a machine whose OS volume is on a native-boot VHDX, before any partition work.
 - **Backup and restore (v49).** The wrapper exposes a byte-for-byte backup of the currently registered WinRE WIM, and a restore operation that writes a previously captured WIM back to the active route transactionally. Backup is non-destructive; restore validates the backup, resolves the current route, and uses the existing deployment machinery.
 - **Temporary crash-recovery task (v49).** Every Repair or Restore run registers a scheduled task that fires shortly after the next boot and once within the hour, so an interrupted run — including a Ctrl+C, a hard kill, or a reboot — is resumed rather than left half-finished. The task is deleted on clean completion. See [SECURITY.md](SECURITY.md) for the privileged-execution implications.
+- **Resume-task protected-path guard (v50).** The SYSTEM crash-recovery task is not registered when the invoking script lives in a directory writable by a non-administrator, because such access would let a non-admin modify the script before the task fires and gain SYSTEM-level execution. On refusal the repair pipeline proceeds without the self-healing hook; the task is a safety net, not a machine-state condition. See [SECURITY.md](SECURITY.md).
+- **Manager config ownership gate (v50).** The machine-wide config file at `C:\ProgramData\OEM\WinRE-Manager\manager.json` is trusted only when its containing directory and its immediate parent are owned by SYSTEM or Administrators. An untrusted, unreadable, or unparseable config is treated as absent; backup root discovery falls back to the default. Writes are refused on an untrusted ancestor.
 - **Stable install location for the maintenance task (v49).** The wrapper's install option copies the local `WinRE.ps1` to `C:\ProgramData\OEM\WinRE-Manager\`, SHA256-verifies the copy, and registers the scheduled task against the installed copy — not the operator's local clone. A hash mismatch aborts the install and refuses to register the task.
 - **Targeted.** WinRE is prepared on its *target* volume. C:'s BitLocker state is never modified by the script.
 - **Isolated workspace.** Scratch uses internal fixed NTFS volumes only. USB, SD/MMC, network, FireWire, Fibre Channel, and unknown-bus disks are excluded.
@@ -295,7 +301,7 @@ The v48 `LocalInputsId` computation runs under `-DryRun` (the value is logged) b
 
 None of the v49 pipeline refinements - the source-ownership classification, the never-downgrade storage-driver check, or the pre-deployment storage-applicability gate - run under `-DryRun`. They all sit inside Step 3, and the full-update path's DryRun choke point exits before Step 1. The dry-run plan's Step 3 line names them as planned steps but does not execute any of them. To see what a live run would decide on any of them, run the script without `-DryRun` on a disposable VM.
 
-The `-Action Backup` and `-Action Restore` actions do not expose a DryRun variant through the wrapper. They are standalone actions invoked by the wrapper's SAFETY options, not pipeline stages; the DryRun contract applies to the Repair path (the default action). Running `-Action Backup` without a `-DryRun` flag is the correct invocation; adding `-DryRun` to a backup action is undefined. If a wrapper menu path is unclear, check the wrapper's screen; the backup and restore options state what they will do.
+The `-Action Backup` and `-Action Restore` actions do not expose a DryRun variant through the wrapper. They are standalone actions invoked by the wrapper's SAFETY and RECOVERY menu options, not pipeline stages; the DryRun contract applies to the Repair path (the default action). Running `-Action Backup` without a `-DryRun` flag is the correct invocation from the wrapper; a direct `-Action Backup -DryRun` invocation is a defined preview that writes nothing, though the wrapper does not surface it. If a wrapper menu path is unclear, check the wrapper's screen; the backup and restore options state what they will do.
 
 The DryRun contract for the v45 pre-shrink deferrals is that the plan is logged and the run continues. The plan line is preceded by `[DRY RUN] Plan is valid:` when the read-only checks passed; the reasons evaluated before the DryRun choke point are surfaced exactly as in a live run, while the reasons only reachable after the choke point or gated on `-not $Script:DryRun` are not. The surfaced group is the plan-rejection reasons (both the base set and the intervening-anchor validation failures), `partition geometry unavailable`, `C: volume could not be read for free-space check`, `post-shrink free space below minimum`, and `active WinRE location could not be resolved`. The unsurfaced group is the pre-shrink execution paths (`pre-shrink failed`, `pre-shrink verification failed`, `resize rounding reduced planned extent`), the two disable-failure paths, the deletion-failure path, and the registered-source-changed abort. To see what the plan would contain on a live run, read the `[DRY RUN] Plan is valid:` line and the subsequent `[DRY RUN] - Disk ...` lines.
 
@@ -314,7 +320,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Backup -Bac
 powershell -ExecutionPolicy Bypass -File .\scripts\WinRE.ps1 -Action Restore -BackupPath "D:\WinRE-Backups\<timestamp>"
 ```
 
-Backup captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar `backup.json` recording the source hash, size, and DISM servicing metadata. Restore validates the backup, resolves the current route, and writes the WIM back transactionally — it does not create a new partition or invent a replacement route. A usable current WinRE route must already exist.
+Backup captures a byte-for-byte copy of the currently registered WinRE WIM plus a sidecar `backup.json` recording the source hash, size, and DISM servicing metadata. Each backup destination is catalogued in `C:\ProgramData\OEM\WinRE-Manager\manager.json` so the Cleanup helper can discover backups without the operator re-specifying the path. Restore validates the backup, resolves the current route, and writes the WIM back transactionally — it does not create a new partition or invent a replacement route. A usable current WinRE route must already exist.
 
 ### One-liners (no local clone)
 
@@ -353,13 +359,13 @@ Full matrix and orchestration policy: **[Exit codes](docs/exit-codes.md)**.
 
 | Component | Version |
 |---|---|
-| `scripts/WinRE.ps1` | **v49 patch 2** |
-| `scripts/Test-WinRE.ps1` (read-only harness) | **v32** |
+| `scripts/WinRE.ps1` | **v50 patch 1** |
+| `scripts/Test-WinRE.ps1` (read-only harness) | **v35** |
 | `scripts/WinRE-Manager.cmd` | (interactive wrapper; rewritten in v49 patch 1) |
 
-**v49 patch 1** is the largest single release since v48. It ships the ASUS-incident containment work (source-ownership classification, never-downgrade, storage-applicability gate), the native-boot VHDX fail-closed gate, backup and restore actions, human-readable narration and run-summary output, a temporary crash-recovery scheduled task, and a rewritten interactive wrapper. `ScriptVersion` moves from 48 to 49, so every managed machine performs one full-update pass on its next scheduled run, then returns to the fast path.
+**v49 patch 1** shipped the ASUS-incident containment work (source-ownership classification, never-downgrade, storage-applicability gate), the native-boot VHDX fail-closed gate, backup and restore, the crash-recovery task, and a rewritten wrapper. **v49 patch 2** corrected four instances of the same fail-open defect class and shipped the wrapper's helper scripts. Full history: **[CHANGELOG.md](CHANGELOG.md)**.
 
-**v49 patch 2** is a safety-critical patch on top of v49 patch 1. It corrects four instances of the same defect class — fail-open safety checks that could interpret a failed query as a safe result — in the native-boot VHDX disk enumeration, the post-deletion partition verification, the WinRE status determination, and the storage-controller enumeration. It also ships two wrapper helper scripts (`Check-Update.ps1`, `Cleanup-Backups.ps1`), adds three conditionally-visible menu entries (`[8]` Restore and `[C]` Cleanup appear only when a backup exists; `[U]` appears only when an update is available), makes the wrapper's elevated launcher block until the elevated process exits so the menu state is always fresh on return, and uses a child-process runner for DryRun so its exit code is visible before the wrapper menu re-renders. `ScriptVersion` remains 49; `ScriptPatchLevel` moves from 1 to 2. No fleet-wide rebuild is forced. Full release notes, migration steps, and per-machine field evidence are in **[CHANGELOG.md](CHANGELOG.md)**.
+**v50 patch 1** is the current release. `ScriptVersion` moves from 49 to 50 so the source-ownership migration fires on machines already on the v49 fast path — a machine that last deployed under v49 runs one full-update pass on its next scheduled run, then returns to the fast path. The release adds a `manager.json` machine-wide config file under `C:\ProgramData\OEM\WinRE-Manager\` that holds the catalogue of backup roots read by `Cleanup-Backups.ps1`; a destination-volume free-space preflight on backup; UNC resolution for mapped-drive backup paths; a resume-task protected-path guard that refuses to register the SYSTEM crash-recovery task when the invoking script lives in a non-admin-writable directory; a two-level ownership check on the manager config directory; empty-parent cleanup after workspace deletion; and an aggregate summary line for stray-recovery-partition cleanup. The wrapper now shows `[8]` Restore and `[C]` Cleanup unconditionally — when no backup exists, the elevated screens explain that and require an explicit path rather than silently hiding the action. The harness advances to v35 with two source-level mirror-binding assertions, empty-parent cleanup mirroring production's `Remove-EmptyWorkspaceParent`, and an inverted interactive cleanup prompt. Full release notes and migration steps are in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Field-tested hardware
 
@@ -375,7 +381,9 @@ Selected results. Full per-machine evidence is in the [changelog](CHANGELOG.md).
 | Lenovo | IdeaPad 3 15IAU7 (MT 82RK) | Win11 26200 | v46 patch 1 — the machine that motivated the plan-clamp fix; after state-file reset, second full update reached DEDICATED |
 | (VM) | Hyper-V Win11 GPT / Win10 MBR | Win11 26300 / Win10 19045 | v45 patch 1 — destructive path verified on the Win11 GPT VM; MBR attribute-application path verified on the Win10 MBR VM (reuse path, not destructive MBR) |
 
-The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis), and three further machines on 2026-10-10 (a Lenovo ThinkCentre neo 50s Gen 5, an HP 250R 15.6 inch G10, and a Dell Precision 3581, all on Win 11 build 26300) ran the full v49 destructive pipeline end-to-end with exit code 0. **v49-specific field verification is partially complete.** Verified on physical hardware: the Ctrl+C resume-task preservation path and the clean-completion removal of the resume task, and the harness's Option S DSI mirror producing a `DSI MATCH` against production on the same machine (ASUS PRIME H510M-D, 2026-10-09); the `-Action Backup` mode capturing a byte-for-byte WIM copy with SHA256 verification and a sidecar (same machine, 2026-10-11); the `Foreign-With-Drivers` preserve branch on a real machine with a third-party driver present (ASUS Zenbook 14 UX3405MA, 2026-10-09); and the full destructive rebuild pipeline on three vendors (Lenovo 12XD with a `no-entry` OEM pack, HP 250R G10 with a SoftPaq extractor that returned exit code 1168 and 195 INFs, and Dell Precision 3581 with a Dell CAB and 64 injected drivers) on 2026-10-10. The outstanding items are documented in the [v49 patch 2 entry](CHANGELOG.md): provenance-marker survival across a real Windows Update servicing event; two-version `iastorvd.inf` coexistence; the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour on the outer-catch, `Invoke-RestoreAction`, hard-kill, and reboot cases; the four fail-open guard paths when their underlying queries actually fail; the wrapper's new conditional menu entries in both visible and hidden states; the wrapper's child-process DryRun runner; the wrapper's `-Wait` on the elevated launcher against a multi-minute backup; `Check-Update.ps1` on a network-unavailable host; `Cleanup-Backups.ps1` with a mixed valid/invalid backup set; and the update-check `[U]` browser launch on a machine where the remote version is newer than the local. The remaining coverage gaps — post-deletion failure on the intervening-anchor path, the v48 multi-intervening and surplus rejections, the transactional-WIM rollback branch, and the architecture gate on ARM64 — are documented in **[Testing](docs/testing.md)**.
+The v44 patch 7 destructive path is field-verified on encrypted C: across eight distinct physical machines (Intel 12th–15th gen and AMD, Dell/HP/Lenovo/ASUS chassis). **v50 patch 1 was field-verified on 2026-10-12**: full-update, fast-path, and backup runs all produced clean logs; the ownership migration hash bridge fired; byte drift from the last deployment showed `NO`; and the temporary resume task registered and cleaned up on clean exit. `Test-WinRE.ps1` passed 20/20 on the same machine, including both source-level mirror-binding assertions.
+
+Per-machine evidence, release-specific verification status, and outstanding coverage items are in **[CHANGELOG.md](CHANGELOG.md)** and **[Testing](docs/testing.md)**.
 
 ## Documentation
 

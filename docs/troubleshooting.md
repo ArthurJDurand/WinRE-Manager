@@ -20,9 +20,9 @@ Log location: `C:\ProgramData\OEM\Logs\WinRE-Manager.log`.
 
 Three common entry points, if you already know which one you are:
 
-- **"The script exited with code 2 or 3 and I don't know why."** ? Read the [exit-codes.md](exit-codes.md) reference first, then come back here with the specific case in hand.
-- **"The machine still has the same problem after running the script."** ? Find the section whose log signature matches your log. If no section matches, the machine is probably in a state this document does not cover and should be reported.
-- **"I have not run the script yet and want to know what it will see."** ? Run `scripts\Test-WinRE.ps1` first. Option 1 shows the diagnostic; Option S shows whether production would take the fast path. Come back here only if the harness reports something unexpected.
+- **"The script exited with code 2 or 3 and I don't know why."** → Read the [exit-codes.md](exit-codes.md) reference first, then come back here with the specific case in hand.
+- **"The machine still has the same problem after running the script."** → Find the section whose log signature matches your log. If no section matches, the machine is probably in a state this document does not cover and should be reported.
+- **"I have not run the script yet and want to know what it will see."** → Run `scripts\Test-WinRE.ps1` first. Option 1 shows the diagnostic; Option S shows whether production would take the fast path. Come back here only if the harness reports something unexpected.
 
 ## How to read the log
 
@@ -37,7 +37,7 @@ A full-update run additionally logs:
 - **The registered-source fingerprint captured before source acquisition**: `Captured registered-source fingerprint: location=..., version=..., hash=...`. This is the value the pre-`/disable` race detector compares against later.
 - **The base WIM source-selection decision**: `Base WIM source selection: <reason> -> <path>`. The reason names the branch — `no hash-validated LKG present; using registered`, `registered at least as new as LKG`, `registered older than LKG`, `metadata comparison indeterminate; using hash-validated LKG`, `registered not usable; using hash-validated LKG`, or `neither registered nor hash-validated LKG usable; GitHub cold-start`.
 - **The strip stage's inventory and progress**: `Strip: pre-strip third-party inventory: N package(s)`, followed by one line per package (`Strip:   <OEM#.inf> | <provider> | <version> | <original filename>`), then `Strip: removed <OEM#.inf>` per removal and a terminator (`Strip: verified zero third-party drivers remaining after removing N package(s)` or `Strip: image already has zero third-party drivers`).
-- **The pre-injection third-party driver count**: `Pre-injection third-party driver count: N`. Under v47 this should be 0 unless the filterless and filtered DISM queries disagree (see the note in the strip-failure section below).
+- **The pre-injection third-party driver count**: `Pre-injection third-party driver count: N`. Under v47 this should be 0 unless the filterless and filtered DISM queries disagree (see the note in the Reporting a bug section below).
 - **The race-detector recheck at whichever `/disable` site the execution reached**: `Registered-source recheck at <site> : unchanged (...)`, where `<site>` is `Ensure-AdequateRecoveryPartition` or `Step 5 deployment`. On drift, the same line reads `CHANGED (location=<bool> version=<bool> hash=<bool>)`.
 - **The registered-versus-deployed metadata comparison** at the drift detector: `Registered WinRE metadata: <ver>|<sp>; last deployed: <ver>|<sp>` (or `(none)` on the first v47 run).
 - **The deployed metadata anchor written at state-write time**: `Deployed WinRE metadata: <ver>|<sp>`.
@@ -56,6 +56,11 @@ The pre-deployment gates, the post-run persistence features, and the backup and 
 - **The restore action** (`-Action Restore -BackupPath <dir>`) — writes a previously captured WIM back to the active route.
 - **The temporary crash-recovery scheduled task** (`WinRE Manager - Resume`) — registered by every Repair or Restore run, deleted on clean completion, preserved on interruption.
 - **The stable install location** for the permanent maintenance task (`C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1`) — the wrapper's install option copies the script there, hash-verifies, and registers the task against the copy.
+
+The v50 patch 1 release adds two new refusal paths with their own sections below:
+
+- **The resume-task protected-path guard** — refuses to register the SYSTEM crash-recovery task when the invoking script lives in a directory writable by a non-admin principal.
+- **The manager config ownership gate** — trusts `C:\ProgramData\OEM\WinRE-Manager\manager.json` only when its containing directory and its immediate parent are owned by SYSTEM or Administrators. An untrusted config is treated as absent.
 
 One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. The destructive path reads C:'s BitLocker state only for diagnostic logging and does not gate on it — only the OS-fallback route does, because on that route the target volume *is* C:.
 
@@ -235,7 +240,7 @@ A `FriendlyName` that names a `.vhdx` file and a `BusType` of `File Backed Virtu
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v49 patch 2) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v50 patch 1) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -246,7 +251,7 @@ Under `-DryRun` the first line reads `Would defer` instead of `Deferring`, and t
 
 **Cause.** Windows is in a transitional state that is not yet a normal-running installation. During Audit Mode, OOBE, the sysprep generalize phase, and the sysprep specialize phase, `reagentc /enable` fails with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM or the state of the recovery partition. There is no workaround; the OS blocks `/enable` on purpose until the machine reaches a normal desktop.
 
-The startup guard reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` ? `ImageState`. It proceeds only when the value is absent (some SKUs omit the key) or exactly `IMAGE_STATE_COMPLETE`. Any other value defers. The predicate is deliberately conservative — it does not depend on knowing the exact value that Audit Mode writes.
+The startup guard reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState`. It proceeds only when the value is absent (some SKUs omit the key) or exactly `IMAGE_STATE_COMPLETE`. Any other value defers. The predicate is deliberately conservative — it does not depend on knowing the exact value that Audit Mode writes.
 
 Field case: **Dell Latitude 5530** (12th Gen Intel i7-1265U, Windows 11 build 26200). The machine was in Audit Mode when the script first ran. The previous code (which had no Audit Mode guard) deployed the WIM successfully through Step 5 and then failed at `reagentc /enable` with `0x4c7` on two consecutive runs. It also wrote a state file recording the deployment as complete, so every subsequent run took the enable-only path and failed the same way — a permanent loop. After the user completed OOBE, signed in, and ran `reagentc /enable` manually, it succeeded on the first attempt with the same WIM. That confirms Audit Mode was the only blocker. This is the case that motivated the Audit Mode guard.
 
@@ -526,7 +531,7 @@ Then the checkpoint is reset to Step 2, `base.wim` and any stale `winre_optimize
 
 The race the detector closes is real: Windows Update can service or replace the registered WinRE while the script is preparing its candidate WIM. The candidate WIM was built from the registered image (or the LKG, or GitHub), the registered image changes under the script's feet, and the `/disable` + `/enable` cycle deploys a WIM that no longer corresponds to what the detector could have verified. The abort is protective.
 
-**Named as a race detector, not a lock.** Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update. The microseconds between the re-read and the `/disable` call returning cannot be eliminated without moving work into the disable?enable window, which would violate invariant 3 (minimize the disable?enable window). The detector narrows the window from minutes to those residual microseconds.
+**Named as a race detector, not a lock.** Microsoft does not document `reagentc /disable` as atomic with respect to Windows Update. The microseconds between the re-read and the `/disable` call returning cannot be eliminated without moving work into the disable→enable window, which would violate invariant 3 (minimize the disable→enable window). The detector narrows the window from minutes to those residual microseconds.
 
 **Resolution.**
 
@@ -575,7 +580,7 @@ In the first two cases the rebuild is triggered by a metadata comparison; in the
 
 **Cause.** The v47 patch 1 drift detector compares the currently-registered WinRE's DISM servicing metadata (`Version` + `SPBuild`) against the state file's `DeployedWinREMetadata` anchor. Three conditions force a rebuild:
 
-1. **The state file has no anchor.** This is the case for every v46-or-earlier state file. The absence forces a rebuild on the first v47 run so that the anchor is written. After the first successful v47 run, the state file carries the anchor and subsequent runs evaluate against it. The rebuild is a one-time cost of the v46 ? v47 migration.
+1. **The state file has no anchor.** This is the case for every v46-or-earlier state file. The absence forces a rebuild on the first v47 run so that the anchor is written. After the first successful v47 run, the state file carries the anchor and subsequent runs evaluate against it. The rebuild is a one-time cost of the v46 → v47 migration.
 2. **The anchor exists but does not match the current registered metadata.** This is the drift case: Windows Update serviced the registered WinRE, changing its `Version` or `SPBuild`. The detector forces a rebuild to bring the deployed WIM back into agreement with the current registered image. This is the intended behavior — Microsoft documents that an LCU bumps `SPBuild` while the base `Version` may remain unchanged, so both are compared.
 3. **The registered metadata is unreadable.** `Get-WimServicingMetadata` failed on the registered WIM. This is a defensive force-rebuild: a valid-looking state file could otherwise let the script take the fast path over an unreadable registered image, which the repair path would then be unable to replace. The rebuild runs so the repair path can replace the image.
 
@@ -905,7 +910,7 @@ The harness reports the computed `LocalInputsId` in Option S alongside the store
 ```
 [INFO]  Backup destination: <destination-path>
 [INFO]  Backup source WIM: <source-wim-path>
-[ERROR] Backup cannot proceed: <reason>              (pre-flight refusal: no registered location, no readable winre.wim, destination not writable)
+[ERROR] Backup cannot proceed: <reason>              (pre-flight refusal: no registered location, no readable winre.wim, destination not writable, destination drive letter unresolvable, insufficient destination free space)
 [ERROR] Backup copy failed: <error>                 (copy failure)
 [ERROR] Backup copy hash verification failed (source=<source-hash>, dest=<dest-hash>).   (hash mismatch — the partial copy is removed)
 [WARN]  Backup sidecar write failed: <error> - the WIM is present and verified; sidecar is metadata only   (exit 2; the WIM backup is usable)
@@ -917,6 +922,8 @@ The harness reports the computed `LocalInputsId` in Option S alongside the store
 - **The destination directory is not writable** by the running account, or does not exist and cannot be created.
 - **The source hash and the copy hash do not match** — the same class of failure the copy-integrity check catches in the rebuild pipeline.
 - **A drive letter could not be assigned** to reach the registered location (all 26 letters exhausted, mapped network drive conflict, or the disk is offline).
+- **The destination drive letter does not resolve to a known local or mapped drive** (v50). The v50 patch 1 free-space preflight runs before the destination directory is created and bails out when the destination drive letter does not resolve. The log line reads `Backup cannot proceed: destination drive letter <letter> in <path> does not resolve to a known local or mapped drive.` This usually means the destination was specified with a drive letter that is not currently mounted, or a mapped network drive that is not currently connected.
+- **The destination volume has insufficient free space** for the WIM plus the 100 MiB margin (v50). The v50 patch 1 free-space preflight refuses when the available free space is less than the source WIM's size plus 100 MiB. The log line reads `Backup cannot proceed: destination <destRoot> has insufficient free space (<n> MiB free, need <n> MiB). No backup was written.` The preflight uses `Get-Volume` for a local drive and `Get-PSDrive` for a mapped network drive; if neither resolves, the check is skipped and the copy proceeds with any space-related failure surfaced by `Copy-Item`.
 
 **Resolution.**
 
@@ -925,6 +932,10 @@ The harness reports the computed `LocalInputsId` in Option S alongside the store
 3. **For a destination-write error**, verify the destination directory exists and the running account has write permission. The backup action attempts to create the destination path; if creation fails (typically a permission error), the run logs "Backup cannot proceed: could not prepare destination directory" — check the log for a directory-creation line.
 4. **For a hash mismatch**, the source WIM was replaced by the OS between the hash and the copy. Re-run; if it recurs, investigate whether a Windows Update or a vendor tool is servicing WinRE.
 5. **For a drive-letter exhaustion**, free a mapped drive (`net use Z: /delete`) and re-run. See "Drive letters exhausted" above for the full diagnostics.
+
+6. **For a destination drive letter that does not resolve (v50),** verify the drive letter is currently mounted. A mapped network drive that is not currently connected, or a drive letter that was assigned to a removable volume that is no longer present, produces this refusal. Reconnect the drive, or specify a different destination via `-BackupPath`.
+
+7. **For insufficient destination free space (v50),** free space on the destination volume, or choose a different destination via `-BackupPath`. The required space is the source WIM's size plus a 100 MiB margin. The log line names both byte counts (`<n> MiB free, need <n> MiB`) and the `Backup free-space check:` line immediately above names the destination free-space source (`Get-Volume` or `Get-PSDrive`).
 
 **Field status.** This action is new in v49. The maintainer wants field data on which failure modes actually fire. If you see a backup failure, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section.
 
@@ -1038,10 +1049,57 @@ If the task is present, one of the five interruption classes occurred.
 
 **Field status.** The resume task is new in v49 patch 1. Field verification is partially complete: the Ctrl+C preservation path and the clean-completion removal of the resume task were verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09). The other persist and interruption paths — the outer catch, the two `Invoke-RestoreAction` mid-transformation failure paths, a hard kill, and a reboot mid-run — have not been exercised in the field. If you see the task present, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — include the invocation context, which interruption occurred, and whether the resume run subsequently completed the operation.
 
+## The temporary resume task was not registered because the script directory is non-admin-writable (v50)
+
+**Symptom.** The run completes normally, but the log shows a WARN line stating the resume task was not registered because the script directory grants write access to a non-admin principal. The run summary's "Changes NOT made" list includes a line naming the offending principal. The repair pipeline itself is unaffected — the run proceeds without the self-healing hook.
+
+**Log signature.** One of:
+
+```
+[WARN] Register-ResumeTask: '<scriptDir>' grants write-capable access to '<principal>' (FileSystemRights=<rights>). Registering the resume task against a script in a non-admin-writable location would allow a non-administrator to modify the file and have it execute as SYSTEM on the next boot. Skipping the temporary resume task; the repair pipeline itself is unaffected.
+```
+
+or, when the ACL of the script directory could not be read:
+
+```
+[WARN] Register-ResumeTask: could not read the ACL of '<scriptDir>': <error> - skipping the temporary resume task (fail closed; the repair pipeline itself is unaffected)
+```
+
+or, in the very rare case the script directory could not be determined:
+
+```
+[WARN] Register-ResumeTask: could not determine the directory containing '<PSCommandPath>' - skipping the temporary resume task (the repair pipeline itself is unaffected)
+```
+
+**Cause.** The v50 patch 1 resume-task protected-path guard refuses to register the SYSTEM crash-recovery task when the directory containing the invoking script grants any write-capable right (`WriteData`, `Delete`, `DeleteSubdirectoriesAndFiles`, `TakeOwnership`, `ChangePermissions`) to `Everyone`, `BUILTIN\Users`, `Authenticated Users`, or `INTERACTIVE`. The task runs as SYSTEM; such access would let a non-admin modify the script before the task fires and gain SYSTEM-level code execution on the next boot. The guard is fail-closed: an unreadable ACL is treated as if it grants write access, and the task is not registered. The mask is `WriteData`-and-up, not the composite `Write` bit — the composite would false-positive on the stock `C:\ProgramData` ACL, which grants `BUILTIN\Users` a container-inherited `AppendData` ACE that alone does not permit modifying a file directly in the directory.
+
+The guard resolves the script directory via `[System.IO.Path]::GetDirectoryName($PSCommandPath)`, not via `Split-Path` + `Test-Path -PathType Container`, because the latter combination returns `$false` on OneDrive-hosted paths for a directory the process is demonstrably reading from — a field failure that silently skipped the resume task on a machine that should have had it. The script directory's existence and accessibility is confirmed by the `Get-Acl` call, which is the operation the function actually needs.
+
+**This is expected behavior on a machine whose script lives in a directory writable by non-admin users.** The standard `C:\ProgramData\OEM\` location with default ACLs does not trigger the guard. If your script lives elsewhere and the guard is firing, either move the script to a non-admin-writable location or accept that the resume task will not be registered on this machine.
+
+**Resolution.**
+
+1. **Confirm the script directory's ACL.**
+
+   ```powershell
+   Get-Acl -Path '<scriptDir>' | Format-List Owner, AccessToString
+   ```
+
+   Look for Allow ACEs granting any of `WriteData`, `Delete`, `DeleteSubdirectoriesAndFiles`, `TakeOwnership`, or `ChangePermissions` to `Everyone`, `BUILTIN\Users`, `Authenticated Users`, or `INTERACTIVE`.
+
+2. **If the ACL is the standard `C:\ProgramData\OEM\` ACL and the guard is still firing,** file a bug. The `WriteData`-and-up mask is deliberate: the standard ACL grants `AppendData` to `BUILTIN\Users` but not `WriteData`, and the guard should not false-positive on it.
+
+3. **If the ACL is legitimately permissive** — a script stored under `C:\Users\...`, `C:\Temp\`, or a user-writable share — move the script to a non-admin-writable location (`C:\ProgramData\OEM\` is the recommended location) and re-run.
+
+4. **If the ACL could not be read** (the fail-closed case), investigate why `Get-Acl` failed. A network path, a reparse point, or a transient filesystem condition is a common cause.
+
+5. **Do not bypass the guard.** The guard exists to prevent a non-admin from gaining SYSTEM-level execution on the next boot by modifying the script. The repair pipeline itself is unaffected — the run proceeds without the self-healing hook — so the guard's only cost is the absence of the resume task on a machine whose script is in a non-standard location.
+
+**Field status.** The v50 patch 1 guard has not been exercised in the field's refusal path. If the refusal fires, capture the full log and the ACL of the script directory; the guard was designed so that the standard `C:\ProgramData\OEM\` location with default ACLs does not trigger it.
+
 ## The wrapper's install step refused because the copy hash did not match (v49)
 
 **Symptom.** The wrapper's install option (`WinRE-Manager.cmd`, option **5**) refused to register the permanent maintenance task because the SHA256 of the copy at `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` did not match the SHA256 of the local source `WinRE.ps1`.
-
 **Log signature.** This output is emitted by `WinRE-Manager.cmd`'s elevated child, to the child window — it does not go to `C:\ProgramData\OEM\Logs\WinRE-Manager.log`. On success:
 
 ```
@@ -1077,6 +1135,67 @@ Install copy hash mismatch. Source=<source-hash> Copy=<installed-copy-hash>
 3. **For a source-file issue**, verify the local `WinRE.ps1` is not open in an editor or otherwise locked. Save any pending edits and re-run the install.
 
 4. **Do not bypass the check.** Registering the task against a copy whose hash does not match the source would defeat the point of the stable install location. If the check is firing repeatedly, the AV/EDR interference or the file-system condition is the problem to solve.
+
+## The manager config was not trusted (v50)
+
+**Symptom.** The backup action completes successfully and writes the WIM and sidecar, but the log shows a WARN line stating the manager config at `C:\ProgramData\OEM\WinRE-Manager\manager.json` was not written because an ancestor directory is not owned by SYSTEM or Administrators. Alternatively, a later backup run or the `Cleanup-Backups.ps1` helper reports the config was treated as empty and no backup roots were loaded from it.
+
+**Log signature.** Three variants, depending on the code path:
+
+```
+[WARN] Refusing to write manager config: ancestor directory '<path>' is not owned by SYSTEM or Administrators. The config remains the empty default.
+```
+
+(write path — `Set-ManagerConfig`, called from `Add-ManagerBackupRoot` after a successful backup)
+
+```
+[WARN] Get-ManagerConfig: ancestor directory '<path>' is not owned by SYSTEM or Administrators - treating config as empty
+```
+
+(read path — `Get-ManagerConfig`, called by `Cleanup-Backups.ps1` and by a later backup that reads the root catalogue)
+
+```
+[WARN] Test-DirectoryOwnedByTrustedPrincipal: could not read ACL of '<path>' : <error> - fail closed
+[WARN] Test-DirectoryOwnedByTrustedPrincipal: could not determine owner of '<path>' - fail closed
+```
+
+(fail-closed variants when the ACL or owner could not be read or resolved)
+
+**Cause.** The v50 patch 1 manager config ownership gate verifies that the directory containing `manager.json` **and its immediate parent** are owned by SYSTEM (`S-1-5-18`) or Administrators (`S-1-5-32-544`). The two-level check exists because the stock ACL on `C:\ProgramData` grants `Authenticated Users` the ability to create subdirectories, and a directory created by a non-admin principal is owned by that principal. Without the two-level check, an attacker could pre-create `C:\ProgramData\OEM\WinRE-Manager` under their own account and inject a `manager.json` whose `BackupCatalog.Roots` points at a location the operator does not control; a later Cleanup helper invoked under SYSTEM would delete files under the attacker's chosen path, or a later Restore would read from an attacker-supplied location. The second-level check catches the delete-and-recreate swap, where an attacker who owns the parent deletes-and-recreates the child to steal ownership of that child between runs.
+
+The write path additionally runs the checks before creating the directory, so a pre-created attacker-owned parent is caught before the manager adds a child to it. An untrusted or unparseable config is treated as absent: the caller gets the empty default, an operator-initiated backup still completes without catalogue registration, and no backup roots are loaded from it.
+
+**This is not a backup failure.** The backup WIM is written and verified; only the catalogue registration is skipped. On the read path, the cleanup helper falls back to the default root alone and reports no roots under the config.
+
+**Resolution.**
+
+1. **Confirm the ownership of the manager config directory and its parent.**
+
+   ```powershell
+   Get-Acl -Path 'C:\ProgramData\OEM\WinRE-Manager' | Format-List Owner
+   Get-Acl -Path 'C:\ProgramData\OEM' | Format-List Owner
+   ```
+
+   Both should read `NT AUTHORITY\SYSTEM` or `BUILTIN\Administrators`.
+
+2. **If either directory is owned by something else,** take ownership and restore the correct owner. From an elevated PowerShell:
+
+   ```powershell
+   takeown /f "C:\ProgramData\OEM\WinRE-Manager" /a
+   takeown /f "C:\ProgramData\OEM" /a
+   icacls "C:\ProgramData\OEM\WinRE-Manager" /setowner "NT AUTHORITY\SYSTEM"
+   icacls "C:\ProgramData\OEM" /setowner "NT AUTHORITY\SYSTEM"
+   ```
+
+   Then re-run the backup. The catalogue registration will succeed on the next run.
+
+3. **If the parent directory legitimately cannot be owned by SYSTEM or Administrators** — for example, an enterprise policy requires a different owner for `C:\ProgramData\OEM` — the config will be treated as absent on every run. This is by design: the config is trusted only when the ownership chain is trusted. The machine still takes backups; the catalogue is simply not maintained.
+
+4. **If the ACL could not be read,** investigate why `Get-Acl` failed. A network path, a reparse point, an unreadable ACL, or a transient filesystem condition are the common causes.
+
+5. **Do not relax the guard.** The gate prevents an attacker from injecting a backup-root catalogue. The cost of a refusal is a skipped catalogue registration; the cost of bypassing the gate is a later Cleanup or Restore operating on an attacker-supplied location.
+
+**Field status.** The v50 patch 1 gate has not been exercised in the field's refusal path. If the refusal fires, capture the two ACLs and the log line; the gate is designed so that the standard `C:\ProgramData\OEM\` hierarchy with default ACLs passes.
 
 ## The script exited with a rename error (concurrent instance)
 
@@ -1210,7 +1329,7 @@ Exit code 3. The machine is unchanged. No WIM deployed, no partition touched.
 - **Case 2** — the state file exists and its `DesiredStateId` is available, but the local safety checks do not pass: the registered metadata no longer matches the anchor, or a force-upgrade was detected, or the stored driver set version differs from the expected one, or the state file is missing the v47 `DeployedWinREMetadata` anchor (a v46-or-earlier state file), or the state file indicates a full update is needed for some other locally-detectable reason. A full update requires the live manifest to resolve the driver set, which is not available. The script defers.
 - **Case 3** — there is no state file at all, so the script cannot compute a `DesiredStateId` to work with. The live manifest is required for the first deployment on a machine.
 
-**The v46 ? v47 transition on offline machines.** Under v47, a v46-or-earlier state file lacks the `DeployedWinREMetadata` anchor. Its absence forces `$needInject = $true` regardless of network state, so Case 2 is what fires on the first v47 run if that run is offline. From the second v47 run onward — after one successful online run has written the anchor — the offline fast path can fire normally. The one-time cost of the v47 migration on offline machines is therefore: the first scheduled v47 run must happen while the machine can reach the driver manifest.
+**The v46 → v47 transition on offline machines.** Under v47, a v46-or-earlier state file lacks the `DeployedWinREMetadata` anchor. Its absence forces `$needInject = $true` regardless of network state, so Case 2 is what fires on the first v47 run if that run is offline. From the second v47 run onward — after one successful online run has written the anchor — the offline fast path can fire normally. The one-time cost of the v47 migration on offline machines is therefore: the first scheduled v47 run must happen while the machine can reach the driver manifest.
 
 **Resolution (Case 1 — nothing to do).** The machine is healthy. The exit code 2 is a degraded-success signal from the fact that the fast path was taken without a live manifest fetch. The next scheduled run with network performs a full manifest fetch and confirms there has been no hardware drift while offline.
 
@@ -1222,7 +1341,7 @@ Exit code 3. The machine is unchanged. No WIM deployed, no partition touched.
 
 **Not to be confused with the Audit Mode or OS-fallback BitLocker deferrals.** All three exit with code 2 and leave the state file unchanged, but the log signature is distinct. The Audit Mode deferral logs `Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=…)` and fires before the hardware check. The OS-fallback BitLocker deferral logs `OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=…)` and fires after the classifier runs. The offline deferral logs `Offline fallback: the machine requires a full update …` and fires before the full-update pipeline. A field engineer reading the log will see the difference immediately.
 
-## OEM or VMD injection failed (Step 3 ? Step 4 pipeline gate)
+## OEM or VMD injection failed (Step 3 → Step 4 pipeline gate)
 
 **Symptom.** The script exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no partition work, no WIM deployment, no `reagentc` calls, and the state file is unchanged (or absent). The difference from the Audit Mode deferral is that the run got much further — the WIM was downloaded or copied to `WorkDir`, mounted, stripped (v47 patch 1, gated by the v49 source-ownership classification), and an OEM or VMD injection attempt was made against it.
 

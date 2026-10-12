@@ -19,6 +19,10 @@
         Get-ProductionScriptVersion; the harness reports the DSI
         comparison as SKIP when the reader cannot resolve it)
       - Get-LocalInputsId (v48 three-field locally-computable hash)
+      - Compare-WimServicingMetadata (v47 Version/SPBuild/SPLevel/
+        Architecture comparator used by production's
+        Select-BaseWinRESource for source selection; the harness
+        exercises it with an 8-case regression self-test)
       - Get-StorageControllerDevices (v49 SCSIAdapter-class device
         enumeration, mirroring production's software-device filter)
       - Get-DriverManifest retry policy (2 attempts, 2s sleep, WARN log)
@@ -60,6 +64,29 @@
           when a regex fails to match. Diagnostics observe the mirror;
           they do not change its control flow.
 
+          A deliberate special case: where production classifies a
+          condition indirectly (via a cmdlet that wraps a native tool,
+          or via a parsed label), the harness may call the native tool
+          directly and print its raw output, so that Microsoft format
+          drift and non-English OS rendering are visible in the
+          diagnostic even when the cmdlet's classification would
+          succeed. Two instances are deliberate:
+            - Get-WinREState captures the full reagentc /info text as
+              RawInfo; Show-SystemDiagnostic prints it verbatim before
+              the parsed status/location/version block, and the
+              parser self-test's regex failure hypotheses cite the raw
+              text alongside the current OS locale.
+            - Test-PlanAdjacencyReadOnly's anchor BitLocker check
+              calls manage-bde -status directly instead of going
+              through production's Test-VolumeAccessibleForResize
+              (which queries Get-BitLockerVolume first and only falls
+              back to manage-bde when the cmdlet returns nothing).
+              The direct call exposes the raw conversion-status and
+              lock-status lines; the harness verdict may therefore
+              differ from production's on a machine where the cmdlet
+              and the native tool classify differently, and that
+              difference is the diagnostic.
+
       (c) An explicit, documented functional difference. Where the
           harness deliberately differs from production - for example,
           Test-VmdDrivers downloads every OS- and CPU-eligible driver
@@ -91,6 +118,16 @@
     v49 patch 2 return-value fix (v30) and the Invoke-CabExtraction
     7-Zip argument list (v31).
 
+    Two source-level binding assertions (checks 18 and 19 in the parser
+    self-test) verify that production's Test-NativeBootVirtualTopology
+    retains the v49 patch 2 fail-closed shape, and that production's
+    Get-StorageControllerDevices retains the mirror contract that check
+    17 depends on (the unary-comma return and both software-device
+    filter regexes). These read WinRE.ps1 if it is adjacent and SKIP
+    when it is not. They are not mirrors; they are invariant-level
+    guards against the mirror-drift class named in the preceding
+    paragraph.
+
 .PARAMETER TestDir
     Working directory. Default C:\Temp\WinRETest.
 
@@ -101,7 +138,57 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 32
+    Version : 35
+
+    v35 changes vs v34:
+    1. Inverted the interactive cleanup prompt. v34 shipped as
+       "Keep test artifacts in $TestDir ? (y/N)" with y=keep and
+       N=delete. The y-as-keep semantics were the reverse of what
+       most operators read ("y to cleanup"), and an operator who
+       answered y expecting deletion got the opposite: the keep
+       branch returned before Remove-EmptyTestParent ran, so neither
+       $TestDir nor its parent was removed. The prompt now reads
+       "Delete test artifacts from $TestDir ? (Y/n)" with y=delete
+       (default) and n=keep. Empty input still deletes. The -Keep
+       switch still short-circuits to keep, and the
+       pre-existing-non-empty refusal is unchanged.
+    2. Menu title and startup Rule bumped 34 -> 35.
+
+    v34 changes vs v33:
+    1. Added Remove-EmptyTestParent, mirroring production's v50
+       Remove-EmptyWorkspaceParent invariant. After
+       Invoke-HarnessCleanup removes $TestDir, the parent
+       (typically C:\Temp for the default path) is checked and
+       removed if and only if its leaf name is exactly "Temp", it is
+       completely empty, and it is not a drive root. Before this
+       change the harness removed $TestDir recursively but left an
+       empty C:\Temp behind on a machine where the harness had
+       created C:\Temp itself. Removal is attempted via Remove-Item
+       with a [System.IO.Directory]::Delete fallback for provider-layer
+       disagreements, then verified: if the directory still exists
+       afterward (typically because another process holds a handle,
+       or because the invoking session's working directory is inside
+       it), a WARN is logged and the directory is left in place. A
+       user-supplied -TestDir whose parent is not named "Temp" (for
+       example C:\Users\Me\Desktop) is therefore never touched.
+    2. Menu title and startup Rule bumped 33 -> 34.
+
+    v33 changes vs v32:
+    1. Added two source-level mirror-binding assertions to the
+       parser self-test (checks 18 and 19).
+       Check 18 verifies that production's Test-NativeBootVirtualTopology
+       retains the v49 patch 2 fail-closed shape: the unfiltered
+       Get-Disk enumeration uses -ErrorAction Stop, the gate sets
+       IsNativeBootVirtual = $true on the corresponding catch path, and
+       the indeterminate-topology reason text is present. Check 19
+       verifies that production's Get-StorageControllerDevices retains
+       the mirror contract that check 17's harness-side test depends
+       on: the unary-comma return (return ,$result) and both
+       software-device filter regexes ({GUID}\ and SWD\). Both checks
+       read the adjacent WinRE.ps1 and SKIP when it is not present.
+       Neither is a mirror; they are invariant-level guards against
+       the mirror-drift class the .DESCRIPTION names as a defect.
+    2. Menu title and startup Rule bumped 32 -> 33.
 
     v32 changes vs v31:
     1. Hardened Record's -Ok parameter with a default of $false. The
@@ -1044,6 +1131,36 @@ function Get-ProductionScriptVersion {
     return $null
 }
 
+# Read the body of a specific function from the adjacent WinRE.ps1, for
+# source-level mirror-binding assertions. Returns $null when the script
+# is not adjacent or the function is not found. The extraction stops at
+# the first line-start "}" after the function header, which matches the
+# brace-at-column-zero convention used throughout WinRE.ps1.
+function Get-ProductionFunctionText {
+    param([Parameter(Mandatory)][string]$FunctionName)
+    $productionPath = Join-Path $PSScriptRoot "WinRE.ps1"
+    if (-not (Test-Path -LiteralPath $productionPath -PathType Leaf)) { return $null }
+    try {
+        # Extract the function body via the PowerShell parser rather than
+        # a brace-at-column-0 regex. A future function-body change (a
+        # here-string containing '}' at column 0, a nested code block)
+        # could otherwise silently truncate the extracted text. Returns
+        # $null on parse error so the caller's SKIP path fires rather
+        # than asserting against a partial parse.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($productionPath, [ref]$tokens, [ref]$parseErrors)
+        if (-not $ast -or ($parseErrors -and $parseErrors.Count -gt 0)) { return $null }
+        $allFunctions = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true)
+        $funcAst = $allFunctions | Where-Object { $_.Name -eq $FunctionName } | Select-Object -First 1
+        if ($funcAst) { return $funcAst.Extent.Text }
+    } catch { }
+    return $null
+}
+
 function Get-DesiredStateId {
     # Mirror of production's Get-DesiredStateId. Production's
     # $ScriptVersion is read from the adjacent WinRE.ps1 via
@@ -1386,6 +1503,18 @@ function Get-HarnessPartitionRef {
 # the layout) and the anchor is reported via InterveningAnchor. If
 # validation fails, the anchor rejection reason becomes the plan rejection. The separation
 # rejection is only reported when no intervening anchor was established.
+#
+# Deliberate difference from production (category (b), raw-output
+# diagnostic): the anchor BitLocker check below calls manage-bde
+# -status directly rather than going through production's
+# Test-VolumeAccessibleForResize, which queries Get-BitLockerVolume
+# first and only falls back to manage-bde when the cmdlet returns
+# nothing. The direct call is a diagnostic choice: it exposes the raw
+# conversion-status and lock-status lines so Microsoft format drift
+# and non-English OS rendering are visible to the operator. The
+# harness verdict may therefore differ from production's when the
+# cmdlet and the native tool classify differently; that difference is
+# itself the observation the harness exists to surface.
 function Test-PlanAdjacencyReadOnly {
     param(
         [Parameter(Mandatory)]$OSDisk,
@@ -2758,6 +2887,102 @@ function Show-SystemDiagnostic {
         Record "Parser: Get-StorageControllerDevices shape" $false "$_"
     }
 
+    # Check 18 (v33): production source-level assertion for the v49 patch 2
+    # native-boot VHDX fail-closed shape. The unfiltered Get-Disk
+    # enumeration in Test-NativeBootVirtualTopology must use
+    # -ErrorAction Stop so an enumeration failure is caught rather than
+    # silently producing an empty result that reads as "no other disks
+    # present" -- the exact fail-open defect v49 patch 2 closed. This is
+    # not a mirror of the function; it is a source-level invariant
+    # assertion that catches the drift class the change was made to fix,
+    # without paying the maintenance cost of running production's gate
+    # logic in the harness. SKIP when WinRE.ps1 is not adjacent.
+    try {
+        $vhdBody = Get-ProductionFunctionText -FunctionName 'Test-NativeBootVirtualTopology'
+        if (-not $vhdBody) {
+            Write-Host "  " -NoNewline
+            Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+            Write-Host " Test-NativeBootVirtualTopology fail-closed shape: WinRE.ps1 not adjacent" -ForegroundColor Gray
+            Record "Parser: VHDX gate fail-closed" $false -State "SKIP" -Detail "production script not adjacent"
+        } else {
+            $issues = @()
+            if (-not $vhdBody.Contains('-ErrorAction Stop')) {
+                $issues += "unfiltered Get-Disk enumeration does not use -ErrorAction Stop"
+            }
+            if (-not $vhdBody.Contains('IsNativeBootVirtual = $true')) {
+                $issues += "gate does not set IsNativeBootVirtual = `$true anywhere (fail-closed return missing)"
+            }
+            if (-not $vhdBody.Contains('Could not enumerate all disks')) {
+                $issues += "unfiltered-enumeration catch block missing the indeterminate-topology reason text"
+            }
+            if ($issues.Count -eq 0) {
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Test-NativeBootVirtualTopology: unfiltered enumeration uses -ErrorAction Stop and fails closed" -ForegroundColor Gray
+                Record "Parser: VHDX gate fail-closed" $true "source-level assertion matched"
+            } else {
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Test-NativeBootVirtualTopology: fail-closed shape not intact in production:" -ForegroundColor Gray
+                foreach ($i in $issues) { Write-Host "          - $i" -ForegroundColor Red }
+                Record "Parser: VHDX gate fail-closed" $false ($issues -join '; ')
+            }
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Test-NativeBootVirtualTopology source assertion threw: $_" -ForegroundColor Gray
+        Record "Parser: VHDX gate fail-closed" $false "$_"
+    }
+
+    # Check 19 (v33): production source-level assertion for the
+    # Get-StorageControllerDevices mirror contract. Check 17 above
+    # exercises the harness's mirror of the function, not production's
+    # own implementation. If production changes the shape the mirror
+    # depends on -- the unary-comma return that preserves an empty
+    # array, or either of the two software-device filter regexes -- the
+    # mirror silently diverges and check 17 continues to pass while the
+    # mirror no longer describes production. This assertion catches that
+    # class of drift at the source level. SKIP when WinRE.ps1 is not
+    # adjacent.
+    try {
+        $scBody = Get-ProductionFunctionText -FunctionName 'Get-StorageControllerDevices'
+        if (-not $scBody) {
+            Write-Host "  " -NoNewline
+            Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+            Write-Host " Get-StorageControllerDevices mirror binding: WinRE.ps1 not adjacent" -ForegroundColor Gray
+            Record "Parser: StorageControllerDevices mirror binding" $false -State "SKIP" -Detail "production script not adjacent"
+        } else {
+            $issues = @()
+            if (-not $scBody.Contains('return ,$result')) {
+                $issues += "missing unary-comma return (return ,`$result)"
+            }
+            if (-not $scBody.Contains('[0-9A-Fa-f-]')) {
+                $issues += "missing {GUID} software-device filter regex"
+            }
+            if (-not $scBody.Contains('^SWD')) {
+                $issues += "missing SWD software-device filter regex"
+            }
+            if ($issues.Count -eq 0) {
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Get-StorageControllerDevices: production mirror contract intact (unary-comma return + both filters)" -ForegroundColor Gray
+                Record "Parser: StorageControllerDevices mirror binding" $true "source-level assertion matched"
+            } else {
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Get-StorageControllerDevices: production has drifted from the harness mirror:" -ForegroundColor Gray
+                foreach ($i in $issues) { Write-Host "          - $i" -ForegroundColor Red }
+                Record "Parser: StorageControllerDevices mirror binding" $false ($issues -join '; ')
+            }
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Get-StorageControllerDevices source assertion threw: $_" -ForegroundColor Gray
+        Record "Parser: StorageControllerDevices mirror binding" $false "$_"
+    }
+
     Write-Diag "  Diagnostic complete. Parser self-test results are in the summary." "Green"
 }
 
@@ -3478,6 +3703,53 @@ function Show-Summary {
 }
 
 # =========================== CLEANUP ===========================
+# Mirror of production's Remove-EmptyWorkspaceParent (v50), applied to
+# $TestDir. After Invoke-HarnessCleanup removes $TestDir, the parent
+# (typically C:\Temp for the default path) may be left behind empty.
+# Remove it only when:
+#   - the parent's leaf name is exactly "Temp", and
+#   - the parent is completely empty, and
+#   - the parent is not a drive root.
+# This matches production's empty-workspace-parent invariant so the
+# harness does not leave an empty directory behind on a machine where
+# production would have removed it. A user-supplied -TestDir whose
+# parent is not named "Temp" (for example C:\Users\Me\Desktop) is
+# therefore never touched.
+function Remove-EmptyTestParent {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not $Path) { return }
+    $parent = $null
+    try { $parent = Split-Path -LiteralPath $Path -Parent } catch { return }
+    if (-not $parent) { return }
+    if ($parent -match '^[A-Za-z]:\\?$') { return }
+    $leaf = $null
+    try { $leaf = Split-Path -LiteralPath $parent -Leaf } catch { return }
+    if (-not $leaf) { return }
+    if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($leaf, 'Temp')) { return }
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) { return }
+    $entries = $null
+    try {
+        $entries = @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop)
+    } catch {
+        Say "Could not enumerate '$parent' to decide whether to remove it: $_" -Level WARN
+        return
+    }
+    if ($entries.Count -ne 0) { return }
+    Say "Removing empty test parent: $parent"
+    try {
+        Remove-Item -LiteralPath $parent -Force -ErrorAction Stop
+    } catch {
+        # Fall back to the .NET API. Remove-Item goes through the
+        # PowerShell provider layer; production's "Provider-based path
+        # checks" lesson records cases where the provider and the .NET
+        # API disagree on a path the process is demonstrably using.
+        try { [System.IO.Directory]::Delete($parent, $false) } catch { }
+    }
+    if (Test-Path -LiteralPath $parent -PathType Container) {
+        Say "Could not remove empty test parent '$parent' - a process may hold a handle to it; leaving it in place" -Level WARN
+    }
+}
+
 # Refuses to delete $TestDir when it pre-existed the run and already
 # contained entries. This is the v18 fix for the destructive-cleanup
 # footgun: passing -TestDir C:\Users\Me\Desktop must not wipe the user's
@@ -3500,13 +3772,23 @@ function Invoke-HarnessCleanup {
     if ($NonInteractive) {
         Say "Removing $TestDir (non-interactive cleanup)"
         try { Remove-Item $TestDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Remove-EmptyTestParent -Path $TestDir
         return
     }
 
-    $keepAnswer = Read-Host "  Keep test artifacts in $TestDir ? (y/N)"
-    if ($keepAnswer.Trim().ToLower() -ne "y") {
+    # v35: prompt inverted. Previous form was "Keep ... ? (y/N)" with
+    # y=keep, N=delete. Operators read "y to cleanup" and answered y
+    # expecting deletion; the keep branch returned before
+    # Remove-EmptyTestParent ran, leaving both $TestDir and its parent
+    # behind. The prompt now reads "Delete ... ? (Y/n)" with y=delete
+    # (default) and n=keep. Empty input still deletes. The -Keep switch
+    # still short-circuits to keep, and the pre-existing-non-empty
+    # refusal is unchanged.
+    $cleanupAnswer = Read-Host "  Delete test artifacts from $TestDir ? (Y/n)"
+    if ($cleanupAnswer.Trim().ToLower() -ne "n") {
         Say "Removing $TestDir"
         try { Remove-Item $TestDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Remove-EmptyTestParent -Path $TestDir
     } else {
         Say "Kept: $TestDir"
     }
@@ -3520,7 +3802,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v32)"
+    $titleContent = "WinRE Manager Test Harness (v35)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -3568,7 +3850,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v32"
+Rule "WinRE Manager test harness v35"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

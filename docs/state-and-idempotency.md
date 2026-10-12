@@ -428,6 +428,8 @@ The state file could in principle be a SQLite database, a binary blob, a Windows
 
 The trade-off is that the script does not defend against an operator manually editing the state file. That is not a scenario the design needs to support; if you edit the state file, you own the consequences.
 
+**A separate durable-settings artifact (v50 patch 1).** The manager also maintains a machine-wide settings file at `C:\ProgramData\OEM\WinRE-Manager\manager.json`. It is not part of the deployment identity, is not read by `Read-WinREState` or written by `Write-WinREState`, and does not participate in the fast-path decision. It holds the backup-root catalogue read by `Cleanup-Backups.ps1`, and it is owner-gated on both read and write (SYSTEM or Administrators on the containing directory and its immediate parent, fail-closed on ambiguity). See [architecture.md](architecture.md) under "The eight state-carrying artifacts" for the full description and [deployment.md](deployment.md) for the fleet-operator view.
+
 ### What the program lock does not replace
 
 The v44 patch 4 program lock at `C:\ProgramData\OEM\Logs\WinREManager.lock` is sometimes confused with persistence. It is not. The lock and the state file serve different purposes:
