@@ -91,16 +91,29 @@ $localPatch   = if ($localPatchMatch.Success) { [int]$localPatchMatch.Groups[1].
 $remoteVersion = $null
 $remotePatch   = $null
 
+$localVersionString = "$localVersion.$localPatch"
 if (-not $Force -and (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
     try {
         $age = (Get-Date) - (Get-Item -LiteralPath $cacheFile).LastWriteTime
         if ($age.TotalHours -lt $CacheHours) {
             $cached = (Get-Content -LiteralPath $cacheFile -Raw -ErrorAction Stop).Trim()
-            $parts = $cached -split '\|', 2
-            if ($parts.Count -ge 1 -and $parts[0] -match '^\d+$') {
-                $remoteVersion = [int]$parts[0]
-                $remotePatch   = if ($parts.Count -ge 2 -and $parts[1] -match '^\d+$') { [int]$parts[1] } else { 0 }
+            $parts = $cached -split '\|'
+            # New format: localVersionString|remoteVersion|remotePatch
+            # Legacy format (v49 patch 2 and earlier): remoteVersion|remotePatch
+            # Invalidate the cache if it was written when a different local version was current,
+            # so a local upgrade immediately re-checks against the remote rather than
+            # reporting a stale comparison.
+            if ($parts.Count -ge 3 -and $parts[0] -eq $localVersionString) {
+                if ($parts[1] -match '^\d+$') {
+                    $remoteVersion = [int]$parts[1]
+                    $remotePatch   = if ($parts[2] -match '^\d+$') { [int]$parts[2] } else { 0 }
+                }
+            } elseif ($parts.Count -eq 2 -and $parts[0] -match '^\d+$') {
+                # Legacy two-field cache: cannot prove it was written under the current
+                # local version. Discard it and fetch fresh.
+                Write-Verbose "Legacy cache format; discarding"
             }
+            # else: malformed or local-version mismatch; fall through to fetch
         }
     } catch { }
 }
@@ -143,7 +156,7 @@ if ($null -eq $remoteVersion) {
 
     if (-not $Quiet) {
         try {
-            Set-Content -LiteralPath $cacheFile -Value "$remoteVersion|$remotePatch" -NoNewline -ErrorAction SilentlyContinue
+            Set-Content -LiteralPath $cacheFile -Value "$localVersionString|$remoteVersion|$remotePatch" -NoNewline -ErrorAction SilentlyContinue
         } catch { }
     }
 }
