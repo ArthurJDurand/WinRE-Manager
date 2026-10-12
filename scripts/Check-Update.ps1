@@ -13,11 +13,13 @@
         AHEAD                - local is newer (dev build)
         ERROR|<reason>       - could not determine
 
-    Caching. The remote version string (e.g. "50|1") is cached in
-    %TEMP%\WinRE-Manager-remote-version.txt for CacheHours hours. The local
-    version is re-read and the comparison re-run on every invocation, so a
-    local update after a cache hit immediately reflects the new state without
-    waiting for a fresh network fetch. Pass -Force to bypass the cache.
+    Caching. The remote version string (e.g. "49|1" meaning remote v49
+    patch 1) is cached in %TEMP%\WinRE-Manager-remote-version.txt for
+    CacheHours hours. The cache file also records the local version that was
+    current when it was written; if the local version has since changed, the
+    cache is discarded and a fresh fetch is performed, so a local upgrade
+    immediately re-checks against the remote rather than reporting a stale
+    comparison. Pass -Force to bypass the cache.
 
     This script is read-only, requires no elevation, and never modifies the
     machine. If the network is unavailable or the remote format is
