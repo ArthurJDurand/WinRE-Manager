@@ -36,6 +36,15 @@ v49 introduced a set of pre-deployment gates and post-run persistence features. 
 - The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its registration, its two independent persist signals — the `$Script:ResumeTaskShouldPersist` flag and the `[WinRECancelKeyProbe]::ShouldPersist` static field, OR-merged by the `finally` block — plus its two finally-never-runs interruption classes, its clean-completion removal, or its `$PSCommandPath` guard — does your feature change when it is registered, or what it invokes?).
 - The **stable install location** at `C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1` and the SHA256-verify-before-register step (does your feature change where the maintenance task is registered, or what is installed?).
 
+### If this feature would touch one of the v50 patch 2 additions
+
+v50 patch 2 added a hypervisor-aware suppression boundary to the non-OS-disk recovery-partition sweep, a protection for mounted VHD/VHDX disks inside that sweep, a `SCSI` entry in the workspace bus allowlist, a per-driver diagnostic loop in the source-ownership classifier, and a URL-builder fix for the restructured `Win10/x64` folder. If your feature would interact with any of them, say so explicitly:
+
+- The **non-OS sweep suppression boundary** in `Remove-StrayRecoveryPartitions` and the `Test-RunningInVirtualMachine` helper it depends on (the ten hypervisor signatures, the `$null` fail-closed return, and the empty-metadata guard — does your feature need a change to the signature list, the detection logic, or the suppression rule?).
+- The **`File Backed Virtual` disk protection** inside the same sweep (does your feature change which non-OS disks the sweep preserves?).
+- The **`SCSI` entry in the workspace bus allowlist** (`Get-WorkDirCandidates`; the OS-volume-only admission rule — does your feature change the workspace selection policy?).
+- The **GitHub Windows 10 URL builder** in `Get-GitHubBaseWinRE` (the `Win10/x64` folder path — does your feature change where the base WIM repository resolves from?).
+
 ---
 
 **On the design invariants.** WinRE Manager's design is organized around four rules, in this order — see [`docs/architecture.md`](docs/architecture.md) for the full hierarchy:

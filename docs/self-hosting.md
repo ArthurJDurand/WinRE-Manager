@@ -146,7 +146,7 @@ Same edit as the maps — the `$DriverManifestUrl` line in `WinRE.ps1` and `Test
 
 The `$BaseWinRERepoApi` URL points at a GitHub repository that holds the project's curated `winre.wim` images, split into 7-Zip archives. The repository has two folders:
 
-- `Win10/` — `winre.7z.001`, `winre.7z.002`, ... — a split archive whose extraction produces `winre.wim` for Windows 10.
+- `Win10/x64/` — `Winre.7z.001`, `Winre.7z.002`, ... — a split archive whose extraction produces `winre.wim` for Windows 10. **As of v50 patch 2, production reads this folder; a self-hosted mirror must place the Windows 10 archives at the same path (`Win10/x64/`), not the pre-v50-patch-2 `Win10/` path.**
 - `Win11/` — the same, for Windows 11.
 
 The production script reads the folder listing via the GitHub contents API, downloads every file whose name matches `^[Ww]inre\.7z\.\d+$`, sorts them by name, and extracts with 7-Zip. 7-Zip auto-detects sibling parts when extracting from the first part.

@@ -43,7 +43,17 @@ function Write-T {
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $M" -ForegroundColor $c
 }
 
-if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null }
+# Stale-workspace cleanup. Recreate the workspace fresh on every run so that
+# a workspace left behind by an earlier interrupted run cannot satisfy this
+# run's file-presence checks. Mirrors the equivalent cleanup at the start
+# of Inspect-GitHubWinRE.ps1.
+if (Test-Path -LiteralPath $WorkDir) {
+    Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $WorkDir) {
+        try { [System.IO.Directory]::Delete($WorkDir, $true) } catch { }
+    }
+}
+New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 if (-not (Test-Path $7Zip)) { Write-T "7-Zip not found at $7Zip - aborting" -L ERROR; return }
 
 # Download CAB
@@ -189,3 +199,44 @@ $output = @{
 [System.IO.File]::WriteAllText($OutputFile, ($output | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
 Write-T "Map saved: $OutputFile" -L SUCCESS
 Write-T "Upload to your Dell map gist and set `$DellWinPEMapUrl in WinRE.ps1" -L INFO
+
+# Workspace cleanup. The map JSON is written to $MapsDir, which is
+# separate from the build workspace. The workspace holds the downloaded
+# catalog CAB and the extracted XML, neither of which is needed after the
+# map is built. Remove the workspace, then remove the parent directory if
+# it is named "Temp" and is now empty. Mirrors Remove-EmptyWorkspaceParent
+# in WinRE.ps1.
+if (Test-Path -LiteralPath $WorkDir) {
+    try {
+        Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction Stop
+        Write-T "Workspace removed: $WorkDir" -L INFO
+    } catch {
+        try { [System.IO.Directory]::Delete($WorkDir, $true) } catch { }
+        if (Test-Path -LiteralPath $WorkDir) {
+            Write-T "Could not remove workspace ${WorkDir}: $_" -L WARN
+            Write-T "Manual cleanup:  Remove-Item '$WorkDir' -Recurse -Force" -L WARN
+        } else {
+            Write-T "Workspace removed: $WorkDir" -L INFO
+        }
+    }
+}
+$workspaceParent = $null
+try { $workspaceParent = Split-Path -LiteralPath $WorkDir -Parent } catch { }
+if ($workspaceParent -and $workspaceParent -notmatch '^[A-Za-z]:\\?$') {
+    $leaf = $null
+    try { $leaf = Split-Path -LiteralPath $workspaceParent -Leaf } catch { }
+    if ($leaf -and [System.StringComparer]::OrdinalIgnoreCase.Equals($leaf, 'Temp')) {
+        if (Test-Path -LiteralPath $workspaceParent -PathType Container) {
+            $entries = $null
+            try { $entries = @(Get-ChildItem -LiteralPath $workspaceParent -Force -ErrorAction Stop) } catch { $entries = $null }
+            if ($null -ne $entries -and $entries.Count -eq 0) {
+                try {
+                    Remove-Item -LiteralPath $workspaceParent -Force -ErrorAction Stop
+                    Write-T "Removed empty parent: $workspaceParent" -L INFO
+                } catch {
+                    try { [System.IO.Directory]::Delete($workspaceParent, $false) } catch { }
+                }
+            }
+        }
+    }
+}

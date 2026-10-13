@@ -57,6 +57,16 @@ If your PR touches any of the v50 patch 1 additions below, say so explicitly and
 
 A change to any of these that is not covered by an existing field case still requires a `CHANGELOG.md` entry per the Changelog section above.
 
+If your PR touches any of the v50 patch 2 additions below, say so explicitly and include the test result that demonstrates the change behaves as claimed:
+
+- The **GitHub Windows 10 URL builder** in `Get-GitHubBaseWinRE` (the `Win10/x64` folder path for the restructured `OriginalWindowsREImages` repository).
+- The **classifier diagnostic loop** in `Main`'s Step 3 (the per-driver pre-strip inventory logging that precedes the source-ownership classification).
+- The **non-OS sweep suppression boundary** in `Remove-StrayRecoveryPartitions` and the new `Test-RunningInVirtualMachine` helper it depends on (the ten hypervisor signatures, the `$null` fail-closed return, and the empty-metadata guard that returns `$null` when `Win32_ComputerSystem` succeeds but returns empty or whitespace-only Manufacturer and Model fields).
+- The **`File Backed Virtual` disk protection** inside the same sweep (the preservation of mounted VHD/VHDX disks regardless of the hypervisor detection result, and the `preserved virtual:` field in the aggregate summary line).
+- The **`SCSI` entry in the workspace bus allowlist** (`Get-WorkDirCandidates`; the OS-volume-only admission rule).
+
+A change to any of these that is not covered by an existing field case still requires a `CHANGELOG.md` entry per the Changelog section above.
+
 ### If this PR touches the destructive sequence
 
 The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPartition`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, the `New-Partition` / `Format-Volume` / `Set-RecoveryPartitionAttributes` calls, `Remove-OrphanPartition`, `Restore-OSPartitionSize`, `Restore-PreviousWinRERoute`, `Assert-RecoveryPartitionLayout`, `Remove-StrayRecoveryPartitions`, and any caller of those functions. **Delete this subsection if it does not apply.**
@@ -65,7 +75,7 @@ The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPar
 - [ ] I have named **which of the four design invariants this PR strengthens**.
 - [ ] I confirm this PR **does not weaken any of rules 1–3**.
 - [ ] I have included the **test result that demonstrates the change behaves as claimed** — or, if the required test is the post-deletion failure test described in [`docs/testing.md`](docs/testing.md), I have said so explicitly and noted that this PR is **blocked until that test runs and its result is recorded**.
-- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v49 patch 2. v50 patch 1 does not touch the destructive sequence and did not modify the gate.
+- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v50 patch 2. v50 patch 1 does not touch the destructive sequence and did not modify the gate. v50 patch 2 modifies `Remove-StrayRecoveryPartitions` (the non-OS sweep suppression boundary and the `File Backed Virtual` protection), which is on the broader destructive-sequence list in this template, but not the post-deletion segment that the gate protects; the gate's scope is unchanged.
 
 ## Invariants
 

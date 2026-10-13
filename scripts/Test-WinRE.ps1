@@ -25,6 +25,11 @@
         exercises it with an 8-case regression self-test)
       - Get-StorageControllerDevices (v49 SCSIAdapter-class device
         enumeration, mirroring production's software-device filter)
+      - Test-RunningInVirtualMachine (v50 patch 2 hypervisor-detection
+        helper used by production's Remove-StrayRecoveryPartitions to
+        suppress the non-OS-disk recovery-partition sweep when the
+        running OS is inside a known hypervisor, or when detection is
+        indeterminate)
       - Get-DriverManifest retry policy (2 attempts, 2s sleep, WARN log)
       - VMD detection (fail-closed on PnP enumeration error)
       - Lenovo map resolution status machine (5 states)
@@ -118,15 +123,19 @@
     v49 patch 2 return-value fix (v30) and the Invoke-CabExtraction
     7-Zip argument list (v31).
 
-    Two source-level binding assertions (checks 18 and 19 in the parser
-    self-test) verify that production's Test-NativeBootVirtualTopology
-    retains the v49 patch 2 fail-closed shape, and that production's
-    Get-StorageControllerDevices retains the mirror contract that check
-    17 depends on (the unary-comma return and both software-device
-    filter regexes). These read WinRE.ps1 if it is adjacent and SKIP
-    when it is not. They are not mirrors; they are invariant-level
-    guards against the mirror-drift class named in the preceding
-    paragraph.
+    Three source-level binding assertions (checks 18, 19, and 20 in the
+    parser self-test) verify that production's
+    Test-NativeBootVirtualTopology retains the v49 patch 2 fail-closed
+    shape, that production's Get-StorageControllerDevices retains the
+    mirror contract that check 17 depends on (the unary-comma return and
+    both software-device filter regexes), and that production's
+    Test-RunningInVirtualMachine retains the ten hypervisor signatures,
+    the fail-closed `$null` return, the empty-metadata IsNullOrWhiteSpace
+    guard, the Win32_ComputerSystem query source, and the combined-string
+    construction the harness's mirror and Option 1 sweep-suppression
+    preview depend on. These read WinRE.ps1 if it is adjacent and SKIP
+    when it is not. They are not mirrors; they are invariant-level guards
+    against the mirror-drift class named in the preceding paragraph.
 
 .PARAMETER TestDir
     Working directory. Default C:\Temp\WinRETest.
@@ -138,7 +147,57 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 35
+    Version : 37
+
+    v37 changes vs v36:
+    1. Mirrored production v50 patch 2's empty-metadata fail-closed
+       correction in the harness's Test-RunningInVirtualMachine mirror.
+       Production treats a Win32_ComputerSystem query that succeeds but
+       returns empty or whitespace-only Manufacturer and Model fields as
+       indeterminate and returns $null; without that guard, the empty
+       string falls through to the signature scan, matches nothing, and
+       is classified as a physical machine. The harness mirror lacked the
+       guard, so on such a machine the Option 1 sweep-suppression preview
+       would report "physical (sweep runs)" while production reports
+       "indeterminate (sweep suppressed)". This closes the mirror gap.
+    2. Extended check 20 with an assertion that production's
+       Test-RunningInVirtualMachine retains the empty-metadata guard
+       (the IsNullOrWhiteSpace call). Before this, check 20 verified the
+       ten signatures, the fail-closed $null return, the
+       Win32_ComputerSystem query source, and the combined-string
+       construction -- but not the guard that makes the $null return
+       reachable for the empty-metadata case. A future production edit
+       that dropped the guard would have passed check 20 silently.
+    3. Menu title and startup Rule bumped 36 -> 37.
+
+    v36 changes vs v35:
+    1. Closed a diagnostic gap exposed by v50 patch 2's hypervisor-
+       suppression boundary in production's Remove-StrayRecoveryPartitions.
+       The harness now mirrors production's Test-RunningInVirtualMachine
+       and adds a "Non-OS sweep suppression preview" section to Option 1
+       that reports what production would decide for this machine: guest
+       (sweep suppressed), physical (sweep runs), or indeterminate
+       (fail-closed; sweep suppressed). On any verdict, the section also
+       lists every non-OS recovery partition with its disposition under
+       the sweep's deletion rules (WOULD DELETE / WOULD PRESERVE /
+       WOULD SKIP, with a one-line reason). The operator can now see,
+       before running production, whether the sweep will run and what it
+       would target.
+    2. Added source-level mirror-binding assertion check 20: reads
+       production's Test-RunningInVirtualMachine and verifies the ten
+       hypervisor signatures, the fail-closed `$null` return, the
+       Win32_ComputerSystem query source, and the combined-string
+       construction are all intact. Catches the same mirror-drift class
+       that checks 18 and 19 guard against. SKIP when WinRE.ps1 is not
+       adjacent.
+    3. Added Test-RunningInVirtualMachine to the "Mirrored from
+       production" list in .DESCRIPTION.
+    4. No $ProductionScriptVersion bump is needed for v50 patch 2:
+       production's $ScriptVersion remains 50 across the patch-level
+       bump (only $ScriptPatchLevel moves 1 -> 2), and the harness
+       reads the value directly from the adjacent WinRE.ps1 via
+       Get-ProductionScriptVersion, so the DSI mirror remains correct.
+    5. Menu title and startup Rule bumped 35 -> 36.
 
     v35 changes vs v34:
     1. Inverted the interactive cleanup prompt. v34 shipped as
@@ -1705,6 +1764,84 @@ function Test-PlanAdjacencyReadOnly {
     }
 }
 
+# =========================== HYPERVISOR DETECTION (mirror of WinRE.ps1) ===========================
+# Mirror of production v50 patch 2's Test-RunningInVirtualMachine.
+# Production uses the return value in Remove-StrayRecoveryPartitions to
+# decide whether to suppress the entire non-OS-disk recovery-partition
+# sweep. A host physical disk exposed to a guest via passthrough
+# (Hyper-V) or raw disk access (VirtualBox) is indistinguishable from a
+# genuine secondary internal disk by BusType alone, so production errs
+# on the side of suppression when the running OS is inside a detected
+# hypervisor, or when detection is indeterminate. The harness mirrors
+# the function so the Option 1 diagnostic can preview what production
+# would decide for this machine.
+#
+# Return values (identical to production):
+#   $true  - a known hypervisor signature matched. Production treats
+#            this environment as a guest and suppresses the sweep.
+#   $false - no known hypervisor signature matched. Production treats
+#            this environment as a physical machine and allows the
+#            sweep to run.
+#   $null  - the query failed or returned no usable data. Production
+#            treats this as indeterminate and fails closed by
+#            suppressing the sweep.
+#
+# The signature list is un-anchored on purpose: the detector is a
+# safety gate, so over-detection (a physical machine misidentified as
+# a guest, sweep suppressed, no destructive action) is preferable to
+# under-detection (a guest misidentified as physical, sweep runs,
+# host disk at risk). Anchoring short patterns like 'Xen' or 'KVM'
+# would trade a hypothetical false positive for real, documented Xen
+# DMI strings such as 'XenSource' and 'XenServer'; do not anchor them.
+function Test-RunningInVirtualMachine {
+    $cs = $null
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    } catch {
+        Say "Test-RunningInVirtualMachine: could not read Win32_ComputerSystem: $_ - treating as indeterminate (fail closed)" -Level WARN
+        return $null
+    }
+    if (-not $cs) {
+        Say "Test-RunningInVirtualMachine: Win32_ComputerSystem returned nothing - treating as indeterminate (fail closed)" -Level WARN
+        return $null
+    }
+    $mfg = if ($cs.Manufacturer) { ([string]$cs.Manufacturer).Trim() } else { '' }
+    $mdl = if ($cs.Model)        { ([string]$cs.Model).Trim() }        else { '' }
+    # v37: mirror of production v50 patch 2's fail-closed correction. A
+    # query that succeeds but returns both fields empty or whitespace is
+    # not usable data. Treat as indeterminate rather than falling through
+    # to the signature scan, which would classify an empty string as a
+    # physical machine and permit the sweep. Without this guard the
+    # harness's Option 1 preview would report "physical (sweep runs)" on
+    # exactly the machine where production reports "indeterminate (sweep
+    # suppressed)".
+    if ([string]::IsNullOrWhiteSpace($mfg) -and [string]::IsNullOrWhiteSpace($mdl)) {
+        Say "Test-RunningInVirtualMachine: Manufacturer and Model are both unavailable - treating as indeterminate (fail closed)" -Level WARN
+        return $null
+    }
+    $combined = "$mfg $mdl"
+    $signatures = @(
+        'VMware',
+        'VirtualBox',
+        'innotek',
+        'Microsoft Corporation.*Virtual Machine',
+        'Xen',
+        'QEMU',
+        'Parallels',
+        'Bochs',
+        'KVM',
+        'bhyve'
+    )
+    foreach ($sig in $signatures) {
+        if ($combined -match $sig) {
+            Say "Test-RunningInVirtualMachine: signature '$sig' matched (Manufacturer='$mfg', Model='$mdl') -> guest environment"
+            return $true
+        }
+    }
+    Say "Test-RunningInVirtualMachine: no known hypervisor signature (Manufacturer='$mfg', Model='$mdl') -> treating as physical"
+    return $false
+}
+
 # =========================== DIAGNOSTIC ===========================
 function Show-SystemDiagnostic {
     Rule "System diagnostic - read-only information gathering"
@@ -2003,6 +2140,119 @@ function Show-SystemDiagnostic {
                 ([string]$isLabel).PadRight(8),
                 ([string]$onOsDisk).PadRight(9)) $color
         }
+    }
+
+    # ---- Non-OS sweep suppression preview (v36) ----
+    # Preview of production v50 patch 2's Remove-StrayRecoveryPartitions
+    # decision: whether the non-OS-disk recovery-partition sweep would
+    # run, be suppressed (guest / indeterminate), or be partially
+    # suppressed (File Backed Virtual disks preserved individually).
+    # Closes the diagnostic gap left by the v50 patch 2 hypervisor-
+    # suppression boundary: without this preview, an operator on a
+    # Hyper-V test VM or a physical refurbishment machine could not see
+    # from the diagnostic alone which way production's detector would
+    # decide. Reads from the same source production reads
+    # (Win32_ComputerSystem) and uses the same signature list via the
+    # harness mirror above.
+    Write-Diag ""
+    Write-Diag "  Non-OS sweep suppression preview" "Cyan"
+    Write-Diag "  ────────────────────────────────" "DarkGray"
+    $csSweep = $null
+    try { $csSweep = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop } catch { }
+    $mfgSweep = if ($csSweep -and $csSweep.Manufacturer) { ([string]$csSweep.Manufacturer).Trim() } else { '' }
+    $mdlSweep = if ($csSweep -and $csSweep.Model)        { ([string]$csSweep.Model).Trim() }        else { '' }
+    if ($csSweep) {
+        Write-KV "Manufacturer" "$mfgSweep" "Gray"
+        Write-KV "Model"        "$mdlSweep" "Gray"
+        Write-KV "Combined"     "$mfgSweep $mdlSweep" "DarkGray"
+    } else {
+        Write-KV "Win32_ComputerSystem" "(query failed)" "Yellow"
+    }
+    $vmVerdict = Test-RunningInVirtualMachine
+    if ($null -eq $vmVerdict) {
+        Write-KV "Production verdict" "indeterminate (fail closed; sweep suppressed)" "Yellow"
+        Write-Diag "           Production treats an indeterminate detection as unsafe and" "DarkGray"
+        Write-Diag "           suppresses the sweep. Recovery partitions on non-OS disks" "DarkGray"
+        Write-Diag "           are preserved." "DarkGray"
+    } elseif ($vmVerdict) {
+        Write-KV "Production verdict" "guest (sweep suppressed)" "Cyan"
+        Write-Diag "           A known hypervisor signature matched. Production would" "DarkGray"
+        Write-Diag "           skip the entire non-OS-disk recovery-partition sweep" "DarkGray"
+        Write-Diag "           on the next run. This protects a host physical disk" "DarkGray"
+        Write-Diag "           exposed to the guest via passthrough or raw disk" "DarkGray"
+        Write-Diag "           access, which BusType alone cannot identify." "DarkGray"
+    } else {
+        Write-KV "Production verdict" "physical (sweep runs)" "Green"
+        Write-Diag "           No known hypervisor signature matched. Production would" "DarkGray"
+        Write-Diag "           run the non-OS-disk recovery-partition sweep on the next" "DarkGray"
+        Write-Diag "           run: type-coded recovery partitions <= 2048 MiB on non-OS" "DarkGray"
+        Write-Diag "           disks would be deleted. File Backed Virtual (mounted" "DarkGray"
+        Write-Diag "           VHD/VHDX) disks are preserved individually." "DarkGray"
+    }
+
+    # Enumerate the dispositions of every non-OS recovery partition
+    # against the sweep's deletion rules. Shown regardless of the
+    # verdict so an operator on a physical host can see exactly what
+    # production would target, and so an operator on a guest or in an
+    # indeterminate environment can see what would be preserved.
+    if ($osDisk) {
+        $dispositionRows = @()
+        foreach ($disk in Get-Disk) {
+            if ($disk.Number -eq $osDisk.Number) { continue }
+            $diskBus = ''
+            try { $diskBus = [string]$disk.BusType } catch { }
+            foreach ($rp in @(Get-RecoveryPartitions -DiskNumber $disk.Number)) {
+                $isTyped = ($rp.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($rp.MbrType -eq 0x27)
+                $sz = [int64]$rp.Size
+                $disposition = ''
+                $reason = ''
+                if ($diskBus -eq 'File Backed Virtual') {
+                    $disposition = 'WOULD PRESERVE'
+                    $reason = 'File Backed Virtual disk (v50 patch 2)'
+                } elseif (-not $isTyped) {
+                    $disposition = 'WOULD SKIP'
+                    $reason = 'label-only match (type code not Recovery)'
+                } elseif ($sz -gt [int64](2048 * 1MB)) {
+                    $disposition = 'WOULD PRESERVE'
+                    $reason = 'oversized (> 2048 MiB)'
+                } else {
+                    $disposition = 'WOULD DELETE'
+                    $reason = 'type-coded recovery <= 2048 MiB'
+                }
+                $dispositionRows += [PSCustomObject]@{
+                    DiskNumber      = $disk.Number
+                    PartitionNumber = $rp.PartitionNumber
+                    SizeMiB         = [math]::Round($sz / 1MB, 1)
+                    BusType         = if ($diskBus) { $diskBus } else { 'unknown' }
+                    Disposition     = $disposition
+                    Reason          = $reason
+                }
+            }
+        }
+        if ($dispositionRows.Count -eq 0) {
+            Write-Diag ""
+            Write-Diag "  Non-OS recovery partitions: (none)" "DarkGray"
+        } else {
+            Write-Diag ""
+            Write-Diag "  Non-OS recovery partitions and their disposition under the sweep:" "Cyan"
+            if ($vmVerdict -ne $false) {
+                Write-Diag "    (Sweep is suppressed this run - the dispositions below are what" "DarkGray"
+                Write-Diag "     production would apply on a physical machine, shown for reference.)" "DarkGray"
+            }
+            foreach ($dispRow in $dispositionRows) {
+                $color = switch ($dispRow.Disposition) {
+                    'WOULD DELETE'   { 'Yellow' }
+                    'WOULD PRESERVE' { 'Green' }
+                    'WOULD SKIP'     { 'DarkGray' }
+                    default          { 'Gray' }
+                }
+                Write-Diag ("    Disk {0} Part {1}: {2} MiB, bus={3}, {4} ({5})" -f `
+                    $dispRow.DiskNumber, $dispRow.PartitionNumber, $dispRow.SizeMiB, $dispRow.BusType, $dispRow.Disposition, $dispRow.Reason) $color
+            }
+        }
+    } else {
+        Write-Diag ""
+        Write-Diag "  (OS disk could not be resolved - disposition list not evaluated)" "Yellow"
     }
 
     # ---- Plan adjacency preview (read-only mirror of production plan rejections) ----
@@ -2983,6 +3233,80 @@ function Show-SystemDiagnostic {
         Record "Parser: StorageControllerDevices mirror binding" $false "$_"
     }
 
+    # Check 20 (v36; extended in v37): production source-level assertion
+    # for the Test-RunningInVirtualMachine hypervisor-detection contract.
+    # The harness mirrors this function for the Option 1 sweep-suppression
+    # preview; if production's signature list, fail-closed return,
+    # empty-metadata guard, or query source changes, the mirror silently
+    # drifts and the preview no longer describes what production's
+    # Remove-StrayRecoveryPartitions would decide. SKIP when WinRE.ps1 is
+    # not adjacent.
+    try {
+        $vmBody = Get-ProductionFunctionText -FunctionName 'Test-RunningInVirtualMachine'
+        if (-not $vmBody) {
+            Write-Host "  " -NoNewline
+            Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+            Write-Host " Test-RunningInVirtualMachine mirror binding: WinRE.ps1 not adjacent" -ForegroundColor Gray
+            Record "Parser: Test-RunningInVirtualMachine mirror binding" $false -State "SKIP" -Detail "production script not adjacent"
+        } else {
+            $issues = @()
+            $requiredSignatures = @(
+                'VMware',
+                'VirtualBox',
+                'innotek',
+                'Microsoft Corporation.*Virtual Machine',
+                'Xen',
+                'QEMU',
+                'Parallels',
+                'Bochs',
+                'KVM',
+                'bhyve'
+            )
+            foreach ($sig in $requiredSignatures) {
+                if (-not $vmBody.Contains("'$sig'")) {
+                    $issues += "missing signature '$sig'"
+                }
+            }
+            if (-not $vmBody.Contains('Get-CimInstance Win32_ComputerSystem')) {
+                $issues += "missing Win32_ComputerSystem query source"
+            }
+            if (-not $vmBody.Contains('return $null')) {
+                $issues += "missing fail-closed return `$null path"
+            }
+            # v37: the empty-metadata fail-closed guard is what makes the
+            # 'return $null' path reachable for the Win32_ComputerSystem
+            # case where the query succeeds but both Manufacturer and
+            # Model come back empty or whitespace. Production added it in
+            # v50 patch 2 alongside the hypervisor-suppression boundary;
+            # the harness mirror now includes the same guard, and this
+            # assertion binds the pair so a future production edit that
+            # drops the guard is caught here.
+            if (-not $vmBody.Contains('IsNullOrWhiteSpace')) {
+                $issues += "missing empty-metadata fail-closed guard (IsNullOrWhiteSpace check)"
+            }
+            if (-not $vmBody.Contains('$combined = "$mfg $mdl"')) {
+                $issues += "missing combined-string construction"
+            }
+            if ($issues.Count -eq 0) {
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Test-RunningInVirtualMachine: production mirror contract intact (10 signatures + fail-closed + empty-metadata guard + query source)" -ForegroundColor Gray
+                Record "Parser: Test-RunningInVirtualMachine mirror binding" $true "source-level assertion matched"
+            } else {
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Test-RunningInVirtualMachine: production has drifted from the harness mirror:" -ForegroundColor Gray
+                foreach ($i in $issues) { Write-Host "          - $i" -ForegroundColor Red }
+                Record "Parser: Test-RunningInVirtualMachine mirror binding" $false ($issues -join '; ')
+            }
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Test-RunningInVirtualMachine source assertion threw: $_" -ForegroundColor Gray
+        Record "Parser: Test-RunningInVirtualMachine mirror binding" $false "$_"
+    }
+
     Write-Diag "  Diagnostic complete. Parser self-test results are in the summary." "Green"
 }
 
@@ -3372,7 +3696,7 @@ function Test-GitHubBaseWim {
     if (Test-Path $dir) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
 
-    $apiUrl = "$BaseWinRERepoApi/$OS"
+    $apiUrl = if ($OS -eq 'Win10') { "$BaseWinRERepoApi/Win10/x64" } else { "$BaseWinRERepoApi/$OS" }
     try {
         $files = Invoke-RestMethod -Uri $apiUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
     } catch {
@@ -3802,7 +4126,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v35)"
+    $titleContent = "WinRE Manager Test Harness (v37)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -3850,7 +4174,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v35"
+Rule "WinRE Manager test harness v37"
 Say "Working dir: $TestDir"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN

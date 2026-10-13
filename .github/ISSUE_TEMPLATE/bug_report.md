@@ -10,7 +10,7 @@ labels: ['bug', 'needs-triage']
 
 ## Environment
 
-- **WinRE.ps1 version:** <!-- e.g. v50 patch 1, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v50 patch 1) ==========`) -->
+- **WinRE.ps1 version:** <!-- e.g. v50 patch 2, from the .NOTES block or from the first line of the log (`========== WinRE Manager Started (v50 patch 2) ==========`) -->
 - **Windows build:** <!-- output of: [Environment]::OSVersion.Version -->
 - **Vendor / model / Lenovo MT:** <!-- e.g. Lenovo 21L1 -->
 - **Partition style:** <!-- GPT or MBR -->
@@ -137,7 +137,14 @@ labels: ['bug', 'needs-triage']
 - **Manager config ancestor could not be checked.** `Test-DirectoryOwnedByTrustedPrincipal: could not read ACL of '<path>' : <error> - fail closed` and `Test-DirectoryOwnedByTrustedPrincipal: could not determine owner of '<path>' - fail closed`. Both are fail-closed paths. Include the exact error text and the ACL form of the directory.
 - **Empty workspace parent removal refused.** `Could not remove empty workspace parent '<parent>' - a process may hold a handle to it; leaving it in place`. Informational; not a failure. Include the parent path and whether a process (Explorer, VS Code, or the invoking PowerShell session's working directory) may be holding the folder.
 - **Empty test parent removal refused (harness).** `Could not remove empty test parent '<parent>' - a process may hold a handle to it; leaving it in place` — the same message pattern emitted by Test-WinRE.ps1. If the harness cleanup left `C:\Temp` behind, this line tells you why.
-- **Stray-recovery cleanup aggregate summary (v50).** `Stray-recovery cleanup summary: deleted: <list>; preserved oversized: <list>; skipped non-typed: <list>` in live mode, or `Stray-recovery cleanup summary (DRY RUN): would delete: <list>; preserved oversized: <list>; skipped non-typed: <list>` in DryRun. This line is emitted on every run and enumerates what was (or would be) deleted, preserved-oversized, skipped-non-typed, or failed. If a stray recovery partition you expected to be preserved was deleted, or one you expected to be deleted was preserved, this summary is the line to quote.
+- **Stray-recovery cleanup aggregate summary (v50; extended v50 patch 2).** `Stray-recovery cleanup summary: deleted: <list>; preserved oversized: <list>; preserved virtual: <list>; skipped non-typed: <list>` in live mode, or `Stray-recovery cleanup summary (DRY RUN): would delete: <list>; preserved oversized: <list>; preserved virtual: <list>; skipped non-typed: <list>` in DryRun. This line is emitted on every run and enumerates what was (or would be) deleted, preserved-oversized, preserved-virtual (mounted VHD/VHDX disks, v50 patch 2), skipped-non-typed, or failed. If a stray recovery partition you expected to be preserved was deleted, or one you expected to be deleted was preserved, this summary is the line to quote.
+
+**v50 patch 2 log signatures.** The v50 patch 2 features add the following log lines. Include them verbatim if your run failed in a way that mentions one of them:
+
+- **Non-OS sweep suppression (hypervisor detected).** `Stray-recovery cleanup: skipping the non-OS-disk sweep because a known hypervisor signature was detected. Any recovery partitions on non-OS disks are preserved. The OS-disk repair path is unaffected.` — the running OS was detected inside a known hypervisor and the entire non-OS-disk sweep was suppressed. Include this line, the `Test-RunningInVirtualMachine: signature '<sig>' matched ...` line above it, and the output of `Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer, Model`.
+- **Non-OS sweep suppression (indeterminate).** `Stray-recovery cleanup: skipping the non-OS-disk sweep because detection was indeterminate (fail closed). Any recovery partitions on non-OS disks are preserved. The OS-disk repair path is unaffected.` — the hypervisor detection could not produce a verdict, so the sweep was suppressed as the safe direction. Include this line and the `Test-RunningInVirtualMachine:` diagnostic above it (`could not read Win32_ComputerSystem: <error>`, `Win32_ComputerSystem returned nothing`, or `Manufacturer and Model are both unavailable - treating as indeterminate (fail closed)`).
+- **Hypervisor-detection verdict lines.** `Test-RunningInVirtualMachine: signature '<sig>' matched (Manufacturer='<mfg>', Model='<mdl>') -> guest environment`, `Test-RunningInVirtualMachine: no known hypervisor signature (Manufacturer='<mfg>', Model='<mdl>') -> treating as physical`, `Test-RunningInVirtualMachine: Manufacturer and Model are both unavailable - treating as indeterminate (fail closed)`, `Test-RunningInVirtualMachine: could not read Win32_ComputerSystem: <error> - treating as indeterminate (fail closed)`, and `Test-RunningInVirtualMachine: Win32_ComputerSystem returned nothing - treating as indeterminate (fail closed)`. One of these is emitted on every run. Include it if the machine is a VM and the sweep's behavior is unexpected.
+- **File Backed Virtual disk preservation.** `Stray-recovery cleanup: preserving File Backed Virtual (mounted VHD/VHDX) disk <n> - a mounted virtual disk may contain another installation's recovery environment` — the sweep skipped a mounted VHD/VHDX. Include this line and the disk's `BusType` from `Get-Disk -Number <n> | Format-List BusType, FriendlyName`.
 
 <details>
 <summary>C:\ProgramData\OEM\Logs\WinRE-Manager.log (relevant slice)</summary>
@@ -152,7 +159,7 @@ paste here
 <summary>Test-WinRE.ps1 output</summary>
 
 ```
-paste the interactive output here. Options 1 (System diagnostic) and S (State file parity check) are the most useful. On the v28+ harness the Option 1 output includes the "Storage controllers" block and the VMD diagnostic advisory when VMD is not detected but SCSIAdapter-class devices are present.
+paste the interactive output here. Options 1 (System diagnostic) and S (State file parity check) are the most useful. On the v28+ harness the Option 1 output includes the "Storage controllers" block and the VMD diagnostic advisory when VMD is not detected but SCSIAdapter-class devices are present. On the v36+ harness the Option 1 output also includes the "Non-OS sweep suppression preview" section, which reports the hypervisor-detection verdict (`guest`, `physical`, or `indeterminate`) and every non-OS recovery partition's disposition under the sweep's deletion rules. On the v37+ harness the preview's hypervisor-detection mirror also includes the empty-metadata fail-closed guard, so a machine whose Win32_ComputerSystem returns empty or whitespace-only Manufacturer and Model fields is correctly reported as `indeterminate` rather than `physical`.
 ```
 
 </details>

@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 50.1 (v50 patch 1)
+    Version : 50.2 (v50 patch 2)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -205,6 +205,24 @@
                 is a stable, named deferral (EXIT_WARNING). Do not
                 rely on user-configured SAN policy as the safety
                 mechanism; the application fails closed on its own.
+
+            - Non-OS recovery-partition sweep with hypervisor and
+                mounted-VHDX suppression (v50 patch 2). The non-OS-disk
+                recovery-partition sweep in Remove-StrayRecoveryPartitions
+                deletes type-coded recovery partitions under 2 GiB on
+                every disk except the OS disk. That behavior is retained
+                for physical refurbishment machines. It is suppressed
+                when the running OS is inside a known hypervisor
+                (detected via Win32_ComputerSystem manufacturer/model
+                signatures in Test-RunningInVirtualMachine) or when the
+                detection is indeterminate, because a host physical disk
+                exposed to a guest via passthrough (Hyper-V) or raw disk
+                access (VirtualBox) is indistinguishable from a genuine
+                secondary internal disk by BusType alone. Non-OS disks
+                reported as File Backed Virtual (mounted VHD/VHDX files)
+                are also preserved individually. The OS-disk repair path
+                is unaffected by this suppression: it operates only on
+                the OS disk, which is the guest's own.
 
             - Source ownership gates destructive normalization (v49;
                 ownership bridge tightened in v50). Strip and injection
@@ -528,7 +546,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 50
-$ScriptPatchLevel = "1"
+$ScriptPatchLevel = "2"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -544,6 +562,13 @@ $WorkDir                   = $DefaultWorkDir
 $MinFreeSpaceGB            = 3
 $WorkDirResumeMinFreeMB    = 200
 # DriveType=Fixed also includes USB hard drives; require a known internal bus.
+# v50 patch 2: 'SCSI' is deliberately absent from this list. A non-OS SCSI
+# volume may be a host physical disk passed through to a guest; the
+# workspace holds temporary servicing files, so admitting SCSI globally
+# would let the planner prefer such a volume over the OS volume. The
+# eligibility check in Get-WorkDirCandidates admits SCSI for the running
+# OS volume only, which covers the Hyper-V guest case without widening the
+# write surface. See the comment at the point of use.
 $InternalWorkspaceBusTypes = @('ATA', 'SATA', 'NVMe', 'RAID', 'SAS', 'Spaces', 'Virtual', 'File Backed Virtual', 'SCM')
 $LogDir                    = "C:\ProgramData\OEM\Logs"
 # v50: single durable machine-wide settings file. Holds settings that
@@ -1391,7 +1416,19 @@ function Get-WorkDirCandidates {
         if ($partition.IsSystem -and -not $partition.IsBoot) { continue }
 
         $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction SilentlyContinue
-        if (-not $disk -or $disk.IsOffline -or $disk.BusType.ToString() -notin $InternalWorkspaceBusTypes) { continue }
+        if (-not $disk -or $disk.IsOffline) { continue }
+        # v50 patch 2: 'SCSI' is admitted only for the running OS volume.
+        # Hyper-V exposes virtual disks to guests via a virtual SCSI
+        # controller, so a guest whose only fixed NTFS volume is its own
+        # OS disk would otherwise find no eligible workspace and defer.
+        # A non-OS SCSI volume is NOT admitted automatically: a host
+        # physical disk passed through to a guest can also report SCSI,
+        # and the workspace is scratch, not a deletion target, so
+        # restricting SCSI to the OS volume keeps the Hyper-V case working
+        # without widening the write surface.
+        $busType = $disk.BusType.ToString()
+        $isOSVolumeCandidate = ($driveLetter -eq $osDriveLetter)
+        if ($busType -notin $InternalWorkspaceBusTypes -and -not ($busType -eq 'SCSI' -and $isOSVolumeCandidate)) { continue }
 
         $workspacePath = "${driveLetter}:\Temp\WinREWork"
         $hasReparsePath = $false
@@ -1889,22 +1926,135 @@ function Get-RecoveryPartitions {
     return @($allParts)
 }
 
+# =========================== HYPERVISOR DETECTION (v50 patch 2) ===========================
+# Detect whether the running OS is inside a known hypervisor. Used by
+# Remove-StrayRecoveryPartitions to suppress the non-OS-disk recovery-
+# partition sweep when the visible "other" disks may include a host
+# physical disk exposed to the guest via passthrough (Hyper-V) or raw
+# disk access (VirtualBox).
+#
+# Why this signal and not BusType: Get-Disk.BusType describes how the
+# guest sees the storage controller, not who owns the underlying bytes.
+# A host physical disk passed through to a Hyper-V guest typically
+# appears as SCSI or SAS; a VirtualBox raw disk typically appears as
+# SCSI or SATA; a mounted VHDX appears as File Backed Virtual. None of
+# these labels distinguish "host disk exposed to a guest" from a
+# genuine secondary internal disk. The manufacturer/model strings
+# reported by Win32_ComputerSystem are a stronger signal of a known
+# hypervisor platform.
+#
+# Return values:
+#   $true  - a known hypervisor signature matched. The caller must
+#            treat the environment as a guest and suppress the sweep.
+#   $false - no known hypervisor signature matched. The environment
+#            appears to be a physical machine.
+#   $null  - the query failed or returned no usable data. Indeterminate;
+#            the caller must fail closed (suppress the sweep).
+#
+# This is not a security boundary. A hypervisor can be configured to
+# spoof its manufacturer/model strings, and unusual platforms may not
+# match any signature. The function reduces exposure to known platforms;
+# it does not eliminate it. The File Backed Virtual disk check inside
+# Remove-StrayRecoveryPartitions provides an additional layer.
+function Test-RunningInVirtualMachine {
+    $cs = $null
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    } catch {
+        Write-Log "Test-RunningInVirtualMachine: could not read Win32_ComputerSystem: $_ - treating as indeterminate (fail closed)" -Level WARN
+        return $null
+    }
+    if (-not $cs) {
+        Write-Log "Test-RunningInVirtualMachine: Win32_ComputerSystem returned nothing - treating as indeterminate (fail closed)" -Level WARN
+        return $null
+    }
+    $mfg = if ($cs.Manufacturer) { ([string]$cs.Manufacturer).Trim() } else { '' }
+    $mdl = if ($cs.Model)        { ([string]$cs.Model).Trim() }        else { '' }
+    # v50 patch 2 fail-closed correction: a query that succeeds but returns
+    # both fields empty or whitespace is not usable data. Treat as
+    # indeterminate rather than falling through to the signature scan,
+    # which would classify an empty string as a physical machine and
+    # permit the sweep.
+    if ([string]::IsNullOrWhiteSpace($mfg) -and [string]::IsNullOrWhiteSpace($mdl)) {
+        Write-Log "Test-RunningInVirtualMachine: Manufacturer and Model are both unavailable - treating as indeterminate (fail closed)" -Level WARN
+        return $null
+    }
+    $combined = "$mfg $mdl"
+    # Signatures are matched case-insensitively as regex fragments. Each
+    # entry is a well-known vendor fingerprint. The 'Virtual Machine'
+    # string is paired with 'Microsoft Corporation' in a single
+    # alternation so a model that merely contains the phrase does not
+    # match on its own.
+    $signatures = @(
+        'VMware',
+        'VirtualBox',
+        'innotek',
+        'Microsoft Corporation.*Virtual Machine',
+        'Xen',
+        'QEMU',
+        'Parallels',
+        'Bochs',
+        'KVM',
+        'bhyve'
+    )
+    foreach ($sig in $signatures) {
+        if ($combined -match $sig) {
+            Write-Log "Test-RunningInVirtualMachine: signature '$sig' matched (Manufacturer='$mfg', Model='$mdl') -> guest environment"
+            return $true
+        }
+    }
+    Write-Log "Test-RunningInVirtualMachine: no known hypervisor signature (Manufacturer='$mfg', Model='$mdl') -> treating as physical"
+    return $false
+}
+
 # Delete every type-coded recovery partition on a non-OS disk. Label-only
 # matches on non-OS disks are logged and skipped — a label alone is never
 # sufficient authority to delete. Called from the fast path, the
 # enable-only path, both pending-reboot exits, and Step 7.
+#
+# v50 patch 2 safety boundary: the entire sweep is suppressed when the
+# running OS is inside a known hypervisor (or when detection is
+# indeterminate), and non-OS disks reported as File Backed Virtual are
+# preserved individually. See Test-RunningInVirtualMachine and the
+# in-function comments below. The OS-disk repair path is unaffected.
 function Remove-StrayRecoveryPartitions {
     param([Parameter(Mandatory)][int]$OSDiskNumber)
+
+    # v50 patch 2: hypervisor suppression. Running inside a detected (or
+    # indeterminate) hypervisor means the visible "other" disks may
+    # include a host physical disk exposed to the guest via passthrough
+    # (Hyper-V) or raw disk access (VirtualBox). BusType cannot
+    # distinguish such a disk from a genuine secondary internal disk.
+    # Suppress the entire sweep when a known hypervisor signature is
+    # present, or when detection is indeterminate (fail closed). The
+    # OS-disk repair path is unaffected: it operates only on the OS
+    # disk, which is the guest's own.
+    $vmVerdict = Test-RunningInVirtualMachine
+    if ($vmVerdict -ne $false) {
+        $why = if ($null -eq $vmVerdict) { 'detection was indeterminate (fail closed)' } else { 'a known hypervisor signature was detected' }
+        Write-Log "Stray-recovery cleanup: skipping the non-OS-disk sweep because $why. Any recovery partitions on non-OS disks are preserved. The OS-disk repair path is unaffected." -Level WARN
+        return $true
+    }
 
     $anyFailed = $false
     $deletedList          = [System.Collections.Generic.List[string]]::new()
     $wouldDeleteList      = [System.Collections.Generic.List[string]]::new()
     $preservedOversized   = [System.Collections.Generic.List[string]]::new()
+    $preservedVirtual     = [System.Collections.Generic.List[string]]::new()
     $skippedNonTyped      = [System.Collections.Generic.List[string]]::new()
     $failedToDelete       = [System.Collections.Generic.List[string]]::new()
 
     foreach ($disk in Get-Disk) {
         if ($disk.Number -eq $OSDiskNumber) { continue }
+        # v50 patch 2: mounted-VHDX protection. A non-OS disk reported as
+        # File Backed Virtual is a VHD/VHDX file mounted on the host. It
+        # may contain another Windows installation's recovery environment.
+        # Do not delete from it.
+        if ([string]$disk.BusType -eq 'File Backed Virtual') {
+            Write-Log "Stray-recovery cleanup: preserving File Backed Virtual (mounted VHD/VHDX) disk $($disk.Number) - a mounted virtual disk may contain another installation's recovery environment" -Level WARN
+            $preservedVirtual.Add("disk $($disk.Number)") | Out-Null
+            continue
+        }
         foreach ($rp in @(Get-RecoveryPartitions -DiskNumber $disk.Number)) {
             $ref = "disk $($disk.Number) part $($rp.PartitionNumber)"
             $isTyped = ($rp.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($rp.MbrType -eq 0x27)
@@ -1946,6 +2096,7 @@ function Remove-StrayRecoveryPartitions {
         $parts = @()
         if ($wouldDeleteList.Count -gt 0)    { $parts += "would delete: $($wouldDeleteList -join ', ')" }
         if ($preservedOversized.Count -gt 0) { $parts += "preserved oversized: $($preservedOversized -join ', ')" }
+        if ($preservedVirtual.Count -gt 0)   { $parts += "preserved virtual: $($preservedVirtual -join ', ')" }
         if ($skippedNonTyped.Count -gt 0)    { $parts += "skipped non-typed: $($skippedNonTyped -join ', ')" }
         if ($parts.Count -gt 0) {
             Write-Log "Stray-recovery cleanup summary (DRY RUN): $($parts -join '; ')"
@@ -1957,6 +2108,7 @@ function Remove-StrayRecoveryPartitions {
         if ($deletedList.Count -gt 0)        { $parts += "deleted: $($deletedList -join ', ')" }
         if ($failedToDelete.Count -gt 0)     { $parts += "failed: $($failedToDelete -join ', ')" }
         if ($preservedOversized.Count -gt 0) { $parts += "preserved oversized: $($preservedOversized -join ', ')" }
+        if ($preservedVirtual.Count -gt 0)   { $parts += "preserved virtual: $($preservedVirtual -join ', ')" }
         if ($skippedNonTyped.Count -gt 0)    { $parts += "skipped non-typed: $($skippedNonTyped -join ', ')" }
         if ($parts.Count -gt 0) {
             Write-Log "Stray-recovery cleanup summary: $($parts -join '; ')"
@@ -6100,7 +6252,7 @@ function Get-GitHubBaseWinRE {
         Write-Log "7-Zip required" -Level FATAL
         return $false
     }
-    $folder = if ($Hardware.IsWin10) { "Win10" } else { "Win11" }
+    $folder = if ($Hardware.IsWin10) { "Win10/x64" } else { "Win11" }
     $apiUrl = "$BaseWinRERepoApi/$folder"
     $files = Invoke-RestMethod -Uri $apiUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
     $parts = $files | Where-Object { $_.name -match '^[Ww]inre\.7z\.\d+$' } | Sort-Object name
@@ -8384,6 +8536,9 @@ public static class WinRECancelKeyProbe {
             exit $EXIT_WARNING
         }
         Write-Log "Source-ownership decision: pre-strip third-party inventory: $($preStripDrivers.Count) package(s)"
+        foreach ($d in $preStripDrivers) {
+            Write-Log "  $($d.Driver) | $($d.ProviderName) | $($d.Version) | $($d.OriginalFileName)"
+        }
 
         $ownership = Get-SourceOwnershipClassification -MountDir $MountDir -PreStripDrivers $preStripDrivers `
                         -State $state -StagedSourceHash $Script:StagedWimSourceHash -CurrentLineageId $Script:LineageId `

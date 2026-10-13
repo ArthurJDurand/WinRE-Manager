@@ -37,6 +37,7 @@ A full-update run additionally logs:
 - **The registered-source fingerprint captured before source acquisition**: `Captured registered-source fingerprint: location=..., version=..., hash=...`. This is the value the pre-`/disable` race detector compares against later.
 - **The base WIM source-selection decision**: `Base WIM source selection: <reason> -> <path>`. The reason names the branch — `no hash-validated LKG present; using registered`, `registered at least as new as LKG`, `registered older than LKG`, `metadata comparison indeterminate; using hash-validated LKG`, `registered not usable; using hash-validated LKG`, or `neither registered nor hash-validated LKG usable; GitHub cold-start`.
 - **The strip stage's inventory and progress**: `Strip: pre-strip third-party inventory: N package(s)`, followed by one line per package (`Strip:   <OEM#.inf> | <provider> | <version> | <original filename>`), then `Strip: removed <OEM#.inf>` per removal and a terminator (`Strip: verified zero third-party drivers remaining after removing N package(s)` or `Strip: image already has zero third-party drivers`).
+- **The classifier's per-driver diagnostic loop (v50 patch 2)**: `Source-ownership decision: pre-strip third-party inventory: N package(s)`, followed by one line per entry (`  <Driver> | <ProviderName> | <Version> | <OriginalFileName>`). This runs in Step 3 before the source-ownership classification returns, so it fires on every source that has any pre-strip driver entry regardless of which ownership class the classifier reaches. On a `Foreign-No-Drivers` source (zero pre-strip drivers) no per-entry lines are printed. The loop is the operator's view of *which* driver triggered a `Foreign-With-Drivers` classification; the classification line alone names the count.
 - **The pre-injection third-party driver count**: `Pre-injection third-party driver count: N`. Under v47 this should be 0 unless the filterless and filtered DISM queries disagree (see the note in the Reporting a bug section below).
 - **The race-detector recheck at whichever `/disable` site the execution reached**: `Registered-source recheck at <site> : unchanged (...)`, where `<site>` is `Ensure-AdequateRecoveryPartition` or `Step 5 deployment`. On drift, the same line reads `CHANGED (location=<bool> version=<bool> hash=<bool>)`.
 - **The registered-versus-deployed metadata comparison** at the drift detector: `Registered WinRE metadata: <ver>|<sp>; last deployed: <ver>|<sp>` (or `(none)` on the first v47 run).
@@ -44,7 +45,7 @@ A full-update run additionally logs:
 
 The program lock is acquired first, immediately after the banner. The log records `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on success, `Another WinRE Manager instance is already running (program lock file is exclusively held). …` if a second instance is running, and `Could not set up program lock at <path> : <error> - proceeding without single-instance protection; concurrent runs may collide` if the lock could not be acquired for a non-contention reason. Under `-DryRun` the lock is skipped and the log records `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances`. See "The script exited with a rename error (concurrent instance)" below for the full discussion.
 
-Four additional lines are logged on the full-update path; the elevation guard adds a fifth. The **elevation guard** (v48 patch 2) either logs `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.` and exits before the program lock and before hardware probes, or passes silently. On refusal it creates the log directory itself so its FATAL message has somewhere to be written. The **architecture gate** logs either `Unsupported OS architecture '<arch>': this manager supports x64 only.` and exits `EXIT_WARNING`, or `Architecture gate passed: x64` and continues. The **`LocalInputsId`** is logged as `LocalInputsId: <hash>` immediately after the architecture gate. On the intervening-anchor path, the **anchor plan** is logged as `Intervening-anchor plan: anchor is disk <n> part <m>; anchor shrink <N> MiB -> planned anchor size <M> MiB; recovery partition will be created at offset <O> MiB`. The **transactional WIM replacement** logs `Preserving existing target ... as rollback copy at <path>` when the target had a pre-existing WIM, and either `Rollback copy restored to <path>` or `rollback restore hash verification failed` depending on the outcome. See the corresponding sections below.
+Several additional lines are logged on the full-update path; the elevation guard adds one on its refusal path. The **elevation guard** (v48 patch 2) either logs `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.` and exits before the program lock and before hardware probes, or passes silently. On refusal it creates the log directory itself so its FATAL message has somewhere to be written. The **architecture gate** logs either `Unsupported OS architecture '<arch>': this manager supports x64 only.` and exits `EXIT_WARNING`, or `Architecture gate passed: x64` and continues. The **`LocalInputsId`** is logged as `LocalInputsId: <hash>` immediately after the architecture gate. On the intervening-anchor path, the **anchor plan** is logged as `Intervening-anchor plan: anchor is disk <n> part <m>; anchor shrink <N> MiB -> planned anchor size <M> MiB; recovery partition will be created at offset <O> MiB`. The **transactional WIM replacement** logs `Preserving existing target ... as rollback copy at <path>` when the target had a pre-existing WIM, and either `Rollback copy restored to <path>` or `rollback restore hash verification failed` depending on the outcome. See the corresponding sections below.
 
 The pre-deployment gates, the post-run persistence features, and the backup and restore actions produce their own log lines. The features with their own sections are:
 
@@ -61,6 +62,10 @@ The v50 patch 1 release adds two new refusal paths with their own sections below
 
 - **The resume-task protected-path guard** — refuses to register the SYSTEM crash-recovery task when the invoking script lives in a directory writable by a non-admin principal.
 - **The manager config ownership gate** — trusts `C:\ProgramData\OEM\WinRE-Manager\manager.json` only when its containing directory and its immediate parent are owned by SYSTEM or Administrators. An untrusted config is treated as absent.
+
+The v50 patch 2 release adds one more suppression boundary with its own section below:
+
+- **The non-OS sweep suppression boundary** — `Remove-StrayRecoveryPartitions` suppresses the entire non-OS-disk sweep when the running OS is detected inside a known hypervisor (via `Test-RunningInVirtualMachine`), and preserves any non-OS disk whose `BusType` is `File Backed Virtual` individually regardless of the hypervisor detection result. Neither suppression changes the run's exit code. See "The non-OS sweep was suppressed (v50 patch 2)" below.
 
 One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. The destructive path reads C:'s BitLocker state only for diagnostic logging and does not gate on it — only the OS-fallback route does, because on that route the target volume *is* C:.
 
@@ -240,7 +245,7 @@ A `FriendlyName` that names a `.vhdx` file and a `BusType` of `File Backed Virtu
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v50 patch 1) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v50 patch 2) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -1849,6 +1854,46 @@ If the fallback also fails — the remaining extent after the current C: end is 
 2. **If the run did not continue** (the log shows `Extension-failure fallback unavailable`), the machine is on the OS-fallback route or has no working recovery route. Check the machine's end state with the harness Option 1. If a recovery route exists, no action needed. If neither route exists, follow the ["The machine has no recovery partition and WinRE is disabled"](#the-machine-has-no-recovery-partition-and-winre-is-disabled) section.
 3. **If extension failures are recurring** on the same machine, the freed space after the old recovery partitions may be partially occupied by unmovable files or by a stale temporary allocation. Run `defrag C: /x` from an elevated shell and re-run.
 
+## The non-OS sweep was suppressed (v50 patch 2)
+
+**Symptom.** The run completes with its usual exit code (the sweep suppression does not change the exit code — it is observation-only), but the log shows that the non-OS-disk recovery-partition sweep in `Remove-StrayRecoveryPartitions` was suppressed. If a type-coded recovery partition on a secondary disk was expected to be removed and was not, this section explains why.
+
+**Log signature.** One of the two suppression variants, followed by the usual `Stray-recovery cleanup summary` line:
+
+[hypervisor detected]
+
+```
+[INFO] Test-RunningInVirtualMachine: signature '<sig>' matched (Manufacturer='<mfg>', Model='<mdl>') -> guest environment
+[WARN] Stray-recovery cleanup: skipping the non-OS-disk sweep because a known hypervisor signature was detected. Any recovery partitions on non-OS disks are preserved. The OS-disk repair path is unaffected.
+```
+
+[detection indeterminate (fail closed)]
+
+```
+[WARN] Test-RunningInVirtualMachine: Manufacturer and Model are both unavailable - treating as indeterminate (fail closed)
+[WARN] Stray-recovery cleanup: skipping the non-OS-disk sweep because detection was indeterminate (fail closed). Any recovery partitions on non-OS disks are preserved. The OS-disk repair path is unaffected.
+```
+
+Or, when the sweep does run (physical machine, no hypervisor signature) but preserves a mounted VHD/VHDX disk individually:
+
+```
+[WARN] Stray-recovery cleanup: preserving File Backed Virtual (mounted VHD/VHDX) disk <n> - a mounted virtual disk may contain another installation's recovery environment
+```
+
+On a clean physical machine whose sweep runs and finds nothing to preserve, the log shows the `Test-RunningInVirtualMachine: no known hypervisor signature (Manufacturer='<mfg>', Model='<mdl>') -> treating as physical` line, then the ordinary `Stray-recovery cleanup summary: no stray recovery partitions on non-OS disks` line.
+
+**Cause.** The v50 patch 2 non-OS sweep suppression boundary addresses a specific hazard the sweep had on VM guests. `Get-Disk`'s `BusType` cannot distinguish a host physical disk exposed to a guest via passthrough (Hyper-V) or raw disk access (VirtualBox) from a genuine secondary internal disk. If the sweep ran inside such a guest, it could delete the host's own recovery partition. The boundary detects the guest environment via `Win32_ComputerSystem` Manufacturer/Model signatures and suppresses the entire sweep. Indeterminate detection (query failure, empty metadata) also suppresses — the fail-closed direction. A non-OS disk reported as `File Backed Virtual` (a mounted VHD/VHDX file) is preserved individually regardless of the hypervisor detection result, because a mounted virtual disk may contain another installation's recovery environment.
+
+**This is expected behavior.** The suppression is a protective response, not a failure. It is the same shape as the [VMD-query-indeterminate deferral](#vmd-hardware-detection-was-indeterminate-v44-patch-6) and the [native-boot VHDX gate](#the-script-refused-to-run-because-the-os-volume-is-on-a-native-boot-vhdx-v49): a safety check whose query cannot complete is treated as unsafe rather than permitted to proceed.
+
+**Resolution.**
+
+1. **On a VM guest:** nothing to do. The suppression is correct. The sweep would have risked the host disk. The OS-disk repair path (WinRE on the guest's own OS disk) is unaffected and was exercised normally.
+2. **On a physical machine:** the `Test-RunningInVirtualMachine: no known hypervisor signature` line confirms the sweep ran. If a `File Backed Virtual` disk was preserved individually, that is the intended behavior for a mounted VHD/VHDX. If neither line appears (the sweep ran but the whole thing was suppressed on a physical machine), check the Manufacturer/Model strings in the `Test-RunningInVirtualMachine:` verdict line — one of them may have matched a hypervisor signature inadvertently, or the `Win32_ComputerSystem` query may have failed. Include the exact verdict line in a bug report.
+3. **To delete a stray recovery partition that was preserved by the suppression** — a type-coded recovery partition on a non-OS disk that you have confirmed is safe to delete — detach the host physical disk first (for a VM guest), or unmount the VHD/VHDX (for a File Backed Virtual disk), then re-run. The sweep will run against the remaining disks.
+
+**Field status.** The suppression branch has been exercised only on a physical machine — the v50 patch 2 field run on the ASUS PRIME H510M-D (2026-10-13) logged `Test-RunningInVirtualMachine: no known hypervisor signature ... -> treating as physical` and the sweep ran normally. The guest and indeterminate branches have not been exercised in the field. If you see the suppression on a machine, capture the `Test-RunningInVirtualMachine` verdict line and the output of `Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer, Model`.
+
 ## Drive letters exhausted
 
 **Symptom.** The script cannot assign a drive letter to the newly created recovery partition.
@@ -2157,6 +2202,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md). Include:
 - If the log contains `CmdletizationQuery_NotFound_DiskNumber` or `No MSFT_Partition objects found with property 'DiskNumber'`, note the disk number the error names and whether the machine has a card reader or an empty USB enclosure attached. As of v46 patch 2 (production) and v22 (harness), the guard silences the error; include the exact text and the version banner so the reporter can confirm the fix applies.
 - If the log shows `Planned recovery extent is no longer free after deletion (offset=... size=... overlapCount=0)` following the deletion of the old recovery partition, and the plan summary line shows an `alignment reserve` value, this is the v45 plan-rejection corner fixed by v46 patch 1. Include the version banner from the top of the log (v45 patch 1 or later), the `alignment reserve` value, and the state file's `DesiredStateId` at the time of the failure. See [The v45 plan-rejection corner](#the-v45-plan-rejection-corner-fixed-in-v46-patch-1).
 - If the run exited with code 3 and the log ends with `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.`, this is **expected behavior**, not a bug. The v48 patch 2 elevation guard refuses unelevated launches in milliseconds. The fix is to relaunch from an elevated prompt or via `scripts\WinRE-Manager.cmd`. No bug report is needed.
+- **If the log shows the v50 patch 2 non-OS sweep suppression** (`Stray-recovery cleanup: skipping the non-OS-disk sweep because a known hypervisor signature was detected` or `... because detection was indeterminate (fail closed)`), this is **expected behavior**, not a bug. The suppression is the safe direction on a guest whose non-OS disks may include a passthrough host disk. Include the `Test-RunningInVirtualMachine:` verdict line above the suppression line and the output of `Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer, Model`. If the machine is a physical machine that should not have matched any hypervisor signature, the Manufacturer/Model strings are the diagnostic. The `File Backed Virtual` per-disk preservation (`Stray-recovery cleanup: preserving File Backed Virtual (mounted VHD/VHDX) disk <n>`) is likewise expected when a VHD/VHDX is mounted on a non-OS disk.
 - If the run exited with code 2 and the log shows `Unsupported OS architecture '<arch>'`, this is the v48 patch 1 architecture gate refusing to run on a non-x64 host. Include `[Environment]::Is64BitOperatingSystem`, `$env:PROCESSOR_ARCHITECTURE`, `$env:PROCESSOR_ARCHITEW6432`, and the output of `Get-CimInstance Win32_OperatingSystem | Select-Object OSArchitecture, Caption, BuildNumber`.
 - If the run exited with code 2 and the log shows `Dedicated recovery partition plan rejected: anchor is ...` or `intervening anchor is N MiB smaller than the plan requires`, this is a v48 intervening-anchor rejection. Include the anchor partition's current size, filesystem, type code, BitLocker state, and drive letter, plus the full partition inventory from `Get-Partition -DiskNumber <n>`.
 - If the run exited with code 2 and the log shows `recovery-typed partitions exist beyond the intervening anchor's recovery cluster`, this is the v48 multi-intervening rejection. Include the full partition layout from `Get-Partition -DiskNumber <n>`.

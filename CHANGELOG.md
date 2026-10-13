@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Current status
 
-**Production:** `WinRE.ps1` **v50 patch 1** (`ScriptVersion = 50`, `ScriptPatchLevel = "1"`). The v50 pipeline was field-verified on 2026-10-12 on the project's ASUS desktop test machine: full-update, fast-path, and backup runs all produced clean logs; the ownership migration hash bridge fired; byte drift from the last deployment showed `NO`; the temporary resume task registered and cleaned up on clean exit; and `Test-WinRE.ps1` v35 passed 20/20 including both source-level mirror-binding assertions. See [v50 patch 1](#v50-patch-1--2026-10-12). The v50 pipeline inherits the accumulated field-verification baseline from v44 patch 7 through v49 patch 2. Outstanding items across the v49 and v50 generations: the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour on the outer-catch, `Invoke-RestoreAction`, hard-kill, and reboot cases; the four fail-open guard paths when their underlying queries actually fail; the manager config ownership gate's refusal branch on an untrusted ancestor; the resume-task protected-path guard's refusal branch on a non-admin-writable script directory; and the backup free-space preflight's insufficient-space branch. The accumulated baseline covers Windows 11 (builds 26200 and 26300) and Windows 10 22H2 (19045). The WinRE servicing metadata recorded in the field logs — for example `10.0.26100.9545` — is the WinRE base version, not the OS build number, and the two must not be conflated.
-**Harness:** `Test-WinRE.ps1` **v35**.
+**Production:** `WinRE.ps1` **v50 patch 2** (`ScriptVersion = 50`, `ScriptPatchLevel = "2"`). The v50 pipeline was field-verified across both patches: v50 patch 1 on 2026-10-12 on the project's ASUS desktop test machine (full-update, fast-path, and backup runs all produced clean logs; the ownership migration hash bridge fired; byte drift from the last deployment showed `NO`; the temporary resume task registered and cleaned up on clean exit; and `Test-WinRE.ps1` v35 passed 20/20 including both source-level mirror-binding assertions); v50 patch 2 on 2026-10-13 on the same machine (three fast-path runs, all clean, confirming the new banner and the new `Test-RunningInVirtualMachine` verdict line). See [v50 patch 1](#v50-patch-1--2026-10-12) and [v50 patch 2](#v50-patch-2--2026-10-13). The v50 pipeline inherits the accumulated field-verification baseline from v44 patch 7 through v49 patch 2. Outstanding items across the v49 and v50 generations: the storage-applicability gate's false-negative rate (it has never fired in the field); the deliberate post-deletion failure test on a VM; the temporary resume task's persist behaviour on the outer-catch, `Invoke-RestoreAction`, hard-kill, and reboot cases; the four fail-open guard paths when their underlying queries actually fail; the manager config ownership gate's refusal branch on an untrusted ancestor; the resume-task protected-path guard's refusal branch on a non-admin-writable script directory; the backup free-space preflight's insufficient-space branch; the v50 patch 2 URL-builder fix on a Windows 10 machine taking the GitHub cold-start path; the v50 patch 2 classifier diagnostic loop on a source with a non-zero pre-strip driver count; the v50 patch 2 `File Backed Virtual` protection on a machine with a mounted VHD/VHDX on a non-OS disk; the v50 patch 2 `SCSI` OS-volume admission on a machine whose OS-disk bus type is `SCSI`; and the v50 patch 2 `Test-RunningInVirtualMachine` suppression branch on a guest or indeterminate topology. The accumulated baseline covers Windows 11 (builds 26200 and 26300) and Windows 10 22H2 (19045). The WinRE servicing metadata recorded in the field logs — for example `10.0.26100.9545` — is the WinRE base version, not the OS build number, and the two must not be conflated.
+**Harness:** `Test-WinRE.ps1` **v37**.
 
 The harness has no `ScriptVersion` and no `DesiredStateId` of its own; its version is its own marker. Production and harness are deliberately decoupled: a harness move never forces a managed-machine rebuild.
 
@@ -53,6 +53,91 @@ These limitations were documented in a release entry and have since been closed.
 - **The v48-specific intervening-anchor logic is concentrated in the planning and pre-shrink stages.** The resize-target abstraction moves the pre-shrink target from C: to the anchor in the intervening case. The post-deletion sequence (`New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, drive-letter assignment) remains the shared recovery-partition path, with the relevant assertions (`Assert-RecoveryPartitionLayout`) and cleanup (`Remove-OrphanPartition`) operating against the validated resize target and boundary. The v48 development accepted the risk that the post-deletion segment has not been exercised under a deliberate failure on the intervening path, on the reasoning that the segment is the same code with different parameters; the 2026-10-06 field validation confirmed the happy path on the exact motivating layout. The deliberate post-deletion failure test remains the gate for future changes to the segment.
 
 - **Pre-shrink segment (plan, pre-shrink, verification, deferral) is not gated.** The v45 reorder placed the risky step in the reversible window, which closes the v44 residual for the shrink case. The v48 pre-shrink changes (resize-target abstraction, anchor-aware free-space check, `-DefragTarget` parameter, active-route resolution moved before the pre-shrink) are all in this ungated segment.
+
+---
+
+## [v50 patch 2] — 2026-10-13
+
+**The headline.** URL-builder fix for the restructured Windows 10 repository folder, a diagnostic improvement in the source-ownership classifier, a hypervisor-aware suppression boundary on the non-OS-disk recovery-partition sweep, and SCSI added to the workspace bus allowlist. `ScriptVersion` remains 50; `ScriptPatchLevel` moves from `"1"` to `"2"`. No `DesiredStateId` change, no fleet-wide rebuild.
+
+The release addresses four issues discovered after v50 patch 1 shipped.
+
+First, the `52250179/OriginalWindowsREImages` repository was restructured after v50 patch 1 shipped, moving the Windows 10 image files from `Win10/` into `Win10/x64/`. The production script's `Get-GitHubBaseWinRE` URL builder had not been updated, so a Windows 10 machine with no local WIM source would fail to resolve the folder when falling through to the GitHub cold-start. The harness had already been updated in the same window and used the correct path; this release brings the production URL builder into line.
+
+Second, an operator who hit the `Foreign-With-Drivers` classification had no way to know from the log which specific driver triggered the classification — the classifier logged only the count. The new diagnostic loop logs each pre-strip driver's `Driver`, `ProviderName`, `Version`, and `OriginalFileName`, mirroring the strip stage's existing pre-strip inventory logging.
+
+Third, the non-OS-disk recovery-partition sweep in `Remove-StrayRecoveryPartitions` could delete a type-coded recovery partition on a host physical disk exposed to a guest VM via passthrough (Hyper-V) or raw disk access (VirtualBox). `BusType` cannot distinguish such a disk from a genuine secondary internal disk, so the sweep now suppresses itself entirely when the running OS is detected inside a known hypervisor — and fails closed (suppresses) when the detection is indeterminate. Non-OS disks reported as `File Backed Virtual` are preserved individually. A parallel harness move (v36) mirrors the function and adds an Option 1 preview of what the detector would decide.
+
+Fourth, a Hyper-V guest using a virtual SCSI controller for its OS disk had no eligible workspace: the workspace candidate filter did not admit a non-allowlisted bus type on the OS volume, so the full-update path deferred with `no eligible fixed NTFS workspace`. `SCSI` is a recognised local storage interface, and the workspace holds temporary servicing files rather than being a deletion target; admitting it for the OS volume only does not weaken any partition-safety gate.
+
+### Added
+
+- **`Test-RunningInVirtualMachine`.** A hypervisor-detection helper that returns `$true` when the running OS is inside a known hypervisor (matched against the `Win32_ComputerSystem` Manufacturer and Model strings), `$false` when no known hypervisor signature matches, and `$null` when the query itself fails. The signature list is deliberately un-anchored — the detector is a safety gate, so over-detection is preferable to under-detection. Called only from `Remove-StrayRecoveryPartitions`.
+
+- **Non-OS sweep suppression boundary.** `Remove-StrayRecoveryPartitions` now suppresses its entire sweep when `Test-RunningInVirtualMachine` returns `$true` (a known hypervisor) or `$null` (indeterminate; fail closed). On suppression the function logs a warning, returns success, and preserves any recovery partitions on non-OS disks. The OS-disk repair path is unaffected: it operates only on the OS disk, which is the guest's own.
+
+- **`File Backed Virtual` disk protection in the sweep.** When the sweep does run (physical machine, no hypervisor signature), any non-OS disk whose `BusType` is `File Backed Virtual` is preserved individually — a mounted VHD/VHDX may contain another Windows installation's recovery environment. The list of preserved virtual disks appears in the sweep's summary line under a new `preserved virtual:` field.
+
+- **Classifier diagnostic loop.** Before the source-ownership classification returns, `Main`'s Step 3 now logs each entry in `$preStripDrivers` — `Driver`, `ProviderName`, `Version`, `OriginalFileName` — mirroring the strip stage's pre-strip inventory logging. Runs regardless of which classification the classifier reaches, so an operator who hits a `Foreign-With-Drivers` preserve has the driver identity in the log without reproducing the mount manually.
+
+- **`SCSI` admitted for the running OS volume in the workspace candidate filter.** Hyper-V exposes virtual disks to guests via a virtual SCSI controller, and `Get-Disk` inside the guest reports `BusType='SCSI'` in that topology. `SCSI` is deliberately **not** added to `$InternalWorkspaceBusTypes`; it is admitted conditionally in `Get-WorkDirCandidates` only when the candidate volume is the running OS volume (`$driveLetter -eq $osDriveLetter`). A non-OS SCSI volume — which on a passthrough/raw-disk guest may be a host physical disk — is not admitted. Without this conditional admission, a Hyper-V guest whose only fixed NTFS volume is its own OS disk would be unable to find a workspace and the full-update path would defer with `no eligible fixed NTFS workspace`.
+
+### Changed
+
+- **`Get-GitHubBaseWinRE` URL builder now resolves the restructured Windows 10 folder.** The Windows 10 path was `"$BaseWinRERepoApi/Win10"`; it is now `"$BaseWinRERepoApi/Win10/x64"`. The Windows 11 path is unchanged (`"$BaseWinRERepoApi/Win11"`). The repository restructure moved the Windows 10 image parts into a `Win10/x64/` subfolder; without the fix, a Windows 10 machine taking the GitHub cold-start path would list the old folder and fail to find any `Winre.7z.*` parts.
+
+- **`.NOTES` gains a v50 patch 2 design-invariant bullet.** The new bullet documents the non-OS sweep suppression boundary: the sweep is retained for physical refurbishment machines, suppressed under a detected or indeterminate hypervisor, and preserves `File Backed Virtual` disks individually. The bullet also states that the OS-disk repair path is unaffected.
+
+- **`.NOTES` `Version` line updated to `50.2 (v50 patch 2)`.**
+
+### Changed (harness)
+
+- **`Test-WinRE.ps1` moved from v35 to v37.** All changes are harness-only; none triggers a managed-machine rebuild. Two harness moves shipped in this window.
+
+  - A mirror of `Test-RunningInVirtualMachine` (placed in its own section header between the SYSTEM INFO HELPERS section and the DIAGNOSTIC section) so the Option 1 diagnostic can preview what production's detector would decide for this machine.
+  - A "Non-OS sweep suppression preview" section in Option 1 that reports the hypervisor-detection verdict (`guest`, `physical`, or `indeterminate`) and lists every non-OS recovery partition's disposition under the sweep's deletion rules (`WOULD DELETE` / `WOULD PRESERVE` / `WOULD SKIP` with a one-line reason).
+  - A new source-level mirror-binding assertion (check 20) that verifies production's `Test-RunningInVirtualMachine` retains the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, and the combined-string construction the harness's mirror and preview depend on. SKIP when `WinRE.ps1` is not adjacent.
+
+  In v37, two further changes on top of the v36 baseline:
+
+  - The `Test-RunningInVirtualMachine` mirror gains the v50 patch 2 empty-metadata fail-closed guard. Production returns `$null` when `Win32_ComputerSystem` succeeds but returns empty or whitespace-only `Manufacturer` and `Model` fields; without the guard, the harness mirror would fall through to the signature scan, classify the empty string as a physical machine, and report `physical (sweep runs)` on exactly the machine where production reports `indeterminate (sweep suppressed)`.
+  - Check 20 gains the assertion that binds the guard (`IsNullOrWhiteSpace`). Before v37, check 20 verified the ten signatures, the fail-closed `$null` return, the query source, and the combined-string construction, but not the guard that makes the `$null` return reachable for the empty-metadata case. A future production edit that dropped the guard would have passed check 20 silently.
+
+  - `.DESCRIPTION` and `.NOTES` updates: `Test-RunningInVirtualMachine` added to the "Mirrored from production" list, the source-assertion paragraph extended to name checks 18, 19, and 20, v36 and v37 changelog blocks, and the menu title and startup `Rule` bumped 35 — 37.
+
+### Migration Note
+
+`ScriptVersion` remains 50, so the `SCRIPT` component of `DesiredStateId` is unchanged and no fleet-wide rebuild is forced. `ScriptPatchLevel` moves from `"1"` to `"2"`, visible in the startup banner (`WinRE Manager Started (v50 patch 2)`) and in the harness menu (`WinRE Manager Test Harness (v37)`). A machine that ran v50 patch 1 continues on the fast path.
+
+The URL-builder fix takes effect only on a machine that reaches the GitHub cold-start path — a machine with no usable registered WIM and no hash-validated LKG. On a machine whose registered WIM or LKG is usable, the fix is inert.
+
+The non-OS sweep suppression boundary takes effect only on a machine whose `Win32_ComputerSystem` Manufacturer or Model matches a known hypervisor signature, or whose `Win32_ComputerSystem` query fails. On a physical machine, the sweep continues exactly as before.
+
+The `SCSI` OS-volume admission takes effect only on a machine whose OS disk bus type is `SCSI` — typically a Hyper-V guest. On a machine with a different OS-disk bus type, the admission is inert.
+
+Rollback: change `$ScriptPatchLevel` back to `"1"` and revert the v50 patch 2 changes (`Get-GitHubBaseWinRE` URL builder, `Test-RunningInVirtualMachine`, the non-OS sweep suppression boundary and `File Backed Virtual` protection, the classifier diagnostic loop, and the `SCSI` OS-volume admission in `Get-WorkDirCandidates`). No `DesiredStateId` change; no second rebuild.
+
+The read-only harness `Test-WinRE.ps1` moves from v35 to v37 in the same window.
+
+### Field verification
+
+The v50 patch 2 release was field-verified on 2026-10-13 on the project's ASUS desktop test machine (PRIME H510M-D, i5-11400, Windows 11 build 26300). Three runs: all took the fast path, all reported `Byte drift from last deployment: NO`, all exited 0.
+
+- **The banner changed to `WinRE Manager Started (v50 patch 2)`.**
+- **The hypervisor-detection helper fired and reported the correct verdict.** Log line: `Test-RunningInVirtualMachine: no known hypervisor signature (Manufacturer='ASUS', Model='System Product Name') -> treating as physical`. The verdict was `$false`, so the sweep proceeded and found no stray recovery partitions on non-OS disks — matching the pre-v50-patch-2 behavior on the same machine.
+- **No regression:** all three runs accepted the state file, took the fast path, and reported identical SHA256 for the registered and last-deployed WinRE.
+
+The URL-builder fix, the classifier diagnostic loop, the `File Backed Virtual` protection, and the `SCSI` OS-volume admission were not exercised by these runs. The URL builder fires only on a Windows 10 machine taking the GitHub cold-start path; the classifier diagnostic loop fires only on a source with a non-zero pre-strip driver count (the test machine's source is `Foreign-No-Drivers`, i.e. zero); the `File Backed Virtual` protection fires only when a mounted VHD/VHDX is present on a non-OS disk; and the `SCSI` OS-volume admission matters only on a machine whose OS disk bus type is `SCSI` (the test machine's is NVMe). These are covered by inspection and by the harness's source-level assertion for `Test-RunningInVirtualMachine`.
+
+### Known limitations
+
+The eight live limitations listed under [Current known limitations](#current-known-limitations) carry forward unchanged from v50 patch 1. No new user-facing limitations are introduced.
+
+The non-OS sweep suppression boundary is a heuristic, not a security boundary. A hypervisor configured to spoof its manufacturer/model strings, or an unusual platform not covered by the signature list, may not match. The `File Backed Virtual` protection is independent of the hypervisor detection and provides a second layer. The residual is that a VM with a passthrough disk may still not be recognized as a guest; the classification consequence is a missed sweep, which is the safe direction.
+
+### Unchanged
+
+The deployed WIM production recipe is unchanged. The strip stage, the source-selection preference order, the metadata-based drift detector, the pre-`/disable` race detector, the three-source selection chain, the transactional WIM replacement, the intervening-anchor plan, the architecture gate, the native-boot VHDX fail-closed gate, the source-ownership classification classes, the never-downgrade check, the storage-applicability gate, the backup action, the restore action, the run summary and narration layers, and the temporary resume task's registration and cleanup semantics are all unchanged. The state file schema is unchanged. The manager config file schema is unchanged. The checkpoint file format is unchanged. The partition geometry on both the intervening-anchor path and the non-intervening path is unchanged.
 
 ---
 

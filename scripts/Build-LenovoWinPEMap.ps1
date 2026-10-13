@@ -70,7 +70,20 @@ function Extract-JsonObject {
 # ═══════════════════════════════════════════════════════════════════════
 # ENSURE CURL-IMPERSONATE
 # ═══════════════════════════════════════════════════════════════════════
-if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null }
+# Stale-workspace cleanup. Recreate the workspace fresh on every run. This
+# discards the cached curl-impersonate binary and recipecard.json from a
+# previous run; the next run re-downloads them (a few MB, once per run).
+# The alternative -- caching the binary in a location outside C:\Temp --
+# would leave a durable artifact the operator did not ask for, so cleanup
+# is the simpler contract. Mirrors the equivalent cleanup at the start of
+# Inspect-GitHubWinRE.ps1.
+if (Test-Path -LiteralPath $WorkDir) {
+    Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $WorkDir) {
+        try { [System.IO.Directory]::Delete($WorkDir, $true) } catch { }
+    }
+}
+New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 
 if (-not (Test-Path $CiExe)) {
     Write-T "Downloading curl-impersonate ..." -L INFO
@@ -324,3 +337,44 @@ Write-T " MAP BUILT: $($finalMap.Count) machine types" -L SUCCESS
 Write-T " Output: $OutputFile" -L SUCCESS
 Write-T "================================================================" -L SUCCESS
 Write-T "Upload this file to gist 8211b75a38444caa68b8cebd7529376c" -L INFO
+
+# Workspace cleanup. The map JSON is written to $MapsDir, which is
+# separate from the build workspace. The workspace holds the cached
+# curl-impersonate binary, the RecipeCard JSON, and any page scrapes, none
+# of which is needed after the map is built. Remove the workspace, then
+# remove the parent directory if it is named "Temp" and is now empty.
+# Mirrors Remove-EmptyWorkspaceParent in WinRE.ps1.
+if (Test-Path -LiteralPath $WorkDir) {
+    try {
+        Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction Stop
+        Write-T "Workspace removed: $WorkDir" -L INFO
+    } catch {
+        try { [System.IO.Directory]::Delete($WorkDir, $true) } catch { }
+        if (Test-Path -LiteralPath $WorkDir) {
+            Write-T "Could not remove workspace ${WorkDir}: $_" -L WARN
+            Write-T "Manual cleanup:  Remove-Item '$WorkDir' -Recurse -Force" -L WARN
+        } else {
+            Write-T "Workspace removed: $WorkDir" -L INFO
+        }
+    }
+}
+$workspaceParent = $null
+try { $workspaceParent = Split-Path -LiteralPath $WorkDir -Parent } catch { }
+if ($workspaceParent -and $workspaceParent -notmatch '^[A-Za-z]:\\?$') {
+    $leaf = $null
+    try { $leaf = Split-Path -LiteralPath $workspaceParent -Leaf } catch { }
+    if ($leaf -and [System.StringComparer]::OrdinalIgnoreCase.Equals($leaf, 'Temp')) {
+        if (Test-Path -LiteralPath $workspaceParent -PathType Container) {
+            $entries = $null
+            try { $entries = @(Get-ChildItem -LiteralPath $workspaceParent -Force -ErrorAction Stop) } catch { $entries = $null }
+            if ($null -ne $entries -and $entries.Count -eq 0) {
+                try {
+                    Remove-Item -LiteralPath $workspaceParent -Force -ErrorAction Stop
+                    Write-T "Removed empty parent: $workspaceParent" -L INFO
+                } catch {
+                    try { [System.IO.Directory]::Delete($workspaceParent, $false) } catch { }
+                }
+            }
+        }
+    }
+}

@@ -37,7 +37,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v35.** The version history is:
+**Current version: v37.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -60,6 +60,8 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v33** adds two source-level mirror-binding assertions to the parser self-test (checks 18 and 19). Check 18 verifies that production's `Test-NativeBootVirtualTopology` retains the v49 patch 2 fail-closed shape; check 19 verifies that production's `Get-StorageControllerDevices` retains the unary-comma return and both software-device filter regexes that check 17's harness-side test depends on. Both read the adjacent `WinRE.ps1` and SKIP when it is not present. See "v33 changes" below.
 - **v34** adds `Remove-EmptyTestParent`, mirroring production's v50 `Remove-EmptyWorkspaceParent` invariant. After `Invoke-HarnessCleanup` removes `$TestDir`, the parent directory (typically `C:\Temp` for the default path) is checked and removed if and only if its leaf name is exactly `Temp`, it is completely empty, and it is not a drive root. See "v34 changes" below.
 - **v35** inverts the interactive cleanup prompt. The v34 form (`Keep test artifacts in $TestDir → (y/N)` with y=keep) was the reverse of what most operators read, and an operator who answered `y` expecting deletion got the opposite. The prompt now reads `Delete test artifacts from $TestDir → (Y/n)` with `y`=delete (default) and `n`=keep. See "v35 changes" below.
+- **v36** closes a diagnostic gap exposed by production v50 patch 2's hypervisor-suppression boundary: the harness now mirrors production's `Test-RunningInVirtualMachine` and adds a "Non-OS sweep suppression preview" section to Option 1 that reports the hypervisor-detection verdict (`guest`, `physical`, or `indeterminate`) and every non-OS recovery partition's disposition under the sweep's deletion rules. v36 also adds a source-level mirror-binding assertion (check 20) that verifies production's `Test-RunningInVirtualMachine` retains the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, and the combined-string construction. See "v36 changes" below.
+- **v37** mirrors production v50 patch 2's empty-metadata fail-closed correction in the harness's `Test-RunningInVirtualMachine` mirror, and extends check 20 with an assertion that binds the guard (`IsNullOrWhiteSpace`). Before v37 the harness mirror lacked the guard, so a machine whose `Win32_ComputerSystem` returned empty or whitespace-only Manufacturer and Model fields would have been classified as a physical machine by the harness's preview while production's gate returned `$null` (indeterminate; sweep suppressed). See "v37 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
@@ -74,6 +76,34 @@ Two changes, both closing the version-drift family that has required a manual `$
 **2. Menu title and startup `Rule` bumped 28 -> 29.**
 
 The parser self-test count remains at eighteen — v29 adds no new checks.
+
+### v37 changes
+
+Two changes, both downstream of the production v50 patch 2 cycle.
+
+**1. Empty-metadata fail-closed guard added to the `Test-RunningInVirtualMachine` mirror.** Production v50 patch 2 treats a `Win32_ComputerSystem` query that succeeds but returns empty or whitespace-only Manufacturer and Model fields as indeterminate and returns `$null`; without that guard, the empty string falls through to the signature scan, matches nothing, and is classified as a physical machine. The harness mirror lacked the guard, so on such a machine the Option 1 sweep-suppression preview would have reported `physical (sweep runs)` while production would have reported `indeterminate (sweep suppressed)`. v37 closes that mirror gap: the harness mirror now returns `$null` on empty metadata, matching production's behavior.
+
+**2. Check 20 extended with an assertion that binds the guard.** Before v37, check 20 verified the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, and the combined-string construction — but not the guard that makes the `$null` return reachable for the empty-metadata case. A future production edit that dropped the guard would have passed check 20 silently. v37 adds an `IsNullOrWhiteSpace` assertion to close that hole.
+
+**3. Menu title and startup `Rule` bumped 36 -> 37.**
+
+The parser self-test count remains at twenty-one — v37 extends check 20's assertion without adding a new check.
+
+### v36 changes
+
+Five changes, all downstream of the production v50 patch 2 cycle.
+
+**1. Closed a diagnostic gap exposed by v50 patch 2's hypervisor-suppression boundary.** The harness now mirrors production's `Test-RunningInVirtualMachine` and adds a "Non-OS sweep suppression preview" section to Option 1. The preview reports the hypervisor-detection verdict (`guest`, `physical`, or `indeterminate`) that production's `Remove-StrayRecoveryPartitions` will reach, and lists every non-OS recovery partition with its disposition under the sweep's deletion rules (`WOULD DELETE` / `WOULD PRESERVE` / `WOULD SKIP`, with a one-line reason). The operator can now see, before running production, whether the sweep will run and what it would target.
+
+**2. Added source-level mirror-binding assertion check 20.** Reads production's `Test-RunningInVirtualMachine` and verifies the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, and the combined-string construction. Catches the same mirror-drift class that checks 18 and 19 guard against. SKIP when `WinRE.ps1` is not adjacent.
+
+**3. Added `Test-RunningInVirtualMachine` to the "Mirrored from production" list in `.DESCRIPTION`.**
+
+**4. No `$ProductionScriptVersion` bump is needed for v50 patch 2.** Production's `$ScriptVersion` remains 50 across the patch-level bump (only `$ScriptPatchLevel` moves 1 -> 2), and the harness reads the value directly from the adjacent `WinRE.ps1` via `Get-ProductionScriptVersion`, so the DSI mirror remains correct.
+
+**5. Menu title and startup `Rule` bumped 35 -> 36.**
+
+The parser self-test count moves from twenty to twenty-one with the new check 20.
 
 ### v35 changes
 
@@ -307,7 +337,7 @@ As of v34, when the harness does remove `$TestDir`, it also removes the parent d
 
 As of v35, the interactive cleanup prompt reads `Delete test artifacts from $TestDir → (Y/n)` with `y`=delete (default) and `n`=keep. The v34 form was `Keep test artifacts in $TestDir → (y/N)` with `y`=keep, and operators read "y to cleanup" and answered `y` expecting deletion — the keep branch returned before `Remove-EmptyTestParent` ran. Empty input still deletes. The `-Keep` switch still short-circuits to keep, and the pre-existing-non-empty refusal is unchanged.
 
-## Output style (v16; extended in v17 through v35, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, v28's VMD storage-controller diagnostic section, v33's two source-level mirror-binding assertions in the parser self-test, v34's empty-test-parent cleanup, and v35's inverted cleanup prompt as the departures)
+## Output style (v16; extended in v17 through v37, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, v28's VMD storage-controller diagnostic section, v33's two source-level mirror-binding assertions in the parser self-test, v34's empty-test-parent cleanup, v35's inverted cleanup prompt, v36's Non-OS sweep suppression preview section, and v37's empty-metadata fail-closed guard in the sweep-suppression preview mirror as the departures)
 
 As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. The rest of the output format is unchanged from v16.
 
@@ -382,6 +412,7 @@ Read-only information gathering. Dumps:
 - BitLocker on C: (`ProtectionStatus`, `VolumeStatus`, `EncryptionMethod`, `EncryptionPercentage`), **plus a hazard warning for the four mid-operation states and a separate ambiguity warning for `Fully Encrypted + Protection Off`** (v12, warning text updated in v14).
 - **The target recovery partition state** (v14): the BitLocker status of the partition reagentc is registered to. This is the state that determines whether the production script will need to run `manage-bde -off` before calling `reagentc /enable`.
 - VMD hardware presence per manifest (fail-closed as of v18: an enumeration error reports `INDETERMINATE`). As of v28 the section is preceded by the storage-controller enumeration block described below.
+- **The Non-OS sweep suppression preview (v36):** a read-only preview of production v50 patch 2's `Remove-StrayRecoveryPartitions` decision. The section reports the hypervisor-detection verdict (`guest`, `physical`, or `indeterminate`) by calling the harness's mirror of `Test-RunningInVirtualMachine`, and lists every non-OS recovery partition with its disposition under the sweep's deletion rules (`WOULD DELETE` / `WOULD PRESERVE` / `WOULD SKIP`, with a one-line reason). On a machine whose detection is `guest` or `indeterminate`, the sweep is suppressed by production and the dispositions are shown for reference. As of v37 the mirror includes the empty-metadata fail-closed guard, so a machine whose `Win32_ComputerSystem` returns empty or whitespace-only Manufacturer and Model fields is correctly reported as `indeterminate` rather than `physical`.
 
 Then it runs the parser self-test (below).
 
@@ -558,7 +589,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Twenty checks as of v35 (eighteen as of v28, seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, v27, v29, v30, v31, v32, and v34 did not change the count or the contents. v28 added the `Get-StorageControllerDevices` shape check; v33 added the two source-level mirror-binding assertions (checks 18 and 19). Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
+Twenty-one checks as of v37 (twenty as of v35, eighteen as of v28, seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, v27, v29, v30, v31, v32, v34, and v35 did not change the count or the contents, and v37 extended check 20's assertion without adding a new check. v28 added the `Get-StorageControllerDevices` shape check; v33 added the two source-level mirror-binding assertions (checks 18 and 19); v36 added check 20, the `Test-RunningInVirtualMachine` mirror-binding assertion. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -582,6 +613,7 @@ Twenty checks as of v35 (eighteen as of v28, seventeen as of v25, sixteen as of 
 | 17 | Get-StorageControllerDevices shape | Handles the enumeration's three outcomes: a NULL return (indeterminate PnP enumeration) records FAIL, an empty array records SKIP, and a populated array is verified to have objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. | v28 |
 | 18 | VHDX gate fail-closed | Production's `Test-NativeBootVirtualTopology` retains the v49 patch 2 fail-closed shape: the unfiltered `Get-Disk` enumeration uses `-ErrorAction Stop`, the gate sets `IsNativeBootVirtual = $true` on the corresponding catch path, and the indeterminate-topology reason text is present. SKIP when `WinRE.ps1` is not adjacent. | v33 |
 | 19 | StorageControllerDevices mirror binding | Production's `Get-StorageControllerDevices` retains the unary-comma return (`return ,$result`) and both software-device filter regexes (`{GUID}\` and `SWD\`). SKIP when `WinRE.ps1` is not adjacent. | v33 |
+| 20 | Test-RunningInVirtualMachine mirror binding | Production's `Test-RunningInVirtualMachine` retains the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, the empty-metadata fail-closed guard (`IsNullOrWhiteSpace`), and the combined-string construction (`$combined = "$mfg $mdl"`). SKIP when `WinRE.ps1` is not adjacent. | v36 (extended v37) |
 
 ### What a FAIL means
 
@@ -658,6 +690,7 @@ The harness is deliberately narrow. It does not and cannot test:
 - **The full-update pipeline.** The harness exercises the download and extraction steps in isolation, not the pipeline.
 - **The v45 shrink-first pipeline.** The plan, the pre-shrink, the extension path, and the whole-layout assertion are all production-only code paths. See the "v45 destructive-path regression" section below for how they are tested.
 - **The v49 pre-deployment gates.** The source-ownership classification, the never-downgrade storage-driver check, the pre-deployment storage-applicability gate, and the native-boot VHDX fail-closed gate are all production-only. The harness surfaces the *inputs* those gates read — the storage controllers (v28), the source-WIM ownership class is not currently surfaced — but does not exercise the gates themselves. See the "v49 destructive-path coverage" section below.
+- **The v50 patch 2 additions.** The non-OS sweep suppression boundary, the `File Backed Virtual` protection inside the sweep, the classifier diagnostic loop, the `Get-GitHubBaseWinRE` URL-builder fix, and the `SCSI` OS-volume admission are all production-only. Option 1's "Non-OS sweep suppression preview" (v36) mirrors the hypervisor-detection decision the sweep applies and reports every non-OS recovery partition's disposition under the sweep's rules, so an operator can see what production would decide without running production. The preview does not exercise production's sweep.
 
 Those paths are covered by field testing on representative hardware. See the "Field-tested hardware" table in the [README](../README.md).
 
