@@ -42,14 +42,16 @@ The v49 release added a family of gates that run **before** the destructive sequ
 - The **pre-deployment storage-applicability gate** (the last refusal before the WIM is written to the active route: every present SCSIAdapter-class device on the machine must have at least one matching INF in the candidate).
 - The **native-boot VHDX fail-closed gate** (refuses destructive operations on a VHDX-boot OS volume).
 - The **backup and restore actions** (`-Action Backup` and `-Action Restore`; the sidecar `backup.json` format; the transactional restore path).
-- The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its two independent persist signals — the `$Script:ResumeTaskShouldPersist` flag, set by the outer catch and by `Invoke-RestoreAction`'s two mid-transformation failure paths, and the `[WinRECancelKeyProbe]::ShouldPersist` static field, set by the compiled Ctrl+C delegate — plus its two finally-never-runs interruption classes, its clean-completion removal, and its `$PSCommandPath` guard).
+- The **temporary crash-recovery scheduled task** (`WinRE Manager - Resume`; its two independent persist signals — the `$Script:ResumeTaskShouldPersist` flag, set by the outer catch and by `Invoke-RestoreAction`'s three mid-transformation failure paths (the WIM-deployment failure when the re-enable attempt after the failure does not return `ok`, added in v50 patch 3), and the `[WinRECancelKeyProbe]::ShouldPersist` static field, set by the compiled Ctrl+C delegate — plus its two finally-never-runs interruption classes, its clean-completion removal, and its `$PSCommandPath` guard).
 - The **stable install location** for the permanent maintenance task (`C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1`; the SHA256-verify-before-register step).
+
+A change to any of these that is not covered by an existing field case still requires a `CHANGELOG.md` entry per the Changelog section above.
 
 If your PR touches any of the v50 patch 1 additions below, say so explicitly and include the test result that demonstrates the change behaves as claimed:
 
 - The **`manager.json` config file** and its helpers (`Get-ManagerConfig`, `Set-ManagerConfig`, `Add-ManagerBackupRoot`).
 - The **manager config ownership gate** (two-level SYSTEM/Administrators ownership check on both read and write, fail-closed on ambiguity).
-- The **resume-task protected-path guard** (the check that refuses to register the SYSTEM crash-recovery task when the script directory grants write-capable rights to a non-admin principal).
+- The **resume-task protected-path guard** (the check that refuses to register the SYSTEM crash-recovery task when the script directory grants write-capable rights to a non-admin principal). Superseded in v50 patch 3 by the resume-script staging design listed under the v50 patch 3 additions below.
 - The **destination-volume free-space preflight on backup** (100 MiB margin, before destination directory creation).
 - The **UNC resolution for mapped-drive backup paths** in `Add-ManagerBackupRoot`.
 - The **empty-parent cleanup** in `Remove-EmptyWorkspaceParent` and the parallel logic in `Cleanup-Backups.ps1`.
@@ -67,6 +69,29 @@ If your PR touches any of the v50 patch 2 additions below, say so explicitly and
 
 A change to any of these that is not covered by an existing field case still requires a `CHANGELOG.md` entry per the Changelog section above.
 
+If your PR touches any of the v50 patch 3 additions below, say so explicitly and include the test result that demonstrates the change behaves as claimed:
+
+- The **shared `Test-PathTrustedForSystem` helper** and its split modify-capable mask (`Delete | DeleteSubdirectoriesAndFiles | TakeOwnership | ChangePermissions` on a directory; those plus `WriteData | AppendData` on a file).
+- The **extended manager config trust check** (config file itself, its containing directory, and that directory's parent, all validated via `Test-PathTrustedForSystem`).
+- The **resume-script staging design** (the SYSTEM resume task executes a staged copy of the running script at `C:\Recovery\OEM\Resume\WinRE.ps1` under an explicit DACL, rather than the script's original path; the staging directory is removed on clean terminal exit; the copy is byte-verified against the source).
+- The **Restore resume-task persist condition** on the WIM-deployment-failure path (keyed on `-ne 'ok'`, not `-ne 'ok' -and -ne 'reboot'`).
+- The **post-deletion verification** in `Remove-StrayRecoveryPartitions` (a terminating re-query and absent-from-results check before recording a deletion as confirmed).
+- The **empty archive-parts guard** in `Get-GitHubBaseWinRE`.
+- The **OS-disk scope** on the recovery-volume drive-letter normalization block.
+- The **volume-root preservation** in `Add-ManagerBackupRoot` (`E:\` is not truncated to `E:`).
+- The **wrapper Restore catalogue enumeration** and its WIM-only acceptance.
+- The **wrapper argument quoting** for `Start-Process` paths ending in a backslash.
+- The **reparse-point rejection** in `Cleanup-Backups.ps1` (discovery and pre-deletion revalidation).
+- The **cleanup helper's exit code** and its **explicit-path scope** for the default hierarchy.
+- The **fail-closed drive-letter normalization** in the recovery-volume drive-letter normalization block (a provider error on the `\Windows` presence check skips removal for that volume rather than aborting the run).
+- The **fail-closed workspace volume enumeration** in `Get-WorkDirCandidates` (a Storage-module error returns an empty candidate list so the caller defers cleanly rather than aborting FATAL).
+- The **ACE-catch fail-closed correction** in `Test-PathTrustedForSystem` (the ACE loop now logs and returns `$false` on an unresolvable SID rather than silently skipping it, honouring the header comment contract).
+- The **two mirror syncs of the ACE-catch fix** (the duplicated trust helper in `Cleanup-Backups.ps1` and the compressed inline trust check in `WinRE-Manager.cmd`'s Restore `TARGET_COMMAND`).
+- The **Restore-failure state invalidation** in `Invoke-RestoreAction` (the target WIM's SHA256 is captured before the deploy attempt and again on failure; the state file, checkpoint, and deferral marker are preserved only when both hashes match, and the resume-task persist flag is set unconditionally in the invalidate branch).
+- The **numeric-selection fix** in `Cleanup-Backups.ps1` (`@($backups).Count` and typed `List[int]` handle the single-backup case correctly).
+
+A change to any of these that is not covered by an existing field case still requires a `CHANGELOG.md` entry per the Changelog section above.
+
 ### If this PR touches the destructive sequence
 
 The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPartition`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, the `New-Partition` / `Format-Volume` / `Set-RecoveryPartitionAttributes` calls, `Remove-OrphanPartition`, `Restore-OSPartitionSize`, `Restore-PreviousWinRERoute`, `Assert-RecoveryPartitionLayout`, `Remove-StrayRecoveryPartitions`, and any caller of those functions. **Delete this subsection if it does not apply.**
@@ -75,7 +100,7 @@ The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPar
 - [ ] I have named **which of the four design invariants this PR strengthens**.
 - [ ] I confirm this PR **does not weaken any of rules 1–3**.
 - [ ] I have included the **test result that demonstrates the change behaves as claimed** — or, if the required test is the post-deletion failure test described in [`docs/testing.md`](docs/testing.md), I have said so explicitly and noted that this PR is **blocked until that test runs and its result is recorded**.
-- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v50 patch 2. v50 patch 1 does not touch the destructive sequence and did not modify the gate. v50 patch 2 modifies `Remove-StrayRecoveryPartitions` (the non-OS sweep suppression boundary and the `File Backed Virtual` protection), which is on the broader destructive-sequence list in this template, but not the post-deletion segment that the gate protects; the gate's scope is unchanged.
+- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v50 patch 3. v50 patch 1 does not touch the destructive sequence and did not modify the gate. v50 patch 2 modifies `Remove-StrayRecoveryPartitions` (the non-OS sweep suppression boundary and the `File Backed Virtual` protection), which is on the broader destructive-sequence list in this template, but not the post-deletion segment that the gate protects; the gate's scope is unchanged. v50 patch 3 modifies `Remove-StrayRecoveryPartitions` (positive post-deletion verification) and the recovery-volume drive-letter normalization block in `Main` (OS-disk scope); the former is on the broader destructive-sequence list. Neither touches the post-deletion segment that the gate protects, and the gate's scope is unchanged.
 
 ## Invariants
 

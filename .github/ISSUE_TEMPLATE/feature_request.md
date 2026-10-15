@@ -45,6 +45,28 @@ v50 patch 2 added a hypervisor-aware suppression boundary to the non-OS-disk rec
 - The **`SCSI` entry in the workspace bus allowlist** (`Get-WorkDirCandidates`; the OS-volume-only admission rule — does your feature change the workspace selection policy?).
 - The **GitHub Windows 10 URL builder** in `Get-GitHubBaseWinRE` (the `Win10/x64` folder path — does your feature change where the base WIM repository resolves from?).
 
+### If this feature would touch one of the v50 patch 3 additions
+
+v50 patch 3 extended the manager config and resume-task trust checks, added a shared `Test-PathTrustedForSystem` helper, and closed seven correctness gaps across production and the wrapper. If your feature would interact with any of them, say so explicitly:
+
+- The **shared `Test-PathTrustedForSystem` helper** and its split modify-capable mask (does your feature need a different mask, a different trusted-principal set, or a check on a new path?).
+- The **extended manager config trust check** on the config file, its containing directory, and its parent.
+- The **resume-script staging design** (the SYSTEM resume task executes a staged copy of the running script at `C:\Recovery\OEM\Resume\WinRE.ps1` under an explicit DACL, rather than the script's original path).
+- The **Restore resume-task persist condition** on the WIM-deployment-failure path (does your feature change when the resume task is preserved?).
+- The **post-deletion verification** in `Remove-StrayRecoveryPartitions` (does your feature change what constitutes a confirmed deletion?).
+- The **empty archive-parts guard** in `Get-GitHubBaseWinRE` (does your feature change how base WIM parts are discovered?).
+- The **recovery-volume drive-letter normalization scope** (does your feature change which volumes are subject to letter removal?).
+- The **volume-root preservation** in `Add-ManagerBackupRoot` (does your feature change how backup roots are stored?).
+- The **wrapper Restore catalogue enumeration** and WIM-only backup acceptance.
+- The **wrapper argument quoting** for `Start-Process` paths.
+- The **reparse-point rejection** in `Cleanup-Backups.ps1` and its exit-code / explicit-path-scope behaviour.
+- The **fail-closed drive-letter normalization** in the recovery-volume drive-letter normalization block (does your feature change how a provider error on the `\Windows` presence check is handled?).
+- The **fail-closed workspace volume enumeration** in `Get-WorkDirCandidates` (does your feature change how an enumeration error is handled?).
+- The **ACE-catch fail-closed correction** in `Test-PathTrustedForSystem` (does your feature need a different behaviour on an unresolvable ACE SID, or a different modify-capable mask?).
+- The **two mirror syncs of the ACE-catch fix** in `Cleanup-Backups.ps1` and the compressed inline copy in `WinRE-Manager.cmd`'s Restore `TARGET_COMMAND` (does your feature change how either duplicated trust check evaluates an ACE?).
+- The **Restore-failure state invalidation** in `Invoke-RestoreAction` (does your feature change when the state file, checkpoint, or deferral marker is preserved or invalidated after a failed WIM replacement?).
+- The **numeric-selection fix** in `Cleanup-Backups.ps1` (does your feature change how backup numbers are parsed, deduplicated, or mapped to backup objects?).
+
 ---
 
 **On the design invariants.** WinRE Manager's design is organized around four rules, in this order — see [`docs/architecture.md`](docs/architecture.md) for the full hierarchy:

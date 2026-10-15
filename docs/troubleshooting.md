@@ -58,10 +58,10 @@ The pre-deployment gates, the post-run persistence features, and the backup and 
 - **The temporary crash-recovery scheduled task** (`WinRE Manager - Resume`) — registered by every Repair or Restore run, deleted on clean completion, preserved on interruption.
 - **The stable install location** for the permanent maintenance task (`C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1`) — the wrapper's install option copies the script there, hash-verifies, and registers the task against the copy.
 
-The v50 patch 1 release adds two new refusal paths with their own sections below:
+The v50 patch 3 release replaces the v50 patch 1 resume-task protected-path guard with a staging design, and extends the manager config trust gate. Two sections below cover the new forms:
 
-- **The resume-task protected-path guard** — refuses to register the SYSTEM crash-recovery task when the invoking script lives in a directory writable by a non-admin principal.
-- **The manager config ownership gate** — trusts `C:\ProgramData\OEM\WinRE-Manager\manager.json` only when its containing directory and its immediate parent are owned by SYSTEM or Administrators. An untrusted config is treated as absent.
+- **The resume-script staging design** — the SYSTEM resume task executes a staged copy of the running script placed at `C:\Recovery\OEM\Resume\WinRE.ps1` under an explicit DACL, rather than the script's original path. Staging failure at any step (staging-directory creation, stale-directory clear, script copy, hash verification, or the final trust check) skips the resume task with a warning. The v50 patch 1 guard and the v50 patch 3 first-revision three-path check both shipped a false positive on every development checkout, which the staging design closes.
+- **The extended manager config trust gate** — trusts `C:\ProgramData\OEM\WinRE-Manager\manager.json` only when the ACL owner is SYSTEM or Administrators, no Allow ACE grants a modify-capable right to a principal outside SYSTEM, Administrators, or TrustedInstaller, and the config file itself passes the check in addition to its containing directory and that directory's parent. An untrusted config is treated as absent.
 
 The v50 patch 2 release adds one more suppression boundary with its own section below:
 
@@ -137,6 +137,8 @@ Read the `Conversion Status:` line.
   ```
 
   This starts decryption. On a machine mid-encryption, decryption is usually faster than encryption. Wait until `Conversion Status:` reads `Fully Decrypted` before continuing.
+
+- If it says `Decryption In Progress` or `Decryption Paused` — the encryption service is already stopping. Wait for it to finish.
 
 **Step 2 — update `WinRE.ps1` to v43 patch 5 (further revision 5) or later.** Check the `.NOTES` block at the top of the file for its `Version` line. If the version is below 43 patch 5 (further revision 5), deploy the current release before proceeding.
 
@@ -245,7 +247,7 @@ A `FriendlyName` that names a `.vhdx` file and a `BusType` of `File Backed Virtu
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v50 patch 2) ==========`, the `Acquired program lock at …` line, and the `*** DRY RUN MODE ***` line if `-DryRun` was passed:
+**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v50 patch 3) ==========` banner, the `*** DRY RUN MODE ***` line if `-DryRun` was passed, and the program-lock line (`Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on a live run, or `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances` under `-DryRun`):
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -955,20 +957,20 @@ The harness reports the computed `LocalInputsId` in Option S alongside the store
 [ERROR] Restore cannot proceed: <reason>              (pre-flight refusal)
 [ERROR] Restore aborted: reagentc /disable failed (exit <n>). The existing WinRE route is intact; no changes were made.
 [ERROR] Restore aborted: WinRE still reports <status> after reagentc /disable.
-[ERROR] Restore failed: could not replace the target WIM. Attempting to re-enable WinRE with the existing WIM.
+[ERROR] Restore failed: the target WIM replacement did not complete. Attempting to re-enable WinRE.   (v50 patch 3: if the re-enable attempt does not return `ok`, the resume task's persist flag is set; a `reboot` result does not confirm WinRE is enabled)
 [INFO]  Restore: target WIM replaced and hash-verified
 [ERROR] Restore failed at reagentc /setreimage: <output>    (exit 3; the resume task is preserved)
 [WARN]  Restore: WIM replaced but reagentc /enable returned <failed|bitlocker>. The WIM is in place; a subsequent repair run or manual reagentc /enable may resolve.   (exit 2; resume task preserved)
 ```
 
-The two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place) are also the two paths that set the temporary resume task's persist flag — see the next section.
+The three mid-transformation failure paths — the WIM-deployment failure when the re-enable attempt after the failure does not return `ok` (v50 patch 3), `/setreimage` failing after the WIM has been replaced, and `/enable` returning failed/bitlocker after the WIM is in place — are also the three paths that set the temporary resume task's persist flag. See the next section.
 
 **Cause.** The v49 restore action validates the backup, resolves the current registered route, handles dedicated and OS-fallback targets, uses the existing deployment machinery, re-registers WinRE, and re-enables it. Restore does not create a new partition or invent a replacement route — a usable current WinRE route must already exist. Common failure points:
 
 - **The backup directory or its `backup.json` is missing, malformed, or fails validation.** The backup must have been produced by a backup action.
 - **The current registered route cannot be resolved.** No usable current WinRE route exists — restore cannot create one.
 - **The WIM replacement failed.** The transactional helper rolled back; the machine's previous WIM is intact.
-- **`/setreimage` failed after the WIM was replaced**, or **`/enable` returned failed/bitlocker after the WIM was in place.** Either of these sets the resume task's persist flag so the run is resumed on the next boot or within the hour.
+- **The WIM-deployment failure when the re-enable attempt after the failure does not return `ok`**, **`/setreimage` failed after the WIM was replaced**, or **`/enable` returned failed/bitlocker after the WIM was in place.** All three set the resume task's persist flag so the run is resumed on the next boot or within the hour.
 - **The rollback restore failed and could not hash-verify.** Rare; the previous WIM may not be readable after the failed replacement.
 
 **Resolution.**
@@ -983,7 +985,7 @@ The two mid-transformation failure paths (`/setreimage` failing after the WIM ha
 4. **For a mid-transformation failure**, the resume task was registered. Do not delete it manually; the next boot or the T+1h one-shot will re-invoke the script in resume mode and complete the operation. See the next section for the resume task's expected behavior.
 5. **For a rollback-restore failure**, the machine's WinRE WIM may be in an inconsistent state. Investigate `C:\Recovery\WindowsRE\winre.wim` and the rollback copy in the workspace. This is a rare path and warrants a bug report.
 
-**Field status.** This action is new in v49. The two mid-transformation failure paths have not been exercised in the field. If you see either, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — the project wants field data on the transactional-helper rollback behavior on real storage.
+**Field status.** This action is new in v49. The three mid-transformation failure paths have not been exercised in the field. If you see any, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — the project wants field data on the transactional-helper rollback behavior on real storage.
 
 ## The temporary resume task is still registered (v49)
 
@@ -1012,11 +1014,11 @@ Under gist-bootstrap or paste-into-console invocation (no `$PSCommandPath`):
 
 On clean completion the task is deleted; on interruption it is preserved.
 
-**Cause.** Every Repair or Restore run registers the temporary `WinRE Manager - Resume` task. It is deleted on clean completion. The persist decision is made by OR-merging two independent signals in the `finally` block: `$Script:ResumeTaskShouldPersist` (set by the outer catch on an unhandled exception, and by `Invoke-RestoreAction`'s two mid-transformation failure paths) and `[WinRECancelKeyProbe]::ShouldPersist` (set by the compiled `ConsoleCancelKeyPress` delegate introduced in v49 patch 1). Three cases set a persist signal directly:
+**Cause.** Every Repair or Restore run registers the temporary `WinRE Manager - Resume` task. It is deleted on clean completion. The persist decision is made by OR-merging two independent signals in the `finally` block: `$Script:ResumeTaskShouldPersist` (set by the outer catch on an unhandled exception, and by `Invoke-RestoreAction`'s three mid-transformation failure paths) and `[WinRECancelKeyProbe]::ShouldPersist` (set by the compiled `ConsoleCancelKeyPress` delegate introduced in v49 patch 1). Three cases set a persist signal directly:
 
 1. The outer catch, on an unhandled exception — sets `$Script:ResumeTaskShouldPersist`.
 2. The compiled `ConsoleCancelKeyPress` delegate, on Ctrl+C — sets `[WinRECancelKeyProbe]::ShouldPersist`. This is the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C, and because the event callback runs on a thread-pool thread that cannot safely mutate PowerShell session state (hence the compiled delegate and the static field rather than a scriptblock).
-3. `Invoke-RestoreAction`'s two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, or `/enable` returning failed/bitlocker after the WIM is in place) — set `$Script:ResumeTaskShouldPersist`.
+3. `Invoke-RestoreAction`'s three mid-transformation failure paths — the WIM-deployment failure when the re-enable attempt after the failure does not return `ok` (v50 patch 3; a `reboot` result does not confirm WinRE is enabled, so the persist condition is `-ne 'ok'`, not `-ne 'ok' -and -ne 'reboot'`), `/setreimage` failing after the WIM has been replaced, and `/enable` returning failed/bitlocker after the WIM is in place — set `$Script:ResumeTaskShouldPersist`.
 
 Two further interruption classes leave the task registered without setting either signal, because the `finally` block never runs to consult them:
 
@@ -1040,7 +1042,7 @@ If the task is present, one of the five interruption classes occurred.
 
 3. **To see what the resume run would do**, run `WinRE.ps1 -DryRun` and read the plan. The resume run takes the same path the interrupted run would have; the checkpoint file at `C:\ProgramData\OEM\Logs\winre_checkpoint.txt` records the staged step.
 
-4. **If the task keeps reappearing** after each attempt to complete the operation, the interrupted operation is failing in the same way every time. Read the log around the failing step. The two mid-transformation restore failure paths are documented in the previous section; the checkpoint-resume failure paths are documented under "The checkpoint validator invalidated a legacy or drifted checkpoint" and "The pre-`/disable` race detector fired" above.
+4. **If the task keeps reappearing** after each attempt to complete the operation, the interrupted operation is failing in the same way every time. Read the log around the failing step. The three mid-transformation restore failure paths are documented in the previous section; the checkpoint-resume failure paths are documented under "The checkpoint validator invalidated a legacy or drifted checkpoint" and "The pre-`/disable` race detector fired" above.
 
 5. **To delete the task manually** (only when you intend to abandon the interrupted operation):
    ```powershell
@@ -1050,57 +1052,73 @@ If the task is present, one of the five interruption classes occurred.
 
 6. **Under `$PSCommandPath`-less invocation** (gist bootstrap via `Invoke-RestMethod | Invoke-Expression`, or paste-into-console), the task is not registered at all; the log records an INFO line stating the guard skipped it. This is by design. Do not expect a resume task from a gist-bootstrap run.
 
-7. **If the log shows `Could not register the Ctrl+C handler for the resume task`**, the compiled Ctrl+C delegate could not be registered on this run. The v49 patch 1 fix replaced the pre-fix `[Console]::CancelKeyPress += { ... }` scriptblock subscription — which always failed on PowerShell 5.1 with `The property 'CancelKeyPress' cannot be found on this object`, causing the `finally` block to read `$false` and delete the resume task on exactly the Ctrl+C interruption it existed for — with a compiled C# delegate (`WinRECancelKeyProbe`) whose callback sets a `volatile static bool`. Registration of the compiled delegate is expected to succeed on both PowerShell 5.1 and 7.x; the WARN is emitted only when the `Add-Type` or `Register()` step throws. When it fires, the Ctrl+C persistence signal is unavailable for this run, and the resume task is deleted on a Ctrl+C interruption; the other persist signals (the outer catch, and the two mid-transformation restore failure paths) continue to work normally. A hard kill (`taskkill /F`) and a reboot mid-run leave the task registered regardless, because the `finally` block never runs to consult any signal. The WARN is emitted once per Repair or Restore run. The Ctrl+C preservation path has been field-verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09) with the compiled delegate in place; see the v49 patch 1 entry in `CHANGELOG.md`.
+7. **If the log shows `Could not register the Ctrl+C handler for the resume task`**, the compiled Ctrl+C delegate could not be registered on this run. The v49 patch 1 fix replaced the pre-fix `[Console]::CancelKeyPress += { ... }` scriptblock subscription — which always failed on PowerShell 5.1 with `The property 'CancelKeyPress' cannot be found on this object`, causing the `finally` block to read `$false` and delete the resume task on exactly the Ctrl+C interruption it existed for — with a compiled C# delegate (`WinRECancelKeyProbe`) whose callback sets a `volatile static bool`. Registration of the compiled delegate is expected to succeed on both PowerShell 5.1 and 7.x; the WARN is emitted only when the `Add-Type` or `Register()` step throws. When it fires, the Ctrl+C persistence signal is unavailable for this run, and the resume task is deleted on a Ctrl+C interruption; the other persist signals (the outer catch, and the three mid-transformation restore failure paths) continue to work normally. A hard kill (`taskkill /F`) and a reboot mid-run leave the task registered regardless, because the `finally` block never runs to consult any signal. The WARN is emitted once per Repair or Restore run. The Ctrl+C preservation path has been field-verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09) with the compiled delegate in place; see the v49 patch 1 entry in `CHANGELOG.md`.
 
-**Field status.** The resume task is new in v49 patch 1. Field verification is partially complete: the Ctrl+C preservation path and the clean-completion removal of the resume task were verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09). The other persist and interruption paths — the outer catch, the two `Invoke-RestoreAction` mid-transformation failure paths, a hard kill, and a reboot mid-run — have not been exercised in the field. If you see the task present, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — include the invocation context, which interruption occurred, and whether the resume run subsequently completed the operation.
+**Field status.** The resume task is new in v49 patch 1. Field verification is partially complete: the Ctrl+C preservation path and the clean-completion removal of the resume task were verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09). The other persist and interruption paths — the outer catch, the three `Invoke-RestoreAction` mid-transformation failure paths (the WIM-deployment failure when the re-enable attempt after the failure does not return `ok`, added in v50 patch 3; `/setreimage` failing after the WIM has been replaced; and `/enable` returning failed/bitlocker after the WIM is in place), a hard kill, and a reboot mid-run — have not been exercised in the field. If you see the task present, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — include the invocation context, which interruption occurred, and whether the resume run subsequently completed the operation.
 
-## The temporary resume task was not registered because the script directory is non-admin-writable (v50)
+## The temporary resume task was not registered because staging failed (v50 patch 3)
 
-**Symptom.** The run completes normally, but the log shows a WARN line stating the resume task was not registered because the script directory grants write access to a non-admin principal. The run summary's "Changes NOT made" list includes a line naming the offending principal. The repair pipeline itself is unaffected — the run proceeds without the self-healing hook.
+**Symptom.** The run completes normally, but the log shows a WARN line stating the resume task was not registered because the running script could not be staged to a trusted location. The run summary's "Changes NOT made" list includes a line naming the reason. The repair pipeline itself is unaffected — the run proceeds without the self-healing hook.
 
-**Log signature.** One of:
-
-```
-[WARN] Register-ResumeTask: '<scriptDir>' grants write-capable access to '<principal>' (FileSystemRights=<rights>). Registering the resume task against a script in a non-admin-writable location would allow a non-administrator to modify the file and have it execute as SYSTEM on the next boot. Skipping the temporary resume task; the repair pipeline itself is unaffected.
-```
-
-or, when the ACL of the script directory could not be read:
+**Log signature.** The generic skip line, always preceded by one or more specific staging-failure lines:
 
 ```
-[WARN] Register-ResumeTask: could not read the ACL of '<scriptDir>': <error> - skipping the temporary resume task (fail closed; the repair pipeline itself is unaffected)
+[WARN] Register-ResumeTask: could not stage the running script to a trusted location. Skipping the temporary resume task; the repair pipeline itself is unaffected.
 ```
 
-or, in the very rare case the script directory could not be determined:
+The specific failure lines (one or more, immediately above the generic line):
 
 ```
-[WARN] Register-ResumeTask: could not determine the directory containing '<PSCommandPath>' - skipping the temporary resume task (the repair pipeline itself is unaffected)
+[WARN] Resume-script staging: could not create C:\Recovery\OEM\Resume with a strict DACL: <error> - refusing to register the resume task
+[WARN] Resume-script staging: could not copy <src> to <dst>: <error>
+[WARN] Resume-script staging: hash mismatch after copy (source=<src-hash>, staged=<dst-hash>) - refusing to register the resume task
+[WARN] Resume-script staging: staged file <path> is not trusted after staging - refusing to register the resume task
+[WARN] Resume-script staging: staging directory <path> is not trusted after staging - refusing to register the resume task
+[WARN] Resume-script staging: could not clear stale staging directory <path>: <error>
 ```
 
-**Cause.** The v50 patch 1 resume-task protected-path guard refuses to register the SYSTEM crash-recovery task when the directory containing the invoking script grants any write-capable right (`WriteData`, `Delete`, `DeleteSubdirectoriesAndFiles`, `TakeOwnership`, `ChangePermissions`) to `Everyone`, `BUILTIN\Users`, `Authenticated Users`, or `INTERACTIVE`. The task runs as SYSTEM; such access would let a non-admin modify the script before the task fires and gain SYSTEM-level code execution on the next boot. The guard is fail-closed: an unreadable ACL is treated as if it grants write access, and the task is not registered. The mask is `WriteData`-and-up, not the composite `Write` bit — the composite would false-positive on the stock `C:\ProgramData` ACL, which grants `BUILTIN\Users` a container-inherited `AppendData` ACE that alone does not permit modifying a file directly in the directory.
+On the normal path (staging succeeds), the log shows the success line at startup:
 
-The guard resolves the script directory via `[System.IO.Path]::GetDirectoryName($PSCommandPath)`, not via `Split-Path` + `Test-Path -PathType Container`, because the latter combination returns `$false` on OneDrive-hosted paths for a directory the process is demonstrably reading from — a field failure that silently skipped the resume task on a machine that should have had it. The script directory's existence and accessibility is confirmed by the `Get-Acl` call, which is the operation the function actually needs.
+```
+[INFO] Resume-script staging: staged <src> -> C:\Recovery\OEM\Resume\WinRE.ps1 (SHA256=<hash>)
+[INFO] Registered temporary resume task 'WinRE Manager - Resume' against staged copy 'C:\Recovery\OEM\Resume\WinRE.ps1' (boot +1m, one-shot T+1h); it will be removed on clean completion
+```
 
-**This is expected behavior on a machine whose script lives in a directory writable by non-admin users.** The standard `C:\ProgramData\OEM\` location with default ACLs does not trigger the guard. If your script lives elsewhere and the guard is firing, either move the script to a non-admin-writable location or accept that the resume task will not be registered on this machine.
+On the self-staging short-circuit (the resume task itself firing and re-invoking the script from the staged path):
+
+```
+[INFO] Resume-script staging: running from the staged copy (<path>); reusing it
+```
+
+**Cause.** The v50 patch 3 resume-script staging design stages the running script to `C:\Recovery\OEM\Resume\WinRE.ps1` under an explicit DACL (SYSTEM and Administrators FullControl, inheritance disabled), byte-verifies the copy against the source, re-verifies the staged file and its directory with `Test-PathTrustedForSystem`, and registers the task against the staged copy. Staging failure at any step skips the resume task.
+
+This design replaced the v50 patch 1 resume-task protected-path guard, which refused to register the task whenever the invoking script lived in a directory a non-admin could write. That guard (and the v50 patch 3 first-revision three-path `Test-PathTrustedForSystem` check that replaced it) shipped a false positive on every development checkout: any script running from a path a non-admin could write was refused, so an interrupted run (WinRE disabled, old recovery partition deleted, deployment incomplete) had no automatic recovery hook. The staging design preserves the security property the guard aimed at — the SYSTEM task's execution target cannot be modified by a non-admin after staging — without the false positive.
+
+The residual — a non-admin who modifies the running script *before* this elevated process stages it — is not a new exposure: the process is already executing that script elevated.
+
+**This is expected behavior when the staging directory cannot be created with the strict DACL, the copy fails, or the staged file fails the final trust check.** The standard `C:\ProgramData\OEM\` location with default ACLs does not trigger any failure branch; the standard path stages successfully.
 
 **Resolution.**
 
-1. **Confirm the script directory's ACL.**
+1. **Read the specific WARN line.** The staging failure lines above the generic skip line name the exact step that failed.
+
+2. **For a staging-directory creation failure** (`could not create ... with a strict DACL` or `could not clear stale staging directory`), inspect `C:\Recovery\OEM\Resume`:
 
    ```powershell
-   Get-Acl -Path '<scriptDir>' | Format-List Owner, AccessToString
+   Get-Acl -Path 'C:\Recovery\OEM\Resume' -ErrorAction SilentlyContinue | Format-List
    ```
 
-   Look for Allow ACEs granting any of `WriteData`, `Delete`, `DeleteSubdirectoriesAndFiles`, `TakeOwnership`, or `ChangePermissions` to `Everyone`, `BUILTIN\Users`, `Authenticated Users`, or `INTERACTIVE`.
+   The staging design clears any stale staging directory from a previous interrupted run before recreating it. If the clear fails (a process holds a handle to the directory, or the ACL denies deletion), the staging fails. Remove the directory manually if it exists, and re-run. The directory, when present, should be owned by SYSTEM or Administrators with an explicit DACL (no inherited ACEs).
 
-2. **If the ACL is the standard `C:\ProgramData\OEM\` ACL and the guard is still firing,** file a bug. The `WriteData`-and-up mask is deliberate: the standard ACL grants `AppendData` to `BUILTIN\Users` but not `WriteData`, and the guard should not false-positive on it.
+3. **For a script-copy failure** (`could not copy ...`), the source script may be locked by an editor or another process. Save any pending edits, verify the script's own path is not in use, and re-run.
 
-3. **If the ACL is legitimately permissive** — a script stored under `C:\Users\...`, `C:\Temp\`, or a user-writable share — move the script to a non-admin-writable location (`C:\ProgramData\OEM\` is the recommended location) and re-run.
+4. **For a hash mismatch** (`hash mismatch after copy`), the source script was replaced by the OS between the copy and the hash verification, or an antivirus/EDR product altered the copied file in place. Re-run; if the mismatch recurs, add `C:\Recovery\OEM\Resume` to the AV/EDR exclusion list.
 
-4. **If the ACL could not be read** (the fail-closed case), investigate why `Get-Acl` failed. A network path, a reparse point, or a transient filesystem condition is a common cause.
+5. **For a final-trust-check failure** (`staged file ... is not trusted` or `staging directory ... is not trusted`), the DACL that the staging design applied at creation was subsequently altered. This is rare; investigate what process modifies ACLs under `C:\Recovery\OEM`. Re-run after resolving.
 
-5. **Do not bypass the guard.** The guard exists to prevent a non-admin from gaining SYSTEM-level execution on the next boot by modifying the script. The repair pipeline itself is unaffected — the run proceeds without the self-healing hook — so the guard's only cost is the absence of the resume task on a machine whose script is in a non-standard location.
+6. **Do not bypass the staging design.** The design ensures the SYSTEM task's execution target is writable only by SYSTEM and Administrators. The repair pipeline itself is unaffected — the run proceeds without the self-healing hook. Bypassing the check would reintroduce the security property the design protects.
 
-**Field status.** The v50 patch 1 guard has not been exercised in the field's refusal path. If the refusal fires, capture the full log and the ACL of the script directory; the guard was designed so that the standard `C:\ProgramData\OEM\` location with default ACLs does not trigger it.
+**Field status.** The success path was field-verified on the project's ASUS desktop test machine on 2026-10-14: the running script was staged, SHA256-verified, registered against the temporary resume task, and removed with its staging directory on clean exit. The failure branches — staging-directory creation, script copy, hash verification, stale-directory clear, and the self-staging short-circuit — are code-inspected only and have not been exercised in the field.
 
 ## The wrapper's install step refused because the copy hash did not match (v49)
 
@@ -1141,66 +1159,83 @@ Install copy hash mismatch. Source=<source-hash> Copy=<installed-copy-hash>
 
 4. **Do not bypass the check.** Registering the task against a copy whose hash does not match the source would defeat the point of the stable install location. If the check is firing repeatedly, the AV/EDR interference or the file-system condition is the problem to solve.
 
-## The manager config was not trusted (v50)
+## The manager config was not trusted (v50 patch 1; extended v50 patch 3)
 
-**Symptom.** The backup action completes successfully and writes the WIM and sidecar, but the log shows a WARN line stating the manager config at `C:\ProgramData\OEM\WinRE-Manager\manager.json` was not written because an ancestor directory is not owned by SYSTEM or Administrators. Alternatively, a later backup run or the `Cleanup-Backups.ps1` helper reports the config was treated as empty and no backup roots were loaded from it.
+**Symptom.** The backup action completes successfully and writes the WIM and sidecar, but the log shows a WARN line stating the manager config at `C:\ProgramData\OEM\WinRE-Manager\manager.json` was not written because the extended trust check refused an ancestor directory or the config file itself. Alternatively, a later backup run or the `Cleanup-Backups.ps1` helper reports the config was treated as empty and no backup roots were loaded from it.
 
-**Log signature.** Three variants, depending on the code path:
+**Log signature.** Four variants, depending on the code path:
 
 ```
-[WARN] Refusing to write manager config: ancestor directory '<path>' is not owned by SYSTEM or Administrators. The config remains the empty default.
+[WARN] Refusing to write manager config: ancestor directory '<path>' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions). The config remains the empty default.
+[WARN] Refusing to write manager config: existing config file '<path>' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions on it). The config remains unchanged.
 ```
 
 (write path — `Set-ManagerConfig`, called from `Add-ManagerBackupRoot` after a successful backup)
 
 ```
-[WARN] Get-ManagerConfig: ancestor directory '<path>' is not owned by SYSTEM or Administrators - treating config as empty
+[WARN] Get-ManagerConfig: ancestor directory '<path>' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions) - treating config as empty
+[WARN] Get-ManagerConfig: config file '<path>' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions on it) - treating config as empty
 ```
 
 (read path — `Get-ManagerConfig`, called by `Cleanup-Backups.ps1` and by a later backup that reads the root catalogue)
 
+And the underlying helper's refusal lines:
+
 ```
-[WARN] Test-DirectoryOwnedByTrustedPrincipal: could not read ACL of '<path>' : <error> - fail closed
-[WARN] Test-DirectoryOwnedByTrustedPrincipal: could not determine owner of '<path>' - fail closed
+[WARN] Test-PathTrustedForSystem: '<path>' is owned by SID <sid>, which is neither SYSTEM nor Administrators - refusing
+[WARN] Test-PathTrustedForSystem: '<path>' grants write-capable access to '<principal>' (SID=<sid>, FileSystemRights=<rights>) - refusing
 ```
 
-(fail-closed variants when the ACL or owner could not be read or resolved)
+**Cause.** The v50 patch 1 manager config ownership gate verified the ACL owner of the containing directory and its immediate parent. The v50 patch 3 extended check replaces this with the shared `Test-PathTrustedForSystem` helper: the ACL owner is SYSTEM (`S-1-5-18`) or Administrators (`S-1-5-32-544`), no Allow ACE grants a modify-capable right to a principal outside SYSTEM, Administrators, or TrustedInstaller, and the config file itself is checked in addition to the containing directory and that directory's parent. The modify-capable mask differs by object class (on a directory: `Delete | DeleteSubdirectoriesAndFiles | TakeOwnership | ChangePermissions`; on a file: those plus `WriteData | AppendData`).
 
-**Cause.** The v50 patch 1 manager config ownership gate verifies that the directory containing `manager.json` **and its immediate parent** are owned by SYSTEM (`S-1-5-18`) or Administrators (`S-1-5-32-544`). The two-level check exists because the stock ACL on `C:\ProgramData` grants `Authenticated Users` the ability to create subdirectories, and a directory created by a non-admin principal is owned by that principal. Without the two-level check, an attacker could pre-create `C:\ProgramData\OEM\WinRE-Manager` under their own account and inject a `manager.json` whose `BackupCatalog.Roots` points at a location the operator does not control; a later Cleanup helper invoked under SYSTEM would delete files under the attacker's chosen path, or a later Restore would read from an attacker-supplied location. The second-level check catches the delete-and-recreate swap, where an attacker who owns the parent deletes-and-recreates the child to steal ownership of that child between runs.
+The file-level check closes a pre-creation attack a directory-only check would not: a non-admin who pre-created `manager.json` inside a SYSTEM-owned directory would pass a directory-only check but is refused by the file-level check, because the planted file is owned by the attacker, not SYSTEM. The two directory levels are still checked (the stock `C:\ProgramData` ACL grants `Authenticated Users` the ability to create subdirectories, and a directory created by a non-admin principal is owned by that principal; checking only the immediate parent is bypassable on a subsequent run by a delete-and-recreate swap).
 
-The write path additionally runs the checks before creating the directory, so a pre-created attacker-owned parent is caught before the manager adds a child to it. An untrusted or unparseable config is treated as absent: the caller gets the empty default, an operator-initiated backup still completes without catalogue registration, and no backup roots are loaded from it.
+The write path runs the checks before creating the directory, so a pre-created attacker-owned parent is caught before the manager adds a child to it. An untrusted or unparseable config is treated as absent: the caller gets the empty default, an operator-initiated backup still completes without catalogue registration, and no backup roots are loaded from it.
 
 **This is not a backup failure.** The backup WIM is written and verified; only the catalogue registration is skipped. On the read path, the cleanup helper falls back to the default root alone and reports no roots under the config.
 
 **Resolution.**
 
-1. **Confirm the ownership of the manager config directory and its parent.**
+1. **Confirm the ownership and DACL of the manager config directory, its parent, and the config file itself.**
 
    ```powershell
    Get-Acl -Path 'C:\ProgramData\OEM\WinRE-Manager' | Format-List Owner
    Get-Acl -Path 'C:\ProgramData\OEM' | Format-List Owner
+   Get-Acl -Path 'C:\ProgramData\OEM\WinRE-Manager\manager.json' -ErrorAction SilentlyContinue | Format-List Owner
    ```
 
-   Both should read `NT AUTHORITY\SYSTEM` or `BUILTIN\Administrators`.
+   All three should be owned by `NT AUTHORITY\SYSTEM` or `BUILTIN\Administrators`.
 
-2. **If either directory is owned by something else,** take ownership and restore the correct owner. From an elevated PowerShell:
+2. **If any directory or file is owned by something else,** take ownership and restore the correct owner. From an elevated PowerShell:
 
    ```powershell
    takeown /f "C:\ProgramData\OEM\WinRE-Manager" /a
    takeown /f "C:\ProgramData\OEM" /a
+   takeown /f "C:\ProgramData\OEM\WinRE-Manager\manager.json" /a
    icacls "C:\ProgramData\OEM\WinRE-Manager" /setowner "NT AUTHORITY\SYSTEM"
    icacls "C:\ProgramData\OEM" /setowner "NT AUTHORITY\SYSTEM"
+   icacls "C:\ProgramData\OEM\WinRE-Manager\manager.json" /setowner "NT AUTHORITY\SYSTEM"
    ```
+
+   If the `Test-PathTrustedForSystem` refusal line names a specific principal (the `... grants write-capable access to '<principal>'` variant), inspect the DACL further:
+
+   ```powershell
+   icacls "C:\ProgramData\OEM\WinRE-Manager"
+   icacls "C:\ProgramData\OEM"
+   icacls "C:\ProgramData\OEM\WinRE-Manager\manager.json"
+   ```
+
+   Look for Allow ACEs granting any of `WriteData`, `AppendData`, `Delete`, `DeleteSubdirectoriesAndFiles`, `TakeOwnership`, or `ChangePermissions` (file) or `Delete`, `DeleteSubdirectoriesAndFiles`, `TakeOwnership`, or `ChangePermissions` (directory) to principals outside SYSTEM, Administrators, or TrustedInstaller.
 
    Then re-run the backup. The catalogue registration will succeed on the next run.
 
-3. **If the parent directory legitimately cannot be owned by SYSTEM or Administrators** — for example, an enterprise policy requires a different owner for `C:\ProgramData\OEM` — the config will be treated as absent on every run. This is by design: the config is trusted only when the ownership chain is trusted. The machine still takes backups; the catalogue is simply not maintained.
+3. **If a directory or file legitimately cannot be owned by SYSTEM or Administrators** — for example, an enterprise policy requires a different owner for `C:\ProgramData\OEM` — the config will be treated as absent on every run. This is by design: the config is trusted only when the ownership chain is trusted. The machine still takes backups; the catalogue is simply not maintained.
 
-4. **If the ACL could not be read,** investigate why `Get-Acl` failed. A network path, a reparse point, an unreadable ACL, or a transient filesystem condition are the common causes.
+4. **If the ACL could not be read,** investigate why `Get-Acl` failed. A network path, a reparse point, an unreadable ACL, or a transient filesystem condition are the common causes. `Test-PathTrustedForSystem` fails closed on any of these.
 
 5. **Do not relax the guard.** The gate prevents an attacker from injecting a backup-root catalogue. The cost of a refusal is a skipped catalogue registration; the cost of bypassing the gate is a later Cleanup or Restore operating on an attacker-supplied location.
 
-**Field status.** The v50 patch 1 gate has not been exercised in the field's refusal path. If the refusal fires, capture the two ACLs and the log line; the gate is designed so that the standard `C:\ProgramData\OEM\` hierarchy with default ACLs passes.
+**Field status.** The extended gate accepts the stock `C:\ProgramData\OEM` ACL, confirmed by the v50 patch 3 field verification on 2026-10-14 (a backup action ran end-to-end, `manager.json` was written with `BackupRoots count=2`, and no `Test-PathTrustedForSystem:` WARN line was emitted). The refusal branches — an untrusted ancestor directory and an untrusted config file — are code-inspected only and have not been exercised in the field.
 
 ## The script exited with a rename error (concurrent instance)
 
@@ -1992,7 +2027,7 @@ Parser: reagentc location  [FAIL] ...did not match any line
 
 **Resolution.** Automatic. The script falls through to the full-update path. A rebuild on a healthy machine is a no-op for the partition layout; it copies the current WIM, verifies it, and rewrites the state file.
 
-**Expected during the v44 patch 1, v45 patch 1, v46 patch 1, v47 patch 1, v47 patch 2, v48 patch 1, and v49 rollouts.** Each revision changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45, v46 patch 1, v47 patch 1, and v48 patch 1 each changed the `SCRIPT` component; v47 patch 2 changes the DSI value on one narrow machine class by normalising the `Win32_ComputerSystemProduct.Version` field (machines whose padded value is at least four characters long while its trimmed value is shorter than four); v49 changes the `SCRIPT` component again to 49. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
+**Expected during the v44 patch 1, v45 patch 1, v46 patch 1, v47 patch 1, v47 patch 2, v48 patch 1, v49, and v50 patch 1 rollouts.** Each revision changed an input the `DesiredStateId` depends on: v44 added CPU vendor/generation and VMD presence; v45, v46 patch 1, v47 patch 1, and v48 patch 1 each changed the `SCRIPT` component; v47 patch 2 changes the DSI value on one narrow machine class by normalising the `Win32_ComputerSystemProduct.Version` field (machines whose padded value is at least four characters long while its trimmed value is shorter than four); v49 changes the `SCRIPT` component to 49, and v50 patch 1 changes it to 50. Every managed machine's stored state file, written under the previous version, no longer matches the ID computed under the new version. The `No valid state (missing or stale) - rebuilding` line will appear on every machine on its first run after each update. This is the intended behaviour and is not a defect. Subsequent runs take the fast path once the state file is rewritten under the new ID.
 
 Under v47 the first run also writes the `DeployedWinREMetadata` anchor. From the second v47 run onward the drift detector compares against it.
 
@@ -2220,8 +2255,8 @@ The v49 features and their log lines are catalogued in the feature-specific sect
 - **The pre-deployment storage-applicability gate.** Include the candidate image path, the machine's SCSIAdapter-class devices (from the harness Option 1 "Storage controllers" block, harness v28), and the manifest version. This gate has never fired in the field; a field log of the refusal is high-signal.
 - **The native-boot VHDX fail-closed gate.** Include the volume inventory from `Get-Volume` and the output of `Get-Disk` for the OS disk. Report whether the machine is a native-boot VHDX and whether the operator expected the manager to support that topology.
 - **The backup action.** Include the source WIM path, the destination directory, the source hash, the copy hash, and the `backup.json` contents. Include whether the destination directory pre-existed and its free space.
-- **The restore action.** Include the backup directory path, the `backup.json` contents, the resolved current route, and whether the transaction completed or restored the rollback copy. Include the log lines for the two mid-transformation failure paths if either fired.
-- **The temporary resume task.** If the task is present after a run, include the invocation context (interactive vs SYSTEM, `$PSCommandPath` populated vs null), which interruption occurred (Ctrl+C, hard kill, reboot, or an exception in the outer catch), whether the task was left registered, and — if the resume run subsequently completed the operation — the log from the resume run. The Ctrl+C trigger is the load-bearing one; it was verified end-to-end on the ASUS PRIME H510M-D (2026-10-09). The other four interruption classes — the outer catch, the two `Invoke-RestoreAction` mid-transformation failure paths, a hard kill, and a reboot mid-run — have not been exercised in the field.
+- **The restore action.** Include the backup directory path, the `backup.json` contents, the resolved current route, and whether the transaction completed or restored the rollback copy. Include the log lines for the three mid-transformation failure paths if any fired.
+- **The temporary resume task.** If the task is present after a run, include the invocation context (interactive vs SYSTEM, `$PSCommandPath` populated vs null), which interruption occurred (Ctrl+C, hard kill, reboot, or an exception in the outer catch), whether the task was left registered, and — if the resume run subsequently completed the operation — the log from the resume run. The Ctrl+C trigger is the load-bearing one; it was verified end-to-end on the ASUS PRIME H510M-D (2026-10-09). The other interruption classes — the outer catch, the three `Invoke-RestoreAction` mid-transformation failure paths (WIM-deployment failure, `/setreimage` failure, `/enable` failure), a hard kill, and a reboot mid-run — have not been exercised in the field.
 - **The stable install location.** Include the source path, the installed path, the source hash, the installed hash, and whether the task was registered against the installed copy. If the install step refused because the copy hash did not match, include the two hashes and the AV/EDR product name if one is in use.
 
 ## Related documents

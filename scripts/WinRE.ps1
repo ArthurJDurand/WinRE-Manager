@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 50.2 (v50 patch 2)
+    Version : 50.3 (v50 patch 3)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -295,10 +295,20 @@
                 mid-transformation (Invoke-RestoreAction sets the
                 flag directly when /setreimage fails after the WIM
                 has been replaced, or when /enable returns
-                failed/bitlocker after the WIM is in place; both
-                paths delete the state file, checkpoint, and
+                failed/bitlocker after the WIM is in place; the v50
+                patch 3 WIM-deployment-failure path also sets it,
+                when the re-enable attempt after a failed deploy
+                does not return 'ok' ('reboot' counts as not-ok),
+                and additionally when the failed deploy leaves the
+                target WIM in a state that cannot be proven
+                byte-identical to its pre-restore content. The
+                /setreimage-failure and /enable-failure paths
+                always delete the state file, checkpoint, and
                 deferral marker so the retry starts from a clean
-                slate). The Ctrl+C distinction is load-bearing:
+                slate; the WIM-deployment-failure path deletes them
+                under the same condition that sets the persist
+                flag, and preserves them when the target WIM is
+                provably unchanged). The Ctrl+C distinction is load-bearing:
                 without the CancelKeyPress handler, the finally
                 block would delete the task on exactly the
                 interruption it exists for. Network availability is deliberately not
@@ -310,7 +320,7 @@
                 and re-enable. It is a crash-recovery hook, not a
                 retry-until-success mechanism: a clean exit deletes
                 the task and leaves the state file to govern the
-                next scheduled run, except for the two Restore
+                next scheduled run, except for the three Restore
                 mid-transformation paths noted above.
                 Registration failure
                 is a non-fatal warning in the log and a
@@ -320,7 +330,10 @@
                 A leftover task with this name found at the next
                 run's registration step is logged as evidence that
                 the previous run was interrupted; the registration
-                step then overwrites it via -Force.
+                step then overwrites it via -Force. The task
+                executes a staged copy of the running script (see
+                Resume-script staging below), not the script's
+                original path.
 
             - Fail-closed principle (v49 patch 2). A safety check that
                 cannot complete is never interpreted as a safe result.
@@ -341,42 +354,71 @@
                 closed independently, and the principle is stated here
                 so future guards are written against it from the start.
 
-            - Manager config ownership gate (v50). The single durable
-                machine-wide config file at
-                C:\ProgramData\OEM\WinRE-Manager\manager.json holds
-                settings that must survive across runs but are not
-                operational state (currently the backup-location
+            - Manager config trust gate (v50; extended v50
+                patch 3). The single durable machine-wide config
+                file at C:\ProgramData\OEM\WinRE-Manager\manager.json
+                holds settings that must survive across runs but are
+                not operational state (currently the backup-location
                 catalogue). Both the read path (Get-ManagerConfig)
                 and the write path (Set-ManagerConfig) verify that
-                the directory containing manager.json and its
-                immediate parent are owned by SYSTEM (S-1-5-18) or
-                Administrators (S-1-5-32-544), fail-closed on any
-                ambiguity. Two levels are checked, not one: an
-                attacker who owns the parent can delete-and-recreate
-                the child to steal ownership of that child between
-                runs. An untrusted or unparseable config is treated
-                as the empty default, so a config read failure never
-                blocks a Backup and never causes a Restore or Cleanup
-                to assume a root exists. Writes are atomic via
-                Write-FileAtomically.
+                the containing directory, its immediate parent, and
+                the config file itself are trusted, via
+                Test-PathTrustedForSystem, fail-closed on any
+                ambiguity. "Trusted" means the ACL owner is SYSTEM
+                (S-1-5-18) or Administrators (S-1-5-32-544), and no
+                Allow ACE grants a modify-capable right to any
+                principal outside SYSTEM, Administrators, or
+                TrustedInstaller. The mask is stricter for files
+                than for directories: on a directory it is Delete,
+                DeleteSubdirectoriesAndFiles, TakeOwnership, and
+                ChangePermissions; on a file it adds WriteData and
+                AppendData, because on a directory those two mean
+                only create-new-file and create-new-subdirectory,
+                not modify-existing. See Test-PathTrustedForSystem
+                for the exact sets. The ownership
+                check alone (v50) did not establish that the DACL
+                prevents untrusted modification; the extended check
+                does. Two levels of directory are checked, not one:
+                an attacker who owns the parent can
+                delete-and-recreate the child to steal ownership of
+                that child between runs. The config file itself is
+                also checked, because directory ownership does not
+                prove the file inside it is safe. An untrusted or
+                unparseable config is treated as the empty default,
+                so a config read failure never blocks a Backup and
+                never causes a Restore or Cleanup to assume a root
+                exists. Writes are atomic via Write-FileAtomically.
 
-            - Resume-task protected-path guard (v50). The crash-recovery
-                resume task runs as SYSTEM. Register-ResumeTask refuses
-                to register the task when the directory containing the
-                invoking script grants any write-capable right
-                (WriteData, Delete, DeleteSubdirectoriesAndFiles,
-                TakeOwnership, or ChangePermissions) to a non-admin
-                principal (Everyone, BUILTIN\Users, Authenticated
-                Users, or INTERACTIVE), because such access would
-                allow a non-admin to modify the script before the task
-                fires and gain SYSTEM-level execution. The mask is
-                WriteData-and-up, not the composite Write bit, which
-                would false-positive on the stock C:\ProgramData ACL:
-                BUILTIN\Users holds a container-inherited AppendData
-                ACE, which alone does not permit modifying a file
-                directly in the directory. Fail-closed on unreadable
-                ACL. Registration failure is non-fatal: the repair
-                pipeline proceeds without the self-healing hook.
+            - Resume-script staging (v50 patch 3). The crash-
+                recovery resume task runs as SYSTEM. Rather than
+                registering the task against the running script's
+                path and refusing when that path is not trusted,
+                Register-ResumeTask stages the running script to
+                $ResumeStagedScriptPath and registers the task
+                against the staged copy. The staging directory is
+                created with an explicit DACL granting FullControl
+                only to SYSTEM and Administrators, with inheritance
+                disabled; the copy is byte-verified against the
+                source and then re-verified with
+                Test-PathTrustedForSystem before the task is
+                registered. The staging directory is removed on
+                clean terminal exit, at the same point the task is
+                unregistered, so the two share a lifetime. This
+                replaces the v50/v50-patch-3 guard, which refused
+                to register the task whenever the running script
+                lived in a location a non-admin could write and so
+                silently disabled the self-healing hook on every
+                development checkout, leaving an interrupted run
+                (WinRE disabled, old recovery partition deleted,
+                new deployment not yet complete) with no automatic
+                recovery. The staged-copy design preserves the
+                security property the guard aimed at (the SYSTEM
+                task's execution target cannot be modified by a
+                non-admin after staging) without the false
+                positive. The residual - a non-admin modifies the
+                running script before this elevated process stages
+                it - is not a new exposure: the process is already
+                executing that script elevated.
 
             - Empty-parent cleanup (v50). After workspace cleanup,
                 Remove-EmptyWorkspaceParent removes the now-empty
@@ -546,7 +588,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 50
-$ScriptPatchLevel = "2"
+$ScriptPatchLevel = "3"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -579,6 +621,13 @@ $LogDir                    = "C:\ProgramData\OEM\Logs"
 # backup metadata). Writes are atomic via Write-FileAtomically.
 $ManagerConfigDir          = "C:\ProgramData\OEM\WinRE-Manager"
 $ManagerConfigPath         = "$ManagerConfigDir\manager.json"
+# v50 patch 3: staged copy of the running script that the temporary
+# resume task executes. See Initialize-ResumeScriptStaging. The
+# parent chain (C:\Recovery\OEM) is created by this script for the
+# state file; the Resume leaf is created with an explicit DACL
+# granting FullControl only to SYSTEM and Administrators.
+$ResumeStagedDir           = "$env:SystemDrive\Recovery\OEM\Resume"
+$ResumeStagedScriptPath    = "$ResumeStagedDir\WinRE.ps1"
 $StateFileName             = "winre_state.json"
 $PartitionDeferralFileName = "winre_partition_deferred.json"
 $CheckpointFile            = "$LogDir\winre_checkpoint.txt"
@@ -680,9 +729,11 @@ $Script:ForeignSourceAcceptedHash = $null
 # hardware detection. Deleted in the finally block on a clean
 # terminal exit unless a persist signal fired: either this flag
 # was set (by the outer catch on an unhandled exception, or by
-# Invoke-RestoreAction's two mid-transformation failure paths -
-# /setreimage failing after the WIM was replaced, or /enable
-# returning failed/bitlocker after the WIM was in place), or the
+# Invoke-RestoreAction's three mid-transformation failure paths -
+# /setreimage failing after the WIM was replaced, /enable
+# returning failed/bitlocker after the WIM was in place, or the
+# v50 patch 3 WIM-deployment failure path where the re-enable
+# attempt after a failed deploy did not return 'ok'), or the
 # C# Ctrl+C probe's static field was set (a compiled
 # ConsoleCancelKeyPress delegate; PowerShell runs finally blocks
 # but bypasses catch blocks on Ctrl+C, so a compiled delegate is
@@ -1136,9 +1187,11 @@ function Test-NativeBootVirtualTopology {
 # such as taskkill /F (the finally block never runs), a reboot
 # mid-run (the OS terminates PowerShell), or a Restore that returned
 # cleanly but left the machine mid-transformation (Invoke-
-# RestoreAction sets the flag directly on the /setreimage-failed and
-# /enable-failed paths, where the new WIM is in place but WinRE could
-# not be confirmed Enabled). The task is a crash-recovery mechanism,
+# RestoreAction sets the flag directly on the /setreimage-failed
+# path, on the /enable-failed path, and on the WIM-deployment-
+# failure path where the re-enable attempt after a failed deploy
+# did not return 'ok', where the new WIM is in place but WinRE
+# could not be confirmed Enabled). The task is a crash-recovery mechanism,
 # not a retry-until-success mechanism: it fires at boot + 1 minute
 # and at a one-shot T+1 hour trigger, so an interruption that did not
 # reboot the machine is also recovered if the machine stays up.
@@ -1149,11 +1202,175 @@ function Test-NativeBootVirtualTopology {
 # attempt. Registration sets no warning state and does not affect the
 # exit code: the resume task is a per-run safety net, not a
 # machine-state condition.
+#
+# v50 patch 3: the task executes a staged copy of the running script
+# placed in a SYSTEM/Administrators-owned location, not the script's
+# original path. See Initialize-ResumeScriptStaging.
+#
+# The staged-copy design replaced the v50/v50-patch-3 guard that
+# refused registration whenever the running script lived in a
+# non-admin-writable location. That guard had a false positive that
+# disabled the safety net on every dev checkout: on any machine
+# where the script is not installed under a SYSTEM-owned path, the
+# task was never registered, so an interrupted run (WinRE
+# disabled, old recovery partition deleted, deployment incomplete)
+# had no automatic recovery. The staged copy preserves the security
+# property the guard aimed at without the false positive: the
+# SYSTEM task's execution target is created and verified to be
+# writable only by SYSTEM and Administrators, so a non-admin
+# cannot modify the script after staging. The residual - a
+# non-admin modifies the running script before this elevated
+# process stages it - is not a new exposure: the process is
+# already executing that script elevated.
+
+# --- Resume-script staging (v50 patch 3) ---
+
+# Create the staging directory with an explicit DACL (SYSTEM and
+# Administrators, FullControl; inheritance disabled) and copy the
+# currently-running script into it. Returns the staged path on
+# success, $null on any failure. Any $null return is safe: the
+# caller logs a warning, skips the resume task, and proceeds
+# without the self-healing hook - the same behavior as the
+# previous guard's refusal path, but reached only when staging
+# genuinely fails rather than whenever the source script happens
+# to live outside a SYSTEM-owned directory.
+#
+# The staged copy is what the resume task executes. Its trust is
+# established by construction (the directory's DACL) and
+# re-verified with Test-PathTrustedForSystem before the caller
+# registers the task. A self-staging case (the resume task firing
+# and re-invoking the script from the staged path) is detected and
+# short-circuited: the file is reused in place, verified, and
+# returned.
+function Initialize-ResumeScriptStaging {
+    param(
+        [Parameter(Mandatory)][string]$SourceScriptPath,
+        [Parameter(Mandatory)][string]$StagedDir,
+        [Parameter(Mandatory)][string]$StagedScriptPath
+    )
+
+    $srcFull = $null; $dstFull = $null
+    try { $srcFull = [System.IO.Path]::GetFullPath($SourceScriptPath) } catch { }
+    try { $dstFull = [System.IO.Path]::GetFullPath($StagedScriptPath) } catch { }
+
+    # Self-staging case: the running script IS the staged script.
+    # This happens when the resume task itself fires and re-invokes
+    # the script from the staging path. Reuse it rather than trying
+    # to copy the file onto itself. The DACL is verified so a
+    # tampered staged copy is refused.
+    if ($srcFull -and $dstFull -and [System.StringComparer]::OrdinalIgnoreCase.Equals($srcFull, $dstFull)) {
+        if ((Test-PathTrustedForSystem -Path $StagedScriptPath -Kind 'File') -and
+            (Test-PathTrustedForSystem -Path $StagedDir -Kind 'Directory')) {
+            Write-Log "Resume-script staging: running from the staged copy ($StagedScriptPath); reusing it"
+            return $StagedScriptPath
+        }
+        Write-Log "Resume-script staging: running from $StagedScriptPath but the file or its directory is not trusted - refusing to register the resume task" -Level WARN
+        return $null
+    }
+
+    # Clear any stale staging directory from a previous interrupted
+    # run. Delete-and-recreate so the DACL is applied from scratch
+    # and no attacker-planted content survives.
+    if (Test-Path -LiteralPath $StagedDir -PathType Container) {
+        try {
+            Remove-Item -LiteralPath $StagedDir -Force -Recurse -ErrorAction Stop
+        } catch {
+            Write-Log "Resume-script staging: could not clear stale staging directory ${StagedDir}: $_" -Level WARN
+            return $null
+        }
+    }
+
+    # Create the staging directory with an explicit security
+    # descriptor applied at creation time. Directory.CreateDirectory
+    # with a DirectorySecurity parameter ensures there is no window
+    # in which the directory exists with an inherited permissive
+    # ACL. Owner is set to BUILTIN\Administrators so the subsequent
+    # Test-PathTrustedForSystem owner check passes regardless of the
+    # primary token's default owner SID.
+    try {
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $adminsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $sec = New-Object System.Security.AccessControl.DirectorySecurity
+        $sec.SetAccessRuleProtection($true, $false)
+        $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $allow  = [System.Security.AccessControl.AccessControlType]::Allow
+        $inherit = ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                    [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+        $noProp = [System.Security.AccessControl.PropagationFlags]::None
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, $rights, $inherit, $noProp, $allow)))
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($adminsSid, $rights, $inherit, $noProp, $allow)))
+        $sec.SetOwner($adminsSid)
+        [System.IO.Directory]::CreateDirectory($StagedDir, $sec) | Out-Null
+    } catch {
+        Write-Log "Resume-script staging: could not create $StagedDir with a strict DACL: $_ - refusing to register the resume task" -Level WARN
+        return $null
+    }
+
+    # Copy the running script byte-for-byte. Copy-Item preserves
+    # bytes, so a signed script stays signed and the BOM (if any) is
+    # preserved exactly.
+    try {
+        Copy-Item -LiteralPath $SourceScriptPath -Destination $StagedScriptPath -Force -ErrorAction Stop
+    } catch {
+        Write-Log "Resume-script staging: could not copy ${SourceScriptPath} to ${StagedScriptPath}: $_" -Level WARN
+        return $null
+    }
+
+    # Verify the copy is byte-identical to the source. Copy-Item is
+    # byte-preserving, but the hash check catches a partial copy or
+    # a source modified mid-copy.
+    try {
+        $srcHash = (Get-FileHash -LiteralPath $SourceScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        $dstHash = (Get-FileHash -LiteralPath $StagedScriptPath  -Algorithm SHA256 -ErrorAction Stop).Hash
+        if (-not $srcHash -or -not $dstHash -or $srcHash -ne $dstHash) {
+            Write-Log "Resume-script staging: hash mismatch after copy (source=$srcHash, staged=$dstHash) - refusing to register the resume task" -Level WARN
+            return $null
+        }
+    } catch {
+        Write-Log "Resume-script staging: hash verification failed: $_ - refusing to register the resume task" -Level WARN
+        return $null
+    }
+
+    # Final explicit trust check on the staged file and directory.
+    # This is redundant with the DACL set at creation time, but it is
+    # the property the SYSTEM task depends on, so it is asserted
+    # directly rather than inferred from the DACL.
+    if (-not (Test-PathTrustedForSystem -Path $StagedScriptPath -Kind 'File')) {
+        Write-Log "Resume-script staging: staged file $StagedScriptPath is not trusted after staging - refusing to register the resume task" -Level WARN
+        return $null
+    }
+    if (-not (Test-PathTrustedForSystem -Path $StagedDir -Kind 'Directory')) {
+        Write-Log "Resume-script staging: staging directory $StagedDir is not trusted after staging - refusing to register the resume task" -Level WARN
+        return $null
+    }
+
+    Write-Log "Resume-script staging: staged $SourceScriptPath -> $StagedScriptPath (SHA256=$dstHash)"
+    return $StagedScriptPath
+}
+
+# Remove the staged resume-script directory. Called on clean terminal
+# exit from the finally block, at the same point the resume task is
+# unregistered, so the two share a lifetime. Left in place whenever
+# the task persists (the task still needs the staged copy). Failure
+# to remove is a warning, not an error: a stale directory is harmless
+# - the next run overwrites it - and does not affect the exit code.
+function Remove-ResumeScriptStaging {
+    param([Parameter(Mandatory)][string]$StagedDir)
+    if (-not $StagedDir) { return }
+    if (-not (Test-Path -LiteralPath $StagedDir -PathType Container)) { return }
+    try {
+        Remove-Item -LiteralPath $StagedDir -Force -Recurse -ErrorAction Stop
+        Write-Log "Removed resume-script staging directory: $StagedDir"
+    } catch {
+        Write-Log "Could not remove resume-script staging directory ${StagedDir}: $_ - it will be cleared on the next run" -Level WARN
+    }
+}
+
 function Register-ResumeTask {
     param([Parameter(Mandatory)][string]$TaskName)
 
     if ($Script:DryRun) {
-        Write-Log "[DRY RUN] Would register temporary resume task '$TaskName' (boot trigger at +1 minute, one-shot trigger at +1 hour)"
+        Write-Log "[DRY RUN] Would stage the running script to $ResumeStagedScriptPath and register temporary resume task '$TaskName' against it (boot trigger at +1 minute, one-shot trigger at +1 hour)"
         return $false
     }
 
@@ -1163,79 +1380,20 @@ function Register-ResumeTask {
         return $false
     }
 
-    # v50: protected-path guard. The resume task runs as SYSTEM. If the
-    # script file it points at lives in a directory that grants
-    # write-capable access to a non-administrator principal, that
-    # principal could modify the script before the task fires and gain
-    # SYSTEM-level code execution. Fail closed: refuse to register the
-    # task from such a location. The repair pipeline itself proceeds
-    # without the self-healing hook; the resume task is a safety net,
-    # not a machine-state condition.
-    # [System.IO.Path]::GetDirectoryName is pure .NET path manipulation,
-    # no PowerShell provider layer involved. The previous form combined
-    # Split-Path with Test-Path -PathType Container; on a OneDrive-hosted
-    # path the FileSystem provider's container check returned $false for a
-    # directory the process is demonstrably reading, which skipped the
-    # task on a machine that should have had it. The existence and
-    # accessibility of the directory is now confirmed by the Get-Acl
-    # call below, which is the operation this function actually needs
-    # and which fails closed via its own try/catch.
-    $scriptDir = $null
-    try { $scriptDir = [System.IO.Path]::GetDirectoryName($PSCommandPath) } catch { }
-    if (-not $scriptDir) {
-        Write-Log "Register-ResumeTask: could not determine the directory containing '$PSCommandPath' - skipping the temporary resume task (the repair pipeline itself is unaffected)" -Level WARN
-        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Temporary resume task not registered: script directory could not be determined.'
-        return $false
-    }
-    $scriptDirAcl = $null
-    try {
-        $scriptDirAcl = Get-Acl -LiteralPath $scriptDir -ErrorAction Stop
-    } catch {
-        Write-Log "Register-ResumeTask: could not read the ACL of '$scriptDir': $_ - skipping the temporary resume task (fail closed; the repair pipeline itself is unaffected)" -Level WARN
-        Add-RunSummaryLine -Field 'ChangesNotMade' -Line "Temporary resume task not registered: ACL of '$scriptDir' could not be read."
-        return $false
-    }
-    # Principals whose write access represents a non-administrator risk:
-    #   S-1-1-0        Everyone
-    #   S-1-5-32-545   BUILTIN\Users
-    #   S-1-5-11       Authenticated Users
-    #   S-1-5-4        INTERACTIVE
-    # An Allow ACE for any of these that carries any write-capable right
-    # on the directory means a non-admin can modify the script file
-    # (write it, delete-and-recreate it, take ownership, or change its
-    # permissions). Any of those paths leads to SYSTEM execution of
-    # non-admin-controlled bytes.
-    $unsafeScriptDirSids = @('S-1-1-0','S-1-5-32-545','S-1-5-11','S-1-5-4')
-    # WriteData (0x2) is the minimum right that permits a principal to
-    # create or modify a file directly in the directory. The composite
-    # Write (0x116), Modify, and FullControl grants all include
-    # WriteData, so an ACE granting any of them is still caught.
-    # AppendData (0x4) alone is deliberately NOT in the mask: for a
-    # directory it only permits creating subdirectories, which does not
-    # let a non-admin modify or replace the script file. Including it
-    # would false-positive on the stock C:\ProgramData ACL, which
-    # grants BUILTIN\Users a container-inherited AppendData ACE.
-    $writeCapableMask = ([int][System.Security.AccessControl.FileSystemRights]::WriteData) -bor
-                        ([int][System.Security.AccessControl.FileSystemRights]::Delete) -bor
-                        ([int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
-                        ([int][System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
-                        ([int][System.Security.AccessControl.FileSystemRights]::ChangePermissions)
-    $unsafeGrant = $null
-    foreach ($ace in $scriptDirAcl.Access) {
-        if ($ace.AccessControlType -ne 'Allow') { continue }
-        $aceSid = $null
-        try {
-            $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-        } catch { continue }
-        if ($unsafeScriptDirSids -notcontains $aceSid) { continue }
-        if (((([int]$ace.FileSystemRights) -band $writeCapableMask)) -ne 0) {
-            $unsafeGrant = $ace
-            break
-        }
-    }
-    if ($unsafeGrant) {
-        Write-Log "Register-ResumeTask: '$scriptDir' grants write-capable access to '$($unsafeGrant.IdentityReference)' (FileSystemRights=$($unsafeGrant.FileSystemRights)). Registering the resume task against a script in a non-admin-writable location would allow a non-administrator to modify the file and have it execute as SYSTEM on the next boot. Skipping the temporary resume task; the repair pipeline itself is unaffected." -Level WARN
-        Add-RunSummaryLine -Field 'ChangesNotMade' -Line "Temporary resume task not registered: script directory is writable by $($unsafeGrant.IdentityReference)."
+    # v50 patch 3: stage the running script to a SYSTEM/Administrators-
+    # owned location and register the task against the staged copy.
+    # This replaces the v50/v50-patch-3 guard, which refused to register
+    # the task whenever the running script lived in a location a
+    # non-admin could write and so disabled the self-healing hook on
+    # every dev checkout. See the Resume-script staging section in the
+    # .NOTES block and the header comment on
+    # Initialize-ResumeScriptStaging for the reasoning and the security
+    # property that is preserved.
+    $stagedPath = Initialize-ResumeScriptStaging -SourceScriptPath $PSCommandPath `
+                    -StagedDir $ResumeStagedDir -StagedScriptPath $ResumeStagedScriptPath
+    if (-not $stagedPath) {
+        Write-Log "Register-ResumeTask: could not stage the running script to a trusted location. Skipping the temporary resume task; the repair pipeline itself is unaffected." -Level WARN
+        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Temporary resume task not registered: script could not be staged to a trusted location.'
         return $false
     }
 
@@ -1255,7 +1413,7 @@ function Register-ResumeTask {
         }
 
         $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-            -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Repair"
+            -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$stagedPath`" -Action Repair"
 
         $bootTrigger = New-ScheduledTaskTrigger -AtStartup
         $bootTrigger.Delay = "PT1M"
@@ -1281,11 +1439,14 @@ function Register-ResumeTask {
             -Settings $settings `
             -Force -ErrorAction Stop | Out-Null
 
-        Write-Log "Registered temporary resume task '$TaskName' (boot +1m, one-shot T+1h); it will be removed on clean completion"
+        Write-Log "Registered temporary resume task '$TaskName' against staged copy '$stagedPath' (boot +1m, one-shot T+1h); it will be removed on clean completion"
         return $true
     } catch {
         Write-Log "Could not register the temporary resume task '$TaskName': $_ - the repair pipeline will proceed without self-healing" -Level WARN
         Add-RunSummaryLine -Field 'ChangesNotMade' -Line "Temporary resume task not registered: $($_.Exception.Message)"
+        # Registration failed; the staged copy has no referent, so
+        # remove it rather than leave it orphaned.
+        Remove-ResumeScriptStaging -StagedDir $ResumeStagedDir
         return $false
     }
 }
@@ -1395,7 +1556,23 @@ function Get-AvailableDriveLetter {
 
 function Get-WorkDirCandidates {
     $osDriveLetter = $env:SystemDrive.TrimEnd(':').ToUpperInvariant()
-    $volumes = @(Get-Volume -ErrorAction Stop)
+    # v50 patch 3 (hardening): explicit fail-closed on volume
+    # enumeration. The previous bare `Get-Volume -ErrorAction Stop`
+    # threw out of this function under a transient Storage-module
+    # error, aborting the whole run FATAL from a step that only
+    # allocates a scratch workspace. An empty candidate list is the
+    # correct signal to the caller: Get-WorkDirPlan returns a null
+    # Path, and Main defers with a named reason. The log line makes
+    # the enumeration failure distinguishable from "enumeration
+    # succeeded but found nothing eligible." This is fail-closed:
+    # no workspace is selected, so no servicing work begins.
+    $volumes = @()
+    try {
+        $volumes = @(Get-Volume -ErrorAction Stop)
+    } catch {
+        Write-Log "Get-WorkDirCandidates: could not enumerate volumes: $_ - no workspace candidates will be offered (fail closed; caller will defer)" -Level WARN
+        return @()
+    }
     $candidates = @()
 
     foreach ($volume in $volumes) {
@@ -2076,8 +2253,33 @@ function Remove-StrayRecoveryPartitions {
             }
             try {
                 $rp | Remove-Partition -Confirm:$false -ErrorAction Stop
-                Write-Log "Stray-recovery cleanup: deleted stray recovery partition $ref"
-                $deletedList.Add($ref) | Out-Null
+                Start-Sleep -Seconds 1
+                # v50 patch 3: positive post-deletion verification. A
+                # successful Remove-Partition call is not by itself
+                # proof the partition is gone. Re-query the target disk
+                # with a terminating query and confirm the partition is
+                # not among the results, mirroring the pattern used by
+                # Remove-OrphanPartition and the main destructive
+                # deletion loop.
+                $verificationOk = $false
+                $stillThere = $true
+                try {
+                    $remainingParts = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)
+                    $stillThere = (@($remainingParts | Where-Object { $_.PartitionNumber -eq $rp.PartitionNumber }).Count -gt 0)
+                    $verificationOk = $true
+                } catch {
+                    Write-Log "Stray-recovery cleanup: post-deletion verification query failed for $ref : $_ - treating as not-confirmed-deleted (fail closed)" -Level WARN
+                }
+                if (-not $verificationOk -or $stillThere) {
+                    $failDesc = if (-not $verificationOk) { "could not be verified as deleted (query failed)" } else { "still present after Remove-Partition returned success" }
+                    Write-Log "Stray-recovery cleanup: stray recovery partition $ref $failDesc" -Level WARN
+                    $failedToDelete.Add($ref) | Out-Null
+                    $Script:nonFatalWarning = $true
+                    $anyFailed = $true
+                } else {
+                    Write-Log "Stray-recovery cleanup: deleted stray recovery partition $ref"
+                    $deletedList.Add($ref) | Out-Null
+                }
             } catch {
                 Write-Log "Stray-recovery cleanup: failed to delete stray recovery partition $ref : $_" -Level WARN
                 $failedToDelete.Add($ref) | Out-Null
@@ -5126,40 +5328,78 @@ function Clear-PartitionDeferral {
 # backup, and never causes a Restore or Cleanup to incorrectly assume
 # a root exists.
 #
-# The directory containing manager.json, and its immediate parent,
-# must be owned by SYSTEM or Administrators. A non-admin can
-# pre-create a subdirectory under C:\ProgramData (the default ACL
-# grants Create Folders to Authenticated Users) and become its owner;
-# the same non-admin can later delete-and-recreate a child directory
-# to steal ownership of that child. Both the read and write paths
-# verify the chain via Test-DirectoryOwnedByTrustedPrincipal and
-# treat any failure as an empty config. This blocks both the initial
-# pre-creation attack and the delete-and-recreate swap.
+# The directory containing manager.json, its immediate parent, and the
+# config file itself must be trusted. The helper is
+# Test-PathTrustedForSystem, which validates the ACL owner (SYSTEM or
+# Administrators) and additionally rejects any Allow ACE granting a
+# modify-capable right to a principal outside SYSTEM, Administrators,
+# or TrustedInstaller. The mask differs by object class: on a
+# directory it is Delete, DeleteSubdirectoriesAndFiles, TakeOwnership,
+# and ChangePermissions; on a file it adds WriteData and AppendData.
+# The v50 form checked the owner alone; the v50 patch 3 form extends
+# the check to the effective DACL mask and also verifies the config
+# file itself, not just the two directory levels.
+#
+# Two levels of directory are checked, not one: an attacker who owns
+# the parent can delete-and-recreate the child to steal ownership of
+# that child between runs. The file-level check closes the
+# pre-creation attack a directory-only check would miss. The read
+# path treats any failure as an empty config; the write path refuses
+# and leaves the config unchanged.
 
-# Return $true when the given directory is owned by SYSTEM
-# (S-1-5-18) or Administrators (S-1-5-32-544). Fail-closed: a missing
-# directory, unreadable ACL, unknown owner, or unresolvable owner SID
-# returns $false. Used by Get-ManagerConfig and Set-ManagerConfig to
-# gate reads and writes of the machine-wide config file.
-function Test-DirectoryOwnedByTrustedPrincipal {
-    param([Parameter(Mandatory)][string]$Path)
+# v50 patch 3 (rev 2): shared trust-validation helper for any path
+# whose contents will be read, written, or executed by SYSTEM. The
+# v50 check verified only the ACL owner; ownership and effective
+# write permissions are separate properties, and a directory owned
+# by SYSTEM can still carry a permissive inherited ACE that lets a
+# non-administrator modify its contents. The helper accepts both
+# directories and files and validates:
+#   - the ACL owner is SYSTEM (S-1-5-18) or Administrators
+#     (S-1-5-32-544), and
+#   - no Allow ACE grants a modify-capable right to any principal
+#     outside SYSTEM, Administrators, or TrustedInstaller.
+#
+# The modify-capable mask differs by Kind. For a directory: Delete,
+# DeleteSubdirectoriesAndFiles, TakeOwnership, ChangePermissions.
+# WriteData and AppendData are DELIBERATELY EXCLUDED on
+# directories: on a directory those rights mean create-new-file /
+# create-new-subdirectory (FILE_ADD_FILE / FILE_ADD_SUBDIRECTORY),
+# not modify-existing-file. The stock C:\ProgramData ACL grants
+# BUILTIN\Users (I)(CI)(WD,AD,WEA,WA) on every directory it inherits
+# into; including WD would false-positive on the standard install
+# location and block every Backup and resume-task registration. The
+# pre-creation attack WD would enable - a non-admin planting
+# manager.json before the first legitimate write - is closed by the
+# file-level check, because the planted file is owned by the
+# attacker, not SYSTEM. For a file: WriteData, AppendData, Delete,
+# DeleteSubdirectoriesAndFiles, TakeOwnership, ChangePermissions.
+#
+# Returns $true only when both conditions hold. Fail-closed on
+# unreadable ACL, unknown owner, or unresolvable SID.
+function Test-PathTrustedForSystem {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('File','Directory')][string]$Kind
+    )
     if (-not $Path) { return $false }
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $exists = if ($Kind -eq 'File') {
+        Test-Path -LiteralPath $Path -PathType Leaf
+    } else {
+        Test-Path -LiteralPath $Path -PathType Container
+    }
+    if (-not $exists) { return $false }
     $acl = $null
     try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
-        Write-Log "Test-DirectoryOwnedByTrustedPrincipal: could not read ACL of '$Path' : $_ - fail closed" -Level WARN
+        Write-Log "Test-PathTrustedForSystem: could not read ACL of '$Path' : $_ - fail closed" -Level WARN
         return $false
     }
     if (-not $acl -or -not $acl.Owner) {
-        Write-Log "Test-DirectoryOwnedByTrustedPrincipal: could not determine owner of '$Path' - fail closed" -Level WARN
+        Write-Log "Test-PathTrustedForSystem: could not determine owner of '$Path' - fail closed" -Level WARN
         return $false
     }
-    # $acl.Owner is an IdentityReference. Depending on how the Security
-    # Descriptor was stored and how the .NET runtime reads it, the
-    # object handed back may be a SecurityIdentifier (the SID string
-    # form, e.g. "S-1-5-18") or an NTAccount (the account-name form,
-    # e.g. "NT AUTHORITY\SYSTEM"). Translate to a canonical SID string
-    # before comparing against the trusted-principal list.
+    # Resolve the owner to a canonical SID string. $acl.Owner may be a
+    # SecurityIdentifier or an NTAccount depending on how the descriptor
+    # was stored.
     $ownerSid = $null
     try {
         $ownerRef = $acl.Owner
@@ -5176,11 +5416,55 @@ function Test-DirectoryOwnedByTrustedPrincipal {
             }
         }
     } catch {
-        Write-Log "Test-DirectoryOwnedByTrustedPrincipal: could not resolve owner '$($acl.Owner)' of '$Path' to a SID: $_ - fail closed" -Level WARN
+        Write-Log "Test-PathTrustedForSystem: could not resolve owner '$($acl.Owner)' of '$Path' to a SID: $_ - fail closed" -Level WARN
         return $false
     }
-    $trustedSids = @('S-1-5-18','S-1-5-32-544')
-    return ($trustedSids -contains $ownerSid)
+    $trustedOwnerSids = @('S-1-5-18','S-1-5-32-544')
+    if ($trustedOwnerSids -notcontains $ownerSid) {
+        Write-Log "Test-PathTrustedForSystem: '$Path' is owned by SID $ownerSid, which is neither SYSTEM nor Administrators - refusing" -Level WARN
+        return $false
+    }
+    # Effective-permission check. Reject any Allow ACE that grants a
+    # modify-capable right to a principal outside the trusted set.
+    # The mask differs by Kind; see the header comment for the
+    # reasoning. For a file, WriteData and AppendData are content-
+    # modify rights and are included. For a directory, both mean only
+    # create-new-file / create-new-subdirectory, and including them
+    # would false-positive on the stock C:\ProgramData ACL.
+    $trustedAceSids = @(
+        'S-1-5-18',
+        'S-1-5-32-544',
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+    )
+    if ($Kind -eq 'File') {
+        $writeCapableMask = ([int][System.Security.AccessControl.FileSystemRights]::WriteData) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::AppendData) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::Delete) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::ChangePermissions)
+    } else {
+        $writeCapableMask = ([int][System.Security.AccessControl.FileSystemRights]::Delete) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
+                            ([int][System.Security.AccessControl.FileSystemRights]::ChangePermissions)
+    }
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        $aceSid = $null
+        try {
+            $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            Write-Log "Test-PathTrustedForSystem: could not resolve the SID for an ACE on '$Path' (IdentityReference='$($ace.IdentityReference)') - fail closed" -Level WARN
+            return $false
+        }
+        if ($trustedAceSids -contains $aceSid) { continue }
+        if (((([int]$ace.FileSystemRights) -band $writeCapableMask)) -ne 0) {
+            Write-Log "Test-PathTrustedForSystem: '$Path' grants write-capable access to '$($ace.IdentityReference)' (SID=$aceSid, FileSystemRights=$($ace.FileSystemRights)) - refusing" -Level WARN
+            return $false
+        }
+    }
+    return $true
 }
 
 function Get-ManagerConfig {
@@ -5199,10 +5483,17 @@ function Get-ManagerConfig {
     foreach ($anc in @($configDir, (Split-Path $configDir -Parent))) {
         if (-not $anc) { continue }
         if (-not (Test-Path -LiteralPath $anc -PathType Container)) { continue }
-        if (-not (Test-DirectoryOwnedByTrustedPrincipal -Path $anc)) {
-            Write-Log "Get-ManagerConfig: ancestor directory '$anc' is not owned by SYSTEM or Administrators - treating config as empty" -Level WARN
+        if (-not (Test-PathTrustedForSystem -Path $anc -Kind 'Directory')) {
+            Write-Log "Get-ManagerConfig: ancestor directory '$anc' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions) - treating config as empty" -Level WARN
             return $default
         }
+    }
+    # v50 patch 3: check the config file itself. A non-admin who can
+    # pre-create manager.json inside a SYSTEM-owned directory would
+    # pass the directory check but supply hostile content.
+    if (-not (Test-PathTrustedForSystem -Path $path -Kind 'File')) {
+        Write-Log "Get-ManagerConfig: config file '$path' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions on it) - treating config as empty" -Level WARN
+        return $default
     }
     try {
         $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
@@ -5272,8 +5563,17 @@ function Set-ManagerConfig {
         foreach ($anc in $ancestors) {
             if (-not $anc) { continue }
             if (-not (Test-Path -LiteralPath $anc -PathType Container)) { continue }
-            if (-not (Test-DirectoryOwnedByTrustedPrincipal -Path $anc)) {
-                Write-Log "Refusing to write manager config: ancestor directory '$anc' is not owned by SYSTEM or Administrators. The config remains the empty default." -Level WARN
+            if (-not (Test-PathTrustedForSystem -Path $anc -Kind 'Directory')) {
+                Write-Log "Refusing to write manager config: ancestor directory '$anc' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions). The config remains the empty default." -Level WARN
+                return $false
+            }
+        }
+        # v50 patch 3: if the config file already exists, verify it too.
+        # An existing file whose ACL has been widened by a non-admin is
+        # not a safe write target even when its directory is trusted.
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            if (-not (Test-PathTrustedForSystem -Path $path -Kind 'File')) {
+                Write-Log "Refusing to write manager config: existing config file '$path' is not trusted (owner is not SYSTEM or Administrators, or a non-admin principal holds write-capable permissions on it). The config remains unchanged." -Level WARN
                 return $false
             }
         }
@@ -5292,8 +5592,29 @@ function Set-ManagerConfig {
 function Add-ManagerBackupRoot {
     param([Parameter(Mandatory)][string]$Root)
     if (-not $Root) { return $false }
+    # v50 patch 3: preserve volume roots. GetFullPath('E:\')
+    # returns 'E:\', and TrimEnd('\') turns it into 'E:', which
+    # is drive-relative in PowerShell and does not match the
+    # mapped-drive resolution regex below (which requires a
+    # backslash after the colon). Preserve a path whose form is
+    # exactly a volume root (X:\ or X:); trim trailing separators
+    # only from ordinary directory paths.
     $normalized = $null
-    try { $normalized = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') } catch { $normalized = ([string]$Root).TrimEnd('\') }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Root)
+        if ($full -match '^[A-Za-z]:\\?$') {
+            $normalized = $full.Substring(0, 2) + '\'
+        } else {
+            $normalized = $full.TrimEnd('\')
+        }
+    } catch {
+        $raw = ([string]$Root)
+        if ($raw -match '^[A-Za-z]:\\?$') {
+            $normalized = $raw.Substring(0, 2) + '\'
+        } else {
+            $normalized = $raw.TrimEnd('\')
+        }
+    }
     if (-not $normalized) { return $false }
     # v50: resolve a mapped drive letter to its UNC path when possible.
     # A mapped drive is a session-specific DOS device mapping; a later
@@ -5311,7 +5632,13 @@ function Add-ManagerBackupRoot {
         if ($psDrive -and $psDrive.DisplayRoot) {
             $uncRoot = ([string]$psDrive.DisplayRoot).TrimEnd('\')
             if ($uncRoot -match '^\\\\') {
-                $normalized = "$uncRoot\$relative"
+                # v50 patch 3 (hardening): a bare drive root (E:\)
+                # resolves with an empty $relative; do not append a
+                # separator, or the stored form becomes \\srv\share\.
+                # Comparisons elsewhere TrimEnd('\') before matching,
+                # so this is cosmetic, but the stored value should be
+                # on-form.
+                $normalized = if ($relative) { "$uncRoot\$relative" } else { $uncRoot }
                 Write-Log "Add-ManagerBackupRoot: resolved mapped drive ${letter}: to UNC path $uncRoot for catalogue storage"
             }
         }
@@ -6255,7 +6582,16 @@ function Get-GitHubBaseWinRE {
     $folder = if ($Hardware.IsWin10) { "Win10/x64" } else { "Win11" }
     $apiUrl = "$BaseWinRERepoApi/$folder"
     $files = Invoke-RestMethod -Uri $apiUrl -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
-    $parts = $files | Where-Object { $_.name -match '^[Ww]inre\.7z\.\d+$' } | Sort-Object name
+    $parts = @($files | Where-Object { $_.name -match '^[Ww]inre\.7z\.\d+$' } | Sort-Object name)
+    # v50 patch 3: explicit empty-parts guard. If the folder is reachable
+    # but its contents no longer match the expected filename pattern,
+    # $parts is empty and the download loop would silently do nothing,
+    # then the extraction call would index $parts[0] on an empty array.
+    # Reject the candidate with a named reason.
+    if ($parts.Count -eq 0) {
+        Write-Log "Get-GitHubBaseWinRE: no winre.7z.NNN archive parts found at $apiUrl" -Level ERROR
+        return $false
+    }
     foreach ($part in $parts) {
         Invoke-WebRequest -Uri $part.download_url -OutFile (Join-Path $WorkDir $part.name) -Headers $GitHubHeaders -UseBasicParsing -TimeoutSec $NetworkTimeoutSeconds -ErrorAction Stop
     }
@@ -6692,9 +7028,20 @@ function Invoke-RestoreAction {
     Write-Log "Restore target: $targetWim (mode=$(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' }))"
 
     # ---- Short-circuit when target already matches ----
+    # v50 patch 3 (rev 3): capture the pre-restore target hash so the
+    # failure path below can distinguish a target that is provably
+    # byte-identical to its pre-restore content (untouched, or
+    # rollback-restored and hash-verified) from one whose content
+    # cannot be verified. Get-LiveWimHash returns $null both when the
+    # file is absent and when hashing fails; the caller cannot tell
+    # the two cases apart. Either way, an unavailable pre-restore
+    # hash means unchanged content cannot be proven, and the failure
+    # path below treats it as 'cannot prove unchanged' and invalidates
+    # the state markers conservatively.
+    $preRestoreTargetHash = $null
     if (Test-Path -LiteralPath $targetWim -PathType Leaf) {
-        $currentHash = Get-LiveWimHash -WimPath $targetWim
-        if ($currentHash -and $currentHash -eq $srcHash) {
+        $preRestoreTargetHash = Get-LiveWimHash -WimPath $targetWim
+        if ($preRestoreTargetHash -and $preRestoreTargetHash -eq $srcHash) {
             Write-Log "Target already matches the backup WIM (SHA256=$srcHash) - nothing to do"
             Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
             Set-RunSummaryField -Field 'Why' -Value 'Target already matches backup'
@@ -6826,7 +7173,7 @@ function Invoke-RestoreAction {
         $WorkDir = $prevWorkDir
     }
     if (-not $deployOk) {
-        Write-Log "Restore failed: could not replace the target WIM. Attempting to re-enable WinRE with the existing WIM." -Level ERROR
+        Write-Log "Restore failed: the target WIM replacement did not complete. Attempting to re-enable WinRE." -Level ERROR
         if ($preRestoreState.Status -eq 'Enabled') {
             $reenableResult = if ($isOSFallback) {
                 Invoke-ReagentcEnable -ReRegisterPath $permanentPath
@@ -6834,12 +7181,63 @@ function Invoke-RestoreAction {
                 Invoke-ReagentcEnable -AllowTempLetter -Partition @{ DiskNumber = $targetPart.DiskNumber; PartitionNumber = $targetPart.PartitionNumber } -ReRegisterPath $permanentPath
             }
             Write-Log "Re-enable attempt result: $reenableResult"
+            # v50 patch 3: preserve the resume task when WinRE could not be
+            # confirmed Enabled after the re-enable attempt. A 'reboot'
+            # result does not confirm Enabled - it means the registration
+            # did not establish an enabled state and a reboot may be
+            # needed. Only 'ok' confirms Enabled. Without this flag the
+            # finally block would unregister the resume task and leave the
+            # machine with no self-healing hook.
+            if ($reenableResult -ne 'ok') {
+                $Script:ResumeTaskShouldPersist = $true
+                Write-Log "Restore deployment failure: WinRE could not be confirmed Enabled after the re-enable attempt (result=$reenableResult) - preserving the temporary resume task so the operation is resumed on the next boot or within the hour" -Level WARN
+            }
+        }
+        # v50 patch 3 (rev 3): the deploy function returns $false for
+        # several distinct transaction outcomes and the caller sees only
+        # a Boolean. Before the attempt we captured the target WIM hash;
+        # here we capture it again and compare. A match proves the target
+        # is byte-identical to its pre-restore content (untouched, or
+        # rollback-restored and hash-verified), so the state file,
+        # checkpoint, and deferral marker remain accurate and are
+        # preserved. Any other outcome - a differing hash, an unavailable
+        # pre-restore hash, or an unavailable post-failure hash - means
+        # the target's content cannot be proven unchanged; the state
+        # markers are then invalidated so the next run does not take the
+        # fast path over a possibly broken WIM.
+        $postFailureTargetHash = $null
+        try { $postFailureTargetHash = Get-LiveWimHash -WimPath $targetWim } catch { }
+        $targetUnchanged = ($null -ne $preRestoreTargetHash -and
+                            $null -ne $postFailureTargetHash -and
+                            $preRestoreTargetHash -eq $postFailureTargetHash)
+        if ($targetUnchanged) {
+            Write-Log "Restore failure: target WIM is unchanged from the pre-restore state (SHA256=$postFailureTargetHash); preserving state file, checkpoint, and deferral marker" -Level WARN
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'The target WIM was not replaced.'
+        } else {
+            # The target WIM's content cannot be proven unchanged. A
+            # reagentc /enable returning 'ok' above establishes only
+            # that reagentc reports Enabled, not that the target WIM's
+            # bytes are intact: reagentc registers the location, it
+            # does not hash-verify the file. Preserve the resume task
+            # unconditionally in this branch so the next boot or T+1h
+            # trigger performs a fresh rebuild, regardless of the
+            # re-enable result and regardless of the pre-restore WinRE
+            # status. Without this, we would invalidate state but leave
+            # no scheduled repair run to recover from it.
+            $Script:ResumeTaskShouldPersist = $true
+            $preHashDesc = if ($preRestoreTargetHash) { $preRestoreTargetHash } else { '(unavailable before restore, or absent)' }
+            $postHashDesc = if ($postFailureTargetHash) { $postFailureTargetHash } else { '(unavailable after failure)' }
+            Write-Log "Restore failure: target WIM cannot be proven unchanged (before=$preHashDesc, after=$postHashDesc); invalidating state file, checkpoint, and deferral marker so the next run does not trust stale state" -Level WARN
+            $statePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+            Remove-ItemIfExist $statePath
+            Remove-ItemIfExist $CheckpointFile
+            Clear-PartitionDeferral
+            Add-RunSummaryLine -Field 'ChangesMade' -Line 'The target WIM was replaced or damaged by the failed deploy; state file, checkpoint, and deferral marker were deleted.'
         }
         try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
         Set-RunSummaryField -Field 'Result' -Value 'FATAL'
         Set-RunSummaryField -Field 'Why' -Value 'WIM replacement failed'
         Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
-        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'The target WIM was not replaced.'
         return $EXIT_FATAL
     }
     Write-Log "Restore: target WIM replaced and hash-verified"
@@ -7358,10 +7756,41 @@ public static class WinRECancelKeyProbe {
     }
 
     # ---- Recovery-volume drive-letter normalization ----
-    Get-Volume | Where-Object { $_.FileSystemLabel -eq "Recovery" -or $_.FileSystemLabel -eq "WINRE" } | ForEach-Object {
-        if ($_.DriveLetter) {
-            $part = Get-Partition -Volume $_ -ErrorAction SilentlyContinue
-            if ($part -and -not $part.IsBoot -and -not $part.IsSystem -and -not (Test-Path "$($_.DriveLetter):\Windows")) {
+    # v50 patch 3: scope this normalization to the OS disk. The block's
+    # original purpose was to remove drive letters the manager had left
+    # on recovery partitions it created, which are always on the OS
+    # disk. On a VM guest with a passthrough host disk, a non-OS disk's
+    # recovery volume may be visible with a drive letter; removing it
+    # would be a modification to a non-OS disk that bypasses the v50
+    # patch 2 sweep suppression. The sweep suppression protects against
+    # partition deletion, not letter removal, so this block applies the
+    # same OS-disk restriction that Remove-StrayRecoveryPartitions uses.
+    $osDiskForNormalization = Get-OSDisk
+    if ($osDiskForNormalization) {
+        Get-Volume | Where-Object { $_.FileSystemLabel -eq "Recovery" -or $_.FileSystemLabel -eq "WINRE" } | ForEach-Object {
+            if ($_.DriveLetter) {
+                $part = Get-Partition -Volume $_ -ErrorAction SilentlyContinue
+                if (-not ($part -and $part.DiskNumber -eq $osDiskForNormalization.Number -and -not $part.IsBoot -and -not $part.IsSystem)) {
+                    continue
+                }
+                # v50 patch 3 (hardening): explicit fail-closed on the
+                # \Windows presence check. The previous inline Test-Path
+                # had no error handling. Under $ErrorActionPreference='Stop'
+                # a transient provider error would propagate and abort the
+                # whole run FATAL, which is disproportionate for a
+                # best-effort drive-letter cleanup. Adding
+                # -ErrorAction SilentlyContinue would be worse: $false on
+                # error passes the -not check and removes the letter on a
+                # volume we could not verify. Correct shape: try/catch,
+                # log on error, treat indeterminate as "do not remove."
+                $hasWindowsDir = $null
+                try {
+                    $hasWindowsDir = Test-Path "$($_.DriveLetter):\Windows" -ErrorAction Stop
+                } catch {
+                    Write-Log "Could not verify whether $($_.DriveLetter): contains \Windows ($_) - skipping drive-letter removal for this recovery volume (fail closed)" -Level WARN
+                    continue
+                }
+                if ($hasWindowsDir) { continue }
                 if (-not $Script:DryRun) {
                     if (-not $Script:tempDriveLetters.Contains($_.DriveLetter)) { $Script:tempDriveLetters.Add($_.DriveLetter) }
                     Invoke-DriveLetterRemoval -Letter $_.DriveLetter | Out-Null
@@ -7370,6 +7799,8 @@ public static class WinRECancelKeyProbe {
                 }
             }
         }
+    } else {
+        Write-Log "Recovery-volume drive-letter normalization skipped: OS disk could not be resolved" -Level WARN
     }
 
     $WinREState = Get-WinREState
@@ -9527,10 +9958,28 @@ finally {
     # (WinRECancelKeyProbe.ShouldPersist). Left registered when the
     # process was hard-killed and the finally block never ran (the
     # task then fires on the next boot or at T+1 hour).
+    # v50 patch 3: the staged resume script is removed at the same
+    # point the task is unregistered, so the two share a lifetime.
+    # Left in place whenever the task persists, because the task still
+    # needs the staged copy to execute.
     $persist = $Script:ResumeTaskShouldPersist
     try { if ([WinRECancelKeyProbe]::ShouldPersist) { $persist = $true } } catch { }
+    # v50 patch 3 fix: the staging directory is removed only when the
+    # resume task is unregistered, so the two share a lifetime exactly
+    # as the design intent states. The prior form removed staging
+    # whenever $persist was false, regardless of whether a task had
+    # been registered: under -DryRun (Register-ResumeTask is never
+    # called, so $Script:ResumeTaskCreated stays $false), the finally
+    # block still deleted C:\Recovery\OEM\Resume, mutating disk state
+    # under a mode whose contract is "no changes were made". Moving
+    # the call inside the same if that gates the unregister closes
+    # that. Stale staging left by a staging-succeeded-but-
+    # registration-failed run is already cleared by
+    # Register-ResumeTask's own catch block, so no cleanup coverage
+    # is lost.
     if ($Script:ResumeTaskCreated -and -not $persist) {
         Unregister-ResumeTask -TaskName $Script:ResumeTaskName
+        Remove-ResumeScriptStaging -StagedDir $ResumeStagedDir
     }
     try { [WinRECancelKeyProbe]::Unregister() } catch { }
 

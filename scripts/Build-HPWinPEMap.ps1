@@ -115,6 +115,11 @@ if ($packs.ContainsKey('WinPE1011')) {
     Write-T "Current pack: $($packs['Current'].softPaqId) v$($packs['Current'].version)" -L SUCCESS
 }
 
+if ($packs.Count -le 0) {
+    Write-T "Generated HP map is empty - refusing to publish" -L ERROR
+    throw "Generated HP map is empty"
+}
+
 $output = @{
     Generated = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
     Count     = $packs.Count

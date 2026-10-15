@@ -147,7 +147,33 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 37
+    Version : 38
+
+    v38 changes vs v37:
+    1. Added run logging. Every Say / Rule / Write-Diag / Write-KV /
+       Write-WarningBanner call and every Record call appends a line
+       to $env:TEMP\WinRE-TestHarness.log (overwritten at the start of
+       each run). The log captures the full narrative of the run,
+       including every parser self-test result via Record, so an
+       operator or CI consumer can review the run after the console
+       output has scrolled off. The log lives under %TEMP% rather than
+       $TestDir because NonInteractive mode (and interactive mode with
+       the default cleanup answer) deletes $TestDir at exit; a log
+       inside $TestDir would be destroyed with it. The log path is
+       announced at startup via a Say line.
+    2. Fixed NonInteractive mode to exercise the parser self-test.
+       Before this change NonInteractive ran only Invoke-AllRelevant
+       (the download/extraction tests) and never invoked
+       Show-SystemDiagnostic, so the parser self-test -- including
+       the source-level mirror-binding assertions 18, 19, and 20 that
+       were added specifically to catch production mirror drift --
+       was not exercised by CI. A future production edit that dropped
+       one of the asserted shapes would have passed CI silently.
+       NonInteractive now runs Show-SystemDiagnostic first, then
+       Invoke-AllRelevant, then the summary and cleanup. The v25
+       changelog promise ("CI and cron consumers can now treat the
+       harness as a regression gate") is now honored in full.
+    3. Menu title and startup Rule bumped 37 -> 38.
 
     v37 changes vs v36:
     1. Mirrored production v50 patch 2's empty-metadata fail-closed
@@ -688,6 +714,22 @@ $Script:HPWinPEMap            = $null
 $Script:LenovoWinPEMap        = $null
 $Script:LenovoPackResolution  = "unknown"
 
+# v38: run log. Every Say / Rule / Write-Diag / Write-KV /
+# Write-WarningBanner call and every Record call appends to this file,
+# in addition to its console output. Placed under %TEMP% rather than
+# $TestDir because NonInteractive mode (and interactive mode with the
+# default cleanup answer) deletes $TestDir at exit; a log inside
+# $TestDir would be destroyed with it and would be unavailable for
+# post-run triage. Overwritten at the start of each run.
+$Script:HarnessLogPath = if ($env:TEMP) { Join-Path $env:TEMP "WinRE-TestHarness.log" } else { $null }
+
+# Truncate the log at the start of each run. Failure to truncate is
+# silent: Write-Log also fails silently, so an unwritable log location
+# does not abort the harness.
+if ($Script:HarnessLogPath -and (Test-Path -LiteralPath $Script:HarnessLogPath)) {
+    Remove-Item -LiteralPath $Script:HarnessLogPath -Force -ErrorAction SilentlyContinue | Out-Null
+}
+
 # Captured before any directory work, so the cleanup path can refuse to
 # delete a pre-existing user-supplied $TestDir. See v18 change #4.
 $Script:TestDirWasPreexisting = Test-Path -LiteralPath $TestDir
@@ -696,6 +738,17 @@ $Script:TestDirInitialEntryCount = if ($Script:TestDirWasPreexisting) {
 } else { 0 }
 
 # =========================== HARNESS LOGGING / UI ===========================
+# v38: append a line to the harness log. Failures are silent (no throw,
+# no console output): a log location that is unexpectedly unwritable does
+# not affect the harness. An empty Message writes a blank line.
+function Write-Log {
+    param([AllowEmptyString()][string]$Message = "")
+    if (-not $Script:HarnessLogPath) { return }
+    try {
+        Add-Content -LiteralPath $Script:HarnessLogPath -Value $Message -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 function Say {
     param(
         [string]$Message,
@@ -716,7 +769,9 @@ function Say {
             default  { "Gray" }
         }
     }
-    Write-Host "$Timestamp [$Level] $Message" -ForegroundColor $Color
+    $line = "$Timestamp [$Level] $Message"
+    Write-Host $line -ForegroundColor $Color
+    Write-Log $line
 }
 
 function Rule {
@@ -726,6 +781,8 @@ function Rule {
     Write-Host "--- " -NoNewline -ForegroundColor DarkGray
     Write-Host $Title -NoNewline -ForegroundColor $Color
     Write-Host " $dashes" -ForegroundColor DarkGray
+    Write-Log ""
+    Write-Log "--- $Title $dashes"
 }
 
 function Write-Diag {
@@ -735,6 +792,7 @@ function Write-Diag {
     } else {
         Write-Host ""
     }
+    Write-Log $Message
 }
 
 function Write-KV {
@@ -751,6 +809,8 @@ function Write-KV {
         Write-Host $Key.PadRight($KeyWidth) -NoNewline -ForegroundColor DarkGray
     }
     Write-Host $Value -ForegroundColor $ValueColor
+    $keyCell = if ($Key.Length -ge $KeyWidth) { "$Key " } else { $Key.PadRight($KeyWidth) }
+    Write-Log "  $keyCell$Value"
 }
 
 function Format-Size {
@@ -825,6 +885,12 @@ function Write-WarningBanner {
         Write-Host "  $l" -ForegroundColor $Color
     }
     Write-Host "  $bottom" -ForegroundColor $Color
+    Write-Log "  $top"
+    Write-Log "  $hLine"
+    foreach ($line in $BodyLines) {
+        Write-Log ("  | " + $line.PadRight($innerWidth - 2) + " |")
+    }
+    Write-Log "  $bottom"
 }
 
 function New-TestDir {
@@ -867,6 +933,9 @@ function Record {
         OK     = ($State -eq "PASS")
         Detail = $Detail
     })
+    # v38: every recorded result lands in the log, so a NonInteractive
+    # run's log is self-contained and can be grepped by a CI consumer.
+    Write-Log "[$State] $Test  $Detail"
 }
 
 # =========================== SHARED FETCH (mirrors production) ===========================
@@ -1473,6 +1542,12 @@ function Get-StorageControllerDevices {
     try {
         $devs = @(Get-PnpDevice -Class 'SCSIAdapter' -PresentOnly -ErrorAction Stop)
     } catch {
+        # Mirror of production's WARN line. The harness caller
+        # already reports the INDETERMINATE state to the operator,
+        # but the specific exception was discarded. Surface it so a
+        # PnP enumeration failure is diagnosable from the harness
+        # output alone.
+        Say "Storage applicability: could not enumerate SCSIAdapter-class devices: $_" -Level WARN
         return $null
     }
     $result = @()
@@ -3377,7 +3452,7 @@ function Show-StateFileParity {
     if ($null -eq $computedDsi) {
         Write-Diag ""
         Write-KV "Computed DesiredStateId" "(unavailable)" "Yellow"
-        Write-Diag "           Production's \$ScriptVersion could not be read from an adjacent" "Yellow"
+        Write-Diag "           Production's `$ScriptVersion could not be read from an adjacent" "Yellow"
         Write-Diag "           WinRE.ps1, so the DSI mirror cannot be computed. Place WinRE.ps1" "Yellow"
         Write-Diag "           beside Test-WinRE.ps1 and re-run, or use the harness in the same" "Yellow"
         Write-Diag "           repository layout as production." "Yellow"
@@ -4024,6 +4099,8 @@ function Show-Summary {
     Write-Host ", skipped " -NoNewline -ForegroundColor Gray
     Write-Host "$skipped" -NoNewline -ForegroundColor $skipColor
     Write-Host " (of $($Script:Results.Count))" -ForegroundColor Gray
+    # v38: single summary line in the log for CI consumers.
+    Write-Log "Summary: Passed=$passed Failed=$failed Skipped=$skipped Total=$($Script:Results.Count)"
 }
 
 # =========================== CLEANUP ===========================
@@ -4126,7 +4203,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v37)"
+    $titleContent = "WinRE Manager Test Harness (v38)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -4174,16 +4251,28 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v37"
+Rule "WinRE Manager test harness v38"
 Say "Working dir: $TestDir"
+Say "Run log: $(if ($Script:HarnessLogPath) { $Script:HarnessLogPath } else { '(unavailable - %TEMP% not set)' })"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {
     Say "TestDir pre-existed with $($Script:TestDirInitialEntryCount) entr(y|ies). Cleanup on exit will refuse to delete it." -Level WARN
 }
 if (-not (Test-Path $7Zip)) { Say "7-Zip not found at $7Zip - extraction tests will fail" -Level WARN }
 
 if ($NonInteractive) {
+    # v38: NonInteractive mode now runs the full System diagnostic
+    # (Option 1) as well as the "All relevant" test set, so the
+    # parser self-test -- including source-level mirror-binding
+    # assertions 18, 19, and 20 -- is exercised by CI. Before this
+    # change the diagnostic was interactive-only, so a production-
+    # side mirror gap could pass CI silently.
+    Say "NonInteractive mode: running System diagnostic and all relevant tests."
+    Show-SystemDiagnostic
     Invoke-AllRelevant
     Show-Summary
+    if ($Script:HarnessLogPath) {
+        Say "Run log: $Script:HarnessLogPath"
+    }
     Invoke-HarnessCleanup -NonInteractive
     Say "Done."
     $failedCount = @($Script:Results | Where-Object { $_.State -eq "FAIL" }).Count

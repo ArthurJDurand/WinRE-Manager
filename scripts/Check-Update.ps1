@@ -12,7 +12,8 @@
     the main branch is fetched and the topmost production version header
     is parsed. Whichever source resolves first is used.
 
-    Protocol output (single line, no trailing newline):
+    Protocol output (single line; the wrapper's for /f consumer strips
+    the line terminator):
         CURRENT              - local and remote match
         UPDATE|vX patch Y    - remote is newer
         AHEAD                - local is newer (dev build)

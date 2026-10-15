@@ -37,7 +37,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v37.** The version history is:
+**Current version: v38.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -62,6 +62,7 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v35** inverts the interactive cleanup prompt. The v34 form (`Keep test artifacts in $TestDir → (y/N)` with y=keep) was the reverse of what most operators read, and an operator who answered `y` expecting deletion got the opposite. The prompt now reads `Delete test artifacts from $TestDir → (Y/n)` with `y`=delete (default) and `n`=keep. See "v35 changes" below.
 - **v36** closes a diagnostic gap exposed by production v50 patch 2's hypervisor-suppression boundary: the harness now mirrors production's `Test-RunningInVirtualMachine` and adds a "Non-OS sweep suppression preview" section to Option 1 that reports the hypervisor-detection verdict (`guest`, `physical`, or `indeterminate`) and every non-OS recovery partition's disposition under the sweep's deletion rules. v36 also adds a source-level mirror-binding assertion (check 20) that verifies production's `Test-RunningInVirtualMachine` retains the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, and the combined-string construction. See "v36 changes" below.
 - **v37** mirrors production v50 patch 2's empty-metadata fail-closed correction in the harness's `Test-RunningInVirtualMachine` mirror, and extends check 20 with an assertion that binds the guard (`IsNullOrWhiteSpace`). Before v37 the harness mirror lacked the guard, so a machine whose `Win32_ComputerSystem` returned empty or whitespace-only Manufacturer and Model fields would have been classified as a physical machine by the harness's preview while production's gate returned `$null` (indeterminate; sweep suppressed). See "v37 changes" below.
+- **v38** adds run logging and fixes `-NonInteractive` to also run the parser self-test. Every `Say` / `Rule` / `Write-Diag` / `Write-KV` / `Write-WarningBanner` call and every `Record` call now appends to `%TEMP%\WinRE-TestHarness.log`. `-NonInteractive` now runs `Show-SystemDiagnostic` before `Invoke-AllRelevant`, so the parser self-test - including the source-level mirror-binding assertions 18, 19, and 20 that exist to catch production mirror drift - is exercised by a CI consumer invoking the harness non-interactively. See "v38 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
@@ -69,7 +70,7 @@ The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the m
 
 ### v29 changes
 
-Two changes, both closing the version-drift family that has required a manual `$ProductionScriptVersion` bump on five consecutive releases (v21, v22, v23, v27, v28).
+Two changes, both closing the version-drift family that has required a manual `$ProductionScriptVersion` bump on five releases across the family (v21, v22, v23, v27, v28).
 
 **1. Version-drift family closed by `Get-ProductionScriptVersion`.** A new reader extracts production's `$ScriptVersion` from the adjacent `WinRE.ps1` at call time, using a regex match against the source. `Get-DesiredStateId`'s `$ProductionScriptVersion` parameter is now `[Nullable[int]]` with a `$null` default; when the caller does not supply a value, the function invokes the reader; when the reader returns `$null` (production file absent, unparseable, or lacking the declaration), the function returns `$null` and the caller records `State file parity` as SKIP rather than substituting a stale default and reporting a false MISMATCH. This closes the version-drift family permanently: the harness no longer needs a manual bump whenever production bumps `$ScriptVersion`. The `49` default is retained as an explicit override path for the parser self-test (Check 15 passes `44` and `43` explicitly to prove version-sensitivity), but is no longer the load-bearing value on the live Option S path. When the DSI cannot be computed — the production file is not adjacent to the harness — Option S prints an explicit "place WinRE.ps1 beside Test-WinRE.ps1" hint.
 
@@ -77,9 +78,23 @@ Two changes, both closing the version-drift family that has required a manual `$
 
 The parser self-test count remains at eighteen — v29 adds no new checks.
 
+### v38 changes
+
+Three changes, all affecting the harness's own behaviour rather than its mirrors of production.
+
+**1. Run logging added.** Every `Say` / `Rule` / `Write-Diag` / `Write-KV` / `Write-WarningBanner` call and every `Record` call now appends a line to `%TEMP%\WinRE-TestHarness.log` in addition to its console output. The log captures the full narrative of the run, including every parser self-test result via `Record`, so an operator or CI consumer can review the run after the console output has scrolled off. The log is overwritten at the start of each run and its path is announced at startup via a `Say` line.
+
+The log lives under `%TEMP%` rather than `$TestDir` because NonInteractive mode (and interactive mode with the default cleanup answer) deletes `$TestDir` at exit; a log inside `$TestDir` would be destroyed with it and would be unavailable for post-run triage. If `$env:TEMP` is not set, the log is not created; every `Write-Log` call is a no-op and the harness continues without it.
+
+**2. `-NonInteractive` now runs the parser self-test.** Before v38, NonInteractive ran only `Invoke-AllRelevant` (the download/extraction tests) and never invoked `Show-SystemDiagnostic`, so the parser self-test - including the source-level mirror-binding assertions 18, 19, and 20 that were added specifically to catch production mirror drift - was not exercised by CI. A future production edit that dropped one of the asserted shapes would have passed CI silently. NonInteractive now runs `Show-SystemDiagnostic` first, then `Invoke-AllRelevant`, then the summary and cleanup. The v25 changelog promise ("CI and cron consumers can now treat the harness as a regression gate") is now honored in full.
+
+**3. Menu title and startup `Rule` bumped 37 -> 38.**
+
+The parser self-test count remains at twenty-one - v38 adds no new checks.
+
 ### v37 changes
 
-Two changes, both downstream of the production v50 patch 2 cycle.
+Three changes, all downstream of the production v50 patch 2 cycle.
 
 **1. Empty-metadata fail-closed guard added to the `Test-RunningInVirtualMachine` mirror.** Production v50 patch 2 treats a `Win32_ComputerSystem` query that succeeds but returns empty or whitespace-only Manufacturer and Model fields as indeterminate and returns `$null`; without that guard, the empty string falls through to the signature scan, matches nothing, and is classified as a physical machine. The harness mirror lacked the guard, so on such a machine the Option 1 sweep-suppression preview would have reported `physical (sweep runs)` while production would have reported `indeterminate (sweep suppressed)`. v37 closes that mirror gap: the harness mirror now returns `$null` on empty metadata, matching production's behavior.
 
@@ -117,7 +132,7 @@ The parser self-test count remains at twenty — v35 adds no new checks.
 
 ### v34 changes
 
-One change, mirroring production's v50 `Remove-EmptyWorkspaceParent` invariant.
+Two changes: `Remove-EmptyTestParent` mirroring production's v50 `Remove-EmptyWorkspaceParent` invariant, and a menu-title and `Rule` bump.
 
 **1. Added `Remove-EmptyTestParent`.** After `Invoke-HarnessCleanup` removes `$TestDir`, the parent directory (typically `C:\Temp` for the default path) is checked and removed if and only if its leaf name is exactly `Temp`, it is completely empty, and it is not a drive root. Before this change the harness removed `$TestDir` recursively but left an empty `C:\Temp` behind on a machine where the harness had created `C:\Temp` itself. Removal is attempted via `Remove-Item` with a `[System.IO.Directory]::Delete` fallback for provider-layer disagreements, then verified: if the directory still exists afterward (typically because another process holds a handle, or because the invoking session's working directory is inside it), a WARN is logged and the directory is left in place. A user-supplied `-TestDir` whose parent is not named `Temp` (for example `C:\Users\Me\Desktop`) is therefore never touched.
 
@@ -127,7 +142,7 @@ The parser self-test count remains at twenty — v34 adds no new checks.
 
 ### v33 changes
 
-One change, adding two source-level mirror-binding assertions to the parser self-test.
+Two changes: two source-level mirror-binding assertions added to the parser self-test, and a menu-title and `Rule` bump.
 
 **1. Added two source-level mirror-binding assertions (checks 18 and 19).**
 
@@ -141,17 +156,19 @@ The parser self-test count moves from eighteen to twenty with the two new checks
 
 ### v32 changes
 
-Two changes, both defensive or documentation-only.
+Three changes, all defensive or documentation-only.
 
 **1. `Record`'s `-Ok` parameter hardened with an explicit default.** The parameter previously had no default and was not marked mandatory, so a future call site writing `Record <name> -State <state>` without `-Ok` would have silently bound `$Ok = $false`. The behavior was already correct (when `-State` is supplied it is authoritative), so the change is defensive only: it makes the implicit default explicit. No observable behavior change; every current call site supplies `-Ok`.
 
 **2. Design note added to `Get-DriverManifest`'s header.** Explains why the function is called afresh by each of the four interactive entry points that need the manifest (Options 1, 2, 9, and S) rather than caching the result across the session. The choice is deliberate: production fetches once in `Main` and passes the manifest down, so there is no production function to mirror that would hold a cache; and a cached manifest would hide a mid-session network failure from a later entry point. Documentation only.
 
+**3. Menu title and startup `Rule` bumped 31 -> 32.**
+
 The parser self-test count remains at eighteen — v32 adds no new checks.
 
 ### v31 changes
 
-Three changes, all downstream of the v31 cycle.
+Four changes, all downstream of the v31 cycle.
 
 **1. Mirror-discipline principle documented in `.DESCRIPTION`.** Every function named in the "Mirrored from production" list above, and every function under a "based on WinRE.ps1" section header, matches its production counterpart line-for-line in logic and functional calls. The only permitted differences are: (a) the log sink (`Say` vs `Write-Log`); (b) diagnostics layered around the mirror (observational, no control-flow change); (c) an explicit, documented functional difference; (d) an output-shape-aligned helper whose implementation may differ (`Get-ThisMachineProfile`, `Get-HarnessPartitionRef`). Any deviation outside these four is a mirror gap and is treated as a defect.
 
@@ -159,17 +176,21 @@ Three changes, all downstream of the v31 cycle.
 
 **3. Parser self-test failure output enriched for the two English-language-dependent regexes.** Check 1 (reagentc status, matching "Enabled"/"Disabled") and check 2b (reagentc Windows RE Version, anchored on the label "Windows RE Version:") now report the current OS locale and a two-cause hypothesis on a non-match: structural reagentc format drift, or a non-English OS. The recorded test result (FAIL) is unchanged; the added output is observational.
 
+**4. Menu title and startup `Rule` bumped 30 -> 31.**
+
 The parser self-test count remains at eighteen — v31 adds no new checks.
 
 ### v30 changes
 
-Three changes, all downstream of the v49 patch 2 cycle.
+Four changes, all downstream of the v49 patch 2 cycle.
 
 **1. `Get-StorageControllerDevices` mirror corrected.** The harness's copy of the function carried the same defect as production's — `return @($result)` collapsed an empty result to `$null`, so the caller in the Option 1 diagnostic mis-reported "INDETERMINATE (PnP enumeration failed)" for a successfully-empty enumeration, and the parser self-test at check 17 recorded FAIL instead of the intended SKIP. Both sites now use `return ,$result` and reach their intended branches.
 
 **2. `Say` line for filtered software/virtual devices.** The harness now emits a `Say` line when a software or virtual storage device is filtered out of the SCSIAdapter-class enumeration, similar to production's equivalent line but without production's `Storage applicability: ` prefix. Previously the harness dropped filtered devices silently, so an operator comparing the harness's controller list against their own `Get-PnpDevice -Query` had no visible explanation for the difference.
 
 **3. NonInteractive exit-code effect documented.** On a machine whose SCSIAdapter-class enumeration legitimately returns zero devices, check 17 now records SKIP instead of FAIL, so `-NonInteractive` returns exit code 0 for that case.
+
+**4. Menu title and startup `Rule` bumped 29 -> 30.**
 
 The parser self-test count remains at eighteen — v30 adds no new checks.
 
@@ -337,9 +358,17 @@ As of v34, when the harness does remove `$TestDir`, it also removes the parent d
 
 As of v35, the interactive cleanup prompt reads `Delete test artifacts from $TestDir → (Y/n)` with `y`=delete (default) and `n`=keep. The v34 form was `Keep test artifacts in $TestDir → (y/N)` with `y`=keep, and operators read "y to cleanup" and answered `y` expecting deletion — the keep branch returned before `Remove-EmptyTestParent` ran. Empty input still deletes. The `-Keep` switch still short-circuits to keep, and the pre-existing-non-empty refusal is unchanged.
 
-## Output style (v16; extended in v17 through v37, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, v28's VMD storage-controller diagnostic section, v33's two source-level mirror-binding assertions in the parser self-test, v34's empty-test-parent cleanup, v35's inverted cleanup prompt, v36's Non-OS sweep suppression preview section, and v37's empty-metadata fail-closed guard in the sweep-suppression preview mirror as the departures)
+## Output style (v16; extended in v17 through v38, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, v28's VMD storage-controller diagnostic section, v33's two source-level mirror-binding assertions in the parser self-test, v34's empty-test-parent cleanup, v35's inverted cleanup prompt, v36's Non-OS sweep suppression preview section, v37's empty-metadata fail-closed guard in the sweep-suppression preview mirror, and v38's run logging as the departures)
 
 As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. The rest of the output format is unchanged from v16.
+
+### Run logging (v38)
+
+Every `Say`, `Rule`, `Write-Diag`, `Write-KV`, and `Write-WarningBanner` call, and every `Record` call, appends a line to `%TEMP%\WinRE-TestHarness.log` in addition to its console output. The log is overwritten at the start of each run and its path is announced at startup.
+
+The log lives under `%TEMP%` rather than `$TestDir` because NonInteractive mode (and interactive mode with the default cleanup answer) deletes `$TestDir` at exit; a log inside `$TestDir` would be destroyed with it and would be unavailable for post-run triage. If `$env:TEMP` is not set, the log is not created; every logging call is a no-op and the harness continues without it.
+
+The log captures the full narrative of the run, including every parser self-test result via `Record`. A CI consumer running `-NonInteractive` can grep the log for `[FAIL]` or `Summary: Passed=N Failed=M` to find failures without parsing console output. An interactive operator can review the log after the console has scrolled.
 
 ### Colour-coded values
 
@@ -589,7 +618,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Twenty-one checks as of v37 (twenty as of v35, eighteen as of v28, seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v23, v24, v26, v27, v29, v30, v31, v32, v34, and v35 did not change the count or the contents, and v37 extended check 20's assertion without adding a new check. v28 added the `Get-StorageControllerDevices` shape check; v33 added the two source-level mirror-binding assertions (checks 18 and 19); v36 added check 20, the `Test-RunningInVirtualMachine` mirror-binding assertion. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
+Twenty-one checks as of v38 (twenty-one as of v36, twenty as of v33, eighteen as of v28, seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v19, v20, v21, v23, v24, v26, v27, v29, v30, v31, v32, v34, v35, and v38 did not change the count or the contents, and v37 extended check 20's assertion without adding a new check. v28 added the `Get-StorageControllerDevices` shape check; v33 added the two source-level mirror-binding assertions (checks 18 and 19); v36 added check 20, the `Test-RunningInVirtualMachine` mirror-binding assertion. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -633,6 +662,8 @@ The most likely FAILs and their implications:
 - **Check 18 (VHDX gate fail-closed).** Production's `Test-NativeBootVirtualTopology` no longer has the v49 patch 2 fail-closed shape (the unfiltered `Get-Disk` enumeration using `-ErrorAction Stop`; the `IsNativeBootVirtual = $true` assignment on the catch path; the indeterminate-topology reason text). This is a source-level assertion, not a machine-tooling check — it means production's source has drifted from the shape the harness asserts against. Update the assertion if the shape has legitimately changed, or restore the fail-closed shape if it was removed by accident; the assertion exists to catch exactly this class of regression. This is not a machine-specific failure — the same FAIL would appear on any machine.
 - **Check 19 (StorageControllerDevices mirror binding).** Production's `Get-StorageControllerDevices` no longer has the unary-comma return (`return ,$result`) or the two software-device filter regexes (`{GUID}\` and `SWD\`) that the harness's mirror of the function depends on. Same reasoning as check 18 — a source-level drift, not a machine-tooling issue. A change to either is a change to the mirror contract that check 17's harness-side test depends on.
 
+- **Check 20 (Test-RunningInVirtualMachine mirror binding).** Production's `Test-RunningInVirtualMachine` no longer has the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, the `IsNullOrWhiteSpace` empty-metadata guard, or the `$combined = "$mfg $mdl"` construction. Same reasoning as checks 18 and 19: a source-level drift, not a machine-tooling issue. A change to any of these breaks the harness's sweep-suppression preview mirror.
+
 ### What a SKIP means
 
 A SKIP means the check could not run in the current context. The reasons:
@@ -641,7 +672,7 @@ A SKIP means the check could not run in the current context. The reasons:
 - **The state it inspects is absent.** WinRE location is empty, no OS partition, no lettered volume to sample, or similar. The check has nothing to inspect.
 - **Zero devices present (Check 17).** The `Get-StorageControllerDevices` enumeration returns an empty array on some VMs (no SCSIAdapter-class devices). A zero-device result is legitimate; the check SKIPs rather than FAILing. The distinction matters: NULL means the enumeration failed (indeterminate), and an empty array means the enumeration succeeded but found nothing (legitimate). The check verifies both cases.
 - **A precondition was not met.** `Test-VmdDrivers` (not a parser check) records SKIP when the Intel CPU generation cannot be parsed, because driver applicability was not evaluated. Option S records SKIP when the VMD query is indeterminate, because the DSI parity verdict cannot be computed from an indeterminate driver-set determination. Check 2b records SKIP when WinRE is Disabled or reagentc suppressed the version line.
-- **Production's source is not adjacent (checks 18 and 19).** Both source-level mirror-binding assertions SKIP when `WinRE.ps1` is not beside `Test-WinRE.ps1`. The SKIP is the correct outcome — the assertion cannot run without the source — and it does not indicate a defect. Place `WinRE.ps1` beside `Test-WinRE.ps1` and re-run to exercise them.
+- **Production's source is not adjacent (checks 18, 19, and 20).** All three source-level mirror-binding assertions SKIP when `WinRE.ps1` is not beside `Test-WinRE.ps1`. The SKIP is the correct outcome — the assertion cannot run without the source — and it does not indicate a defect. Place `WinRE.ps1` beside `Test-WinRE.ps1` and re-run to exercise them.
 
 A SKIP does not indicate a defect.
 
@@ -671,9 +702,9 @@ The BitLocker, target-partition, `ImageState`, Build numbers, storage-controller
 .\scripts\Test-WinRE.ps1 -NonInteractive
 ```
 
-Runs `Invoke-AllRelevant`, prints the summary, exits.
+Runs `Show-SystemDiagnostic`, then `Invoke-AllRelevant`, prints the summary, exits (v38). Before v38, NonInteractive ran only `Invoke-AllRelevant`.
 
-`-NonInteractive` runs the download and extraction tests. It does not run the System Diagnostic (Option 1) or the State file parity check (Option S), so the BitLocker warnings, the target-partition state block, the `ImageState` check, the Build numbers block, the storage-controller block, and the DSI comparison are not printed in this mode. If you need any of those, run the harness interactively and choose Option 1 or Option S.
+`-NonInteractive` runs the full System Diagnostic (Option 1), including the parser self-test and its source-level mirror-binding assertions (checks 18, 19, and 20), and then the download and extraction tests. It does not run the State file parity check (Option S). So the BitLocker warnings, the target-partition state block, the `ImageState` check, the Build numbers block, the storage-controller block, the sweep-suppression preview, and the parser self-test are printed; the DSI comparison is not. If you need the DSI comparison, run the harness interactively and choose Option S.
 
 The exit code is 0 when no FAIL results were recorded, and 1 when at least one FAIL was recorded (v25+). SKIPs do not affect the exit code. The summary remains the authoritative view of what ran. The behavior was introduced in v25 so that CI and cron consumers can treat the harness as a regression gate rather than a reporter.
 
@@ -691,6 +722,7 @@ The harness is deliberately narrow. It does not and cannot test:
 - **The v45 shrink-first pipeline.** The plan, the pre-shrink, the extension path, and the whole-layout assertion are all production-only code paths. See the "v45 destructive-path regression" section below for how they are tested.
 - **The v49 pre-deployment gates.** The source-ownership classification, the never-downgrade storage-driver check, the pre-deployment storage-applicability gate, and the native-boot VHDX fail-closed gate are all production-only. The harness surfaces the *inputs* those gates read — the storage controllers (v28), the source-WIM ownership class is not currently surfaced — but does not exercise the gates themselves. See the "v49 destructive-path coverage" section below.
 - **The v50 patch 2 additions.** The non-OS sweep suppression boundary, the `File Backed Virtual` protection inside the sweep, the classifier diagnostic loop, the `Get-GitHubBaseWinRE` URL-builder fix, and the `SCSI` OS-volume admission are all production-only. Option 1's "Non-OS sweep suppression preview" (v36) mirrors the hypervisor-detection decision the sweep applies and reports every non-OS recovery partition's disposition under the sweep's rules, so an operator can see what production would decide without running production. The preview does not exercise production's sweep.
+- **The v50 patch 3 additions.** The extended manager config trust check (`Test-PathTrustedForSystem` with the split modify-capable mask, applied to the config file itself, its containing directory, and that directory's parent), the resume-script staging design, the Restore resume-task persist condition, the stray-recovery post-deletion verification, the empty archive-parts guard in `Get-GitHubBaseWinRE`, the recovery-volume drive-letter normalization scope and its fail-closed provider-error handling, the volume-root preservation in `Add-ManagerBackupRoot`, the fail-closed workspace volume enumeration in `Get-WorkDirCandidates`, the `Test-PathTrustedForSystem` ACE-catch fail-closed correction and its two mirror syncs (in `Cleanup-Backups.ps1` and the wrapper's compressed inline trust check), the `Invoke-RestoreAction` Restore-failure hash-comparison state invalidation, and the `Cleanup-Backups.ps1` numeric-selection fix are all production-only. The harness surfaces none of them: it does not read the manager config, does not stage the running script, does not touch the recovery-partition sweep, and does not exercise any production partition path. See [SECURITY.md](../SECURITY.md) for the trust model of the config and staging paths.
 
 Those paths are covered by field testing on representative hardware. See the "Field-tested hardware" table in the [README](../README.md).
 
@@ -698,7 +730,7 @@ Those paths are covered by field testing on representative hardware. See the "Fi
 
 The harness shares code paths with production in the download, extraction, and CPU-generation helpers. It is documented in the file's own docstring which functions are "based on" the production versions and which are harness-specific.
 
-Thirteen known differences:
+Fourteen known differences:
 
 - **`Test-VmdDrivers` does not filter on VMD hardware presence.** Production skips manifest entries whose `requiredDevices` do not match anything on the machine. The harness intentionally does not — it validates every OS/CPU-eligible URL and extraction path from a single machine, regardless of installed hardware. This makes the harness a package validator, not a machine-specific compatibility test. As of v17, the harness prints an explicit three-line note before the driver loop explaining this. The state-file parity check (Option S) *does* apply the hardware filter, because it is replicating production's DSI computation and production's DSI includes VMD presence.
 - **The harness does not run production's BitLocker helper functions.** The BitLocker sections in the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and categorize the result for display as hazardous, ambiguous, or safe. Production's `Test-VolumeEncrypted` returns a tri-state ($true / $false / $null); the harness's three-way UI categorization is a display-level view of the same underlying state, not a distinct predicate. The harness does not call `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`. This is intentional: the harness does not exercise production's BitLocker control flow, and a change to that control flow does not require a harness update to remain correct. The v14 update changed the warning text and added the target-partition state block, but did not change the classifier itself.
@@ -713,6 +745,7 @@ Thirteen known differences:
 - **`Architecture` and `LocalInputsId` are reported as of v27.** The harness's hardware-profile helper now carries the same normalized architecture token production's `Get-HardwareObject` produces, and the System Diagnostic renders it with a red banner when the value is anything other than `x64`. This surfaces production's v48 architecture-gate refusal before an operator runs production on a non-x64 host. Option S shows both the computed and the stored `LocalInputsId`, matching production v48 patch 1's offline-fallback input. Neither the architecture token nor `LocalInputsId` enters the harness's DSI computation — matching production, where they are gate inputs rather than `DesiredStateId` components.
 - **The storage-controller enumeration and VMD diagnostic are aligned with production as of v28.** `Get-StorageControllerDevices` mirrors production v49's SCSIAdapter-class enumeration, including the software-device filter (`{GUID}\` and `SWD\` prefixes skipped). The Option 1 diagnostic surfaces the machine's controller IDs, the manifest's VMD patterns, and the ASUS-shape advisory. The harness does not run the pre-deployment storage-applicability gate itself — that is a production-only check immediately before the WIM is written to the active route — but it gives the operator the same inputs production's gate reads, so a mismatch that would cause production to refuse the candidate is visible before the run.
 - **The harness does not exercise the v49 pre-deployment gates.** The source-ownership classification, the never-downgrade storage-driver check, the pre-deployment storage-applicability gate, and the native-boot VHDX fail-closed gate are all production-only. The harness surfaces the storage controllers (v28) that the applicability gate reads; it does not classify the source WIM, does not compare driver versions, and does not check the OS volume topology.
+- **The harness writes a run log under `%TEMP%` as of v38.** Every `Say` / `Rule` / `Write-Diag` / `Write-KV` / `Write-WarningBanner` call and every `Record` call appends to `%TEMP%\WinRE-TestHarness.log`. Production does not write a per-run log under `%TEMP%`; it writes to `C:\ProgramData\OEM\Logs\WinRE-Manager.log` via `Write-Log`. The two logs are different files with different lifecycles: the harness log is overwritten at the start of each run and lives under `%TEMP%`; the production log is append-only and lives under `ProgramData`. The harness does not write to the production log and production does not write to the harness log.
 
 The harness has no mirror of the v45 shrink-first pipeline. Option 1 and Option S report the machine's current state and the DSI comparison, but they do not simulate the plan, the pre-shrink, the extension path, or the whole-layout assertion. That is by design: those paths are destructive and cannot be simulated read-only.
 
@@ -762,8 +795,8 @@ The v49 release introduces several pre-deployment gates, post-run persistence fe
 - **Pre-deployment storage-applicability gate.** Unexercised in the field — it has never fired. This gate is the last refusal before the WIM is written to the active route: every present SCSIAdapter-class device on the machine must have at least one INF in the candidate whose `HardwareID` or `CompatibleID` prefix-matches one of the device's IDs. The test shape: a VM whose controller is deliberately absent from the manifest's VMD patterns and from the OEM pack's INFs, and a candidate image prepared from the manifest. Confirm the gate refuses the candidate, the run exits `EXIT_WARNING`, and the log names the candidate image path, the machine's storage controllers, and the fact that no INF matched. This is the highest-signal v49 test because the gate has never fired in the field.
 - **Native-boot VHDX fail-closed gate.** Unexercised on VHDX-boot hardware. The test shape: a Windows VM booted from a native VHDX rather than a physical or pass-through volume. Confirm the gate refuses before any destructive operation and the run exits `EXIT_WARNING` with the topology-named refusal. Confirm the log line names the VHDX topology and the specific operations the manager does not support under it.
 - **Backup action.** Exercised on the clean path by the wrapper. The failure branches (a source-WIM read error, a destination-write error, a copy hash mismatch, a drive-letter exhaustion) have not been exercised. Test each against a VM: mock the source read to fail, mock the destination write to fail, tamper with the copy to cause a hash mismatch, and exhaust drive letters. Confirm the run exits with a non-zero code, the machine state is unchanged, and the log names the specific failure point.
-- **Restore action.** Exercised on the clean path by the wrapper. The two mid-transformation failure paths (`/setreimage` failing after the WIM has been replaced, `/enable` returning failed/bitlocker after the WIM is in place) have not been exercised. Test both against a VM: mock `/setreimage` to return non-zero after the WIM has been written, and mock `/enable` to return a terminal failure after the WIM is in place. Confirm in each case that the resume task's persist flag is set, that the transactional helper leaves the machine's previous WIM in place (either by completing the rollback or by reporting a rollback-restore failure), and that the machine's end state matches one of the two documented outcomes.
-- **Temporary resume task persist triggers.** Exercised on the clean-completion path only — the task is registered and then deleted. The five interruption classes (outer catch, Ctrl+C, the two restore failure paths, hard kill, reboot) have not been exercised. The Ctrl+C trigger is the load-bearing one and is high-signal. Test each: force an unhandled exception, send Ctrl+C during a run, invoke the two restore failure paths above, kill the PowerShell process mid-run (`Stop-Process -Force`), and reboot the VM mid-run. Confirm in each case that the resume task is preserved, that it fires on the next boot (or within the hour), and that the resume run completes the interrupted operation.
+- **Restore action.** Exercised on the clean path by the wrapper. The three mid-transformation failure paths - the WIM-deployment failure when the re-enable attempt after the failure does not return `ok` (v50 patch 3), `/setreimage` failing after the WIM has been replaced, and `/enable` returning failed/bitlocker after the WIM is in place - have not been exercised. Test each against a VM: mock the transactional helper's copy to fail and the follow-up re-enable to return non-`ok`, mock `/setreimage` to return non-zero after the WIM has been written, and mock `/enable` to return a terminal failure after the WIM is in place. Confirm in each case that the resume task's persist flag is set, that the transactional helper leaves the machine's previous WIM in place (either by completing the rollback or by reporting a rollback-restore failure), and that the machine's end state matches one of the two documented outcomes. For the WIM-deployment failure path specifically, the v50 patch 3 follow-up adds a hash-comparison step: the branch captures the target WIM's SHA256 before the deploy attempt and again after the failure, and either preserves the state file, checkpoint, and deferral marker (when the two hashes match, so the target is provably unchanged) or invalidates them and sets the resume-task persist flag unconditionally (when the two hashes differ, or either hash is unavailable). The test should exercise both outcomes: mock the failure so the transactional helper leaves the target unchanged, and confirm the three markers survive; then mock the failure so the target ends up different or unreadable, and confirm the markers are invalidated and the persist flag is set.
+- **Temporary resume task persist triggers.** Exercised on the clean-completion path only — the task is registered and then deleted. The six interruption classes (outer catch, Ctrl+C, the three restore failure paths, hard kill, reboot) have not been exercised. The Ctrl+C trigger is the load-bearing one and is high-signal. Test each: force an unhandled exception, send Ctrl+C during a run, invoke the three restore failure paths above, kill the PowerShell process mid-run (`Stop-Process -Force`), and reboot the VM mid-run. Confirm in each case that the resume task is preserved, that it fires on the next boot (or within the hour), and that the resume run completes the interrupted operation.
 - **Stable install location and copy-hash verification.** Exercised on the clean path by the wrapper. The copy-hash mismatch refusal branch has not been exercised. Test by mocking the copy to introduce a byte discrepancy (or by racing an AV/EDR product that alters the copy in place). Confirm the install step refuses to register the task, the log names the source and destination hashes, and the installed copy is left in place.
 
 Each of these tests should be recorded with the same data the v45 / v46 tests record: the VM setup, the branch that fired (with the log line), the machine's end state, the exit code, and any divergence from the documented behavior.

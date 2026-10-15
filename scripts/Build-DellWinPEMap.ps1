@@ -190,6 +190,11 @@ if ($allSorted.Count -gt 0) {
     Write-T "Current alias: $($newest.Name) (generation $newestGen)" -L SUCCESS
 }
 
+if ($jsonPacks.Count -le 0) {
+    Write-T "Generated Dell map is empty - refusing to publish" -L ERROR
+    throw "Generated Dell map is empty"
+}
+
 $output = @{
     Generated = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
     Count     = $jsonPacks.Count

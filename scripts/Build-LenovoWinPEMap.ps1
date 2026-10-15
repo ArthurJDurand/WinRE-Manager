@@ -86,12 +86,30 @@ if (Test-Path -LiteralPath $WorkDir) {
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 
 if (-not (Test-Path $CiExe)) {
-    Write-T "Downloading curl-impersonate ..." -L INFO
+    Write-T "Resolving latest curl-impersonate release ..." -L INFO
     if (Test-Path $ArchiveDir) { Remove-Item $ArchiveDir -Recurse -Force }
     New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null
     $tarball = Join-Path $ArchiveDir "ci.tar.gz"
     try {
-        Invoke-WebRequest -Uri "https://github.com/lexiforest/curl-impersonate/releases/download/v2.2.3/curl-impersonate-v2.2.3.i686-win32.tar.gz" -OutFile $tarball -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        # Trust model (documented in SECURITY.md): the curl-impersonate
+        # release artifact is resolved via the GitHub Releases API rather
+        # than pinned to a specific version. GitHub enforces 2FA on the
+        # release owner account and serves release assets from
+        # github.com / objects.githubusercontent.com. A pinned SHA256
+        # would be stronger but requires manual maintenance across
+        # releases; the project chose to consume the release endpoint
+        # directly and records this choice in SECURITY.md.
+        $apiHeaders = @{ 'User-Agent' = 'WinRE-Manager-Build'; 'Accept' = 'application/vnd.github+json' }
+        $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/lexiforest/curl-impersonate/releases/latest" -Headers $apiHeaders -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
+        $asset = @($latest.assets) | Where-Object { $_.name -match '\.i686-win32\.tar\.gz$' } | Select-Object -First 1
+        if (-not $asset -or -not $asset.browser_download_url) { throw "No i686-win32.tar.gz asset in latest curl-impersonate release" }
+        $downloadUrl = [string]$asset.browser_download_url
+        $parsed = [System.Uri]$downloadUrl
+        if ($parsed.Host -notin @('github.com','objects.githubusercontent.com','codeload.github.com')) {
+            throw "Unexpected download host: $($parsed.Host)"
+        }
+        Write-T "Latest curl-impersonate: $($latest.tag_name) -> $downloadUrl" -L INFO
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tarball -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
         $7z = "C:\Program Files\7-Zip\7z.exe"
         if (Test-Path $7z) {
             & $7z x $tarball -o"$ArchiveDir" -y 2>&1 | Out-Null
