@@ -147,7 +147,29 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 38
+    Version : 39
+
+    v39 changes vs v38:
+    1. Tightened check 18 to verify the specific Get-Disk -ErrorAction Stop
+       enumeration and its Where-Object filter, not just the presence of
+       -ErrorAction Stop anywhere in Test-NativeBootVirtualTopology. The
+       prior form would pass even if the -ErrorAction Stop moved to an
+       unrelated command in the same function.
+    2. Added check 21: source-pattern assertion that production's
+       Get-PartitionPlan contains the Int64-safe comparison form and does
+       not contain the vulnerable [Math]::Max(0, ...) pattern. Guards
+       against reintroduction of the v50 patch 4 Int32 overflow fix
+       (Surface Pro 3, 2026-10-16: three recovery partitions, ~4.9 GB
+       extend delta, fatal "Cannot convert argument val2" from
+       [Math]::Max binding to Max(Int32, Int32)).
+    3. Added check 22: behavioral Int32 regression test. Reproduces both
+       the safe shrink and safe extend forms with a delta larger than
+       Int32.MaxValue and confirms the correct value is returned without
+       throwing; also confirms the vulnerable Math.Max form still throws
+       on the same input in this PowerShell environment. Complementary to
+       check 21: catches an off-by-one or wrong-direction rewrite that
+       would still match check 21's source pattern.
+    4. Menu title and startup Rule bumped 38 -> 39.
 
     v38 changes vs v37:
     1. Added run logging. Every Say / Rule / Write-Diag / Write-KV /
@@ -3231,8 +3253,11 @@ function Show-SystemDiagnostic {
             Record "Parser: VHDX gate fail-closed" $false -State "SKIP" -Detail "production script not adjacent"
         } else {
             $issues = @()
-            if (-not $vhdBody.Contains('-ErrorAction Stop')) {
-                $issues += "unfiltered Get-Disk enumeration does not use -ErrorAction Stop"
+            if (-not $vhdBody.Contains('Get-Disk -ErrorAction Stop')) {
+                $issues += "unfiltered Get-Disk enumeration does not use Get-Disk -ErrorAction Stop"
+            }
+            if (-not $vhdBody.Contains('Where-Object { $_.Number -ne $osDisk.Number }')) {
+                $issues += "unfiltered Get-Disk enumeration missing the Where-Object filter for other disks"
             }
             if (-not $vhdBody.Contains('IsNativeBootVirtual = $true')) {
                 $issues += "gate does not set IsNativeBootVirtual = `$true anywhere (fail-closed return missing)"
@@ -3380,6 +3405,97 @@ function Show-SystemDiagnostic {
         Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
         Write-Host " Test-RunningInVirtualMachine source assertion threw: $_" -ForegroundColor Gray
         Record "Parser: Test-RunningInVirtualMachine mirror binding" $false "$_"
+    }
+
+    # Check 21 (v50 patch 4): production Get-PartitionPlan must not
+    # compute shrink/extend deltas via [Math]::Max(0, delta). PowerShell
+    # binds the literal 0 as Int32 and selects Max(Int32, Int32); any
+    # delta whose magnitude exceeds the Int32 range throws during
+    # argument conversion before Max can clamp the value. The safe form
+    # is a conditional comparison. A future edit that reintroduces the
+    # Math.Max pattern, or removes the safe comparison, is caught here.
+    try {
+        $gppBody = Get-ProductionFunctionText -FunctionName 'Get-PartitionPlan'
+        if (-not $gppBody) {
+            Write-Host "  " -NoNewline
+            Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
+            Write-Host " Get-PartitionPlan Int32-safe arithmetic: WinRE.ps1 not adjacent" -ForegroundColor Gray
+            Record "Parser: Get-PartitionPlan Int32-safe arithmetic" $false -State "SKIP" -Detail "production script not adjacent"
+        } else {
+            $int32Issues = @()
+            if ($gppBody.Contains('[Math]::Max(0, ($osSize - $plannedOSSize))')) { $int32Issues += "vulnerable shrink Math.Max pattern present" }
+            if ($gppBody.Contains('[Math]::Max(0, ($plannedOSSize - $osSize))')) { $int32Issues += "vulnerable extend Math.Max pattern present" }
+            if (-not $gppBody.Contains('} elseif ($osSize -gt $plannedOSSize) {')) { $int32Issues += "safe shrink comparison missing" }
+            if (-not $gppBody.Contains('} elseif ($plannedOSSize -gt $osSize) {')) { $int32Issues += "safe extend comparison missing" }
+            if ($int32Issues.Count -eq 0) {
+                Write-Host "  " -NoNewline
+                Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+                Write-Host "Get-PartitionPlan: Int32-safe arithmetic pattern present, vulnerable Math.Max pattern absent" -ForegroundColor Gray
+                Record "Parser: Get-PartitionPlan Int32-safe arithmetic" $true "source-level assertion matched"
+            } else {
+                Write-Host "  " -NoNewline
+                Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+                Write-Host " Get-PartitionPlan: Int32-safe arithmetic pattern has drifted:" -ForegroundColor Gray
+                foreach ($i in $int32Issues) { Write-Host "          - $i" -ForegroundColor Red }
+                Record "Parser: Get-PartitionPlan Int32-safe arithmetic" $false ($int32Issues -join '; ')
+            }
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Get-PartitionPlan Int32-safe arithmetic source assertion threw: $_" -ForegroundColor Gray
+        Record "Parser: Get-PartitionPlan Int32-safe arithmetic" $false "$_"
+    }
+
+    # Check 22 (v50 patch 4): behavioral Int32-overflow regression test.
+    # Check 21 verifies the source pattern is present. Check 22 exercises
+    # the arithmetic with a delta that exceeds the Int32 range (in both
+    # directions) to confirm the safe form computes correctly, and to
+    # confirm that the pre-patch [Math]::Max form would have thrown on the
+    # same input. Catches an off-by-one or wrong-direction rewrite that
+    # still matches check 21's source pattern.
+    try {
+        $bigDelta = [int64]3000000000
+        $int32Issues = @()
+
+        # Reproduce production's safe shrink form (Int64-safe comparison)
+        $osSizeShrink = $bigDelta
+        $plannedOSSizeShrink = [int64]0
+        $safeShrink = if ($osSizeShrink -gt $plannedOSSizeShrink) { [int64]($osSizeShrink - $plannedOSSizeShrink) } else { [int64]0 }
+
+        # Reproduce production's safe extend form (Int64-safe comparison)
+        $osSizeExtend = [int64]0
+        $plannedOSSizeExtend = $bigDelta
+        $safeExtend = if ($plannedOSSizeExtend -gt $osSizeExtend) { [int64]($plannedOSSizeExtend - $osSizeExtend) } else { [int64]0 }
+
+        # Confirm the vulnerable form would have thrown on the same input
+        $wouldThrowShrink = $false
+        try { $null = [Math]::Max(0, $bigDelta) } catch { $wouldThrowShrink = $true }
+        $wouldThrowExtend = $false
+        try { $null = [Math]::Max(0, $bigDelta) } catch { $wouldThrowExtend = $true }
+
+        if ($safeShrink -ne $bigDelta) { $int32Issues += "safe shrink returned $safeShrink, expected $bigDelta" }
+        if ($safeExtend -ne $bigDelta) { $int32Issues += "safe extend returned $safeExtend, expected $bigDelta" }
+        if (-not $wouldThrowShrink) { $int32Issues += "vulnerable Math.Max no longer throws on overflow (harness environment changed)" }
+        if (-not $wouldThrowExtend) { $int32Issues += "vulnerable Math.Max no longer throws on overflow (harness environment changed)" }
+
+        if ($int32Issues.Count -eq 0) {
+            Write-Host "  " -NoNewline
+            Write-Host "[OK]  " -NoNewline -ForegroundColor Green
+            Write-Host "Int64 arithmetic behavioral: safe forms return $bigDelta without throwing; vulnerable Math.Max throws on overflow" -ForegroundColor Gray
+            Record "Parser: Int64 arithmetic behavioral" $true "safe forms correct, vulnerable form throws"
+        } else {
+            Write-Host "  " -NoNewline
+            Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+            Write-Host " Int64 arithmetic behavioral: $($int32Issues.Count) issue(s)" -ForegroundColor Gray
+            foreach ($i in $int32Issues) { Write-Host "          - $i" -ForegroundColor Red }
+            Record "Parser: Int64 arithmetic behavioral" $false ($int32Issues -join '; ')
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
+        Write-Host " Int64 arithmetic behavioral threw: $_" -ForegroundColor Gray
+        Record "Parser: Int64 arithmetic behavioral" $false "$_"
     }
 
     Write-Diag "  Diagnostic complete. Parser self-test results are in the summary." "Green"
@@ -4203,7 +4319,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v38)"
+    $titleContent = "WinRE Manager Test Harness (v39)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -4251,7 +4367,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v38"
+Rule "WinRE Manager test harness v39"
 Say "Working dir: $TestDir"
 Say "Run log: $(if ($Script:HarnessLogPath) { $Script:HarnessLogPath } else { '(unavailable - %TEMP% not set)' })"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {

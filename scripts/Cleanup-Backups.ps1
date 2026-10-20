@@ -158,6 +158,7 @@ function Test-PathTrustedForSystem {
     }
     foreach ($ace in $acl.Access) {
         if ($ace.AccessControlType -ne 'Allow') { continue }
+        if (($ace.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
         $aceSid = $null
         try {
             $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value

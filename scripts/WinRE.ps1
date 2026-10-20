@@ -3,7 +3,7 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 50.3 (v50 patch 3)
+    Version : 50.4 (v50 patch 4)
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -320,8 +320,10 @@
                 and re-enable. It is a crash-recovery hook, not a
                 retry-until-success mechanism: a clean exit deletes
                 the task and leaves the state file to govern the
-                next scheduled run, except for the three Restore
-                mid-transformation paths noted above.
+                next scheduled run, except for the mid-transformation
+                failure paths noted below (the three original Restore
+                paths, twelve full-update exits added in v50 patch 4,
+                and the Step 5 fail-closed guard).
                 Registration failure
                 is a non-fatal warning in the log and a
                 ChangesNotMade line in the run summary; it does not
@@ -334,6 +336,27 @@
                 executes a staged copy of the running script (see
                 Resume-script staging below), not the script's
                 original path.
+
+            - Resume-task lifecycle hardening (v50 patch 4). Twelve
+                additional full-update failure exits set
+                $Script:ResumeTaskShouldPersist = $true. The invariant:
+                when the full-update operation has changed recovery
+                state and the script cannot positively verify an
+                acceptable final recovery route, the resume task must
+                not be unregistered. Two script-scope flags track
+                staging safety: $Script:ResumeStagingTaskInvalid (set
+                at entry to the staging touch-region, so any subsequent
+                failure leaves an existing task pointing at a missing,
+                partial, or untrusted script; cleared only on a
+                verified staged copy) and
+                $Script:ResumeTaskCompromiseUnresolved (set only when
+                the invalid flag is set AND removal of the existing
+                task cannot be positively confirmed via
+                Get-ScheduledTask enumeration). Main exits FATAL when
+                the compromise flag is set, before any destructive
+                repair work. Registration failure on an otherwise-safe
+                staging path preserves the verified staged copy so a
+                prior task is not orphaned.
 
             - Fail-closed principle (v49 patch 2). A safety check that
                 cannot complete is never interpreted as a safe result.
@@ -353,6 +376,27 @@
                 from "enumeration failed"). Each site was fixed to fail
                 closed independently, and the principle is stated here
                 so future guards are written against it from the start.
+                A fifth instance of the same class was found and closed
+                in v50 patch 4: the Step 5 deployment site had no else
+                branch, so an Unknown status skipped the disable block
+                and reached deployment. That site now fails closed.
+
+            - Partition-plan size arithmetic (v50 patch 4). Never call
+                [Math]::Max or [Math]::Min with mixed Int32/Int64
+                arguments in size arithmetic. PowerShell resolves
+                Max(0, $x) against Max(Int32, Int32) because the
+                literal 0 binds as Int32, then converts $x to Int32
+                for the val2 parameter, which throws before Max runs
+                when $x is outside the Int32 range (~+/-2.1 GB). The
+                field failure: Surface Pro 3, 2026-10-16, three
+                type-coded recovery partitions on disk 0, ~4.9 GB
+                extend delta, fatal at Get-PartitionPlan with
+                'Cannot convert argument "val2", with value
+                "-5262802944", for "Max" to type "System.Int32"'.
+                Every subsequent invocation crashed identically,
+                defeating the self-healing resume task. Use explicit
+                -gt / -lt comparisons with [int64] casts on both
+                sides.
 
             - Manager config trust gate (v50; extended v50
                 patch 3). The single durable machine-wide config
@@ -389,6 +433,22 @@
                 never causes a Restore or Cleanup to assume a root
                 exists. Writes are atomic via Write-FileAtomically.
 
+            - Trust-check InheritOnly and three-copy invariant (v50
+                patch 4). Test-PathTrustedForSystem skips InheritOnly
+                ACEs; those apply only to children, not to the object
+                being checked. The stock ProgramData hierarchy carries
+                an inherited CREATOR OWNER ACE with InheritOnly;
+                treating it as effective on the object itself is a
+                false-positive source. CREATOR OWNER (S-1-3-0) and
+                CREATOR GROUP (S-1-3-1) are deliberately NOT added to
+                the trusted SID list - the fix is to skip ACEs that do
+                not apply, not to trust their principals generally.
+                The identical logic exists in three copies: WinRE.ps1's
+                Test-PathTrustedForSystem, Cleanup-Backups.ps1's local
+                copy, and the inline _T helper inside WinRE-Manager.cmd's
+                RESTORE TARGET_COMMAND. Any future change to this
+                logic must land in all three.
+
             - Resume-script staging (v50 patch 3). The crash-
                 recovery resume task runs as SYSTEM. Rather than
                 registering the task against the running script's
@@ -419,6 +479,24 @@
                 running script before this elevated process stages
                 it - is not a new exposure: the process is already
                 executing that script elevated.
+                v50 patch 4 adds two further staging properties.
+                (a) Staging cleanup never runs Remove-Item -Recurse on
+                the tree: Remove-StagingDirectorySafely enumerates
+                expected children, refuses unexpected content and
+                reparse points, and deletes only expected files
+                individually before removing the now-empty directory.
+                PS 5.1's recursive delete can follow NTFS junctions,
+                so a junction substituted for the staging directory
+                could delete an attacker-chosen target such as
+                C:\Windows\System32. (b) A warn-only parent-chain
+                trust check logs when C:\Recovery\OEM or C:\Recovery
+                fails the SYSTEM trust policy, but does not refuse
+                registration; a strict check would disable self-
+                healing on machines where the parent ACL is imperfect.
+                The residual risk - a local user with Modify access on
+                the parent chain can replace the staged directory
+                between task registration and task execution - is
+                documented rather than closed.
 
             - Empty-parent cleanup (v50). After workspace cleanup,
                 Remove-EmptyWorkspaceParent removes the now-empty
@@ -588,7 +666,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 50
-$ScriptPatchLevel = "3"
+$ScriptPatchLevel = "4"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -728,12 +806,17 @@ $Script:ForeignSourceAcceptedHash = $null
 # dispatcher (so an interrupted Restore is recoverable), and before
 # hardware detection. Deleted in the finally block on a clean
 # terminal exit unless a persist signal fired: either this flag
-# was set (by the outer catch on an unhandled exception, or by
-# Invoke-RestoreAction's three mid-transformation failure paths -
-# /setreimage failing after the WIM was replaced, /enable
-# returning failed/bitlocker after the WIM was in place, or the
-# v50 patch 3 WIM-deployment failure path where the re-enable
-# attempt after a failed deploy did not return 'ok'), or the
+# was set (by the outer catch on an unhandled exception; by any of
+# the following mid-transformation failure paths:
+# Invoke-RestoreAction's three v49 patch 1 paths (/setreimage
+# after WIM replacement, /enable returning failed/bitlocker, or
+# the v50 patch 3 WIM-deployment failure path where re-enable did
+# not return 'ok'); the twelve full-update exits added in v50
+# patch 4 (WIM deployment, setreimage, terminal enable, three
+# Restore-PreviousWinRERoute failures inside
+# Ensure-AdequateRecoveryPartition, five final-verification exits,
+# and the OS-fallback encryption cascade); or the Step 5
+# fail-closed guard introduced in v50 patch 4), or the
 # C# Ctrl+C probe's static field was set (a compiled
 # ConsoleCancelKeyPress delegate; PowerShell runs finally blocks
 # but bypasses catch blocks on Ctrl+C, so a compiled delegate is
@@ -747,6 +830,8 @@ $Script:ForeignSourceAcceptedHash = $null
 $Script:ResumeTaskName          = "WinRE Manager - Resume"
 $Script:ResumeTaskCreated       = $false
 $Script:ResumeTaskShouldPersist = $false
+$Script:ResumeStagingTaskInvalid = $false
+$Script:ResumeTaskCompromiseUnresolved = $false
 
 # v49: persistent lineage identifier carried through the state file
 # and embedded in the provenance marker. Populated from state on
@@ -1223,6 +1308,46 @@ function Test-NativeBootVirtualTopology {
 # process stages it - is not a new exposure: the process is
 # already executing that script elevated.
 
+# v50 patch 4 lifecycle hardening. Two script-scope flags track
+# staging safety: $Script:ResumeStagingTaskInvalid (set when staging
+# has been touched and any subsequent failure could leave an existing
+# task pointing at a missing, partial, or untrusted script) and
+# $Script:ResumeTaskCompromiseUnresolved (set when the invalid flag
+# is set AND removal of the existing task cannot be positively
+# confirmed). Main exits FATAL when the compromise flag is set,
+# before destructive repair work.
+
+# v50 patch 4: safe staging-directory cleanup helper.
+# Deletes only expected files individually (no recursive Remove-Item).
+# Returns $true only when the path is absent OR cleanup completes
+# cleanly. Returns $false on any refusal or failure.
+function Remove-StagingDirectorySafely {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedLeafName
+    )
+    if (-not $Path) { return $false }
+    if ($Path -match '^[A-Za-z]:\\?$') { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $item = $null
+    try { $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { return $false }
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    if (-not $item.PSIsContainer) { return $false }
+    $children = @()
+    try { $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) } catch { return $false }
+    foreach ($c in $children) {
+        if (($c.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        if ($c.PSIsContainer) { return $false }
+        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($c.Name, $ExpectedLeafName)) { return $false }
+    }
+    foreach ($c in $children) {
+        try { Remove-Item -LiteralPath $c.FullName -Force -ErrorAction Stop } catch { return $false }
+    }
+    try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { return $false }
+    return $true
+}
+
 # --- Resume-script staging (v50 patch 3) ---
 
 # Create the staging directory with an explicit DACL (SYSTEM and
@@ -1249,6 +1374,25 @@ function Initialize-ResumeScriptStaging {
         [Parameter(Mandatory)][string]$StagedScriptPath
     )
 
+    # v50 patch 4: warn-only parent-chain trust check.
+    # A local user with write access to the parent chain could replace
+    # the staged directory between task registration and task execution.
+    # We do not refuse registration here because that would remove self-
+    # healing on machines where the parent ACL is imperfect. We log the
+    # residual risk so an operator can secure the parent chain if that
+    # threat model applies.
+    $parentChain = @(
+        (Split-Path -Path $StagedDir -Parent),
+        (Split-Path -Path (Split-Path -Path $StagedDir -Parent) -Parent)
+    )
+    foreach ($anc in $parentChain) {
+        if (-not $anc) { continue }
+        if (-not (Test-Path -LiteralPath $anc -PathType Container)) { continue }
+        if (-not (Test-PathTrustedForSystem -Path $anc -Kind 'Directory')) {
+            Write-Log "Resume-script staging: parent directory '$anc' does not satisfy the SYSTEM trust policy. The resume task will still register; this is a warning, not a refusal. Residual risk: a local user with write access to this parent could replace the staged directory between task registration and task execution. To fully close that class, secure the parent chain with a policy-appropriate ACL." -Level WARN
+        }
+    }
+
     $srcFull = $null; $dstFull = $null
     try { $srcFull = [System.IO.Path]::GetFullPath($SourceScriptPath) } catch { }
     try { $dstFull = [System.IO.Path]::GetFullPath($StagedScriptPath) } catch { }
@@ -1265,17 +1409,25 @@ function Initialize-ResumeScriptStaging {
             return $StagedScriptPath
         }
         Write-Log "Resume-script staging: running from $StagedScriptPath but the file or its directory is not trusted - refusing to register the resume task" -Level WARN
+        $Script:ResumeStagingTaskInvalid = $true
         return $null
     }
+
+    # v50 patch 4: from this point on, the existing staging directory may
+    # be modified or removed. Any subsequent failure leaves an existing
+    # resume task pointing at a missing, partial, or untrusted script.
+    # Set the invalid-target flag now; clear it only when a verified
+    # staged copy is returned successfully.
+    $Script:ResumeStagingTaskInvalid = $true
 
     # Clear any stale staging directory from a previous interrupted
     # run. Delete-and-recreate so the DACL is applied from scratch
     # and no attacker-planted content survives.
-    if (Test-Path -LiteralPath $StagedDir -PathType Container) {
-        try {
-            Remove-Item -LiteralPath $StagedDir -Force -Recurse -ErrorAction Stop
-        } catch {
-            Write-Log "Resume-script staging: could not clear stale staging directory ${StagedDir}: $_" -Level WARN
+    if (Test-Path -LiteralPath $StagedDir) {
+        $expectedLeaf = 'WinRE.ps1'
+        try { $expectedLeaf = (Split-Path -Path $StagedScriptPath -Leaf) } catch { }
+        if (-not (Remove-StagingDirectorySafely -Path $StagedDir -ExpectedLeafName $expectedLeaf)) {
+            Write-Log "Resume-script staging: could not safely clear stale staging directory ${StagedDir} (unexpected contents, reparse point, non-directory path, or removal failure) - refusing to register the resume task" -Level WARN
             return $null
         }
     }
@@ -1344,6 +1496,7 @@ function Initialize-ResumeScriptStaging {
         return $null
     }
 
+    $Script:ResumeStagingTaskInvalid = $false
     Write-Log "Resume-script staging: staged $SourceScriptPath -> $StagedScriptPath (SHA256=$dstHash)"
     return $StagedScriptPath
 }
@@ -1357,12 +1510,13 @@ function Initialize-ResumeScriptStaging {
 function Remove-ResumeScriptStaging {
     param([Parameter(Mandatory)][string]$StagedDir)
     if (-not $StagedDir) { return }
-    if (-not (Test-Path -LiteralPath $StagedDir -PathType Container)) { return }
-    try {
-        Remove-Item -LiteralPath $StagedDir -Force -Recurse -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $StagedDir)) { return }
+    $expectedLeaf = 'WinRE.ps1'
+    try { $expectedLeaf = (Split-Path -Path $ResumeStagedScriptPath -Leaf) } catch { }
+    if (Remove-StagingDirectorySafely -Path $StagedDir -ExpectedLeafName $expectedLeaf) {
         Write-Log "Removed resume-script staging directory: $StagedDir"
-    } catch {
-        Write-Log "Could not remove resume-script staging directory ${StagedDir}: $_ - it will be cleared on the next run" -Level WARN
+    } else {
+        Write-Log "Could not safely remove resume-script staging directory ${StagedDir} (unexpected contents, reparse point, non-directory path, or removal failure) - it will be left in place" -Level WARN
     }
 }
 
@@ -1393,6 +1547,38 @@ function Register-ResumeTask {
                     -StagedDir $ResumeStagedDir -StagedScriptPath $ResumeStagedScriptPath
     if (-not $stagedPath) {
         Write-Log "Register-ResumeTask: could not stage the running script to a trusted location. Skipping the temporary resume task; the repair pipeline itself is unaffected." -Level WARN
+        if ($Script:ResumeStagingTaskInvalid) {
+            # Staging may have left the target of an existing task missing,
+            # partial, or untrusted. Attempt removal and positively verify
+            # absence. Every uncertain outcome fails closed via
+            # $Script:ResumeTaskCompromiseUnresolved; the main pipeline
+            # then aborts rather than continue with an unverified SYSTEM
+            # task potentially registered against unsafe content.
+            $attemptedRemove = $false
+            try {
+                Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false -ErrorAction Stop
+                $attemptedRemove = $true
+            } catch {
+                # Either the task was absent, or removal failed. The
+                # verification pass below distinguishes the two.
+            }
+            try {
+                $allTasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop)
+                $stillPresent = @($allTasks | Where-Object { $_.TaskName -eq $TaskName }).Count -gt 0
+                if ($stillPresent) {
+                    $Script:ResumeTaskCompromiseUnresolved = $true
+                    Write-Log "Existing '$TaskName' task is still present after remove attempt - cannot confirm absence; refusing to proceed" -Level ERROR
+                } elseif ($attemptedRemove) {
+                    Write-Log "Removed existing '$TaskName' task because the staging path is not verifiable as safe" -Level WARN
+                    Add-RunSummaryLine -Field 'ChangesMade' -Line "Removed existing '$TaskName' task (staging path not verifiable as safe)"
+                } else {
+                    Write-Log "Staging path is not verifiable as safe, but no existing '$TaskName' task was found to remove" -Level WARN
+                }
+            } catch {
+                $Script:ResumeTaskCompromiseUnresolved = $true
+                Write-Log "Cannot enumerate scheduled tasks to verify whether '$TaskName' remains registered: $_ - refusing to proceed" -Level ERROR
+            }
+        }
         Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Temporary resume task not registered: script could not be staged to a trusted location.'
         return $false
     }
@@ -1444,9 +1630,11 @@ function Register-ResumeTask {
     } catch {
         Write-Log "Could not register the temporary resume task '$TaskName': $_ - the repair pipeline will proceed without self-healing" -Level WARN
         Add-RunSummaryLine -Field 'ChangesNotMade' -Line "Temporary resume task not registered: $($_.Exception.Message)"
-        # Registration failed; the staged copy has no referent, so
-        # remove it rather than leave it orphaned.
-        Remove-ResumeScriptStaging -StagedDir $ResumeStagedDir
+        # v50 patch 4: preserve the verified staged copy on registration
+        # failure. A -Force registration failure can leave a prior task in
+        # place; deleting its target would orphan it. The next run's safe
+        # cleanup handles any leftover staging directory that is not in use.
+        Write-Log "Registration failed; preserving verified staged copy at $ResumeStagedScriptPath so that any existing task is not orphaned. The next run will clear unused staging." -Level INFO
         return $false
     }
 }
@@ -2194,6 +2382,13 @@ function Test-RunningInVirtualMachine {
 # indeterminate), and non-OS disks reported as File Backed Virtual are
 # preserved individually. See Test-RunningInVirtualMachine and the
 # in-function comments below. The OS-disk repair path is unaffected.
+#
+# v50 patch 4 bus-type scoping: the sweep targets internal disks only.
+# Non-OS disks whose BusType is not in $InternalWorkspaceBusTypes are
+# preserved individually (USB, SD/MMC, iSCSI, Fibre Channel, unknown).
+# The File Backed Virtual exclusion is retained. The allowlist matches
+# the workspace selector's; the destructive sweep and the workspace
+# selector now have symmetric internal-disk scoping.
 function Remove-StrayRecoveryPartitions {
     param([Parameter(Mandatory)][int]$OSDiskNumber)
 
@@ -2218,6 +2413,7 @@ function Remove-StrayRecoveryPartitions {
     $wouldDeleteList      = [System.Collections.Generic.List[string]]::new()
     $preservedOversized   = [System.Collections.Generic.List[string]]::new()
     $preservedVirtual     = [System.Collections.Generic.List[string]]::new()
+    $preservedUnsupportedBus = [System.Collections.Generic.List[string]]::new()
     $skippedNonTyped      = [System.Collections.Generic.List[string]]::new()
     $failedToDelete       = [System.Collections.Generic.List[string]]::new()
 
@@ -2230,6 +2426,13 @@ function Remove-StrayRecoveryPartitions {
         if ([string]$disk.BusType -eq 'File Backed Virtual') {
             Write-Log "Stray-recovery cleanup: preserving File Backed Virtual (mounted VHD/VHDX) disk $($disk.Number) - a mounted virtual disk may contain another installation's recovery environment" -Level WARN
             $preservedVirtual.Add("disk $($disk.Number)") | Out-Null
+            continue
+        }
+        $busType = ''
+        try { $busType = [string]$disk.BusType } catch { }
+        if (-not $busType -or $busType -notin $InternalWorkspaceBusTypes) {
+            Write-Log "Stray-recovery cleanup: preserving disk $($disk.Number) with bus type '$busType' (not an internal-bus type; the sweep is scoped to internal disks)" -Level WARN
+            $preservedUnsupportedBus.Add("disk $($disk.Number) (bus=$busType)") | Out-Null
             continue
         }
         foreach ($rp in @(Get-RecoveryPartitions -DiskNumber $disk.Number)) {
@@ -2299,6 +2502,7 @@ function Remove-StrayRecoveryPartitions {
         if ($wouldDeleteList.Count -gt 0)    { $parts += "would delete: $($wouldDeleteList -join ', ')" }
         if ($preservedOversized.Count -gt 0) { $parts += "preserved oversized: $($preservedOversized -join ', ')" }
         if ($preservedVirtual.Count -gt 0)   { $parts += "preserved virtual: $($preservedVirtual -join ', ')" }
+        if ($preservedUnsupportedBus.Count -gt 0) { $parts += "preserved unsupported-bus: $($preservedUnsupportedBus -join ', ')" }
         if ($skippedNonTyped.Count -gt 0)    { $parts += "skipped non-typed: $($skippedNonTyped -join ', ')" }
         if ($parts.Count -gt 0) {
             Write-Log "Stray-recovery cleanup summary (DRY RUN): $($parts -join '; ')"
@@ -2311,6 +2515,7 @@ function Remove-StrayRecoveryPartitions {
         if ($failedToDelete.Count -gt 0)     { $parts += "failed: $($failedToDelete -join ', ')" }
         if ($preservedOversized.Count -gt 0) { $parts += "preserved oversized: $($preservedOversized -join ', ')" }
         if ($preservedVirtual.Count -gt 0)   { $parts += "preserved virtual: $($preservedVirtual -join ', ')" }
+        if ($preservedUnsupportedBus.Count -gt 0) { $parts += "preserved unsupported-bus: $($preservedUnsupportedBus -join ', ')" }
         if ($skippedNonTyped.Count -gt 0)    { $parts += "skipped non-typed: $($skippedNonTyped -join ', ')" }
         if ($parts.Count -gt 0) {
             Write-Log "Stray-recovery cleanup summary: $($parts -join '; ')"
@@ -3046,8 +3251,20 @@ function Get-PartitionPlan {
 
     $plannedOSSize = if ($interveningAnchor) { $osSize } else { [int64]($plannedPartitionStart - $osStart) }
     $plannedOSEnd = if ($interveningAnchor) { $osEnd } else { $plannedPartitionStart }
-    $shrinkBytes = if ($interveningAnchor) { [int64]0 } else { [int64][Math]::Max(0, ($osSize - $plannedOSSize)) }
-    $extendBytes = if ($interveningAnchor) { [int64]0 } else { [int64][Math]::Max(0, ($plannedOSSize - $osSize)) }
+    $shrinkBytes = if ($interveningAnchor) {
+        [int64]0
+    } elseif ($osSize -gt $plannedOSSize) {
+        [int64]($osSize - $plannedOSSize)
+    } else {
+        [int64]0
+    }
+    $extendBytes = if ($interveningAnchor) {
+        [int64]0
+    } elseif ($plannedOSSize -gt $osSize) {
+        [int64]($plannedOSSize - $osSize)
+    } else {
+        [int64]0
+    }
     $plannedAvailableBytes = [int64]$BucketSizeBytes
     $alignmentReserveBytes = [int64]($tailEnd - $alignedManagedExtentEnd)
     $requiresConsolidation = if ($interveningAnchor) { $false } else { ($plannedOSSize -lt $SizeMinBytes) }
@@ -3532,6 +3749,7 @@ function Ensure-AdequateRecoveryPartition {
                 if (Restore-PreviousWinRERoute -PreviousState $stateBefore) {
                     return @{ Status = "Deferred"; Reason = "WinRE disable failed before deletion" }
                 }
+                $Script:ResumeTaskShouldPersist = $true
                 return $null
             }
             Start-Sleep 2
@@ -3543,6 +3761,7 @@ function Ensure-AdequateRecoveryPartition {
                 if (Restore-PreviousWinRERoute -PreviousState $stateBefore) {
                     return @{ Status = "Deferred"; Reason = "WinRE disable verification failed before deletion" }
                 }
+                $Script:ResumeTaskShouldPersist = $true
                 return $null
             }
             Write-Log "WinRE disable verified"
@@ -3658,6 +3877,7 @@ function Ensure-AdequateRecoveryPartition {
                 return @{ Status = "Deferred"; Reason = "recovery partition deletion failed; previous route restored but $resizeTargetLabel geometry restore unverified" }
             }
             Write-Log "Previous WinRE route could not be restored after deletion failure; WinRE will remain disabled until the next run or manual intervention" -Level ERROR
+            $Script:ResumeTaskShouldPersist = $true
             return $null
         }
         Write-Log "Confirmed deletion of partition $($rp.PartitionNumber) on disk $($rp.DiskNumber)"
@@ -5374,6 +5594,18 @@ function Clear-PartitionDeferral {
 # attacker, not SYSTEM. For a file: WriteData, AppendData, Delete,
 # DeleteSubdirectoriesAndFiles, TakeOwnership, ChangePermissions.
 #
+# v50 patch 4: the ACE loop skips InheritOnly ACEs. Those apply only
+# to children, not to the object being checked; treating them as
+# effective on the object itself is a false-positive source on stock
+# ProgramData ACLs (CREATOR OWNER: (OI)(CI)(IO)(F) is the common case).
+# CREATOR OWNER (S-1-3-0) and CREATOR GROUP (S-1-3-1) are deliberately
+# NOT added to the trusted SID list - the fix is to skip ACEs that do
+# not apply, not to trust their principals generally. The identical
+# logic exists in three copies: here, in Cleanup-Backups.ps1's local
+# Test-PathTrustedForSystem, and in the inline _T helper inside
+# WinRE-Manager.cmd's RESTORE TARGET_COMMAND. Any future change to
+# this logic must land in all three.
+#
 # Returns $true only when both conditions hold. Fail-closed on
 # unreadable ACL, unknown owner, or unresolvable SID.
 function Test-PathTrustedForSystem {
@@ -5451,6 +5683,7 @@ function Test-PathTrustedForSystem {
     }
     foreach ($ace in $acl.Access) {
         if ($ace.AccessControlType -ne 'Allow') { continue }
+        if (($ace.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
         $aceSid = $null
         try {
             $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
@@ -7468,6 +7701,15 @@ try {
         Write-Log "[DRY RUN] Would create the temporary resume task '$($Script:ResumeTaskName)' (boot trigger at +1 minute, one-shot trigger at +1 hour); it would be removed on clean completion"
     } else {
         $Script:ResumeTaskCreated = Register-ResumeTask -TaskName $Script:ResumeTaskName
+        if ($Script:ResumeTaskCompromiseUnresolved) {
+            Write-Log "FATAL: the resume staging path could not be verified as safe AND an existing '$($Script:ResumeTaskName)' task could not be confirmed as removed. Refusing to proceed into destructive repair work with an unverified SYSTEM task potentially registered against untrusted content." -Level ERROR
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Decision' -Value 'PREFLIGHT'
+            Set-RunSummaryField -Field 'Why' -Value 'Resume staging compromised and existing task state could not be confirmed safe'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Inspect and remove the leftover task manually, then inspect the staging directory for unexpected content or reparse points before re-running.'
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No repair work performed (unsafe resume state detected).'
+            exit $EXIT_FATAL
+        }
         if ($Script:ResumeTaskCreated) {
             # v49 patch 1: PowerShell runs finally blocks on Ctrl+C but
             # bypasses catch blocks, so without this handler the persist
@@ -9001,7 +9243,7 @@ public static class WinRECancelKeyProbe {
             Set-RunSummaryField -Field 'Decision' -Value 'PRESERVED'
             Set-RunSummaryField -Field 'Why' -Value 'Foreign WinRE source with third-party drivers preserved; no normalization performed'
             Set-RunSummaryField -Field 'OperatingMode' -Value 'PRESERVED'
-            Set-RunSummaryField -Field 'NextAction' -Value 'No action required. WinRE is functional; the manager will not modify this foreign source.'
+            Set-RunSummaryField -Field 'NextAction' -Value 'No action required. The existing recovery image was preserved unmodified; WinRE registration status was not changed by this run.'
             Add-RunSummaryLine -Field 'ChangesMade' -Line "State file records ForeignSourceAcceptedHash=$acceptedHash"
             Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Image was preserved: no strip, no injection, no deployment.'
             exit $EXIT_WARNING
@@ -9508,11 +9750,19 @@ public static class WinRECancelKeyProbe {
             Set-RunSummaryField -Field 'Why' -Value 'OS-fallback requires C: FullyDecrypted'
             Set-RunSummaryField -Field 'OperatingMode' -Value 'OS-FALLBACK'
             Set-RunSummaryField -Field 'NextAction' -Value 'Complete decryption of C: and re-run.'
+            $Script:ResumeTaskShouldPersist = $true
             exit $EXIT_WARNING
         }
     }
 
     $CurrentWinREState = Get-WinREState
+    if ($CurrentWinREState.Status -ne "Enabled" -and $CurrentWinREState.Status -ne "Disabled") {
+        Write-Log "WinRE status could not be determined at Step 5 ('$($CurrentWinREState.Status)') - refusing to deploy without positive confirmation of the current WinRE state" -Level ERROR
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value "WinRE status could not be determined at Step 5 ($($CurrentWinREState.Status))"
+        $Script:ResumeTaskShouldPersist = $true
+        exit $EXIT_FATAL
+    }
     if ($CurrentWinREState.Status -eq "Enabled") {
         # v47: race-detector recheck immediately before the first
         # possible /disable of this execution. This site is reached
@@ -9579,6 +9829,7 @@ public static class WinRECancelKeyProbe {
         Write-Log "FATAL: WIM deployment failed" -Level ERROR
         Set-RunSummaryField -Field 'Result' -Value 'FATAL'
         Set-RunSummaryField -Field 'Why' -Value 'WIM deployment failed'
+        $Script:ResumeTaskShouldPersist = $true
         exit $EXIT_FATAL
     }
 
@@ -9589,6 +9840,7 @@ public static class WinRECancelKeyProbe {
         Write-Log "FATAL: reagentc /setreimage failed: $setImageOutput" -Level ERROR
         Set-RunSummaryField -Field 'Result' -Value 'FATAL'
         Set-RunSummaryField -Field 'Why' -Value 'reagentc /setreimage failed'
+        $Script:ResumeTaskShouldPersist = $true
         exit $EXIT_FATAL
     }
 
@@ -9788,6 +10040,7 @@ public static class WinRECancelKeyProbe {
                 Write-Log "FATAL: WinRE location could not be resolved after 3 verification attempts: $($finalState.Location)" -Level ERROR
                 Set-RunSummaryField -Field 'Result' -Value 'FATAL'
                 Set-RunSummaryField -Field 'Why' -Value 'WinRE location could not be resolved after deployment'
+                $Script:ResumeTaskShouldPersist = $true
                 exit $EXIT_FATAL
             }
 
@@ -9807,6 +10060,7 @@ public static class WinRECancelKeyProbe {
                     Write-Log "FATAL: WinRE is on the OS partition but the script did not deploy it via OS-fallback" -Level ERROR
                     Set-RunSummaryField -Field 'Result' -Value 'FATAL'
                     Set-RunSummaryField -Field 'Why' -Value 'WinRE ended up on the OS partition without an OS-fallback deployment'
+                    $Script:ResumeTaskShouldPersist = $true
                     exit $EXIT_FATAL
                 }
             }
@@ -9824,6 +10078,7 @@ public static class WinRECancelKeyProbe {
                 Write-Log "FATAL: WinRE is on an unexpected partition (disk $($finalPart.DiskNumber) part $($finalPart.PartitionNumber))" -Level ERROR
                 Set-RunSummaryField -Field 'Result' -Value 'FATAL'
                 Set-RunSummaryField -Field 'Why' -Value 'WinRE is on an unexpected partition after deployment'
+                $Script:ResumeTaskShouldPersist = $true
                 exit $EXIT_FATAL
             }
         }
@@ -9835,6 +10090,7 @@ public static class WinRECancelKeyProbe {
             Write-Log "FATAL: WinRE Enabled but location is empty" -Level ERROR
             Set-RunSummaryField -Field 'Result' -Value 'FATAL'
             Set-RunSummaryField -Field 'Why' -Value 'WinRE Enabled but location is empty'
+            $Script:ResumeTaskShouldPersist = $true
             exit $EXIT_FATAL
         }
     }
@@ -9851,6 +10107,7 @@ public static class WinRECancelKeyProbe {
             Set-RunSummaryField -Field 'Why' -Value 'reagentc /enable refused with BitLocker error'
             Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($Script:UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
             Set-RunSummaryField -Field 'NextAction' -Value 'The next scheduled run will retry; the loop-breaker fires after 3 failures.'
+            $Script:ResumeTaskShouldPersist = $true
             exit $EXIT_WARNING
         }
         Write-Log "WinRE not enabled - final attempt" -Level WARN
@@ -9874,6 +10131,7 @@ public static class WinRECancelKeyProbe {
             Write-Log "FATAL: WinRE is not enabled at exit" -Level ERROR
             Set-RunSummaryField -Field 'Result' -Value 'FATAL'
             Set-RunSummaryField -Field 'Why' -Value 'WinRE is not enabled at exit'
+            $Script:ResumeTaskShouldPersist = $true
             exit $EXIT_FATAL
         }
     }

@@ -79,6 +79,28 @@ Changes to the **pre-shrink segment** (plan, pre-shrink, verification, deferral)
 
 If your PR would alter the post-deletion segment, say so explicitly and include the test result that unblocks it.
 
+### The three-copy trust-check invariant
+
+`Test-PathTrustedForSystem` validates that a path's ACL owner is SYSTEM or Administrators, and that no Allow ACE grants a modify-capable right to a principal outside SYSTEM, Administrators, or TrustedInstaller. The per-`Kind` modify-capable mask differs between files and directories. The helper is a security boundary for every path whose contents will be read, written, or executed by SYSTEM; the manager config file, the resume-script staging directory, and the backup-catalogue reads all pass through it.
+
+The logic exists in **three** places. Any future change to it must land in all three:
+
+- `WinRE.ps1`'s `Test-PathTrustedForSystem` is the production copy.
+- `Cleanup-Backups.ps1`'s local `Test-PathTrustedForSystem` is a separate standalone script; dot-sourcing `WinRE.ps1` would execute the production pipeline, so the function is duplicated rather than shared.
+- The inline `_T` helper inside `WinRE-Manager.cmd`'s RESTORE `TARGET_COMMAND` embeds the same logic in the wrapper's Base64-encoded elevated payload so the Restore picker's config read refuses the same inputs production refuses.
+
+The three call sites together gate: `manager.json` reads and writes (production's `Get-ManagerConfig` and `Set-ManagerConfig`), the backup-catalogue read (`Cleanup-Backups.ps1`), resume-script staging (`WinRE.ps1`'s `Initialize-ResumeScriptStaging`), and the wrapper's Restore picker. Splitting the logic would let one call site accept a path another refuses. For example, if only `WinRE.ps1` gained a stricter mask, the wrapper would still enumerate a backup root from a config file that production would refuse to read on the next write.
+
+A change to any of the following must be applied to all three copies in the same PR:
+
+- The owner SID allow-list (`S-1-5-18`, `S-1-5-32-544`).
+- The trusted ACE SID allow-list (`S-1-5-18`, `S-1-5-32-544`, `S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464`).
+- The per-`Kind` modify-capable mask. For files: `WriteData | AppendData | Delete | DeleteSubdirectoriesAndFiles | TakeOwnership | ChangePermissions`. For directories: the same set minus `WriteData | AppendData`, because on a directory those two rights mean only create-new-file and create-new-subdirectory.
+- The `InheritOnly` skip. InheritOnly ACEs apply only to children, not to the object being checked; treating them as effective on the object itself is a false-positive source on the stock `C:\ProgramData` ACL, which carries an inherited `CREATOR OWNER` ACE with `(OI)(CI)(IO)(F)`. `CREATOR OWNER` (`S-1-3-0`) and `CREATOR GROUP` (`S-1-3-1`) are deliberately **not** added to the trusted SID list; the correct response is to skip ACEs that do not apply, not to trust their principals generally.
+- The fail-closed behaviour on unreadable ACL, unknown owner, or unresolvable SID.
+
+When you change trust-check logic, say so explicitly in the PR and list each of the three files you updated. A PR that updates fewer than three copies is not ready to merge. Cross-references: the `.NOTES` bullet for the trust-check InheritOnly skip and the three-copy invariant, the header comments above `Test-PathTrustedForSystem` in each of the three files, and the v50 patch 4 CHANGELOG entry.
+
 ## Style
 
 - PowerShell 5.1-compatible syntax. Do not use operators or cmdlets introduced in 7.x without a fallback.

@@ -1,6 +1,6 @@
 ---
 title: "State and idempotency — WinRE Manager"
-description: "WinRE Manager's DesiredStateId, state file, checkpoint, deferral marker, and the offline-fallback LocalInputsId field."
+description: "WinRE Manager's DesiredStateId, state file, checkpoint, deferral marker, the temporary resume task, and the offline-fallback LocalInputsId field."
 ---
 
 # State and idempotency
@@ -70,7 +70,7 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 - A change to the shrink-first ordering or the single-boundary geometry model (v45 patch 1). These change *how* the destructive path produces the target state, not *what* the target state is. The state file does not record partition-layout details.
 - A change to the pre-deletion resolver guard, the extension-failure fallback bucket cap, the deletion-failure rollback reporting, or the layout assertion's fail-closed branch (all v46 patch 2). These change *how* the destructive path fails and recovers, not *what* the target state is. The state file's schema and the fast path's conditions are unchanged.
 - The backup and restore actions introduced in v49 (`-Action Backup`, `-Action Restore`). They are standalone actions, not part of the repair pipeline. They read and write a backup directory and its `backup.json` sidecar. A backup does not touch the state file and does not change the deployment's identity. A restore replaces the WIM on the currently registered route; on successful completion it deletes the state file, the checkpoint file, and the partition deferral marker so the next repair run re-evaluates the machine from a clean slate. The seven DSI inputs themselves are unchanged — the deployment identity is a function of the inputs above, and none of them changes because a WIM was restored — but the recorded state file is deliberately removed to force a full re-evaluation.
-- The temporary crash-recovery scheduled task introduced in v49 (`WinRE Manager - Resume`). It is registered by a Repair or Restore run and deleted on clean completion. It is a per-run safety net, not a machine-state artifact, and it is not recorded in the state file. Its presence or absence does not affect the fast path.
+- The temporary crash-recovery scheduled task introduced in v49 (`WinRE Manager - Resume`). It is registered by a Repair or Restore run and deleted on clean completion. It is a per-run safety net, not a machine-state artifact, and it is not recorded in the state file. Its presence or absence does not affect the fast path. See "The temporary resume task" below for the lifecycle, the persist-signal list, and the v50 patch 4 staging flags.
 - The stable install location introduced in v49 (`C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1`). The installed copy is a persistent artifact on disk — a wrapper-managed file, not a state-file field. Its presence does not change the DSI; a machine that never installs the maintenance task and a machine that does will compute the same `DesiredStateId` for the same inputs.
 - The native-boot VHDX fail-closed gate introduced in v49. It refuses to run destructive operations on a machine whose OS volume is on a native-boot VHDX. Like the v48 architecture gate, it is a startup refusal, not a DSI input. A VHDX-boot machine that runs the script will exit `EXIT_WARNING` before any state mutation; its state file is unchanged.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
@@ -396,6 +396,44 @@ If a run is interrupted between `Set-Checkpoint -Step 6` and `Remove-ItemIfExist
 When the VMD hardware presence check is indeterminate, the run removes the checkpoint file before exiting `EXIT_WARNING`. This is deliberate: the deferral is a stop before any work is committed, and a stale checkpoint from an interrupted previous run would otherwise cause the next run to resume from a step that no longer reflects reality. Removing the checkpoint forces the next run to start from step 0, re-evaluate the VMD presence check, and proceed cleanly if the enumeration is now healthy.
 
 **The v47 pre-`/disable` race-detector abort rewrites the checkpoint to Step 2 rather than removing it, and removes `base.wim` and any stale `winre_optimized.wim`**, for the same reason: the staged work is tied to a source that has drifted, and resuming from a checkpoint bound to that source would defeat the abort's purpose. Two deferrals remove the checkpoint file entirely: the VMD-query-indeterminate deferral and the offline-fallback deferral (which fires when the manifest fetch fails and the state file indicates a full update is needed). Every other deferral path either preserves the checkpoint (the pre-shrink deferral marker path preserves it alongside the staged workspace) or leaves it intact by never having written one. The `active WinRE location is empty` (v48 patch 1) and `active WinRE location could not be resolved` (v46 patch 2; placement moved by v48 patch 1) deferrals are the notable non-removing cases: the checkpoint is left on disk, and the next run honors it — resuming from Step 4 via the migration guard's `WIM_READY` carve-out — but re-enters the resolver guard, which fires again and defers again until the registration is repaired. Because v48 patch 1 moved the guard before `reagentc /disable`, WinRE is still `Enabled` at the deferral; the old recovery partition and its registration are preserved intact.
+
+## The temporary resume task
+
+Path: Windows Task Scheduler, task name `WinRE Manager - Resume`, root `\`, principal SYSTEM at the highest run level. The task is a scheduled task, not a file.
+
+The resume task is registered on every Repair or Restore run, after the Audit Mode guard and before any state-modifying work, and fires at boot+1m and as a one-shot at T+1h. It invokes the production script's default `-Action Repair`, which re-evaluates the machine state and either completes the interrupted run or takes the fast path. The task is removed in the `finally` block on any clean terminal exit (SUCCESS, WARNING, REBOOT_REQUIRED, or a FATAL exit taken inside `Main`) unless a persist signal fired. The staged copy at `C:\Recovery\OEM\Resume\WinRE.ps1` is removed at the same point, under the same persist guard, so the two share a lifetime: a task that persists always has a staged copy to execute, and a run that cleans up leaves nothing behind.
+
+The task exists to cover the window that Rule 2 cannot fully guarantee: an interrupted run that has disabled WinRE, deleted the old recovery partition, or otherwise changed recovery state, before completing the deploy-and-enable sequence. Without the resume task, the machine would sit in that intermediate state until the next scheduled run or an operator intervention.
+
+### Persist signals
+
+The `finally` block reads the persist decision from the OR-merge of two independent signals:
+
+- `$Script:ResumeTaskShouldPersist` — set by the outer `catch` on an unhandled exception, and by every site that changes recovery state but cannot positively verify an acceptable final route. As of v50 patch 4 the enumeration is eighteen sites: the outer `catch`; `Invoke-RestoreAction`'s three mid-transformation failure paths (`/setreimage` failure after the WIM is replaced, `/enable` failure with the WIM in place, or the v50 patch 3 WIM-deployment failure when the re-enable attempt does not return `ok`); the v50 patch 4 Step 5 fail-closed guard on an indeterminate WinRE status; and the twelve additional full-update exit sites added in v50 patch 4 — WIM deployment failure on the dedicated target, `reagentc /setreimage` failure, terminal enable failure, the three `Restore-PreviousWinRERoute` failures inside `Ensure-AdequateRecoveryPartition` (`reagentc /disable` failure, `/disable` verification failure, recovery-partition deletion failure), the five final-verification exits (`$finalPart` unresolvable after three attempts, WinRE ends on the OS partition without OS-fallback deployment, WinRE ends on an unexpected partition, WinRE reports Enabled but its registered location is empty, BitLocker error on the final enable attempt), and the OS-fallback encryption cascade. The literal string `$Script:ResumeTaskShouldPersist = $true` appears eighteen times in `scripts/WinRE.ps1`.
+- `[WinRECancelKeyProbe]::ShouldPersist` — set by a compiled `ConsoleCancelKeyPress` delegate. PowerShell runs `finally` blocks on Ctrl+C but bypasses `catch` blocks, so a compiled delegate is the only way to preserve the task on that interruption class. The `Add-Type` registration is best-effort: a registration failure logs a WARN and continues; the Ctrl+C signal is then unavailable and the task is removed on that interruption class.
+
+The invariant: **when the full-update operation has changed recovery state and the script cannot positively verify an acceptable final recovery route, the resume task must not be unregistered.** The task is a crash-recovery hook, not a retry-until-success mechanism; a clean exit that leaves the machine in a healthy state deletes the task and lets the state file govern the next scheduled run.
+
+Two interruption classes leave the task registered without setting either signal, because the `finally` block never runs: a hard kill (e.g. `taskkill /F`) and a reboot mid-run (the OS terminates PowerShell).
+
+### Staging lifecycle flags (v50 patch 4)
+
+Two script-scope flags track staging safety during the resume-task setup:
+
+- `$Script:ResumeStagingTaskInvalid` — set at entry to the staging touch-region, so any subsequent failure leaves an existing task pointing at a missing, partial, or untrusted script. Cleared only on a verified success return from `Initialize-ResumeScriptStaging`.
+- `$Script:ResumeTaskCompromiseUnresolved` — set only when `$Script:ResumeStagingTaskInvalid` is set **and** removal of the existing task cannot be positively confirmed via a `Get-ScheduledTask` enumeration.
+
+When `$Script:ResumeStagingTaskInvalid` is set after a staging failure, `Register-ResumeTask` attempts to remove any existing task and positively verify its absence. If the removal cannot be confirmed, `$Script:ResumeTaskCompromiseUnresolved` is set. `Main` exits `$EXIT_FATAL` when the compromise flag is set, **before** any destructive repair work — the reasoning is that continuing into destructive repair with an unverified SYSTEM task potentially registered against untrusted content is worse than refusing.
+
+Registration failure on an otherwise-safe staging path preserves the verified staged copy so a prior task is not orphaned; the next run's safe cleanup handles any leftover staging directory that is not in use.
+
+### What the task does not do
+
+The task does not participate in the program lock directly. When the task fires, it invokes `WinRE.ps1 -Action Repair`, which acquires the program lock through the normal path and is serialized against any concurrent scheduled run.
+
+The task is a per-run safety net, not machine state. It is not recorded in the state file, does not affect the fast-path decision, and does not change the `DesiredStateId`. Its presence on a machine after a clean exit indicates that the run was interrupted; its absence is the normal state.
+
+Under `$PSCommandPath`-less invocation — gist bootstrap via `Invoke-RestMethod | Invoke-Expression`, or paste-into-console — the guard in `Register-ResumeTask` logs at INFO and does not register the task. Those invocation modes have no `$PSCommandPath`, and a run initiated from such an invocation cannot be resumed by the task.
 
 ## Crash consistency
 

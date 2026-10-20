@@ -1,6 +1,6 @@
 ---
 title: "Recovery partition lifecycle — WinRE Manager"
-description: "Recovery partition sizing, the single-boundary geometry model, the shrink-first destructive pipeline, and every deferral reason in WinRE Manager."
+description: "Recovery partition sizing, the single-boundary geometry model, the Int32-safe partition-plan arithmetic, the shrink-first destructive pipeline, and every deferral reason in WinRE Manager."
 ---
 
 # Recovery partition lifecycle
@@ -146,6 +146,8 @@ The plan produces two resizing outputs and exactly one of them is non-zero:
 - `ExtendBytes` — the amount C: must extend into the space the old recovery partitions occupied. Non-zero when the old recovery partitions extended past the target boundary and their deletion left free space that C: must absorb.
 
 If neither is non-zero, C: is already at the boundary and no resize is needed.
+
+**Int32-safe size arithmetic (v50 patch 4).** The plan's shrink and extend deltas must never be computed with `[Math]::Max(0, $delta)`. PowerShell binds the literal `0` in that expression as `Int32` and selects the `Max(Int32, Int32)` overload, then converts the second argument to `Int32` for the `val2` parameter — which throws before `Max` can run when the delta falls outside the `Int32` range (about ±2.1 GB in either direction). The field failure: a Surface Pro 3, 2026-10-16, with three type-coded recovery partitions on disk 0 and a ~4.9 GB extend delta, crashed with `Cannot convert argument "val2", with value "-5262802944", for "Max" to type "System.Int32"`. Every subsequent invocation crashed identically, defeating the self-healing resume task the crash was supposed to trigger. The fix in `Get-PartitionPlan` replaces the vulnerable form with explicit `-gt` comparisons on `[int64]` operands — `if ($x -gt $y) { [int64]($x - $y) } else { [int64]0 }` — for both `ShrinkBytes` and `ExtendBytes`. The harness guards the fix at two levels: check 21 is a source-pattern assertion that the Int64-safe comparison form is present and the `[Math]::Max(0, ...)` form is absent, and check 22 is a behavioral Int64 regression that reproduces both forms with a 3,000,000,000-byte delta, confirming the safe form returns the correct value while the vulnerable form throws. The fix has not been field-verified against a machine with a genuine >2 GiB delta; that would require reproducing the Surface Pro 3's layout.
 
 **Intervening-anchor plan fields (v48 patch 1).** When the plan detects an intervening-anchor layout, four additional fields are populated. `InterveningAnchor` holds the anchor partition object (or `$null` when no anchor applies). `PlannedAnchorPartitionSize` is the anchor's post-shrink size. `AnchorShrinkBytes` is the amount the anchor must shrink from the right to seat the recovery partition at the disk tail; `AnchorExtendBytes` is always `0` — the v48 scope does not extend the anchor. In the non-intervening case these fields are `$null`/`0`/`0`, and the plan has exactly the v47 shape.
 

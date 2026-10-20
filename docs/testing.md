@@ -37,7 +37,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v38.** The version history is:
+**Current version: v39.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -63,6 +63,7 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v36** closes a diagnostic gap exposed by production v50 patch 2's hypervisor-suppression boundary: the harness now mirrors production's `Test-RunningInVirtualMachine` and adds a "Non-OS sweep suppression preview" section to Option 1 that reports the hypervisor-detection verdict (`guest`, `physical`, or `indeterminate`) and every non-OS recovery partition's disposition under the sweep's deletion rules. v36 also adds a source-level mirror-binding assertion (check 20) that verifies production's `Test-RunningInVirtualMachine` retains the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, and the combined-string construction. See "v36 changes" below.
 - **v37** mirrors production v50 patch 2's empty-metadata fail-closed correction in the harness's `Test-RunningInVirtualMachine` mirror, and extends check 20 with an assertion that binds the guard (`IsNullOrWhiteSpace`). Before v37 the harness mirror lacked the guard, so a machine whose `Win32_ComputerSystem` returned empty or whitespace-only Manufacturer and Model fields would have been classified as a physical machine by the harness's preview while production's gate returned `$null` (indeterminate; sweep suppressed). See "v37 changes" below.
 - **v38** adds run logging and fixes `-NonInteractive` to also run the parser self-test. Every `Say` / `Rule` / `Write-Diag` / `Write-KV` / `Write-WarningBanner` call and every `Record` call now appends to `%TEMP%\WinRE-TestHarness.log`. `-NonInteractive` now runs `Show-SystemDiagnostic` before `Invoke-AllRelevant`, so the parser self-test - including the source-level mirror-binding assertions 18, 19, and 20 that exist to catch production mirror drift - is exercised by a CI consumer invoking the harness non-interactively. See "v38 changes" below.
+- **v39** tightens check 18 to verify the specific `Get-Disk -ErrorAction Stop` enumeration and its `Where-Object { $_.Number -ne $osDisk.Number }` filter, not just the presence of `-ErrorAction Stop` anywhere in the function; adds check 21 (source-pattern assertion that `Get-PartitionPlan` contains the Int64-safe comparison form and does not contain the vulnerable `[Math]::Max(0, ...)` pattern); and adds check 22 (behavioral Int64 regression that reproduces both safe forms with a 3,000,000,000-byte delta and confirms the vulnerable form still throws). See "v39 changes" below.
 
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
@@ -77,6 +78,20 @@ Two changes, both closing the version-drift family that has required a manual `$
 **2. Menu title and startup `Rule` bumped 28 -> 29.**
 
 The parser self-test count remains at eighteen — v29 adds no new checks.
+
+### v39 changes
+
+Four changes, all downstream of the production v50 patch 4 cycle.
+
+**1. Check 18 tightened.** The `Test-NativeBootVirtualTopology` source-level mirror-binding assertion now requires the specific `Get-Disk -ErrorAction Stop` enumeration **and** its `Where-Object { $_.Number -ne $osDisk.Number }` filter, not just the presence of `-ErrorAction Stop` anywhere in the function. The prior form would have passed even if `-ErrorAction Stop` moved to an unrelated command in the same function.
+
+**2. Check 21 added (source-pattern).** Asserts that `Get-PartitionPlan` contains the Int64-safe `-gt` comparison form (`} elseif ($osSize -gt $plannedOSSize) {` and `} elseif ($plannedOSSize -gt $osSize) {`) and does not contain the vulnerable `[Math]::Max(0, ...)` pattern. Guards against reintroduction of the v50 patch 4 Int32 overflow fix: the Surface Pro 3, 2026-10-16 field failure where the vulnerable `[Math]::Max(0, ...)` form threw on a ~4.9 GB extend delta and every subsequent invocation crashed identically. SKIP when `WinRE.ps1` is not adjacent.
+
+**3. Check 22 added (behavioral).** Reproduces both the safe shrink and safe extend forms with a delta of 3,000,000,000 bytes (greater than `Int32.MaxValue`) and confirms the correct value is returned without throwing; separately confirms the vulnerable `Math.Max` form still throws on the same input. Complementary to check 21: catches an off-by-one or wrong-direction rewrite that would still match check 21's source pattern. The behavioral check does not read `WinRE.ps1`, so it does not SKIP on source absence.
+
+**4. Menu title and startup `Rule` bumped 38 -> 39.**
+
+The parser self-test count moves from twenty-one to twenty-three with the two new checks.
 
 ### v38 changes
 
@@ -360,7 +375,7 @@ As of v35, the interactive cleanup prompt reads `Delete test artifacts from $Tes
 
 ## Output style (v16; extended in v17 through v38, with v20's menu box alignment, v22's new Build numbers section, v23's Option S `DeployedWinREMetadata` display, v24's dual-path active-WIM probe and `Version` trim, v25's colour-tagged parser self-test additions and seven-component DSI-mismatch sentence, v26's Plan adjacency preview section, v27's `Architecture` line in the System Diagnostic and `LocalInputsId` in Option S, v28's VMD storage-controller diagnostic section, v33's two source-level mirror-binding assertions in the parser self-test, v34's empty-test-parent cleanup, v35's inverted cleanup prompt, v36's Non-OS sweep suppression preview section, v37's empty-metadata fail-closed guard in the sweep-suppression preview mirror, and v38's run logging as the departures)
 
-As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. The rest of the output format is unchanged from v16.
+As of v16 the harness's output is colour-coded and, in several sections, tabular. The changes are presentation-only: the checks, the menu structure, the arguments, and the read-only contract are unchanged. v17, v19, and v21 do not modify the output format. v20 changes only the menu box's interior alignment; every other section's output format is unchanged. v22 adds a `Version` line to the parsed-state block and a new "Build numbers" section. v23 adds a `DeployedWinREMetadata` line to Option S's parity output. v27 adds an `Architecture` line to the Hardware section of the System Diagnostic and a `LocalInputsId` pair to the Option S parity output. v28 adds the VMD storage-controller diagnostic block to the VMD hardware presence section of Option 1. v39 adds two more rows to the parser self-test table (checks 21 and 22) and tightens check 18's assertion; the row format itself is unchanged. The rest of the output format is unchanged from v16.
 
 ### Run logging (v38)
 
@@ -618,7 +633,7 @@ Option A runs the subset relevant to the current machine (its OS, its vendor, it
 
 ## The parser self-test
 
-Twenty-one checks as of v38 (twenty-one as of v36, twenty as of v33, eighteen as of v28, seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v19, v20, v21, v23, v24, v26, v27, v29, v30, v31, v32, v34, v35, and v38 did not change the count or the contents, and v37 extended check 20's assertion without adding a new check. v28 added the `Get-StorageControllerDevices` shape check; v33 added the two source-level mirror-binding assertions (checks 18 and 19); v36 added check 20, the `Test-RunningInVirtualMachine` mirror-binding assertion. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
+Twenty-three checks as of v39 (twenty-one as of v36 through v38, twenty as of v33, eighteen as of v28, seventeen as of v25, sixteen as of v22, fifteen as of v18, ten before v18); v19, v20, v21, v23, v24, v26, v27, v29, v30, v31, v32, v34, v35, and v38 did not change the count or the contents, and v37 extended check 20's assertion without adding a new check. v28 added the `Get-StorageControllerDevices` shape check; v33 added the two source-level mirror-binding assertions (checks 18 and 19); v36 added check 20, the `Test-RunningInVirtualMachine` mirror-binding assertion; v39 tightened check 18's assertion and added checks 21 (source-pattern) and 22 (behavioral) for the Int32-safe arithmetic fix. Each records PASS, FAIL, or SKIP in `$Script:Results` and prints one `[OK]` / `[FAIL]` / `[SKIP]` line. The state tags are colour-coded (green `[OK]`, red `[FAIL]`, dark gray `[SKIP]`); the line format itself is unchanged from earlier versions.
 
 | # | Check | What it verifies | Since |
 |---|---|---|---|
@@ -640,9 +655,11 @@ Twenty-one checks as of v38 (twenty-one as of v36, twenty as of v33, eighteen as
 | 15 | DesiredStateId | 64-hex, deterministic across repeat calls, VMD-sensitive, ScriptVersion-sensitive. | v18 |
 | 16 | Compare-WimServicingMetadata | Eight regression cases covering the DISM servicing-metadata comparison rules. | v25 |
 | 17 | Get-StorageControllerDevices shape | Handles the enumeration's three outcomes: a NULL return (indeterminate PnP enumeration) records FAIL, an empty array records SKIP, and a populated array is verified to have objects each carrying `FriendlyName`, `InstanceId`, and `Ids`. | v28 |
-| 18 | VHDX gate fail-closed | Production's `Test-NativeBootVirtualTopology` retains the v49 patch 2 fail-closed shape: the unfiltered `Get-Disk` enumeration uses `-ErrorAction Stop`, the gate sets `IsNativeBootVirtual = $true` on the corresponding catch path, and the indeterminate-topology reason text is present. SKIP when `WinRE.ps1` is not adjacent. | v33 |
+| 18 | VHDX gate fail-closed | Production's `Test-NativeBootVirtualTopology` retains the v49 patch 2 fail-closed shape: the unfiltered `Get-Disk` enumeration uses `-ErrorAction Stop`, the gate sets `IsNativeBootVirtual = $true` on the corresponding catch path, and the indeterminate-topology reason text is present. As of v39 the assertion additionally requires the specific `Where-Object { $_.Number -ne $osDisk.Number }` filter, not just the presence of `-ErrorAction Stop` anywhere in the function. SKIP when `WinRE.ps1` is not adjacent. | v33 (tightened v39) |
 | 19 | StorageControllerDevices mirror binding | Production's `Get-StorageControllerDevices` retains the unary-comma return (`return ,$result`) and both software-device filter regexes (`{GUID}\` and `SWD\`). SKIP when `WinRE.ps1` is not adjacent. | v33 |
 | 20 | Test-RunningInVirtualMachine mirror binding | Production's `Test-RunningInVirtualMachine` retains the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, the empty-metadata fail-closed guard (`IsNullOrWhiteSpace`), and the combined-string construction (`$combined = "$mfg $mdl"`). SKIP when `WinRE.ps1` is not adjacent. | v36 (extended v37) |
+| 21 | Get-PartitionPlan Int64-safe arithmetic (source pattern) | Production's `Get-PartitionPlan` contains the Int64-safe `-gt` comparison form (`} elseif ($osSize -gt $plannedOSSize) {` and `} elseif ($plannedOSSize -gt $osSize) {`) and does not contain the vulnerable `[Math]::Max(0, ...)` form. Guards against reintroduction of the v50 patch 4 Int32 overflow fix. SKIP when `WinRE.ps1` is not adjacent. | v39 |
+| 22 | Int64 arithmetic (behavioral) | Reproduces the safe shrink and safe extend forms with a delta of 3,000,000,000 bytes (greater than `Int32.MaxValue`) and confirms the safe forms return the correct value without throwing; separately confirms the vulnerable `Math.Max` form still throws on the same input. Complementary to check 21: catches an off-by-one or wrong-direction rewrite that would still match the source pattern. Does not read `WinRE.ps1`; does not SKIP on source absence. | v39 |
 
 ### What a FAIL means
 
@@ -664,6 +681,10 @@ The most likely FAILs and their implications:
 
 - **Check 20 (Test-RunningInVirtualMachine mirror binding).** Production's `Test-RunningInVirtualMachine` no longer has the ten hypervisor signatures, the fail-closed `$null` return, the `Win32_ComputerSystem` query source, the `IsNullOrWhiteSpace` empty-metadata guard, or the `$combined = "$mfg $mdl"` construction. Same reasoning as checks 18 and 19: a source-level drift, not a machine-tooling issue. A change to any of these breaks the harness's sweep-suppression preview mirror.
 
+- **Check 21 (Get-PartitionPlan Int64-safe arithmetic source pattern).** Production's `Get-PartitionPlan` either reintroduced the vulnerable `[Math]::Max(0, ...)` form or lost one of the two safe `-gt` comparison forms. Same reasoning as checks 18, 19, and 20 — a source-level drift, not a machine-tooling issue. This is the class of regression that produced the Surface Pro 3 field failure (2026-10-16): the vulnerable form threw on a ~4.9 GB extend delta, and every subsequent invocation crashed identically, defeating the self-healing resume task. A FAIL here means the Int32 overflow fix has been reverted or partially reverted; do not deploy.
+
+- **Check 22 (Int64 arithmetic behavioral).** The safe shrink or safe extend form returned the wrong value for a delta greater than `Int32.MaxValue`, or the vulnerable `Math.Max` form no longer throws in this PowerShell environment. The second case is unusual — it indicates the runtime's argument-binding rules have changed under the harness, not that production's source has drifted. Either way, the fix's behavior is not what the harness expects; investigate before deploying. This is the one behavioral check among the source-pattern checks (18, 19, 20, 21) and it does not read `WinRE.ps1`, so it is the only one of the five that never SKIPs on source absence.
+
 ### What a SKIP means
 
 A SKIP means the check could not run in the current context. The reasons:
@@ -672,7 +693,7 @@ A SKIP means the check could not run in the current context. The reasons:
 - **The state it inspects is absent.** WinRE location is empty, no OS partition, no lettered volume to sample, or similar. The check has nothing to inspect.
 - **Zero devices present (Check 17).** The `Get-StorageControllerDevices` enumeration returns an empty array on some VMs (no SCSIAdapter-class devices). A zero-device result is legitimate; the check SKIPs rather than FAILing. The distinction matters: NULL means the enumeration failed (indeterminate), and an empty array means the enumeration succeeded but found nothing (legitimate). The check verifies both cases.
 - **A precondition was not met.** `Test-VmdDrivers` (not a parser check) records SKIP when the Intel CPU generation cannot be parsed, because driver applicability was not evaluated. Option S records SKIP when the VMD query is indeterminate, because the DSI parity verdict cannot be computed from an indeterminate driver-set determination. Check 2b records SKIP when WinRE is Disabled or reagentc suppressed the version line.
-- **Production's source is not adjacent (checks 18, 19, and 20).** All three source-level mirror-binding assertions SKIP when `WinRE.ps1` is not beside `Test-WinRE.ps1`. The SKIP is the correct outcome — the assertion cannot run without the source — and it does not indicate a defect. Place `WinRE.ps1` beside `Test-WinRE.ps1` and re-run to exercise them.
+- **Production's source is not adjacent (checks 18, 19, 20, and 21).** All four source-level mirror-binding assertions SKIP when `WinRE.ps1` is not beside `Test-WinRE.ps1`. The SKIP is the correct outcome — the assertion cannot run without the source — and it does not indicate a defect. Place `WinRE.ps1` beside `Test-WinRE.ps1` and re-run to exercise them. Check 22 is behavioral and does not read the source; it does not SKIP on this precondition.
 
 A SKIP does not indicate a defect.
 

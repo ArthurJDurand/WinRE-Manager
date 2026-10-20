@@ -67,6 +67,8 @@ The v50 patch 2 release adds one more suppression boundary with its own section 
 
 - **The non-OS sweep suppression boundary** — `Remove-StrayRecoveryPartitions` suppresses the entire non-OS-disk sweep when the running OS is detected inside a known hypervisor (via `Test-RunningInVirtualMachine`), and preserves any non-OS disk whose `BusType` is `File Backed Virtual` individually regardless of the hypervisor detection result. Neither suppression changes the run's exit code. See "The non-OS sweep was suppressed (v50 patch 2)" below.
 
+The v50 patch 4 release adds three more failure modes with their own sections below: the **Step 5 fail-closed guard** on an indeterminate WinRE status (fires before `reagentc /disable` in the full-update path's Step 5 deployment region; sets the resume task's persist flag; exits `EXIT_FATAL` — see "The Step 5 deployment refused because the WinRE status was indeterminate (v50 patch 4)"); the **resume-script staging warn or refusal** (`Remove-StagingDirectorySafely` refuses to clear a staging directory whose contents are unexpected, a subdirectory, a reparse point, or a non-directory path; the warn-only parent-chain check logs when `C:\Recovery\OEM` or `C:\Recovery` fails the SYSTEM trust policy but does not refuse registration — see "The resume-script staging warned or refused (v50 patch 4)"); and the **resume-task staging lifecycle flags** (`$Script:ResumeTaskCompromiseUnresolved` forces a fatal exit when the staging path cannot be verified and an existing task cannot be positively confirmed as removed — see "The resume-task staging lifecycle flags forced a fatal exit (v50 patch 4)").
+
 One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. The destructive path reads C:'s BitLocker state only for diagnostic logging and does not gate on it — only the OS-fallback route does, because on that route the target volume *is* C:.
 
 One further check that runs early and can defer the run is the VMD hardware presence detection. It is fail-closed: a PnP enumeration error is treated as indeterminate rather than as VMD hardware absent. See "VMD hardware detection was indeterminate" below.
@@ -1020,6 +1022,8 @@ On clean completion the task is deleted; on interruption it is preserved.
 2. The compiled `ConsoleCancelKeyPress` delegate, on Ctrl+C — sets `[WinRECancelKeyProbe]::ShouldPersist`. This is the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C, and because the event callback runs on a thread-pool thread that cannot safely mutate PowerShell session state (hence the compiled delegate and the static field rather than a scriptblock).
 3. `Invoke-RestoreAction`'s three mid-transformation failure paths — the WIM-deployment failure when the re-enable attempt after the failure does not return `ok` (v50 patch 3; a `reboot` result does not confirm WinRE is enabled, so the persist condition is `-ne 'ok'`, not `-ne 'ok' -and -ne 'reboot'`), `/setreimage` failing after the WIM has been replaced, and `/enable` returning failed/bitlocker after the WIM is in place — set `$Script:ResumeTaskShouldPersist`.
 
+   As of v50 patch 4, thirteen more persist sites join this same category: the Step 5 fail-closed guard on an indeterminate WinRE status, and twelve additional full-update exit sites where the operation has changed recovery state but cannot positively verify an acceptable final recovery route (WIM deployment failure on the dedicated target; `reagentc /setreimage` failure after deployment; terminal enable failure; the three `Restore-PreviousWinRERoute` failures inside `Ensure-AdequateRecoveryPartition` for `reagentc /disable` failure, `/disable` verification failure, and recovery-partition deletion failure; the five final-verification exits — `$finalPart` unresolvable after three attempts, WinRE ends on the OS partition without OS-fallback deployment, WinRE ends on an unexpected partition, WinRE reports Enabled with an empty location, BitLocker error on the final enable attempt; and the OS-fallback encryption cascade). The literal string `$Script:ResumeTaskShouldPersist = $true` appears eighteen times in `scripts/WinRE.ps1`. The invariant: **when the full-update operation has changed recovery state and the script cannot positively verify an acceptable final recovery route, the resume task must not be unregistered.**
+
 Two further interruption classes leave the task registered without setting either signal, because the `finally` block never runs to consult them:
 
 4. A hard kill (e.g. `taskkill /F`).
@@ -1119,6 +1123,170 @@ The residual — a non-admin who modifies the running script *before* this eleva
 6. **Do not bypass the staging design.** The design ensures the SYSTEM task's execution target is writable only by SYSTEM and Administrators. The repair pipeline itself is unaffected — the run proceeds without the self-healing hook. Bypassing the check would reintroduce the security property the design protects.
 
 **Field status.** The success path was field-verified on the project's ASUS desktop test machine on 2026-10-14: the running script was staged, SHA256-verified, registered against the temporary resume task, and removed with its staging directory on clean exit. The failure branches — staging-directory creation, script copy, hash verification, stale-directory clear, and the self-staging short-circuit — are code-inspected only and have not been exercised in the field.
+
+## The Step 5 deployment refused because the WinRE status was indeterminate (v50 patch 4)
+
+**Symptom.** The run exits with code 3 (`EXIT_FATAL`) before `reagentc /disable` at Step 5. The machine may have already been modified — the pre-shrink may have executed inside `Ensure-AdequateRecoveryPartition`, and partition deletion may have occurred. The temporary resume task was preserved (the guard sets `$Script:ResumeTaskShouldPersist = $true`), so the next boot or the T+1h one-shot will re-invoke the script.
+
+**Log signature.**
+
+```
+[ERROR] WinRE status could not be determined at Step 5 ('<status>') - refusing to deploy without positive confirmation of the current WinRE state
+```
+
+The `<status>` value is whatever `reagentc /info` reported — typically `Unknown` when the parser could not classify the status line.
+
+**Cause.** The v50 patch 4 Step 5 fail-closed guard fires when the current WinRE status is neither `Enabled` nor `Disabled`. This is the fifth instance of the fail-closed defect class named in `.NOTES` since v49 patch 2: an indeterminate status means the disable block cannot know whether WinRE needs to be disabled before deployment. Proceeding would risk deploying a WIM while the old route is still registered, or skipping a `/disable` that was necessary. By the time the guard fires, the full-update operation has already changed recovery state, so the persist flag ensures the machine has a self-healing hook.
+
+Common causes of an indeterminate status:
+
+- **Non-English OS.** `reagentc /info` emits a translated status value (`Aktiviert`, `Désactivé`, etc.) that the parser does not recognize. The parser regex matches only the English `Enabled` and `Disabled`.
+- **Structural `reagentc` format change.** A Windows build changed the output format such that neither status word appears on the line the parser looks at.
+- **`reagentc /info` itself failed.** The command returned an error rather than output; `Get-WinREState` returns `Unknown`.
+
+**Resolution.**
+
+1. **Inspect the raw `reagentc /info` output.**
+
+   ```powershell
+   reagentc /info
+   ```
+
+   Look at the `Windows RE status:` line. If it reads `Enabled` or `Disabled` in English, the parser should have recognized it — file a bug. If it reads a translated value or the line is missing, the cause is identified.
+
+2. **If the resume task is preserved (the normal case on this path):** the next boot or the T+1h one-shot will re-invoke the script with the same indeterminate status. If the status was transient (a `reagentc` failure that has since cleared), the resume will proceed normally. If the status is structural (a non-English OS or a format change), the resume will hit the same guard — do not rely on the resume in that case.
+
+3. **If you are on a non-English OS:** the manager does not currently support localized `reagentc` output. File a bug with the raw `reagentc /info` output and the OS locale; the parser needs to be extended to recognize the localized status values.
+
+4. **If the status is transient (a `reagentc` failure that has since cleared):** delete the state file and re-run.
+
+   ```powershell
+   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
+   ```
+
+   The next run re-queries the status, gets a clean answer, and proceeds.
+
+**What NOT to do.** Do not manually call `reagentc /disable` or `/enable` to work around the guard. The guard fires because the current recovery state is unknown; manual reagentc calls against an unknown state can leave the machine in a state the pipeline cannot recover from. Capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section.
+
+**Field status.** The guard's FATAL branch is code-inspected but not exercised in the field. The v50 patch 4 field run on the ASUS test machine (2026-10-19) reached Step 5 with `Status=Enabled` and did not fire the guard. A machine with an indeterminate status is the case the guard exists for.
+
+## The resume-script staging warned or refused (v50 patch 4)
+
+**Symptom.** Two distinct sub-cases, both concerning the resume-script staging setup. Neither aborts the repair pipeline — both leave it running without the self-healing hook (sub-case A) or running normally with an informational WARN (sub-case B).
+
+- **Sub-case A (staging directory could not be safely cleared):** a previous run left a staging directory at `C:\Recovery\OEM\Resume` that `Remove-StagingDirectorySafely` refused to delete. The resume task is not registered.
+- **Sub-case B (warn-only parent chain):** the staging directory is being created or has been created, but `C:\Recovery\OEM` or `C:\Recovery` fails the SYSTEM trust policy. The resume task IS registered; the warning is informational.
+
+**Log signature (sub-case A).**
+
+```
+[WARN] Resume-script staging: could not safely clear stale staging directory C:\Recovery\OEM\Resume (unexpected contents, reparse point, non-directory path, or removal failure) - refusing to register the resume task
+[WARN] Register-ResumeTask: could not stage the running script to a trusted location. Skipping the temporary resume task; the repair pipeline itself is unaffected.
+```
+
+**Log signature (sub-case B).**
+
+```
+[WARN] Resume-script staging: parent directory '<anc>' does not satisfy the SYSTEM trust policy. The resume task will still register; this is a warning, not a refusal. Residual risk: a local user with write access to this parent could replace the staged directory between task registration and task execution. To fully close that class, secure the parent chain with a policy-appropriate ACL.
+```
+
+The `[INFO] Resume-script staging: staged <src> -> C:\Recovery\OEM\Resume\WinRE.ps1 (SHA256=<hash>)` line still appears on sub-case B — the staging succeeded, only the parent chain has a warning.
+
+**Cause.** The v50 patch 4 staging lifecycle hardening adds two new behaviors:
+
+- `Remove-StagingDirectorySafely` refuses reparse points, subdirectories, unexpected content, or a non-directory path. The refusal skips the resume task rather than risking a recursive delete that could follow a junction into an attacker-chosen target.
+- The warn-only parent-chain trust check logs but does not refuse. A strict check would disable self-healing on machines where the parent ACL is imperfect; the field observation on the project's ASUS test machine (2026-10-19) showed `C:\Recovery\OEM` user-owned, and the warning is the correct response rather than a refusal. The residual — a local user with `Modify` on the parent chain can replace the staged directory between task registration and task execution — is documented in [SECURITY.md](../SECURITY.md) and accepted rather than closed.
+
+**Sub-case B is expected on the project's ASUS test machine** and on any machine whose `C:\Recovery\OEM` or `C:\Recovery` is user-owned or has a permissive inherited ACE. It does not indicate a bug.
+
+**Resolution (sub-case A).** Inspect the staging directory:
+
+```powershell
+Get-Item C:\Recovery\OEM\Resume -Force -ErrorAction SilentlyContinue | Format-List Name, Attributes, PSIsContainer
+Get-ChildItem C:\Recovery\OEM\Resume -Force -ErrorAction SilentlyContinue
+```
+
+Expected contents: a single file named `WinRE.ps1` (from a previous staged run), or nothing (no stale directory). Anything else — a subdirectory, a junction, a different filename — is what caused the refusal.
+
+Common causes of sub-case A:
+
+- A previous staging attempt left an unexpected file or subdirectory (rare; the staging design writes only `WinRE.ps1`).
+- A reparse point (junction or symlink) was substituted for the staging directory.
+- The staging directory is currently held open by another process (an antivirus scanning the file, or an editor).
+
+Resolve by removing the unexpected content manually after verifying it is safe:
+
+```powershell
+# Only if you are certain the content is not legitimate.
+Remove-Item C:\Recovery\OEM\Resume -Recurse -Force
+```
+
+Then re-run the script. The next staging attempt will create the directory cleanly.
+
+**Resolution (sub-case B).** The warning names the specific parent directory. To close the residual risk, secure the parent chain with a policy-appropriate ACL:
+
+```powershell
+takeown /f "C:\Recovery\OEM" /a
+icacls "C:\Recovery\OEM" /setowner "NT AUTHORITY\SYSTEM"
+icacls "C:\Recovery\OEM" /inheritance:r /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F"
+```
+
+The exact command depends on the ACL policy in force on the machine. The goal is that no non-admin principal holds a modify-capable right on the parent chain. If the machine's policy requires a different owner, the warning remains informational; the residual is accepted, not closed, per [SECURITY.md](../SECURITY.md).
+
+**Field status.** Sub-case B has been field-exercised on the project's ASUS test machine on 2026-10-19 (the warning fired on the user-owned `C:\Recovery\OEM`, staging proceeded, and the task registered and cleaned up correctly). Sub-case A is code-inspected only — no field run has hit a `Remove-StagingDirectorySafely` refusal.
+
+## The resume-task staging lifecycle flags forced a fatal exit (v50 patch 4)
+
+**Symptom.** The run exits with code 3 (`EXIT_FATAL`) at `Main`, before any destructive repair work. The staging path could not be verified as safe AND an existing `WinRE Manager - Resume` task could not be positively confirmed as removed.
+
+**Log signature.** Either of:
+
+```
+[ERROR] Register-ResumeTask: staging path is not verifiable as safe
+[WARN] Existing 'WinRE Manager - Resume' task is still present after remove attempt - cannot confirm absence; refusing to proceed
+[ERROR] FATAL: the resume staging path could not be verified as safe AND an existing 'WinRE Manager - Resume' task could not be confirmed as removed. Refusing to proceed into destructive repair work with an unverified SYSTEM task potentially registered against untrusted content.
+```
+
+or the enumerate-failure variant:
+
+```
+[ERROR] Cannot enumerate scheduled tasks to verify whether 'WinRE Manager - Resume' remains registered: <error> - refusing to proceed
+```
+
+**Cause.** Two script-scope flags track staging safety: `$Script:ResumeStagingTaskInvalid` (set at entry to the staging touch-region, cleared only on a verified success return) and `$Script:ResumeTaskCompromiseUnresolved` (set only when `$Script:ResumeStagingTaskInvalid` is set AND existing-task removal cannot be positively confirmed). `Main` exits FATAL when `$Script:ResumeTaskCompromiseUnresolved = $true`, before any destructive repair work.
+
+The reasoning: continuing into destructive repair with an unverified SYSTEM task potentially registered against untrusted content is worse than refusing. The task executes as SYSTEM at the highest run level; if it is registered against a script whose staging could not be verified, the task is a potential SYSTEM-level code-execution vector. The guard refuses rather than proceed.
+
+**Resolution.** Investigate the leftover task and the staging directory:
+
+1. **Check the task's presence and state:**
+
+   ```powershell
+   Get-ScheduledTask -TaskName 'WinRE Manager - Resume' -ErrorAction SilentlyContinue | Format-List TaskName, State
+   schtasks /query /tn "WinRE Manager - Resume" /v /fo list
+   ```
+
+2. **Inspect the staging directory:**
+
+   ```powershell
+   Get-Item C:\Recovery\OEM\Resume -Force -ErrorAction SilentlyContinue | Format-List Name, Attributes, PSIsContainer
+   Get-ChildItem C:\Recovery\OEM\Resume -Force -ErrorAction SilentlyContinue
+   ```
+
+3. **If both are safe to remove** — the task is either absent or a leftover from an interrupted prior run, and the staging directory is either absent or contains only `WinRE.ps1` — remove them manually:
+
+   ```powershell
+   Unregister-ScheduledTask -TaskName 'WinRE Manager - Resume' -Confirm:$false -ErrorAction SilentlyContinue
+   Remove-Item C:\Recovery\OEM\Resume -Recurse -Force -ErrorAction SilentlyContinue
+   ```
+
+4. **If either looks suspicious** — an unexpected file under the staging directory, a reparse point, or a task whose `Task To Run` path is not `C:\Recovery\OEM\Resume\WinRE.ps1` — investigate further before removing. A system with a SYSTEM task pointing at attacker-controlled content is a security incident, not a WinRE Manager bug; escalate accordingly.
+
+5. **After resolving, re-run `WinRE.ps1`.** The next run's staging attempt starts from a clean state.
+
+**What NOT to do.** Do not manually create or register the `WinRE Manager - Resume` task outside the script. The staging design registers it against a byte-verified copy with a SYSTEM/Administrators-only DACL; a manually-created task bypasses that verification and reintroduces the risk the guard exists to prevent.
+
+**Field status.** The lifecycle flags' FATAL exit branch is code-inspected but not exercised in the field. The v50 patch 4 field run on the ASUS test machine (2026-10-19) did not trigger it — staging succeeded and the task registered cleanly.
 
 ## The wrapper's install step refused because the copy hash did not match (v49)
 
@@ -2258,6 +2426,16 @@ The v49 features and their log lines are catalogued in the feature-specific sect
 - **The restore action.** Include the backup directory path, the `backup.json` contents, the resolved current route, and whether the transaction completed or restored the rollback copy. Include the log lines for the three mid-transformation failure paths if any fired.
 - **The temporary resume task.** If the task is present after a run, include the invocation context (interactive vs SYSTEM, `$PSCommandPath` populated vs null), which interruption occurred (Ctrl+C, hard kill, reboot, or an exception in the outer catch), whether the task was left registered, and — if the resume run subsequently completed the operation — the log from the resume run. The Ctrl+C trigger is the load-bearing one; it was verified end-to-end on the ASUS PRIME H510M-D (2026-10-09). The other interruption classes — the outer catch, the three `Invoke-RestoreAction` mid-transformation failure paths (WIM-deployment failure, `/setreimage` failure, `/enable` failure), a hard kill, and a reboot mid-run — have not been exercised in the field.
 - **The stable install location.** Include the source path, the installed path, the source hash, the installed hash, and whether the task was registered against the installed copy. If the install step refused because the copy hash did not match, include the two hashes and the AV/EDR product name if one is in use.
+
+### v50 patch 4 specific bug data
+
+The v50 patch 4 release adds five new failure-mode signatures. Include the exact strings as they appear in your log, plus the surrounding context the individual section asks for.
+
+- **The Step 5 fail-closed guard on an indeterminate WinRE status.** Include the raw `reagentc /info` output, the OS UI language (to rule out a localized status value), and the resume task's presence. The guard's FATAL branch has not been exercised in the field; a field log of it is high-signal.
+- **The resume-script staging warn-only parent chain.** Include the exact WARN line and the ACL of the parent directory from `Get-Acl -Path '<anc>' | Format-List Owner, AccessToString`. The warning is expected on machines with an imperfect parent ACL; the ACL is what distinguishes "expected" from "unexpected on this machine".
+- **The resume-script staging directory safe-clear refusal.** Include the exact refusal line, the output of `Get-ChildItem C:\Recovery\OEM\Resume -Force`, and the staging directory's attributes from `Get-Item C:\Recovery\OEM\Resume -Force | Format-List Name, Attributes`.
+- **The resume-task staging lifecycle flags FATAL exit.** Include the exact FATAL line, the task's state from `Get-ScheduledTask -TaskName 'WinRE Manager - Resume'`, and the staging directory contents. This branch has not been exercised in the field.
+- **The internal-bus scoping on the non-OS sweep.** This is a behavior change, not a new log signature. If a type-coded recovery partition under 2 GiB on a USB, SD/MMC, iSCSI, Fibre Channel, or unknown-bus disk was expected to be deleted and was preserved, include the `preserved unsupported-bus: disk <n> (bus=<bus>)` line from the sweep's summary and the disk's `BusType` from `Get-Disk -Number <n> | Format-List BusType, FriendlyName`. The preservation is the intended behavior — the sweep and the workspace selector now share the same internal-bus allowlist.
 
 ## Related documents
 
