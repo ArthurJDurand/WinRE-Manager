@@ -1,6 +1,6 @@
 ---
 title: "Driver injection — WinRE Manager"
-description: "How WinRE Manager injects OEM WinPE driver packs and Intel VMD storage drivers into the recovery image, the v49 source-ownership classification (extended by the v50 historical-hash bridge), and the strip stage that normalizes the base."
+description: "How WinRE Manager selects OEM WinPE and Intel VMD storage drivers, verifies storage support, and preserves foreign recovery images safely."
 ---
 
 # Driver injection
@@ -171,6 +171,8 @@ All three downloads go through `Invoke-OemPackDownload`, which:
 - Removes any existing file at the destination.
 - Retries up to 3 times on exception.
 - Verifies SHA256 and/or MD5 if the map provides them.
+- Surrounding whitespace in supplied SHA256/MD5 metadata is trimmed; malformed or whitespace-only supplied digests are refused before downloading. This covers the leading space observed in Lenovo 20JV / DS121687 metadata without accepting mismatching file bytes or silently treating an invalid digest as absent.
+- The Dell builder also validates both digests on packs selected for publication; the Lenovo builder validates its supplied SHA256. Malformed selected metadata stops map publication rather than producing a map that runtime downloads will refuse. Missing hashes retain the existing vendor policy.
 - Accepts a hashless download only if `Invoke-WebRequest` completed cleanly on the same attempt.
 
 The last rule is important. `Invoke-WebRequest` can throw an exception **after** writing the file (connection reset while waiting for a final ACK). Without the rule, a partial file left by a throwing request would be treated as a successful download. The script removes the file and retries.
@@ -220,19 +222,19 @@ This is the "Lenovo SCCM Package issue": some Lenovo packages extract successful
 The Step 3 block runs in this order. The v49 additions are **bolded**:
 
 1. Mount `base.wim`.
-2. **Source-ownership classification (v49).** Classify the mounted source into one of four ownership classes. The classification decision determines whether the strip stage runs (step 3) and whether the current recipe is injected (steps 5–6). A `Foreign-With-Drivers` source is preserved as-is: the mounted image is dismounted with `-Discard`, no WIM is exported, no WIM is deployed, and the state file records `ForeignSourceAcceptedHash`. The other three classes proceed through the strip and injection.
-3. Strip to zero third-party drivers. Prove zero. **Skipped when the source classified as `Foreign-With-Drivers`** (the pipeline exits before this step on such a source).
+2. **Source-ownership classification (v49).** Classify the mounted source before stripping/injection. A `Foreign-With-Drivers` source is dismounted with `-Discard` and its bytes preserved. Patch 5 separately assesses dedicated layout repair, which can copy that unchanged source after a read-only applicability check. The other classes permit normal servicing when it is needed.
+3. Strip to zero third-party drivers. Prove zero. **Skipped when the source is preserved**; unchanged-image relocation bypasses the servicing sequence.
 4. Capture the pre-injection third-party driver count (expected to be zero after a successful strip).
 5. Download, extract, and inject the OEM pack.
 6. Download, extract, and inject the VMD packages (if VMD hardware is present).
-7. **Never-downgrade storage-driver check (v49).** Compare each storage-class driver in the final image against the pre-strip inventory, by INF basename. If any post-injection driver would be older, the candidate is discarded — dismounted with `-Discard`, the source preserved, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`.
+7. **Never-downgrade storage-driver check (v49).** Compare storage-class drivers against the pre-strip inventory by INF basename. If a candidate would be older, discard the entire servicing candidate with `-Discard`, preserve the original source and record acceptance separately from ownership. Patch 5 still evaluates layout remediation.
 8. **Gate for the remaining Step 3 work.** The flag `$Script:ImageInjectionComplete` is set by steps 5 and 6, and is inspected by steps 7, 9, 10, and 11. Each of those runs only when the flag is `$true`; when the flag is `$false`, the pipeline exits with `EXIT_WARNING` immediately after Step 3, before Step 4 (`dism /Export-Image`) and before any partition work (the v44 patch 1 pipeline gate, described under 'When injection fails' below).
 9. **Pre-deployment storage-applicability gate (v49).** Every present SCSIAdapter-class device on the machine must have at least one matching INF in the candidate. A candidate that leaves any controller unmatched is refused, dismounted with `-Discard`, and deferred.
 10. ResetBase (only if injection succeeded).
 11. **Provenance marker write (v49; partially load-bearing in v50).** If the `LineageId` is not yet set, generate one; write the marker into the mounted image at `Sources\Recovery\WinRE-Manager\provenance.json`. In v50 the marker's lineage portion is partially load-bearing: a marker whose `LineageId` matches a known current or historical lineage identifier authorizes the `Manager-Lineage` ownership class on a subsequent run, and a marker whose `LineageId` matches no known value is treated as absent. The marker write does not affect the current run's decisions — no gate in the same run reads what was just written — and a write failure is logged and the pipeline continues.
 12. Dismount with `-Save`.
 
-If step 2 classifies the source as `Foreign-With-Drivers`, the pipeline exits immediately after the classification: the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, `ForeignSourceAcceptedHash` is recorded in the state file, and the run exits `EXIT_WARNING`. Steps 3–12 do not run. If step 3 fails, steps 4–12 never run — the candidate is discarded and the machine is unchanged. If step 7 detects a downgrade, the candidate is discarded; steps 8–12 do not run. If step 9 refuses, the candidate is dismounted with `-Discard` and the run defers; steps 10–12 do not run.
+If step 2 preserves a foreign source, servicing steps 3–12 do not run. Patch 5 can instead use unchanged-image deployment when its dedicated layout needs repair. A step 3 strip failure still aborts before injection or partition work. A step 7 downgrade discards the servicing candidate and preserves its original source for independent layout evaluation. A step 9 applicability refusal rejects the prepared servicing candidate before committing it.
 
 ## Source-ownership classification (v49)
 
@@ -241,7 +243,7 @@ Every candidate source WIM is classified into one of four ownership classes befo
 - **`Manager-Owned`** — the staged source hash exactly matches the state file's `CurrentImageHash`, so the bytes are identical to what the manager last deployed. **As of v50 patch 1, the classifier also accepts a historical `CurrentImageHash` read from a stale state file across a version boundary** — this is the ownership-migration hash bridge, and it exists so that the v50 `ScriptVersion` bump (49 → 50) does not cause a machine's own prior v49 deployment to be reclassified as `Foreign-With-Drivers`. The strip stage runs and the current recipe is injected.
 - **`Manager-Lineage`** — a valid provenance marker is present in the mounted image (`Sources\Recovery\WinRE-Manager\provenance.json`) and its `LineageId` matches the state file's. The strip stage runs and the current recipe is injected.
 - **`Foreign-No-Drivers`** — no positive ownership evidence, but the source contains zero third-party drivers. The strip stage runs (as a no-op on an already-clean image) and the current recipe is injected.
-- **`Foreign-With-Drivers`** — no positive ownership evidence and at least one third-party driver present. The strip stage is **skipped**, and the pipeline exits without deploying: the mounted image is dismounted with `-Discard`, the staged artifacts are removed, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`.
+- **`Foreign-With-Drivers`** — no positive ownership evidence and at least one third-party driver present. Skip stripping/injection and dismount with `-Discard`. The source's accepted hash stays separate from `CurrentImageHash`. Patch 5 evaluates its dedicated layout and can relocate unchanged bytes; preservation does not require leaving an inadequate route untouched.
 
 The classification gate decides whether the strip-and-reinject pipeline runs. **It is not a source-selection input.** Which of the registered WIM, the hash-validated LKG, or the GitHub cold-start source is used as the base is decided by `Select-BaseWinRESource`, which does not consult the ownership class. The classification is evaluated on whichever source that step chose.
 
@@ -269,9 +271,9 @@ When the source classifies as `Foreign-With-Drivers`:
 
 - The strip stage is not run. The mounted image retains its existing third-party driver set.
 - The OEM pack and VMD injections do not run. The current recipe is not applied.
-- **No WIM is exported and no WIM is deployed.** The mounted image is dismounted with `-Discard`; `base.wim` and any stale `winre_optimized.wim` are removed. The existing WinRE route is untouched; the manager does not overwrite the currently-registered image.
-- The state file records the source's hash as `ForeignSourceAcceptedHash`, so subsequent runs recognize the preserved source and take the fast path rather than re-classifying it.
-- The run exits `EXIT_WARNING`.
+- **No WIM servicing or export is committed.** Patch 5 can copy the original verified bytes to a suitable dedicated target when layout remediation is needed. A temporary read-only mount for applicability is discarded.
+- The state file records accepted bytes as `ForeignSourceAcceptedHash`. Adequate layout is still required before the fast path; acceptance does not become positive manager ownership.
+- The final status reflects observed registration, layout and persistence. A preservation message alone does not prove enabled or bootable WinRE.
 
 The result is that the machine keeps whatever recovery image it already had. For a machine whose vendor-populated image is the correct one, this is the right outcome. For a machine whose vendor-populated image is stale, the operator must resolve the staleness through a source that classifies as `Manager-Owned`, `Manager-Lineage`, or `Foreign-No-Drivers` — typically by using the LKG copy (if it is a manager-owned image) or the GitHub cold-start source.
 
@@ -335,7 +337,7 @@ The strip is thus the enforcement of Rule 4's "drivers go into a clean base" cor
 
 ### The never-downgrade storage-driver check (v49)
 
-After injection completes and before ResetBase, the manager compares each storage-class driver in the final image against the pre-strip inventory, matched by INF basename. If any post-injection driver would be older than the source's version of the same basename, the entire candidate is discarded — not just the offending driver — the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, the checkpoint rolls back to Step 2, the state file records `ForeignSourceAcceptedHash` set to the preserved source's hash, and the run exits `EXIT_WARNING`.
+After injection and before ResetBase, the manager compares storage-class drivers against the pre-strip inventory by INF basename. A downgrade discards the whole servicing candidate, preserving the original bytes. Patch 5 can still relocate those bytes to repair the dedicated layout; see the [pending-operation model](state-and-idempotency.md#pending-deployment-record-v50-patch-5).
 
 The check runs inside Step 3, after injection is confirmed complete, before ResetBase and before the applicability gate. It applies to every storage-class driver the manifest resolves — OEM pack drivers and VMD package drivers alike.
 
@@ -343,7 +345,7 @@ The check runs inside Step 3, after injection is confirmed complete, before Rese
 
 **What it does not apply to.** The check does not apply to a source classified as `Foreign-With-Drivers` — the recipe is not injected on such a source, and the pipeline exits before the check is reached. It also does not apply on the enable-only path, which does not inject anything.
 
-**What the refusal looks like.** The log names each detected downgrade — the driver's INF basename, the source version, and the candidate version. The run then discards the candidate: the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, the checkpoint rolls back to Step 2, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`. No WIM is deployed, no partition is touched, WinRE is not disabled.
+**What the refusal looks like.** The log names the INF basename and source/candidate versions. The servicing candidate is discarded with `-Discard`, and the original source is retained. Read the final layout and pending-operation outcome to determine whether relocation completed or remains deferred; do not infer that no partition work occurred.
 
 **Interaction with the success gate.** The check runs only after the injection success gate has already passed (`$Script:ImageInjectionComplete = $true`). A downgrade detected here is not a "skipped injection" the success gate tolerates; it aborts the pipeline and discards the whole candidate. There is no partial-normalize path in v49.
 
@@ -442,7 +444,7 @@ See [troubleshooting.md](troubleshooting.md) and [testing.md](testing.md) for th
 
 ### Interaction with a preserved `Foreign-With-Drivers` source
 
-The gate does not run on a `Foreign-With-Drivers` source. A `Foreign-With-Drivers` source is preserved before the gate is reached: the pipeline exits after the classification step without deploying. The gate runs only on sources the pipeline is prepared to deploy — `Manager-Owned`, `Manager-Lineage`, and `Foreign-No-Drivers`.
+The Step 3 servicing gate is bypassed when a foreign source is preserved. Before patch 5 relocates a preserved image, the pending-deployment workflow mounts its independently verified candidate read-only, runs storage applicability and discards the mount. An already adequate dedicated route avoids unnecessary partition work.
 
 ## The VMD injection path
 
@@ -535,7 +537,7 @@ The machine is left exactly as it was before the run — WinRE is still in whate
 
 **Related to the v47 pre-injection discrepancy check.** Immediately after capturing `$preInjectThirdParty` (expected to be zero after a successful strip), the script checks whether it is greater than zero. A non-zero value is a signal that the filterless and filtered DISM queries disagree on this image. The warning is diagnostic only; the strip's filterless form remains authoritative, and the injection success gate handles the outcome conservatively regardless. See "The v47 pre-injection discrepancy check" above.
 
-**Related to the v49 source-ownership classification.** A `Foreign-With-Drivers` source skips the strip and the injection entirely. The pipeline does not reach the injection gate on such a source; it exits after the classification step, preserving the source and recording `ForeignSourceAcceptedHash`. The classification is the v49 narrowing of the strip-and-reinject policy; see "Source-ownership classification (v49)" above.
+**Related to the v49 source-ownership classification.** A preserved `Foreign-With-Drivers` source bypasses stripping and injection, so the injection success gate is not reached. Patch 5 independently assesses dedicated layout repair and checks applicability on a read-only mount before preserved-image relocation. Acceptance remains separate from ownership.
 
 **Related to the v49 never-downgrade check.** The never-downgrade check runs after injection is confirmed complete. When it detects a downgrade, the whole candidate is discarded — dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` removed, checkpoint rolled back to Step 2, `ForeignSourceAcceptedHash` recorded. The pipeline does not continue with a retained driver; there is no partial-normalize path in v49. See "The never-downgrade storage-driver check (v49)" above.
 

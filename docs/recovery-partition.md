@@ -9,7 +9,7 @@ This document covers how WinRE Manager decides what size a recovery partition sh
 
 ## The invariant
 
-**Exactly one type-coded recovery partition exists, on the OS disk.**
+**The OS disk should have one adequate type-coded recovery partition.** The non-OS sweep is separately scoped and can intentionally leave protected recovery partitions on other disks.
 
 The type code is the partition's identity: GPT GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type code `0x27`. A partition detected only by its `Recovery` or `WINRE` volume label is not a recovery partition for any decision the script makes — the label is a hint, not an identity.
 
@@ -21,7 +21,7 @@ The script enforces this on:
 - The pending-reboot reboot-required exit.
 - Step 7 of the full-update path.
 
-Any type-coded recovery partition (GPT GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27`) on any non-OS disk is deleted. A partition on a non-OS disk that carries a `Recovery` or `WINRE` label but no type code is logged and skipped — a label-only match on a secondary disk is not sufficient authority to delete.
+Eligible type-coded recovery partitions on non-OS internal disks are candidates for the scoped stray sweep. USB/unsupported buses, mounted VHD/VHDX disks, VM/indeterminate topologies and partitions above the 2 GiB ceiling retain their existing protections. A partition on a non-OS disk that carries a `Recovery` or `WINRE` label but no type code is logged and skipped — a label-only match on a secondary disk is not sufficient authority to delete.
 
 The same rule applies symmetrically on the OS disk, and the OS-disk side is the one that matters for convergence. A partition on the OS disk that carries a `Recovery` or `WINRE` label but no type code is:
 
@@ -32,47 +32,35 @@ The same rule applies symmetrically on the OS disk, and the OS-disk side is the 
 
 The last two were always true; the first two were made true in v44 patch 7. Before patch 7, the fast-path count and the active-location classifier accepted a label-only match as evidence of a recovery partition, while the destructive path correctly refused to delete one. The asymmetry meant a Basic Data partition labelled "Recovery" on the OS disk would be counted by the fast path (so the "exactly one recovery partition" condition could never be satisfied) while being preserved by the destructive path (so it was never removed). The machine cycled through rebuilds indefinitely without converging. Patch 7 unified the authority rule: type code everywhere, label nowhere.
 
-The invariant exists because Windows Setup and Startup Repair scan all attached volumes for WinRE-capable partitions. A stray recovery partition on a secondary or USB-attached disk can cause the BCD to be pointed at the wrong WinRE image during repair, which fails the repair. A label-only partition on the OS disk is not a stray in that sense — it never becomes a WinRE target — but it does break the fast path's convergence check, and that is what patch 7 fixes.
+The cleanup policy responds to reported recovery problems on machines with multiple recovery partitions. Their presence alone does not establish that BCD is redirected or that Startup Repair must fail. The scope and exceptions above are deliberate; a volume label alone does not authorize deletion or count toward the manager's dedicated-partition invariant.
 
 ## The sizing policy
 
 ### Where the source WIM size comes from
 
-The `wimSizeMiB` used in both thresholds below is the size of the WIM the script intends to deploy. On the full-update path this is `winre_optimized.wim`, produced by `dism /Export-Image /Compress:max` in Step 4.
+The sizing rules use the actual WIM selected for deployment, in MiB. Patch 5 separates that choice from recovery-layout repair:
 
-Under v47 the pipeline that produces `winre_optimized.wim` sources its base WIM from one of three places, in preference order:
+- **Serviced image:** Step 4 exports the candidate as `winre_optimized.wim`; use the exported size after stripping, injection and ResetBase.
+- **Preserved foreign image:** use the unchanged, hash-verified source size. Classification or never-downgrade preservation dismounts any candidate with `-Discard`; it does not export or service the preserved source.
+- **Current manager-owned image needing only layout repair:** use the unchanged source size. Relocation does not itself require another strip/inject/export pass.
 
-1. **The currently-registered WinRE image.** Used unless the LKG is provably newer by DISM servicing metadata (`Version` + `SPBuild` + `SPLevel`, with `Architecture` required to match).
-2. **The manager's last-known-good copy.** `Get-LKGWinREImagePath` scans every type-coded recovery partition on the OS disk for a `winre.wim` whose SHA256 matches `state.CurrentImageHash`, in addition to the canonical `C:\Recovery\WindowsRE\winre.wim` path (v48 patch 1). Used only when its SHA256 matches — a partial or stale file is not promoted.
-3. **The GitHub base-WIM repository.** Reached only when neither local source is usable.
+Normal servicing selects the currently registered WIM, unless a hash-validated manager LKG is provably newer by compatible servicing metadata; the GitHub base-WIM repository is the cold-start fallback when neither local source is usable. A pending deployment instead pins its independently verified `%ProgramData%\OEM\WinRE-Manager\PendingDeployment\pending.wim` to the expected hash. It must not silently substitute another source.
 
-The v46-era fallback-discovery path that could pick up a WIM outside the registered location is no longer a source-selection candidate.
+The ownership classes remain `Manager-Owned`, `Manager-Lineage`, `Foreign-No-Drivers` and `Foreign-With-Drivers`. They decide whether servicing is permitted; they do not exempt an image from the dedicated-partition capacity requirement. Acceptance of a foreign hash is separate from ownership, and relocation must never copy that hash into `CurrentImageHash`.
 
-Once the base WIM is obtained, the pipeline mounts it, applies the v49 source-ownership classification, strips every third-party driver if the classification permits (v47 patch 1), injects the current OEM and VMD recipe subject to the v49 never-downgrade storage-driver check, and — as of v44 patch 2 — runs `dism /cleanup-image /StartComponentCleanup /ResetBase` on the mounted image. The export is what materialises the strip and ResetBase savings on disk as a smaller WIM. The sizing decision therefore uses the post-strip, post-ResetBase size.
+Recovery-target selection uses a terminating OS-disk partition inventory. An unreadable or partially failed query is a refusal, not evidence that no reusable partition exists; partition creation is not attempted on that basis.
 
-**Source-ownership classification (v49).** Every candidate source WIM is classified before the strip stage runs:
-
-- **`Manager-Owned`** — the staged source hash exactly matches the state file's `CurrentImageHash`, so the bytes are identical to what the manager last deployed. The strip stage runs and the current recipe is injected.
-- **`Manager-Lineage`** — a valid provenance marker is present in the mounted image (`Sources\Recovery\WinRE-Manager\provenance.json`) and its `LineageId` matches the state file's. The strip stage runs and the current recipe is injected.
-- **`Foreign-No-Drivers`** — no positive ownership evidence, but the source contains zero third-party drivers. The strip stage runs (as a no-op on an already-clean image) and the current recipe is injected.
-- **`Foreign-With-Drivers`** — no positive ownership evidence and at least one third-party driver present. The strip stage is **skipped**, and the pipeline exits without deploying: the mounted image is dismounted with `-Discard`, `base.wim` and any stale `winre_optimized.wim` are removed, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING`. The existing WinRE route is untouched.
-
-The classification gate decides whether the strip-and-reinject pipeline runs. It is a narrowing of the v47 strip-everything policy: the strip now applies only when the source is not a foreign WIM that a vendor populated with its own drivers. **It is not a source-selection input** — which of the registered WIM, the hash-validated LKG, or the GitHub cold-start source is used as the base is decided by `Select-BaseWinRESource`, which does not consult the ownership class.
-
-The strip stage does not change the sizing arithmetic: `wimSizeMiB` is measured on the exported WIM after the strip (or preservation) and after ResetBase, and both thresholds below use that value directly. A `Foreign-With-Drivers` source produces a larger exported WIM than the same source would after a strip; the bucket size reflects whatever the export actually produces.
-
-**Never-downgrade storage-driver check (v49).** After injection completes and before ResetBase, the manager compares each storage-class driver in the final image against the pre-strip inventory, matched by INF basename. If any post-injection driver would be older than the source's version of the same basename, the entire candidate is discarded — the mounted image is dismounted with `-Discard`, `base.wim` and any stale `winre_optimized.wim` are removed, the checkpoint rolls back to `Step=2`, the state file records `ForeignSourceAcceptedHash` set to the preserved source's hash, and the run exits `EXIT_WARNING`. There is no partial-normalize path: the whole source is preserved rather than a single driver retained. The check runs inside Step 3, after injection is confirmed complete, before ResetBase and before the applicability gate.
-
-On the enable-only path the sizing policy below is not consulted: no partition is created or resized, so neither threshold applies. The enable-only path operates against the currently registered recovery partition and assumes its size is adequate; if it is not, the operator resolves it by way of the full-update path on a later run.
+An adequately sized dedicated layout is assessed before fast-path and enable-only exits. An undersized dedicated partition or a WIM on the OS partition requires layout remediation even if the image bytes need no update. The healthy-layout check also requires a confirmed unencrypted target: an encrypted or indeterminate dedicated volume is not convergence. A partition that meets the reuse rule can still be prepared and decrypted in place; encryption alone does not require repartitioning or driver servicing. A foreign image already on an adequate, confirmed unencrypted dedicated partition avoids unnecessary partition work.
 
 ### Two thresholds
 
 The script uses two separate free-space thresholds, and it is important not to confuse them.
 
-**Existing-partition acceptance.** An existing recovery partition is accepted only if **both** of the following hold:
+**Existing-partition acceptance.** An existing recovery partition is accepted only if all of the following hold:
 
 - **It is type-coded** — GPT recovery GUID `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR type `0x27`. A partition detected only by a `Recovery`/`WINRE` volume label is not a candidate for reuse. See "The invariant" above for the reasoning and the v44 patch 7 non-convergence loop this closes.
-- Its effective free space is sufficient:
+- Its total size is at least the deployment WIM size plus 250 MiB, and does not exceed the 2048 MiB managed-recovery ceiling.
+- Its measured effective free space is sufficient:
 
 ```
 (partition.SizeRemaining + existingWinreWimSize) >= (sourceWimSize + 250 MiB)
@@ -121,9 +109,9 @@ The 1000 MiB minimum exists because smaller partitions cause problems on OEM har
 
 The ASUS 11th-gen case is the canonical example. That machine had a 757 MiB WIM and a 999 MiB recovery partition. After replacing the WIM, the partition had ~197 MiB free (the raw arithmetic 999 minus 757 is 242 MiB; the difference is NTFS filesystem metadata and reserved space, which is why the effective-free check uses `SizeRemaining + existingWinreWimSize` rather than simple subtraction) — below 250.
 
-The previous script policy accepted that partition with a 195 MiB tolerance (200 minus 5). The current policy does not. On that machine, the script now replaces the 999 MiB partition with a properly sized one (a 1100 MiB partition, because WIM + 250 + 30 = 1037 rounds up to 1100). If the OS partition cannot be shrunk enough to make room, the script defers with the old route preserved (v45 patch 1) or falls back to OS-fallback with exit code 2 (in the limited cases where the plan called for it).
+The previous script policy accepted that partition with a 195 MiB tolerance (200 minus 5). The current policy does not. On that machine, the creation calculation calls for 1100 MiB, because WIM + 250 + 30 = 1037 rounds up to 1100. If the OS partition cannot be shrunk enough to make room, the script defers with the old route preserved. Patch 5 permits OS-fallback only after actual dedicated creation failure and the separately verified last-resort conditions; a plan or pre-shrink refusal does not authorize it.
 
-A recovery partition that cannot meet the servicing margin is a recovery partition that will fail at the next Windows Update. Accepting it would be worse than reporting the degraded state.
+A recovery partition below the servicing margin can fail a later Windows recovery update. It does not meet the healthy-layout requirement even if its current WIM remains readable.
 
 ## The single-boundary geometry model (v45 patch 1)
 
@@ -183,15 +171,15 @@ The sequence below is the shrink-first pipeline. It replaces the v44 pipeline (i
 
 Two read-only startup checks run before any of the steps below.
 
-**Audit Mode guard.** It reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and defers with `EXIT_WARNING` when the value is present and is not `IMAGE_STATE_COMPLETE`. During Audit Mode, OOBE, sysprep generalize, and sysprep specialize, `reagentc /enable` is blocked by the OS with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM. The script defers before touching any partition. This guard runs before the hardware check, the manifest fetch, the OEM pack resolution, the `DesiredStateId` computation, and any other gate or operation. Under `-DryRun` the guard logs `Would defer …` and continues.
+**Audit Mode guard.** It reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State` → `ImageState` and defers with `EXIT_WARNING` when the value is present and is not `IMAGE_STATE_COMPLETE`. During Audit Mode, OOBE, sysprep generalize, and sysprep specialize, `reagentc /enable` is blocked by the OS with `ERROR_CANCELLED` (`0x4c7`, 1223) regardless of the correctness of the deployed WIM. The script defers before touching any partition. This guard runs before the hardware check, manifest fetch and deployment planning, after the elevation guard and program-lock setup. Under `-DryRun` the guard logs `Would defer …` and continues.
 
-**Native-boot VHDX fail-closed gate (v49).** The manager refuses to run destructive operations when the OS disk's bus type is `File Backed Virtual` **and** at least one other disk is on a physical bus — the native-boot VHD/VHDX topology, where the running OS disk is a VHD/VHDX stored on a host physical disk and the host disk appears to the running OS as a non-OS disk subject to the stray-recovery cleanup. A hypervisor guest whose entire storage stack is virtual (every other disk on `Virtual` or `File Backed Virtual`) is not refused. `Resize-Partition` and `New-Partition` against a VHDX-backed volume have different semantics than against a physical disk; the pipeline has not been validated under that topology, and a partial sequence that fails mid-way would leave the machine without a working recovery route. The gate exits `EXIT_WARNING` before any partition or WinRE change; the machine's state file is unchanged. The refusal is a stable deferral, not a transient failure: a genuinely VHDX-boot machine will continue to exit 2 on every run until the topology is supported or the machine is converted. The gate has no `-DryRun` carve-out — the topology is a property of the machine, not of the run mode.
+**Native-boot VHDX fail-closed gate (v49).** The manager refuses to run destructive operations when the OS disk's bus type is `File Backed Virtual` **and** at least one other disk is on a physical bus — the native-boot VHD/VHDX topology, where the running OS disk is a VHD/VHDX stored on a host physical disk and the host disk appears to the running OS as a non-OS disk subject to the stray-recovery cleanup. A hypervisor guest whose entire storage stack is virtual (every other disk on `Virtual` or `File Backed Virtual`) is not refused. The existing refusal protects a file-backed OS disk with visible nonvirtual disks. It is not a blanket refusal of ordinary Hyper-V or VirtualBox guests, whose virtual disks commonly report a virtual controller bus. The gate exits `EXIT_WARNING` before any partition or WinRE change; the machine's state file is unchanged. The refusal is a stable deferral, not a transient failure: a genuinely VHDX-boot machine will continue to exit 2 on every run until the topology is supported or the machine is converted. The gate has no `-DryRun` carve-out — the topology is a property of the machine, not of the run mode.
 
 Under the v43 patch 5 (further revision 5) policy there is **no startup BitLocker gate**. The BitLocker decision is made where the action is taken, not at startup: the target volume is not known until the classifier has resolved the reagentc-registered location, and the OS volume's BitLocker state is irrelevant to the enable-only and dedicated-partition paths.
 
-The consequence for this document is that the resize sequence below is only entered on machines whose `ImageState` is `IMAGE_STATE_COMPLETE` (or absent) and whose OS volume is not a native-boot VHDX.
+The live resize sequence is entered only when setup state and storage topology pass their guards. An ordinary guest's host-side virtual-disk file format does not by itself block OS-disk recovery repair.
 
-**As of v44 patch 6, the destructive partition path does not *gate* on C:'s BitLocker state.** When the destructive sequence will remove the current WinRE route (WinRE `Enabled` or a non-empty deletable set), the script calls `Test-VolumeEncrypted -MountPoint "C:"` and logs the result — the log line names C:'s measured state and explicitly records that C: encryption is not a veto for the dedicated-target path. No gate refuses the destructive sequence on C: encryption. If the destructive sequence fails at any point and the run falls through to OS-fallback, the OS-fallback gate checks C: at that point and defers as designed.
+**As of v44 patch 6, the destructive partition path does not *gate* on C:'s BitLocker state.** When the destructive sequence will remove the current WinRE route (WinRE `Enabled` or a non-empty deletable set), the script calls `Test-VolumeEncrypted -MountPoint "C:"` and logs the result — the log line names C:'s measured state and explicitly records that C: encryption is not a veto for the dedicated-target path. No gate refuses the destructive sequence on C: encryption. If dedicated creation actually fails, last-resort OS-fallback additionally requires verified geometry, fully decrypted C: and no acceptable route to retain. Losing the active route without an acceptable fallback is fatal; capacity/preflight deferral does not authorize fallback.
 
 ### 1. Read-only geometry plan
 
@@ -252,9 +240,11 @@ If the shrink succeeds and verification passes, the script re-reads the resize t
 
 ### 3. Disable WinRE
 
+Patch 5's `-PrepareBeforeDisable` mode defers this action when the active route is outside the deletion set. In that case the caller can prepare and hash-verify the dedicated target before switching registration. Replacement of the active recovery partition still needs the independent source and durable journal before mutation.
+
 If WinRE is currently `Enabled`, `reagentc /disable` runs. The script then verifies via `Get-WinREState` that the status is `Disabled`.
 
-This step runs **after** the pre-shrink, in the reversible window's tail. If the disable fails, the script restores the resize target to its original size and calls `Restore-PreviousWinRERoute -PreviousState $stateBefore`. If the previous route is confirmed restored, the function returns `Deferred` with `Reason = "WinRE disable failed before deletion"` or `Reason = "WinRE disable verification failed before deletion"`. Otherwise it returns `$null` and the main flow falls through to OS-fallback. Neither deferral is retry-suppressed — the failure indicates a storage-level or OS-level condition, not a transient constraint.
+This step runs **after** the pre-shrink, in the reversible window's tail. If the disable fails, the script restores the resize target to its original size and calls `Restore-PreviousWinRERoute -PreviousState $stateBefore`. If the previous route is confirmed restored, the function returns `Deferred` with `Reason = "WinRE disable failed before deletion"` or `Reason = "WinRE disable verification failed before deletion"`. Otherwise it returns `$null` and the pending-deployment caller verifies the remaining route and retains recovery material. Neither deferral is retry-suppressed — the failure indicates a storage-level or OS-level condition, not a transient constraint.
 
 **Pre-`/disable` race detector (v47 patch 1).** Immediately before this `/disable` call — and before whichever other `/disable` site the execution reaches first — the race detector re-reads the registered WinRE's `Location`, `Version`, and WIM SHA256, and compares them against values captured at the start of the rebuild (`Get-RegisteredWinREFingerprint`). Any change — location, version, or hash — aborts before the disable.
 
@@ -286,7 +276,7 @@ If a deletion fails, the script calls `Restore-OSPartitionSize -TargetSizeBytes 
 
 - **Both restores succeed** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored"`.
 - **Route restored, resize-target geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but <resize-target label> geometry restore unverified"` (the label is `OS partition (C:)` on the non-intervening path and `anchor partition (disk X part Y)` on the intervening-anchor path; v48 patch 1), and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. This is a partial rollback and is reported honestly rather than being flattened into the success case.
-- **Route not restored** — `$null`, and the main flow falls through to OS-fallback. This is the post-deletion residual corner.
+- **Route not restored** — `$null`, and the pending-deployment caller verifies the remaining route and retains recovery material. This is the post-deletion residual corner.
 
 None of the deletion-failure deferrals is retry-suppressed.
 
@@ -306,7 +296,7 @@ If `AvailableSize >= Plan.PlannedPartitionSize`, the script places the recovery 
 
 Before v46 patch 2 the fallback assigned the entire `AvailableSize` to the replacement partition without any ceiling. v46 patch 2 introduced the 2 GiB cap but sized the partition to the plan's bucket — the smallest the fallback could produce — leaving the surplus as a trailing unallocated extent on every fallback. v47 patch 2 keeps the ceiling but fills up to it: the cap is what matters, not the bucket.
 
-If `AvailableSize < Plan.PlannedPartitionSize`, the script restores C: to its original size and returns `$null`, and the main flow falls through to OS-fallback.
+If `AvailableSize < Plan.PlannedPartitionSize`, the script restores C: to its original size and returns `$null`, and the pending-deployment caller verifies the remaining route and retains recovery material.
 
 **The whole-layout assertion reflects the fallback geometry.** The assertion is called with `-ExpectedEndBytes $plannedEnd`, the current plan's own end. On the normal path `$plannedEnd` equals `$plan.AlignedManagedExtentEnd`; when the fallback ran, `$plannedEnd` reflects the fallback geometry. Before v47 patch 2 the assertion was called with `$plan.AlignedManagedExtentEnd`, which the fallback block did not update; any fallback case where the trailing extent exceeded the assertion's 1 MiB tolerance — i.e., any case where the fallback was actually needed — failed the assertion, removed the newly created partition via `Remove-OrphanPartition`, and fell through to the OS-fallback route the fallback existed to avoid.
 
@@ -318,7 +308,7 @@ The new partition is created at `Plan.PlannedPartitionStart` with size `Plan.Pla
 
 `New-Partition` is called with the recovery type code applied at creation: `-GptType {de94bba4-06d1-4d40-a16a-bfd50179d6ac}` (GPT) or `-MbrType 0x27` (MBR). Before v43 patch 5, the partition was created as a Basic Data partition and its type was changed minutes later by `Set-RecoveryPartitionAttributes`. On a machine with Device Encryption actively encrypting, the encryption service could claim that Basic Data partition during the window and start encrypting it. Applying the recovery type at creation makes that window zero-width.
 
-`New-Partition` is retried up to 3 times with a fresh overlap check between attempts. If it fails after 3 attempts, the script restores C: to its original size and returns `$null`, and the main flow falls through to OS-fallback.
+`New-Partition` is retried up to 3 times with a fresh overlap check between attempts. If it fails after 3 attempts, the script restores C: to its original size and returns `$null`, and the pending-deployment caller verifies the remaining route and retains recovery material.
 
 ### 7. Whole-layout assertion
 
@@ -341,7 +331,7 @@ On success, the script logs:
 Verified recovery partition layout: disk N partition M, offset O MiB, size S MiB
 ```
 
-On failure, the script calls `Remove-OrphanPartition` to clean up the partition it just created, then restores the resize target and returns `$null`. The main flow falls through to OS-fallback. This matches the existing `Format-Volume`-failure recovery shape.
+On failure, the script calls `Remove-OrphanPartition` to clean up the partition it just created, then restores the resize target and returns `$null`. The pending-deployment caller verifies the remaining route and retains recovery material. A helper failure does not authorize an unverified fallback. This matches the existing `Format-Volume`-failure recovery shape.
 
 ### 8. Format and attribute
 
@@ -378,13 +368,13 @@ Candidates in use are skipped, unless the letter is already owned by the target 
 
 **Preferred letter reuse.** If the current run has already held a drive letter on a recovery partition earlier in this run (tracked in `$Script:tempDriveLetters`), the caller selects that letter as the preferred letter; the helper tries it first, before falling back to a fresh one from `Get-AvailableDriveLetter`. Windows caches letter-to-volume mappings in `MountedDevices`; reusing a letter the script held earlier is more likely to succeed cleanly than picking a fresh one, and it avoids the assign-remove-reassign churn that can leave stale entries. The fallback chain is unchanged: if the preferred letter fails, the helper moves on.
 
-If no drive letter can be assigned — all 23 candidates fail, or the function bailed out early — the script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
+If no drive letter can be assigned — all 23 candidates fail, or the function bailed out early — the script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The pending-deployment caller verifies the remaining route and retains recovery material. A helper failure does not authorize an unverified fallback.
 
 ### 10. Verify encryption state (early check)
 
 After assignment, `Test-VolumeEncrypted` verifies the new partition is not encrypted.
 
-- If it **is** encrypted (`$true`), the script calls `Set-RecoveryPartitionReadyForWinRE` on the partition, which decrypts it in place with `manage-bde -off` and polls for completion, up to a 300-second timeout. If the helper succeeds, the partition is now unencrypted and usable; the run continues. If the helper fails (timeout or unrecoverable error), `Remove-OrphanPartition` deletes the partition and the function returns `$null`; the main flow falls through to OS-fallback.
+- If it **is** encrypted (`$true`), the script calls `Set-RecoveryPartitionReadyForWinRE` on the partition, which decrypts it in place with `manage-bde -off` and polls for completion, up to a 300-second timeout. If the helper succeeds, the partition is now unencrypted and usable; the run continues. If the helper fails (timeout or unrecoverable error), `Remove-OrphanPartition` deletes the partition and the function returns `$null`; the pending-deployment caller verifies the remaining route and retains recovery material.
 - If the state is **unknown** (`$null`), the script proceeds with a warning and lets the deploy step's `Set-RecoveryPartitionReadyForWinRE` call surface any issue.
 - If it is **confirmed unencrypted** (`$false`), nothing further is needed.
 
@@ -402,35 +392,17 @@ The function adds the assigned drive letter to `$Script:tempDriveLetters` before
 
 ## The pre-shrink deferral and the retry-suppressing marker
 
-When the pre-shrink sequence (or the pre-flight geometry plan) returns `Deferred` with `RetrySuppressible = $true`, the main flow writes a marker at `C:\Recovery\OEM\winre_partition_deferred.json`. The marker contains the current `DesiredStateId` and a `Since` timestamp.
+`C:\Recovery\OEM\winre_partition_deferred.json` records a refused attempt separately from the deployment state and durable pending-operation record. Patch 5's version 2 marker records `DesiredStateId`, `Since`, `Category`, `Reason` and `RetryAfterUtc`.
 
-The marker's purpose is to suppress identical retries. A machine whose destructive replacement deferred because the resize target has insufficient free space will defer again the next run if the constraint has not been resolved. The marker records that fact so the next run can skip the same retries and exit cleanly with `EXIT_WARNING` rather than spending a full-update pass on a plan that will fail the same way.
+A capacity refusal is evaluated against actual available space, the required shrink and the free-space reserve on a subsequent run. Free space is not rounded into a coarse retry bucket. A DSI match does not freeze the refusal after the machine's conditions change. Execution/verification failures use a bounded one-hour retry delay rather than indefinite suppression; legacy markers without the new fields do not suppress fresh assessment.
 
-The marker is written only for `RetrySuppressible = $true` deferrals. The v46 patch 2 pre-deletion resolver deferral (`active WinRE location could not be resolved`) is not retry-suppressed: the condition requires operator action to resolve, and the machine is in a state where the next run must re-evaluate the registration rather than skip. The same applies to the `WinRE disable failed before deletion` and `recovery partition deletion failed` deferrals, and to the v47 patch 1 pre-`/disable` race-detector abort (`registered source changed before disable`) — the drift is a Windows-Update-driven transient that the next run re-evaluates, not a stable operator-actionable condition.
+The distinction matters: `post-shrink free space below minimum` is a capacity refusal, while a failed shrink command or unexpected post-resize geometry is an execution/verification outcome. Plan/provider/route-integrity refusals are reported by their actual phase rather than described as proof that space is insufficient.
 
-On each subsequent run, the marker is honored only when both of the following hold:
+A currently blocked operation retains its verified candidate and pending record. An adequate dedicated route can make an obsolete marker unnecessary. An OS-fallback route or undersized dedicated partition is not converged merely because it was previously accepted.
 
-- **The old route is verified functional.** `Test-DeferredWinRERouteFunctional` checks that WinRE is `Enabled`, the registered WIM is readable, and the active location is either a type-coded recovery partition on the OS disk or OS-fallback on a `FullyDecrypted` C:. If any of those conditions is not met, the marker is not honored.
-- **The fast path would not fire.** The run computes `$fastPathWillFire` from the current state: exactly one type-coded recovery partition on the OS disk, no rebuild needed, WinRE `Enabled`. If the fast path would fire, the marker's purpose is obsolete — the machine has converged on its own — and the marker is not honored.
+A verified last-resort OS-fallback is available only after actual dedicated creation failure, with verified geometry and fully decrypted C:, when an acceptable previous or readable enabled route cannot be retained. Its location, expected bytes and saved state are checked; it still retains the journal, candidate and resume task and reports warning rather than convergence. A preflight `Deferred` does not trigger this fallback.
 
-There are three ways the marker is **cleared**:
-
-1. **DSI mismatch on read.** The marker was written under a different `DesiredStateId` — a script version bump, a manifest change, a CPU swap, a VMD flip, or a Windows build change. `Read-PartitionDeferral` logs `Partition deferral marker is stale for the current DesiredStateId; clearing it` and removes the file. This is the common case after a version boundary: the previous deferral no longer applies to the current deployment. On the v48 → v49 boundary specifically, a marker written under a v48 `DesiredStateId` will be cleared on read because the `SCRIPT` component differs.
-
-2. **Old route no longer functional.** `Test-DeferredWinRERouteFunctional` returns `$false`. The marker is cleared in the marker-check block and normal repair evaluation continues. The old route may have been corrupted by an external event, or an intervening run may have changed the state.
-
-3. **Fast path would fire.** The machine has converged — one type-coded recovery partition on the OS disk, no rebuild needed, WinRE `Enabled`. The marker is cleared and the run falls through to the fast path, exiting `EXIT_SUCCESS` rather than being pinned at `EXIT_WARNING` by an obsolete marker.
-
-A marker that is honored causes the run to exit `EXIT_WARNING` without repeating the pre-shrink retries. The staged workspace and checkpoint are preserved — if the machine's inputs have not changed and the previous route is still functional, the staged optimized WIM remains available for the eventual successful run.
-
-To force a retry when the marker is present, delete both the marker and the state file:
-
-```powershell
-Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force
-Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force
-```
-
-The marker deletion clears the suppression record; the state-file deletion clears the recorded deployment identity, which forces a rebuild. If you want to force a retry without losing the recorded state, delete only the marker file — the next run re-attempts the pre-shrink, and if it fails again the marker is re-written with a fresh `Since` timestamp.
+Forcing a retry by deleting deployment state is no longer the normal response to freeing space. Read the current refusal, resolve it and re-run Repair. Do not delete `pending-deployment.json` or its protected candidate to clear a retry marker; those artifacts may be the only independent recovery material after partition mutations. See [state and idempotency](state-and-idempotency.md#partition-deferral-sidecar).
 
 ## Restoring the previous route on deletion failure
 
@@ -454,12 +426,15 @@ The deletion-failure branch captures the size-restore result and the route-resto
 - **Route restored, resize-target geometry restore unverified** — `Deferred` with `Reason = "recovery partition deletion failed; previous route restored but <resize-target label> geometry restore unverified"`, and `$Script:GeometryRestoreFailed` is set. The state file is invalidated so the next run retries from clean. The partial rollback is reported as such; the previous code could report "previous route restored" while the resize target remained shrunken.
 - **Route not restored** — `$null` with an ERROR log stating that the route could not be restored. The machine ends without a working recovery route, and manual intervention is required.
 
-**`Test-WinRELocationMatches`.** reagentc may report the same volume in either the GLOBALROOT form (`\\?\GLOBALROOT\device\harddiskN\partitionM\`) or the Volume-GUID form (`\\?\Volume{guid}\`), and the form can change across a disable/enable cycle. The function compares the two locations by:
+**`Test-WinRELocationMatches`.** reagentc locations can identify a volume by drive letter, GLOBALROOT (`\\?\GLOBALROOT\device\harddiskN\partitionM\`) or volume GUID (`\\?\Volume{guid}\`), followed by the registered folder. The volume spelling can change across a disable/enable cycle. Patch 5 preserves that folder through parsing and checks both **resolved partition identity and normalized relative folder** when comparing different spellings. Two different folders on one partition are different recovery routes.
 
-1. **String equality** on the normalized strings (trailing backslashes trimmed).
-2. If that fails, **disk/partition identity** — resolving each location via `Resolve-WinRELocationToPartition` and comparing the resulting disk number and partition number.
+`Resolve-WinRELocationToPartition` identifies the partition independently of its registered folder. Deployment must resolve an enabled active route before classifying the chosen target as active or independent; failure to resolve it refuses target preparation or copying. This prevents a drive-letter location from being mistaken for an inactive target that is safe to overwrite before WinRE is disabled.
 
-A machine whose WinRE is `Enabled` but registered to a different location is not treated as "restored". The route restoration must confirm the location, not just the status.
+If reagentc reports `Enabled` with an empty or absent location field, registry data cannot establish the active route and is not substituted. The route remains unresolved, so existing preparation guards refuse mutation. Registry fallback remains available when WinRE is disabled. This is a defensive contract; an actual Windows instance producing the inconsistent Enabled-without-location state has not been demonstrated in the supplied logs.
+
+A volume-root location denotes that root literally; it does not imply `Recovery\WindowsRE`. Ambiguous aliases through a reparse point, mounted directory or substituted drive are refused when the backing volume and full directory cannot be proven.
+
+A machine whose WinRE is `Enabled` but registered to a different folder or partition is not treated as "restored". Route restoration checks the full location and the previous image's own expected bytes, not just status or shared partition identity.
 
 ## Where the target partition is prepared for reagentc
 
@@ -529,13 +504,13 @@ As of v48 patch 1, the function also accepts `-AnchorDiskNumber` and `-AnchorPar
 
 ## Step 7 — stray recovery partition cleanup
 
-After deployment, Step 7 removes every type-coded recovery partition on non-OS disks.
+Step 7 runs the scoped non-OS recovery-partition sweep. It does not delete from every attached disk.
 
 ```
 Remove-StrayRecoveryPartitions -OSDiskNumber <n>
 ```
 
-For each disk whose number is not the OS disk, query `Get-RecoveryPartitions`. For each partition found:
+Detected or indeterminate guests skip the sweep. Otherwise it preserves non-OS `File Backed Virtual` disks and unsupported buses, including USB, SD/MMC, iSCSI and Fibre Channel. On the remaining internal disks it queries `Get-RecoveryPartitions`; for each partition found:
 
 - If it is type-coded (GPT `{de94bba4-06d1-4d40-a16a-bfd50179d6ac}` or MBR `0x27`) **and** at most 2 GiB, delete it.
 - If it is not type-coded (label-only match), log and skip.
@@ -547,11 +522,11 @@ As of v50 patch 1, the function also emits one aggregate summary line per run in
 
 As of v50 patch 2, the function first calls `Test-RunningInVirtualMachine`, which matches `Win32_ComputerSystem`'s Manufacturer and Model against a list of hypervisor signatures. When the helper returns `$true` (a known hypervisor signature matched) or `$null` (the query failed, returned nothing, or returned empty/whitespace-only metadata — fail closed), the entire sweep is suppressed and any recovery partitions on non-OS disks are preserved. Suppression is the safe direction: a host physical disk exposed to a guest via passthrough (Hyper-V) or raw disk access (VirtualBox) is indistinguishable from a genuine secondary internal disk by `BusType` alone. When the sweep runs on a physical machine, any non-OS disk whose `BusType` is `File Backed Virtual` is preserved individually — a mounted VHD/VHDX may contain another installation's recovery environment — and its disk number is added to the aggregate summary line's `preserved virtual:` field. The OS-disk repair path is unaffected by either suppression: it operates only on the OS disk, which is the guest's own.
 
-As of v50 patch 3, each deletion the sweep performs is positively verified. After `Remove-Partition` returns, the function re-queries the target disk with a terminating `Get-Partition -DiskNumber $disk.Number -ErrorAction Stop` and confirms the target partition is absent from the results before recording the deletion as confirmed. A query failure is treated as not-confirmed-deleted (fail closed): the partition is added to the `failedToDelete` list, `$Script:nonFatalWarning` is set, and the function returns `$false`. The partition remains on disk and the operator can inspect it; the aggregate summary line's `failed:` field names it. This closes the same class of fail-open the v49 patch 2 changes closed on the main destructive deletion loop, extended to the non-OS sweep.
+As of v50 patch 3, each deletion the sweep performs is positively verified. After `Remove-Partition` returns, the function re-queries the target disk with a terminating `Get-Partition -DiskNumber $disk.Number -ErrorAction Stop` and confirms the target partition is absent from the results before recording the deletion as confirmed. A query failure is treated as not-confirmed-deleted (fail closed): the partition is added to the `failedToDelete` list, `$Script:nonFatalWarning` is set, and the function returns `$false`. The deletion outcome is unconfirmed; inspect the actual inventory before relying on the partition's presence or absence. The aggregate summary line's `failed:` field names it. This closes the same class of fail-open the v49 patch 2 changes closed on the main destructive deletion loop, extended to the non-OS sweep.
 
 The function is called from the fast path, the enable-only path, both pending-reboot exits, and Step 7 of the full-update path. In every case the call is the same; the read-only scan cost when there are no strays is a single `Get-Disk` and a few `Get-Partition` calls per non-OS disk.
 
-**The `Get-RecoveryPartitions` reads are guarded against empty-disk errors (v46 patch 2).** Both `Get-Partition -DiskNumber $diskNum` calls carry `-ErrorAction SilentlyContinue`. On a machine with a disk that exposes no partitions — an SD/MMC card reader, an empty USB enclosure, a disk with no recognized partition table — the call would otherwise throw `CmdletizationQuery_NotFound_DiskNumber`. The error is non-terminating at the current call sites but pollutes the log on every run and would abort a caller wrapped in `-ErrorAction Stop`. The guard silences the throw only for disks that expose no partitions; behaviour on disks that do expose partitions is unchanged.
+**The `Get-RecoveryPartitions` reads are guarded against empty-disk errors (v46 patch 2).** Both `Get-Partition -DiskNumber $diskNum` calls carry `-ErrorAction SilentlyContinue`. On a machine with a disk that exposes no partitions — an SD/MMC card reader, an empty USB enclosure, a disk with no recognized partition table — the call would otherwise throw `CmdletizationQuery_NotFound_DiskNumber`. The error is non-terminating at the current call sites but pollutes the log on every run and would abort a caller wrapped in `-ErrorAction Stop`. The broad discovery helper suppresses those query errors; this alone does not distinguish an empty disk from a provider failure. Destructive OS-target selection separately uses a terminating inventory and refuses on failure.
 
 ## GPT vs MBR
 

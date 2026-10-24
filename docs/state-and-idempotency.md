@@ -1,11 +1,11 @@
 ---
 title: "State and idempotency — WinRE Manager"
-description: "WinRE Manager's DesiredStateId, state file, checkpoint, deferral marker, the temporary resume task, and the offline-fallback LocalInputsId field."
+description: "Understand WinRE Manager state files, deployment identity, protected pending operations, checkpoints, retry delays and recovery-task lifecycles."
 ---
 
 # State and idempotency
 
-WinRE Manager is idempotent via a single hash called `DesiredStateId`. Everything else — the state file, the checkpoint file, the deferral marker, the fast path — exists to make that hash work.
+`DesiredStateId` identifies the deployment inputs. Idempotency also checks the actual recovery route and partition capacity; the identity does not encode current geometry, free space or BitLocker state. A separate durable pending-deployment record protects unfinished work across interruption and identity changes.
 
 ## `DesiredStateId`
 
@@ -72,10 +72,10 @@ Any of the following cause the ID to change, which forces a full rebuild on the 
 - The backup and restore actions introduced in v49 (`-Action Backup`, `-Action Restore`). They are standalone actions, not part of the repair pipeline. They read and write a backup directory and its `backup.json` sidecar. A backup does not touch the state file and does not change the deployment's identity. A restore replaces the WIM on the currently registered route; on successful completion it deletes the state file, the checkpoint file, and the partition deferral marker so the next repair run re-evaluates the machine from a clean slate. The seven DSI inputs themselves are unchanged — the deployment identity is a function of the inputs above, and none of them changes because a WIM was restored — but the recorded state file is deliberately removed to force a full re-evaluation.
 - The temporary crash-recovery scheduled task introduced in v49 (`WinRE Manager - Resume`). It is registered by a Repair or Restore run and deleted on clean completion. It is a per-run safety net, not a machine-state artifact, and it is not recorded in the state file. Its presence or absence does not affect the fast path. See "The temporary resume task" below for the lifecycle, the persist-signal list, and the v50 patch 4 staging flags.
 - The stable install location introduced in v49 (`C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1`). The installed copy is a persistent artifact on disk — a wrapper-managed file, not a state-file field. Its presence does not change the DSI; a machine that never installs the maintenance task and a machine that does will compute the same `DesiredStateId` for the same inputs.
-- The native-boot VHDX fail-closed gate introduced in v49. It refuses to run destructive operations on a machine whose OS volume is on a native-boot VHDX. Like the v48 architecture gate, it is a startup refusal, not a DSI input. A VHDX-boot machine that runs the script will exit `EXIT_WARNING` before any state mutation; its state file is unchanged.
+- The native-boot VHDX fail-closed gate introduced in v49. This default-Repair startup check is not a DSI input. It refuses a `File Backed Virtual` OS disk with another nonvirtual disk, or an indeterminate topology, before Repair partition/WinRE changes. Logging and staging can precede it; Backup and Restore dispatch before it. Guest disk-file format alone does not trigger refusal.
 - A change to the driver manifest's contents without a `version` bump. This is a manifest-authoring bug; production assumes the version field is maintained.
 
-`ScriptVersion` bumps are expensive: they force every healthy machine to rebuild. The project's policy is to bump only when the deployed WIM, the partition layout, or the DSI inputs change. Bug fixes to the main flow ship under the same version without a DSI change, and correct the affected machines on their next run without disturbing the rest. The [CHANGELOG.md](../CHANGELOG.md) carries the per-release record.
+`ScriptVersion` changes can cause fleet-wide re-evaluation. Correctness and recoverability determine whether a bump is appropriate; avoiding fleet work is not a reason to keep an insufficient identity scheme. The project documents changes to deployed WIM bytes, placement policy or DSI inputs in a migration note. Bug fixes to the main flow ship under the same version without a DSI change, and correct the affected machines on their next run without disturbing the rest. The [CHANGELOG.md](../CHANGELOG.md) carries the per-release record.
 
 The v44 patch 1, v45 patch 1, v46 patch 1, v47 patch 1, v48 patch 1, v49, and v50 patch 1 revisions are the deliberate exceptions. Each changes an input the `DesiredStateId` recipe depends on: v44 added `CPU` and `VMD` to the field list; v45, v46 patch 1, v47 patch 1, v48 patch 1, v49, and v50 patch 1 each changed the value of the `SCRIPT` field. Because the ID includes those inputs, the ID changes on every managed machine, and every managed machine performs one full-update pass on its next run before returning to the fast path. See the migration notes in `CHANGELOG.md`; rolling back any of these seven revisions to the preceding one likewise causes a one-time DSI mismatch and rebuild under the older behavior.
 
@@ -87,12 +87,14 @@ The v49 bump has a similar character: it is the version boundary that converges 
 
 Path: `C:\Recovery\OEM\winre_state.json`.
 
+The legacy state readers and writer do not authenticate the file's ACL or ancestor chain. Protect this file and its parents from untrusted modification: current and historical hashes and lineage values can authorize ownership decisions. The protected pending-deployment store is a separate boundary and does not establish the authenticity of legacy state. See [Security](../SECURITY.md#known-limitations-and-accepted-risks) for the accepted parent-directory policy and its consequences.
+
 ### Schema
 
 ```json
 {
     "DesiredStateId":           "<64-char hex>",
-    "CurrentImageHash":         "<SHA256 hex of the deployed winre.wim>",
+    "CurrentImageHash":         "<last positively manager-owned image SHA256, or null>",
     "InjectedDriverSetVersion": "<manifest.version at deploy time>",
     "LastUpdated":              "yyyy-MM-dd HH:mm:ss",
     "PendingReboot":            false,
@@ -109,7 +111,7 @@ Path: `C:\Recovery\OEM\winre_state.json`.
 }
 ```
 
-`ForeignSourceAcceptedHash` and `LineageId` are the v49 additions. Both are optional. `ForeignSourceAcceptedHash` is written when the manager preserves a source rather than normalizing it. In v49 there are two such paths: the source-ownership classification preserving a `Foreign-With-Drivers` source, and the never-downgrade storage-driver check discarding the whole candidate on a detected downgrade. On both paths the field records the preserved source's hash so the next run recognizes the accepted source and takes the fast path. `LineageId` is a persistent identifier generated on the first v49 deploy and embedded in the provenance marker written into the deployed image; it is carried forward across runs on every subsequent state write. Both fields default to `$null` when absent, so a state file written by v48 or earlier is accepted without triggering a rebuild.
+`ForeignSourceAcceptedHash` and `LineageId` are the v49 additions. Both are optional. `ForeignSourceAcceptedHash` is written when the manager preserves a source rather than normalizing it. In v49 there are two such paths: the source-ownership classification preserving a `Foreign-With-Drivers` source, and the never-downgrade storage-driver check discarding the whole candidate on a detected downgrade. On both paths the field records the preserved source's hash so a later run recognizes the accepted bytes. Patch 5 still checks the actual dedicated layout and capacity before fast-path acceptance. The accepted foreign hash is never promoted into `CurrentImageHash` merely because its bytes were copied. `LineageId` is a persistent identifier generated on the first v49 deploy and embedded in the provenance marker written into the deployed image; it is carried forward across runs on every subsequent state write. Both fields default to `$null` when absent, so a state file written by v48 or earlier is accepted without triggering a rebuild.
 
 `DeployedDiskNumber` and `DeployedPartitionNumber` are present only when the deployment reached a dedicated recovery partition. They are used by the pending-reboot path to re-point `reagentc /setreimage` at the correct location after a reboot. They are absent from an OS-fallback state file, because the fallback target is `C:\Recovery\WindowsRE` — a path, not a partition by number.
 
@@ -142,49 +144,55 @@ Note: the stale file is left in place. If the next run also fails to reach a sta
 
 ### Partition deferral sidecar
 
-`C:\Recovery\OEM\winre_partition_deferred.json` records a pre-shrink deferral separately from the deployment state. It stores the `DesiredStateId` under which the deferral was written and a `Since` timestamp. The sidecar is not part of the deployment identity, and it is not what the fast path validates against — it is a temporary suppression record that prevents the script from re-attempting the same failing destructive sequence on every scheduled run while an operator resolves the underlying constraint.
+`C:\Recovery\OEM\winre_partition_deferred.json` records a partition refusal separately from deployment ownership. Patch 5 re-evaluates the relevant present conditions before suppressing another attempt. A matching `DesiredStateId` alone does not prove that the same refusal still applies: free space, geometry, target accessibility and encryption state can change without a DSI change.
 
-`Ensure-AdequateRecoveryPartition` can return `Deferred` with numerous distinct reason strings, grouped into seventeen deferral categories. Only four of the categories write the sidecar, and they are exactly the four that represent an **operator-actionable constraint** on the pre-shrink:
+The version 2 marker contains `SchemaVersion`, `DesiredStateId`, `Since`, `Category`, `Reason` and `RetryAfterUtc`. `Category` distinguishes `Capacity` from `Execution`; execution retries have a one-hour `RetryAfterUtc`, while capacity is freshly assessed. Legacy markers without category/backoff do not suppress a fresh assessment.
 
-- `post-shrink free space below minimum` — C: does not have enough free space to absorb the planned shrink.
-- `pre-shrink failed` — the shrink operation failed all three attempts.
-- `pre-shrink verification failed` — the shrink returned success but the post-resize geometry did not land at the target.
-- `resize rounding reduced planned extent` — the actual post-resize geometry leaves less room than the plan's bucket needs.
+The existing reason classes include both capacity refusals and execution/verification failures. `post-shrink free space below minimum` is a capacity constraint. `pre-shrink failed`, `pre-shrink verification failed` and `resize rounding reduced planned extent` are observed operation/geometry failures; they must not be treated as permanent capacity refusals. Patch 5 uses the recorded reason and current preconditions to decide whether a retry is due.
 
-These four set `RetrySuppressible = $true`, and the main flow writes the marker.
+Capacity is checked against the actual required shrink and free-space reserve. Rounding the observed free space into a coarse bucket could hide the moment a machine becomes eligible; no such bucket is proof that another attempt must remain suppressed. Potentially transient execution failures use a bounded one-hour retry delay. This can delay another execution attempt even if an external condition changes during that hour; an already adequate dedicated route is verified/committed before backoff. Removing only the deferral marker requests immediate reassessment without deleting the pending operation. Indeterminate capacity or geometry reads do not authorize partition changes and remain eligible for later reassessment.
 
-The remaining thirteen `Deferred` categories do **not** set `RetrySuppressible`, and no marker is written:
+The old route still has to satisfy the existing readable/observed-registration checks before suppression can be used. An adequate dedicated route makes an obsolete marker unnecessary. OS-fallback and an inadequate dedicated partition remain remediation conditions rather than healthy fast-path outcomes. An encrypted OS-fallback route is not accepted as functional.
 
-- `partition geometry unavailable` — the pre-flight `Get-PartitionSupportedSize` or disk-layout read failed. Storage-level condition; retrying is reasonable.
-- Any of the plan-rejection reasons (`Dedicated recovery partition plan rejected: ...`). These indicate a layout the planner cannot prove safe; a retry will produce the same rejection. Operator review is required.
-- `unable to resolve deployment source partition` — the caller supplied a `ProtectedSourcePath` but `Get-Volume -FilePath` could not resolve it to a partition. Fail-closed: the destructive sequence is refused before any mutation.
-- `deployment source partition is in the destruction set` — the source WIM resolves to a partition the plan intends to delete. Fail-closed: the destructive sequence is refused before any mutation.
-- `<resize-target label> volume could not be read for free-space check` — the resize target's volume read failed (label is `OS partition (C:)` or `anchor partition (disk X part Y)`). Explicitly `RetrySuppressible = $false` because the read may be transient and the operator should not need to delete the marker to retry.
-- `WinRE disable failed before deletion` — `reagentc /disable` returned non-zero.
-- `WinRE disable verification failed before deletion` — the post-disable status check did not report `Disabled`.
-- `WinRE status is indeterminate (<status>)` (v49 patch 2). reagentc `/info` reported a status that is neither `Enabled` nor `Disabled`, typically on a non-English OS whose output the parser does not classify. The destructive sequence is refused before any mutation. `RetrySuppressible = $false`; the deferral marker is not written.
-- `active WinRE location is empty` (v48 patch 1) — reagentc reports no registered location at all. The destructive sequence is refused before any mutation; the guard fires ahead of the pre-shrink and ahead of `reagentc /disable`, so the machine is left with WinRE still `Enabled` and the old recovery partition intact. Retrying with the same condition would produce the same refusal, so the deferral is not retry-suppressed.
-- `active WinRE location could not be resolved` (v46 patch 2; placement moved by v48 patch 1) — WinRE was `Enabled` but the registered location could not be resolved to a partition. Same fail-closed treatment as above; the guard fires ahead of the pre-shrink and ahead of `reagentc /disable`, so the machine is left with WinRE still `Enabled` and the old recovery partition intact. Retrying with the same unresolvable location would produce the same refusal, so the deferral is not retry-suppressed.
-- `recovery partition deletion failed; previous route restored` (v46 patch 2) — a mid-loop deletion failure; `Restore-OSPartitionSize` verified C: at its original size and `Restore-PreviousWinRERoute` confirmed the previous route was restored. The machine is functional again; no suppression is needed.
-- `recovery partition deletion failed; previous route restored but <resize-target label> geometry restore unverified` (v46 patch 2; label parameterized by v48 patch 1) — a mid-loop deletion failure; the previous route was restored but `Restore-OSPartitionSize` could not verify the resize target at its original size. `$Script:GeometryRestoreFailed` is set, so the state file is invalidated and the next run retries from a clean slate. The deferral is not retry-suppressed because the state-file deletion already forces the retry; the sidecar would be redundant.
-- `registered source changed before disable` (v47 patch 1) — the pre-`/disable` race detector fired at the `Ensure-AdequateRecoveryPartition` site: the registered WinRE's `Location`, `Version`, or WIM SHA256 changed between capture at rebuild start and re-read immediately before the `/disable`. The abort restores C: to its captured size and returns before any partition has been deleted. The deferral is not retry-suppressed because the drift is a transient Windows-Update-driven condition; the next run re-evaluates source selection and either retries against the new registered source or falls through to the LKG.
+A deferral marker is not the pending-deployment record below. The marker can expire or be cleared as its conditions change; an unresolved pending record and its verified source must survive DSI changes and normal workspace cleanup. Do not delete either recovery artifact merely to reset the retry history.
 
-For these twelve, the deferral is not a stable operator-actionable condition that a marker would help suppress. A retry may succeed without any operator action; in the two v46 patch 2 deletion-failure cases the state-file invalidation already forces the retry from clean; and in the v47 patch 1 case the next run's source-selection logic is the correct response. The sidecar is not written; the next run retries naturally.
+### Pending deployment record (v50 patch 5)
 
-On each subsequent run, the main flow reads the marker and evaluates two conditions:
+The trusted record is `%ProgramData%\OEM\WinRE-Manager\pending-deployment.json`. Its independently verified candidate is `%ProgramData%\OEM\WinRE-Manager\PendingDeployment\pending.wim`, under a protected SYSTEM/Administrators directory. A read handle held during deployment denies writers and deletion. The journal binds that fixed candidate path to its expected SHA256. Ordinary servicing-workspace cleanup cannot remove it. Staging requires the WIM size plus 32 MiB free on the OS volume; the subsequent shrink assessment measures free space after that copy. This is durable operation state, separate from `winre_state.json`, the ordinary servicing checkpoint and the backup catalogue.
 
-- **`Test-DeferredWinRERouteFunctional`** — WinRE is `Enabled`, the WIM registered at the active location is readable, and either the active partition is a type-coded recovery partition on the OS disk, or the OS-fallback route is on a `FullyDecrypted` C:.
-- **`$fastPathWillFire`** — the machine has converged on its own. No rebuild is required, WinRE is `Enabled`, and either (a) there is exactly one type-coded recovery partition on the OS disk and the active location is on the recovery partition or on OS-fallback, or (b) there is no recovery partition, `UsedOSFallback` is recorded in the state file, and the active location is on OS-fallback. These are the same conditions the fast path itself uses.
+The disposition is `Managed` or `Preserved`; it is not a new source ownership class. A managed candidate may be a newly serviced WIM or a positively owned current WIM copied unchanged for layout repair. A preserved candidate keeps its accepted bytes and foreign acceptance distinct from `CurrentImageHash`.
 
-The decision tree:
+The schema version is `1`. Its recorded fields are:
 
-- **The deferred route is functional and the fast path would not fire.** The marker is honored. The run exits `EXIT_WARNING` with a log message naming the marker file and, if a staged `WIM_READY` image is present in the recorded workspace, stating that it is available for immediate reuse. The staged workspace and checkpoint are preserved — the eventual successful run can resume from them. The marker alone suppresses identical retries.
-- **The fast path would fire.** The marker is obsolete: the machine has converged on its own, and there is nothing left to suppress. The marker is cleared and the run falls through to the fast path, exiting `EXIT_SUCCESS` rather than being pinned at `EXIT_WARNING`. This is the v45 patch 1 marker-obsolescence behavior.
-- **The deferred route is not functional.** The marker is cleared and normal repair evaluation continues.
+| Group | Fields |
+|---|---|
+| Operation and disposition | `SchemaVersion`, `OperationId`, `Phase`, `Mode`, `ImageHandling`, `UpdatedUtc` |
+| Accepted bytes | `CandidatePath`, `ExpectedSourceHash`, `DeployedWinREMetadata` |
+| Completed-servicing cleanup context | `ServicingWorkDir` (canonical ordinary workspace; cleanup follows dedicated commit) |
+| Deployment inputs and prior ownership | `DesiredStateId`, `DriverVersion`, `LocalInputsId`, `PriorManagedHash`, `LineageId` |
+| OS identity | `OSDiskId`, `OSVolumeId`, `OSPartitionOffset` |
+| Previous route evidence | `PreviousStatus`, `PreviousLocation`, `PreviousHash` |
+| Observed target | `TargetPartitionGuid`, `TargetOffset`, `TargetSize` |
+| Planned target | `PlannedTargetOffset`, `PlannedTargetSize` |
+| Resize and deletion evidence | `ResizeTargetGuid`, `ResizeTargetOffset`, `ResizeTargetInitialSize`, `ResizeTargetPlannedSize`, `RecoveryInventoryJson` |
 
-A marker whose `DesiredStateId` does not match the current one is stale and is cleared on read.
+The previous-route hash belongs to that previous image; it is not assumed to equal the deployment candidate. `PreviousLocation` retains the registered folder as well as its volume spelling. Equivalent drive-letter, GLOBALROOT and volume-GUID spellings must identify both the same partition and the same normalized folder; sharing a partition alone does not establish the same route. The target observations are revalidated against current topology before use.
 
-After freeing space or correcting the layout, delete both `winre_state.json` and `winre_partition_deferred.json` to force a retry without changing the deployment fingerprint. The state-file deletion clears the recorded deployment identity; the sidecar deletion clears the suppression record. Both are safe to delete: the next run treats the state as absent and re-runs the full-update path.
+The recorded phases are:
+
+| Phase | Meaning |
+|---|---|
+| `Prepared` | Independent source bytes and expected SHA256 are durably bound before mutation. |
+| `MutationStarted` | The operation may have changed partition or recovery state; ordinary cleanup must retain its source. |
+| `Copied` | The selected target WIM has been copied and checked against the expected hash. |
+| `Registered` | The target registration has been recorded; observed state must still be checked. A verified last-resort OS-fallback retains this phase and the pending owner. |
+| `Verified` | The final route/image checks have passed; state persistence and record retirement still control source release. |
+
+An existing unreadable, untrusted, malformed or unsupported record is a refusal condition. It is not treated as a first run with no pending operation. A valid record is loaded before action dispatch or ordinary cleanup and resumed after hardware/topology gates, before normal network/DSI preparation. Resume re-reads current topology and hashes; recorded partition numbers are observations, not an authority to replay stale mutations.
+
+The source hash remains bound throughout preparation, partition work and deployment. Any previous-route proof uses the previous image's own expected hash, which can differ from the candidate hash. Registration and byte integrity must be distinguished from an acceptable encrypted-OS-fallback recovery route. Restoring partition size alone cannot restore a deleted partition or its image.
+
+Only a verified dedicated final route followed by durable state persistence/read-back permits the pending record to be retired and its candidate released. Last-resort OS-fallback is allowed only after actual dedicated creation failure, on fully decrypted C: with verified geometry and no acceptable route to retain. Its observed OS location, expected hash and saved fallback state are checked; it reports warning and retains the `Registered` journal, candidate and task for later dedicated repair. State persistence failure retains recovery material even if the new route is already correct; it does not cause a healthy route to be undone. Unresolved failures retain the temporary resume task. See the [validation matrix](testing.md#v50-patch-5-validation); real interruption and post-deletion failures remain VM release gates.
 
 ### Offline fallback trust (v44 patch 5)
 
@@ -200,9 +208,9 @@ The full set of offline fast-path conditions under v48 patch 1:
 - The state file's `DesiredStateId` matches the stored value (used directly; the DSI is not recomputed offline).
 - The drift detector reports no change: the registered WinRE's servicing metadata matches the `DeployedWinREMetadata` anchor, and no force-upgrade, driver-version change, or missing-anchor condition applies.
 - The state file's stored `LocalInputsId` matches the current locally-computable inputs, or the stored value is `$null` because the state file predates v48 patch 1 (in which case the check is skipped and a WARN is logged).
-- The recovery-partition layout is one of the healthy shapes: exactly one **type-coded** recovery partition on the OS disk with the active location on it, or no recovery partition with `UsedOSFallback = $true` in the state file and the active location on the OS partition.
+- Exactly one **type-coded**, adequately sized recovery partition on the OS disk holds the active image; OS-fallback is a remediation condition.
 
-The v49 pipeline narrowing does not add a new offline-path condition. The source-ownership classification, the never-downgrade storage-driver check, and the pre-deployment storage-applicability gate all run inside the full-update path, which the offline fallback does not reach; the native-boot VHDX fail-closed gate runs as a startup refusal on all paths, including offline, and a VHDX-boot machine defers before the offline fallback is engaged.
+The v49 pipeline narrowing does not add a new offline-path condition. The source-ownership classification, the never-downgrade storage-driver check, and the pre-deployment storage-applicability gate all run inside the full-update path, which the offline fallback does not reach; the native-boot VHDX gate precedes offline fallback on the default Repair path. Backup and Restore dispatch earlier. A VHDX-backed guest is not refused merely because its storage is a virtual-disk file.
 
 If all offline conditions pass, the fast path fires and the run exits `EXIT_WARNING` (code 2) because `$Script:offlineFallback = $true` is set. The state file may be rewritten by the fast path to clear stale counters, exactly as it would online; that rewrite preserves the stored `DesiredStateId` and the `DeployedWinREMetadata` anchor. If any condition does not hold, the run exits `EXIT_WARNING` before the full-update pipeline, having done nothing. If the state file does not exist at all, the run throws and exits `EXIT_FATAL` — a first deployment requires the live manifest to compute the initial `DesiredStateId`.
 
@@ -226,7 +234,7 @@ The consequence is that a machine with a valid state file that takes the VMD-que
 - The enable-only path, to record the registration result. On a terminal outcome — `"failed"` from a generic enable failure, `"failed"` from a target-preparation failure, or `"bitlocker"` — the counter is incremented and the state file is written with the corresponding `LastEnableResult`. On `"reboot"` the state file is written with `PendingReboot = $true` and the counter reset to 0. On `"ok"` the enable-only path exits `EXIT_SUCCESS` (or `EXIT_WARNING` if a non-fatal warning flag was set) **without writing the state file**; the counter is not reset by the enable-only path on this outcome. The next run's fast path clears a stale non-zero counter, so the counter is reset one run later.
 - The pending-reboot path, to update the `PendingReboot` and `RepairAttempts` flags. A successful pending-reboot repair resets the enable-failure counter to 0; a reboot-required outcome keeps `RepairAttempts` and resets the enable-failure counter. **A target-preparation failure on the pending-reboot path does not increment `EnableFailureAttempts`** — the exclusion is deliberate, because immediately after a reboot the target partition's encryption state may be transiently indeterminate, and a preparation failure that would resolve on its own within one poll cycle must not be counted against the enable-failure threshold. The pending-reboot path is tracked exclusively by `RepairAttempts`.
 - The full-update path, after Step 6 succeeds. If the run's `$enableResult` is `"failed"` or `"bitlocker"`, the counter is incremented; on any other outcome it resets to 0. The loop-breaker checks the incremented value on the next run.
-- The full-update path's Step 3, on either of the two v49 source-preservation outcomes (the `Foreign-With-Drivers` classification, or the never-downgrade detection). Each writes the state file with `ForeignSourceAcceptedHash` set to the preserved source's hash, then exits `EXIT_WARNING` without reaching Step 4.
+- Source-preservation outcomes (`Foreign-With-Drivers` or never-downgrade) record `ForeignSourceAcceptedHash` separately from ownership. In patch 5, preserving the bytes also evaluates the recovery layout and can enter unchanged-image deployment; it no longer implies an immediate exit before partition remediation.
 
 The enable-failure counter is incremented on both terminal outcomes. The distinction between `"failed"` and `"bitlocker"` is preserved in the state file so the operator can see *why* the enable step is failing, but the counter treats them the same way — a machine that keeps failing on the BitLocker error is in the same kind of loop as a machine failing generically, and both need the same manual intervention.
 
@@ -236,7 +244,7 @@ A separate branch on the restore action (v50 patch 3) takes a different path fro
 
 Before writing, the function checks `$Script:GeometryRestoreFailed`. If that flag is set — meaning a post-shrink or post-delete failure left C: at a geometry the restore helper could not verify — the function **deletes** the state file (if it exists) and returns without writing.
 
-The deletion is deliberate. Skipping the write would not be enough: if the previous state file's `DesiredStateId` matched the current one, the next run's `Read-WinREState` would accept it, the count=0 exemption would fire, and C: would stay at the unverified geometry indefinitely. Deleting the file forces the next run to treat the state as absent, set `needInject = $true`, and re-run the full-update path, which re-extends C: as part of the destructive attempt.
+The deletion is deliberate: a state file must not record successful convergence while geometry restoration is unverified. An existing matching deployment identity is not evidence that the resize target returned to its original size. Patch 5 also retains the independent candidate and pending record and reports this condition as fatal; the next Repair must reassess actual topology rather than assume that rerunning will restore the geometry.
 
 The v46 patch 2 deletion-failure branch makes the flag's meaning more precise: the branch captures the `Restore-OSPartitionSize` result and the `Restore-PreviousWinRERoute` result separately and returns the distinct reason `recovery partition deletion failed; previous route restored but <resize-target label> geometry restore unverified` when only the route restored (the label is `OS partition (C:)` on the non-intervening path and `anchor partition (disk X part Y)` on the intervening-anchor path; v48 patch 1). The flag is set in that sub-case (by `Restore-OSPartitionSize`), the state file is deleted on write, and the operator sees an accurate reason string rather than a flattened "previous route restored".
 
@@ -244,20 +252,13 @@ If the deletion itself fails, the failure is logged as an error. Manual interven
 
 ### Idempotency via the state file
 
-The fast path fires when:
+A matching deployment identity is necessary but not sufficient for the fast path. WinRE must report enabled, the applicable image currency/acceptance checks must pass, and exactly one type-coded OS-disk recovery partition must hold the active image and meet the existing reuse size and effective-free-space requirements. A label-only match is insufficient. An unresolved pending deployment takes precedence over ordinary idempotency.
 
-- WinRE is enabled, AND
-- The state file's `DesiredStateId` matches the current one, AND
-- The drift detector reports no change: the currently-registered WinRE's DISM servicing metadata (`Version` + `SPBuild`) matches the state file's `DeployedWinREMetadata` anchor, and no force-upgrade, driver-version change, or missing-anchor condition applies, AND
-- The recovery-partition layout is one of the healthy shapes: exactly one **type-coded** recovery partition on the OS disk with the active location on it, or no recovery partition with `UsedOSFallback = $true` in the state file and the active location on the OS partition. A partition detected only by a Recovery/WINRE volume label does not satisfy either condition.
+`UsedOSFallback = true` records a constrained prior outcome; it does not exempt the next run from dedicated-layout reassessment. An accepted foreign hash authorizes preserving that image, not keeping an undersized partition or assigning manager ownership. Adequate preserved installations can report `PRESERVED-DEDICATED` without unnecessary partition work.
 
-If all conditions hold, the machine is in the correct end state. The fast path runs `Remove-StrayRecoveryPartitions` (a read-only scan when there are no strays), optionally clears stale `PendingReboot` / `RepairAttempts` / `EnableFailureAttempts` flags and a stale `LastEnableResult`, and exits with `EXIT_SUCCESS`.
+When only layout is wrong, the current verified image can take the copy-only repair path. A failed fast-path predicate therefore does not always require a WIM rebuild. Normal servicing still runs when image currency or deployment inputs require it.
 
-If any condition fails, the script forces a full rebuild. The conditions above are also the fast-path `elseif` branches — the log records which one failed. The type-coded qualifier in the fourth condition was added in v44 patch 7: a label-only partition on the OS disk does not satisfy either side of the healthy-shape check, so a machine whose only recovery-looking partition is label-only never takes the fast path and converges on the full-update path instead. This closes the non-convergence loop described in the `[v44 patch 7]` CHANGELOG entry.
-
-**Note on the WIM hash.** In v46 and earlier, the fast path also compared the deployed WIM's hash at the registered location against the state file's `CurrentImageHash`. That comparison is retired in v47 as a fast-path gate. The WIM hash remains in the state file and is used for LKG validation, copy verification during deployment, deployment verification, and the pre-`/disable` race detector — but the metadata comparison replaces it as the rebuild trigger. The tradeoff is a metadata-neutral Dynamic Update does not trigger a rebuild on its own; see [CHANGELOG.md](../CHANGELOG.md) under the v47 patch 1 entry.
-
-Under the offline fallback (v44 patch 5), the same conditions apply, but the `DesiredStateId` used for the comparison is the one read directly from the state file, and the run exits `EXIT_WARNING` even if all conditions hold. See "Offline fallback trust" above.
+The v47 metadata comparison remains the normal image-currency check; hashes still verify ownership, LKG, copying and deployment, and bind interrupted operations. A metadata-neutral Dynamic Update remains a named residual. During offline fallback, live layout and local-input checks still apply and a completed offline check reports warning because the manifest was unavailable.
 
 ### The loop-breaker
 
@@ -298,7 +299,7 @@ Workspace selection runs only after the healthy fast path, enable-only path, and
 | 4 | Step 4 (optimize) complete and `WIM_READY` recorded. Resume at step 5. |
 | 6 | Full-update path complete. The checkpoint is about to be deleted. |
 
-Step 5 is not checkpointed. It is the partition-and-deploy step, and resuming in the middle of it would leave the machine in an unrecoverable state.
+The ordinary servicing checkpoint does not replay partial partition-and-deployment work. Patch 5 uses the separate pending-operation journal and protected candidate for that recovery. Resume validates the source and current topology and makes a fresh assessment; it does not replay a stored partition number or promise to restore deleted partitions. Interrupted replacement remains a machine-test requirement.
 
 ### Guards on resume
 
@@ -401,7 +402,7 @@ When the VMD hardware presence check is indeterminate, the run removes the check
 
 Path: Windows Task Scheduler, task name `WinRE Manager - Resume`, root `\`, principal SYSTEM at the highest run level. The task is a scheduled task, not a file.
 
-The resume task is registered on every Repair or Restore run, after the Audit Mode guard and before any state-modifying work, and fires at boot+1m and as a one-shot at T+1h. It invokes the production script's default `-Action Repair`, which re-evaluates the machine state and either completes the interrupted run or takes the fast path. The task is removed in the `finally` block on any clean terminal exit (SUCCESS, WARNING, REBOOT_REQUIRED, or a FATAL exit taken inside `Main`) unless a persist signal fired. The staged copy at `C:\Recovery\OEM\Resume\WinRE.ps1` is removed at the same point, under the same persist guard, so the two share a lifetime: a task that persists always has a staged copy to execute, and a run that cleans up leaves nothing behind.
+Live Repair and Restore attempt resume-task registration after the Audit Mode guard and before recovery mutation, when the invocation has a script path and staging can be verified. A registered task fires at boot+1m and as a one-shot at T+1h. It invokes the production script's default `-Action Repair`, which re-evaluates the machine state and either completes the interrupted run or takes the fast path. The task is removed in the `finally` block on any clean terminal exit (SUCCESS, WARNING, REBOOT_REQUIRED, or a FATAL exit taken inside `Main`) unless a persist signal fired. The staged copy at `C:\Recovery\OEM\Resume\WinRE.ps1` is removed at the same point, under the same persist guard, so their cleanup follows the same persist decision. Staging or cleanup can fail; inspect the task and staged-file verification rather than assuming either exists or was removed.
 
 The task exists to cover the window that Rule 2 cannot fully guarantee: an interrupted run that has disabled WinRE, deleted the old recovery partition, or otherwise changed recovery state, before completing the deploy-and-enable sequence. Without the resume task, the machine would sit in that intermediate state until the next scheduled run or an operator intervention.
 
@@ -409,8 +410,8 @@ The task exists to cover the window that Rule 2 cannot fully guarantee: an inter
 
 The `finally` block reads the persist decision from the OR-merge of two independent signals:
 
-- `$Script:ResumeTaskShouldPersist` — set by the outer `catch` on an unhandled exception, and by every site that changes recovery state but cannot positively verify an acceptable final route. As of v50 patch 4 the enumeration is eighteen sites: the outer `catch`; `Invoke-RestoreAction`'s three mid-transformation failure paths (`/setreimage` failure after the WIM is replaced, `/enable` failure with the WIM in place, or the v50 patch 3 WIM-deployment failure when the re-enable attempt does not return `ok`); the v50 patch 4 Step 5 fail-closed guard on an indeterminate WinRE status; and the twelve additional full-update exit sites added in v50 patch 4 — WIM deployment failure on the dedicated target, `reagentc /setreimage` failure, terminal enable failure, the three `Restore-PreviousWinRERoute` failures inside `Ensure-AdequateRecoveryPartition` (`reagentc /disable` failure, `/disable` verification failure, recovery-partition deletion failure), the five final-verification exits (`$finalPart` unresolvable after three attempts, WinRE ends on the OS partition without OS-fallback deployment, WinRE ends on an unexpected partition, WinRE reports Enabled but its registered location is empty, BitLocker error on the final enable attempt), and the OS-fallback encryption cascade. The literal string `$Script:ResumeTaskShouldPersist = $true` appears eighteen times in `scripts/WinRE.ps1`.
-- `[WinRECancelKeyProbe]::ShouldPersist` — set by a compiled `ConsoleCancelKeyPress` delegate. PowerShell runs `finally` blocks on Ctrl+C but bypasses `catch` blocks, so a compiled delegate is the only way to preserve the task on that interruption class. The `Add-Type` registration is best-effort: a registration failure logs a WARN and continues; the Ctrl+C signal is then unavailable and the task is removed on that interruption class.
+- `$Script:ResumeTaskShouldPersist` — armed while inspecting an existing pending deployment and on deployment entry, so unresolved work retains its recovery hook. It is also set by the outer `catch`, the initial indeterminate-status guard, covered Restore failures, failed previous-route restoration and owned-mount cleanup failures. Restore retains the task when re-enable is not confirmed or the original bytes cannot be proven unchanged, and after registration or terminal enable failure following replacement. Verified deployment completion retires the journal and clears the signal. Historical assignment counts belong to their release entries; they are not the maintenance invariant.
+- `[WinRECancelKeyProbe]::ShouldPersist` — set by a compiled `ConsoleCancelKeyPress` delegate. PowerShell runs `finally` blocks on Ctrl+C but bypasses `catch` blocks. The compiled delegate records this interruption for the cleanup decision. The `Add-Type` registration is best-effort: a registration failure logs a WARN and continues; the Ctrl+C signal is unavailable. Ctrl+C alone cannot retain the task in that case; other persist conditions still apply.
 
 The invariant: **when the full-update operation has changed recovery state and the script cannot positively verify an acceptable final recovery route, the resume task must not be unregistered.** The task is a crash-recovery hook, not a retry-until-success mechanism; a clean exit that leaves the machine in a healthy state deletes the task and lets the state file govern the next scheduled run.
 
@@ -431,28 +432,28 @@ Registration failure on an otherwise-safe staging path preserves the verified st
 
 The task does not participate in the program lock directly. When the task fires, it invokes `WinRE.ps1 -Action Repair`, which acquires the program lock through the normal path and is serialized against any concurrent scheduled run.
 
-The task is a per-run safety net, not machine state. It is not recorded in the state file, does not affect the fast-path decision, and does not change the `DesiredStateId`. Its presence on a machine after a clean exit indicates that the run was interrupted; its absence is the normal state.
+The task is a per-run safety net, not machine state. It is not recorded in the state file, does not affect the fast-path decision, and does not change the `DesiredStateId`. Its presence after an exit can mean an interrupted run or an explicitly retained pending deployment. A completed healthy run normally removes it.
 
 Under `$PSCommandPath`-less invocation — gist bootstrap via `Invoke-RestMethod | Invoke-Expression`, or paste-into-console — the guard in `Register-ResumeTask` logs at INFO and does not register the task. Those invocation modes have no `$PSCommandPath`, and a run initiated from such an invocation cannot be resumed by the task.
 
 ## Crash consistency
 
-The three files — state, checkpoint, and deferral marker — have independent lifecycles, and their interaction is what the guards above are protecting.
+The state, checkpoint and deferral marker have independent lifecycles. Patch 5's pending record takes precedence over the ordinary combinations below: if it exists, validate/resume its protected candidate before interpreting these files as authority to clean scratch space or start another deployment.
 
 | State file | Checkpoint file | Deferral marker | Meaning | Next run behaviour |
 |---|---|---|---|---|
 | Absent | Absent | Absent | Fresh machine, never run. | Full update from step 1. |
 | Absent | Present, step < 3 | Absent | Interrupted run before injection. | Full update from step 1 or 2. |
 | Absent | Present, step ≥ 4 | Absent | Interrupted failed-injection run, or `GeometryRestoreFailed` deleted the state file. | Migration guard resets `$step` to 2. Full update from step 2. |
-| Present, matching | Absent | Absent | Healthy, complete run. | Fast path. |
-| Present, matching | Absent | Present, matching | Pre-shrink deferral with the old route intact. | Marker honored if the route is functional; marker cleared if the route is broken. |
-| Present, matching | Present, step 3 (no WIM_READY) | Present, matching | Pre-shrink deferral from a run whose checkpoint was at step 3 (post-injection, pre-export). | Marker honored if the route is functional; on resume, injection is already done and the run proceeds from step 4. |
+| Present, matching | Absent | Absent | Inputs match a prior run; current route still needs assessment. | Fast path only for an Enabled, adequate dedicated layout; otherwise repair or reclassification. |
+| Present, matching | Absent | Present, matching | Historical deferral without a pending owner. | Reassess layout/capacity; an adequate dedicated fast path clears the obsolete marker. |
+| Present, matching | Present, step 3 (no WIM_READY) | Present, matching | Servicing checkpoint and historical deferral without a pending owner. | Validate the checkpoint; capacity is reassessed and execution backoff is checked when entering the pending deployment. |
 | Present, matching | Present, step < 3 | Absent | Interrupted run that matched the state file. Unusual. | Full update from step 1 or 2. |
 | Present, matching | Present, step ≥ 4 | Absent | Interrupted failed-injection run with a stale-but-valid state file. | Migration guard resets `$step` to 2 (because `$needInject` will be true). Full update from step 2. |
-| Present, matching | Present, `WIM_READY` | Present, matching | Pre-shrink deferral with a staged optimized WIM available. | Marker honored if the route is functional; the staged WIM is reused on the eventual successful run. |
+| Present, matching | Present, `WIM_READY` | Present, matching | Staged optimized WIM and historical deferral without a pending owner. | Validate source/checkpoint binding before reuse; a marker alone does not authorize skipping layout assessment. |
 | Present, stale | Any | Any | The machine's `DesiredStateId` has changed. | Full update from step 1. The deferral marker is cleared on read. |
 
-All three files are written atomically (`Write-FileAtomically` uses a temp file + `Move-Item` with retries), so none can be partially written even on power loss.
+The existing writer uses a temporary file and replacement with retries. Patch 5 adds `-Durable` for state and journal writes: the temporary file is flushed with `FileStream.Flush(true)` before replacement. The independent candidate is also flushed before the journal can authorize mutation. Journal and final-state read-back check the expected values. This reduces partial-write exposure but does not establish a power-loss transaction across image, partition, registration and state changes. Existing unreadable or malformed pending records fail closed; real interruption and power-loss recovery require separate testing.
 
 Under v47, a step-≥4 `WIM_READY` checkpoint whose fifth field is absent, or does not match any currently-available source (registered WIM or hash-validated LKG), is invalidated at resume before the step guards run. The checkpoint is removed and the run restarts from step 0 as if no checkpoint existed. This applies to legacy four-field checkpoints and to GitHub-cold-start checkpoints, both of which have no source identity to bind against. See "The v47 source-hash binding" in the checkpoint section.
 
@@ -460,13 +461,13 @@ Under v47, a step-≥4 `WIM_READY` checkpoint whose fifth field is absent, or do
 
 The state file could in principle be a SQLite database, a binary blob, a Windows registry key, or a full configuration management system. The design uses a small JSON file on disk, written atomically, for four reasons:
 
-1. **Atomic writes are easy to get right with a temp file and a rename.** `Write-FileAtomically` writes to a temp file and calls `Move-Item`. On NTFS, `Move-Item` over an existing target is atomic. A database would bring its own atomicity guarantees, but also its own machinery: a database engine to load, a schema migration path, and a file-format compatibility contract to maintain. The current design's atomicity is one helper function.
+1. **Atomic writes are easy to get right with a temp file and a rename.** `Write-FileAtomically` writes to a temp file and calls `Move-Item`. The helper centralizes replacement and retries; it does not provide one atomic transaction spanning the disk layout, WIM, reagentc registration and all state files. A database would bring its own atomicity guarantees, but also its own machinery: a database engine to load, a schema migration path, and a file-format compatibility contract to maintain. The current design's atomicity is one helper function.
 
 2. **The state is small.** It is a few hundred bytes on disk. A database is overkill for this size of data, and the schema has not grown significantly since the v43 generation.
 
 3. **The state file is human-readable on purpose.** When a field engineer opens `C:\Recovery\OEM\winre_state.json`, they should see something they understand: a `DesiredStateId`, a WIM hash, an enable result, a failure counter. A SQLite database or a binary blob would not serve that requirement, and a field engineer diagnosing a stuck machine is exactly the scenario the state file is designed to support. The [troubleshooting.md](troubleshooting.md) playbook depends on it.
 
-4. **The state file is deliberately editable and deletable by the operator.** The loop-breaker recovery procedure tells the operator to delete the state file to reset the enable-failure counter. That is a design choice: the state file is not opaque, and its removal is a legitimate reset operation. A database would add ceremony to that reset without adding safety.
+4. **The ordinary state file has an operator reset path.** The loop-breaker recovery procedure tells the operator to delete the state file to reset the enable-failure counter. That reset applies to the ordinary state file after the cause is resolved; it does not authorize deleting an unresolved pending-deployment record or its candidate. A database would add ceremony to that reset without adding safety.
 
 The trade-off is that the script does not defend against an operator manually editing the state file. That is not a scenario the design needs to support; if you edit the state file, you own the consequences.
 

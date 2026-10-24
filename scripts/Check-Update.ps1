@@ -91,6 +91,8 @@ try {
 }
 
 $localVerMatch   = [regex]::Match($localContent, '(?m)^\s*\$ScriptVersion\s*=\s*(\d+)')
+# Production keeps ScriptPatchLevel double-quoted for this reader.
+# A missing or differently quoted patch assignment falls back to patch 0.
 $localPatchMatch = [regex]::Match($localContent, '(?m)^\s*\$ScriptPatchLevel\s*=\s*"(\d+)"')
 
 if (-not $localVerMatch.Success) {

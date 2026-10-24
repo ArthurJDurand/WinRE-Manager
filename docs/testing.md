@@ -1,28 +1,28 @@
 ---
 title: "Testing — WinRE Manager"
-description: "Test-WinRE.ps1, the read-only harness for WinRE Manager: menu options, parser self-test, and the destructive-path regression tests."
+description: "Validate WinRE Manager with read-only diagnostics, isolated regression suites and disposable Windows VM tests for recovery and partition failures."
 ---
 
 # Testing
 
-`Test-WinRE.ps1` is WinRE Manager's read-only test harness. It shows you what the production script would see on a machine, without changing anything, so you can confirm the machine is in a state production can work with before you deploy. This document explains how to run it, what each menu option does, and what the results mean.
+`Test-WinRE.ps1` diagnoses the current recovery configuration and tests driver downloads/extraction. It does not change WinRE registration, partitions, BitLocker or deployment state. Download tests create and clean scratch files; diagnostics report current observations rather than proving a later Repair will succeed. This document explains how to run it, what each menu option does, and what the results mean.
 
 The harness exists to serve the project's four design invariants, which [`architecture.md`](architecture.md) states in this order: **never break Windows RE**, **never leave a machine without a working recovery route**, **minimize the `reagentc /disable` → `reagentc /enable` window**, and **do no work unless needed; prepare everything before touching anything**. Two of those rules bear directly on the harness:
 
-- **Rule 4 — do no work unless needed.** A read-only diagnostic is the lowest-work thing anyone can do to a machine. The harness exists so that a field engineer or a fleet operator can answer "is this machine healthy?" and "what would production do?" without mounting a WIM, touching a partition, or making a `reagentc` call. Rule 4 is the reason the harness is a first-class tool in the project, not a debugger.
+- **Rule 4 — do no work unless needed.** A read-only diagnostic is the lowest-work thing anyone can do to a machine. The harness exists so that a field engineer or a fleet operator can answer "is this machine healthy?" and "what would production do?" without mounting a WIM or changing a partition or WinRE registration. It reads `reagentc /info`. Rule 4 is the reason the harness is a first-class tool in the project, not a debugger.
 - **Rule 1 — never break Windows RE.** The v45 and v46 destructive-path regression tests documented in this file exist to catch a regression before it reaches a fleet. A canary machine, a disposable VM, and a read-only harness are the three layers that make Rule 1 operational. The **post-deletion failure test** (gating) is the mechanism that will eventually close the one residual corner where Rule 2 — never leave a machine without a working recovery route — cannot be guaranteed.
 
 ## When to run the harness
 
 Run `Test-WinRE.ps1` in any of the following situations:
 
-- **Before deploying to a machine you have not touched before.** A single read-only scan tells you whether the machine is healthy, what state WinRE is in, and whether production would take the fast path or rebuild. Takes a few seconds.
+- **Before deploying to a machine you have not touched before.** Option 1 reports the current WinRE state and safety inputs; Option S compares deployment identity. Neither simulates the full Repair workflow or proves recovery boot.
 - **Before deploying to a fleet.** Run it on one representative machine per vendor/model combination to confirm it agrees with your expectations, then push the scheduled task out. If a machine reports something unexpected, this is where you catch it.
 - **After a Windows Update that might change tooling output.** A new build can change `manage-bde`, `reagentc`, or `Get-Partition` output format, or the shape of a `Get-Disk` / `Get-Volume` / `Get-PnpDevice` object. The parser self-test catches the drift before production runs against it, with a specific PASS/FAIL per dependency.
 - **When production has exited with an unfamiliar error.** The diagnostic reproduces production's vantage point and reports each dependency check independently, so you can see exactly which step failed.
-- **When you are evaluating the project.** A read-only run gives you a complete picture of what the tool does and what it looks at, without touching anything.
+- **When you are evaluating the project.** The diagnostic explains the recovery state and inputs the tool checks. Download/extraction options separately verify package acquisition using scratch files.
 
-The harness requires no elevation and does not modify WinRE, partitions, BitLocker, drive letters, or the state file. All its work is confined to its working directory (`$TestDir`, default `C:\Temp\WinRETest`), where it creates and removes its own test artifacts. It is safe to run on any machine, at any time, including on a machine you are about to hand to a user.
+The harness requires no elevation and does not modify WinRE, partitions, BitLocker, drive letters, or the state file. All its work is confined to its working directory (`$TestDir`, default `C:\Temp\WinRETest`), where it creates and removes its own test artifacts. Use a dedicated scratch directory and keep concurrent harness runs in separate directories so their artifacts do not collide.
 
 ## What the harness is
 
@@ -37,7 +37,7 @@ An interactive PowerShell script that:
 
 It is the primary tool for pre-flight validation on an unfamiliar machine.
 
-**Current version: v39.** The version history is:
+**Current version: v40.** The version history is:
 
 - **v15** added the `DesiredStateId` mirror and the Option S state-file parity check, aligned with production v44 patch 1's DSI change.
 - **v16** reworked the output: colour-coded values, aligned tables, free-space thresholds, and the `Write-Diag` / `Write-KV` diagnostic helpers.
@@ -65,6 +65,8 @@ It is the primary tool for pre-flight validation on an unfamiliar machine.
 - **v38** adds run logging and fixes `-NonInteractive` to also run the parser self-test. Every `Say` / `Rule` / `Write-Diag` / `Write-KV` / `Write-WarningBanner` call and every `Record` call now appends to `%TEMP%\WinRE-TestHarness.log`. `-NonInteractive` now runs `Show-SystemDiagnostic` before `Invoke-AllRelevant`, so the parser self-test - including the source-level mirror-binding assertions 18, 19, and 20 that exist to catch production mirror drift - is exercised by a CI consumer invoking the harness non-interactively. See "v38 changes" below.
 - **v39** tightens check 18 to verify the specific `Get-Disk -ErrorAction Stop` enumeration and its `Where-Object { $_.Number -ne $osDisk.Number }` filter, not just the presence of `-ErrorAction Stop` anywhere in the function; adds check 21 (source-pattern assertion that `Get-PartitionPlan` contains the Int64-safe comparison form and does not contain the vulnerable `[Math]::Max(0, ...)` pattern); and adds check 22 (behavioral Int64 regression that reproduces both safe forms with a 3,000,000,000-byte delta and confirms the vulnerable form still throws). See "v39 changes" below.
 
+- **v40** makes missing-`$PSScriptRoot` production lookups return unavailable and strengthens checks 18–20 with executable AST contracts. See "v40 changes" below.
+
 See the `.NOTES` block at the top of `scripts\Test-WinRE.ps1` for the complete per-version change list.
 
 The harness has no mirror of v45 patch 1's shrink-first pipeline. It reads the machine's state and reports what production would do, but it does not simulate the destructive path or the plan. The shrink-first code paths are exercised on disposable VMs (see "v45 destructive-path regression" below), not through the harness.
@@ -78,6 +80,14 @@ Two changes, both closing the version-drift family that has required a manual `$
 **2. Menu title and startup `Rule` bumped 28 -> 29.**
 
 The parser self-test count remains at eighteen — v29 adds no new checks.
+
+### v40 changes
+
+Both adjacent-production readers now return unavailable when `$PSScriptRoot` is empty, so pasted/selection invocation can SKIP dependent source diagnostics instead of throwing at `Join-Path`. Parser checks 18–20 retain their names but inspect executable AST contracts for the VHDX, storage-controller and VM-detection mirrors. A matching comment or an unrelated `-ErrorAction Stop` no longer satisfies those contracts. Isolated mutation fixtures exercise the checks without invoking the live repair pipeline.
+
+Check 2 uses the shared labelled-location reader and strict parser instead of a separate root-only regex. It recognizes valid drive-letter, GLOBALROOT and volume-GUID paths with their full folders, and cannot accept an unrelated recovery-image field as the WinRE location. An absent or invalid native location while Enabled is a FAIL; an absent location while Disabled is a SKIP. The unresolved-target diagnostic prints the observed status without claiming that resolution failure proves WinRE is unregistered.
+
+The mirror policy explicitly documents omission of production's DryRun-only download/extraction branches. Check 22 now exercises the vulnerable `Math.Max` form with both positive and negative Int64 variables, alongside the independent safe shrink and extend calculations. Casting directly inside the method call changes overload selection and would not reproduce the historical failure.
 
 ### v39 changes
 
@@ -367,7 +377,7 @@ The output format is unchanged from v16 in every respect except the new colour t
 
 The default working directory is `C:\Temp\WinRETest`. All downloads and extractions go there.
 
-**Cleanup guard (v18; extended in v34 and v35).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. To override the guard, delete the directory manually or pass `-Keep`.
+**Cleanup guard (v18; extended in v34 and v35).** The harness refuses to delete `$TestDir` on exit when the directory pre-existed the run and already contained entries. This closes a footgun: before v18, passing `-TestDir C:\Users\Me\Desktop` and then choosing "no" at the cleanup prompt would have deleted the entire desktop directory. The pre-existing state is captured before any harness directory work; a directory that did not exist, or that existed but was empty, is deleted on exit as before. `-Keep` retains artifacts; it does not override the deletion refusal. Choose a separate dedicated scratch directory rather than removing unrelated content.
 
 As of v34, when the harness does remove `$TestDir`, it also removes the parent directory (typically `C:\Temp` for the default path) if and only if its leaf name is exactly `Temp`, it is completely empty, and it is not a drive root — mirroring production's v50 `Remove-EmptyWorkspaceParent` invariant. A user-supplied `-TestDir` whose parent is not named `Temp` (for example `C:\Users\Me\Desktop`) is therefore never touched.
 
@@ -485,9 +495,9 @@ The BitLocker section of the diagnostic distinguishes two categories of state on
 
 The wording of these warnings was updated in harness v14. The v12/v13 wording said production "will refuse destructive partition work" in these states, which described the removed OS-volume-gate policy and would have told a field engineer to defer a run that production would actually succeed on. Under the v43 patch 5 (further revision 5) policy, only the OS-fallback route depends on C:'s BitLocker state; the enable-only and dedicated-partition routes target the recovery partition directly and are not affected. As of v44 patch 6, the destructive partition path does not consult C:'s state either — only the OS-fallback route does.
 
-**Confirmed-safe states.** `VolumeStatus=FullyDecrypted` (or empty) with `ProtectionStatus=Off`, and `ProtectionStatus=On` at any conversion status, are safe for the OS-fallback route. They do not trigger either warning.
+**Production fallback eligibility.** C: must be confirmed `FullyDecrypted` before production can use it for OS-fallback. `ProtectionStatus=On` does not make an encrypted volume eligible, and an empty or unrecognized conversion status is not proof of decryption.
 
-The classification predicate matches production's `Test-VolumeEncrypted`: the four mid-operation states are hazardous, `FullyEncrypted+Off` is ambiguous, and everything else is safe. The harness does not call into production's `Test-VolumeEncrypted` — it queries `Get-BitLockerVolume` directly and applies the same predicate — but a diagnostic that disagreed with production about which states are hazardous, ambiguous, or safe would be worse than no diagnostic at all.
+The harness warning blocks above are narrower diagnostics, not a complete mirror of production's eligibility gate. They currently suppress these additional warnings when protection is `On`, and an unrecognized conversion status does not produce either block. Read the displayed `VolumeStatus`; absence of a warning does not authorize OS-fallback. Production checks the actual target again and refuses an indeterminate encryption state.
 
 #### Target recovery partition state (v14)
 
@@ -515,7 +525,7 @@ The section header is drawn with a divider, then the details are printed as alig
   Classification        fully decrypted (reagentc /enable will accept this)
 ```
 
-**BitLocker-managed.** The partition is encrypted or actively encrypting. Production will decrypt it in place before calling `reagentc /enable`; the harness prints the conversion status and a note about the expected additional runtime.
+**BitLocker-managed.** The partition is encrypted or actively encrypting. Production's preparation helper can attempt in-place decryption before `reagentc /enable`; success depends on the observed target and the command outcome. The harness prints the conversion status and a note about possible additional runtime.
 
 ```
   Target recovery partition state
@@ -638,7 +648,7 @@ Twenty-three checks as of v39 (twenty-one as of v36 through v38, twenty as of v3
 | # | Check | What it verifies | Since |
 |---|---|---|---|
 | 1 | reagentc status regex | `(Enabled\|Disabled)` matches at least one line of `reagentc /info` output. | v1 |
-| 2 | reagentc location regex | `(GLOBALROOT\|Volume GUID)` matches at least one line. | v1 |
+| 2 | reagentc location parser | The labelled native WinRE location passes the shared strict parser, including drive-letter, GLOBALROOT and volume-GUID forms. A missing or invalid reported location while Enabled fails; an absent Disabled location skips. | v1 (updated v40) |
 | 2b | reagentc version regex | `Windows RE Version:` matches at least one line. SKIP when the line is absent (WinRE Disabled, or reagentc suppressed it). | v22 |
 | 3 | manage-bde protection regex | `Protection On` or `Protection Off` appears. | v1 |
 | 4 | manage-bde conversion status regex | A `Conversion Status:` value matches, **or** the string `could not be opened by BitLocker` appears. | v1 |
@@ -670,7 +680,7 @@ The most likely FAILs and their implications:
 - **Check 2b (reagentc version regex).** Windows changed `reagentc /info` output format on this build, or the `Windows RE Version:` line is suppressed while WinRE is Enabled. Production's `Get-WinREState` will return `Version = $null`, and the startup log line will read `WinRE ... Version: unknown`. Production's behavior is unchanged — the value is informational — but the build-drift observability is lost on this machine until the regex is extended.
 - **Check 3 or 4 (manage-bde regex).** Windows changed `manage-bde -status` output format on this build. Production's `Test-VolumeEncrypted` will return `$null`; `Set-RecoveryPartitionReadyForWinRE` will treat the target partition as indeterminate and either retry the query once or proceed to run `manage-bde -off` against it. The machine is safe but the target preparation may take longer than expected.
 - **Check 7 (Get-Partition shape).** The `Storage` module is missing or reduced. Production's partition classification will fail.
-- **Check 10 (Get-PartitionSupportedSize).** The shrink path will fail. The script will fall back to OS-fallback after the OS-shrink attempt, but this is a machine-specific failure that should be investigated.
+- **Check 10 (Get-PartitionSupportedSize).** Safe shrink capability could not be established. Investigate the machine-specific failure. A preflight refusal preserves the previous route; OS-fallback is considered only after actual dedicated creation failure and its separate verification gates, not promised after every failed shrink.
 - **Check 11 (DISM cmdlets).** A DISM cmdlet is missing. Production's driver-injection path cannot run on this machine at all; the pipeline gate will fire on every full-update pass and the machine will never take the fast path unless it is already in the fast-path state.
 - **Check 12 or 13 (Get-Disk / Get-Volume shape).** A property production reads has been removed or renamed. Production may misclassify a disk or a volume.
 - **Check 14 (CPU generation parser).** A CPU string no longer parses to the expected generation. `DesiredStateId` will contain a different `CPU=` value than intended, which will force a rebuild on machines whose state file was written under the previous parse. Investigate the raw CPU string (the diagnostic's Hardware section reports it) and extend the parser.
@@ -725,7 +735,7 @@ The BitLocker, target-partition, `ImageState`, Build numbers, storage-controller
 
 Runs `Show-SystemDiagnostic`, then `Invoke-AllRelevant`, prints the summary, exits (v38). Before v38, NonInteractive ran only `Invoke-AllRelevant`.
 
-`-NonInteractive` runs the full System Diagnostic (Option 1), including the parser self-test and its source-level mirror-binding assertions (checks 18, 19, and 20), and then the download and extraction tests. It does not run the State file parity check (Option S). So the BitLocker warnings, the target-partition state block, the `ImageState` check, the Build numbers block, the storage-controller block, the sweep-suppression preview, and the parser self-test are printed; the DSI comparison is not. If you need the DSI comparison, run the harness interactively and choose Option S.
+`-NonInteractive` runs the full System Diagnostic (Option 1), including the parser self-test, mirror-binding assertions (checks 18–20), the Int64 source-pattern check (21) and behavioral regression (22), and then the download and extraction tests. It does not run the State file parity check (Option S). So the BitLocker warnings, the target-partition state block, the `ImageState` check, the Build numbers block, the storage-controller block, the sweep-suppression preview, and the parser self-test are printed; the DSI comparison is not. If you need the DSI comparison, run the harness interactively and choose Option S.
 
 The exit code is 0 when no FAIL results were recorded, and 1 when at least one FAIL was recorded (v25+). SKIPs do not affect the exit code. The summary remains the authoritative view of what ran. The behavior was introduced in v25 so that CI and cron consumers can treat the harness as a regression gate rather than a reporter.
 
@@ -736,7 +746,7 @@ The harness is deliberately narrow. It does not and cannot test:
 - **Partition creation, deletion, or resize.** No destructive operations.
 - **BitLocker preparation or decryption.** No state changes. The BitLocker sections of the diagnostic query `Get-BitLockerVolume` and `manage-bde -status` directly and do not call into production's `Set-RecoveryPartitionReadyForWinRE` or `Test-VolumeEncrypted`.
 - **`reagentc /setreimage` or `reagentc /enable`.** No WinRE registration changes.
-- **The program lock.** The harness does not acquire `C:\ProgramData\OEM\Logs\WinREManager.lock`. It is read-only and safe to run concurrently with a live production run, with another harness run, or with any number of other processes. Production's lock is a mutual-exclusion primitive for `WinRE.ps1` only; the harness deliberately does not participate in it.
+- **The program lock.** The harness does not acquire `C:\ProgramData\OEM\Logs\WinREManager.lock`. It does not modify the live recovery configuration, but a concurrent Repair can change the observations while they are read. Separate concurrent harness runs need separate scratch directories. Production's lock is a mutual-exclusion primitive for `WinRE.ps1` only; the harness deliberately does not participate in it.
 - **The offline fallback.** The harness always performs a live manifest fetch. On an offline machine it will fail the manifest fetch and report the failure rather than exercising production's offline fast-path behavior. This is intentional: the harness is a download-and-extraction validator first, and the offline path is only reachable in production by design.
 - **State file, checkpoint file, or deferral-marker writes.** Those files are production-only artifacts. Option S reads the state file but does not modify it.
 - **The full-update pipeline.** The harness exercises the download and extraction steps in isolation, not the pipeline.
@@ -770,6 +780,127 @@ Fourteen known differences:
 
 The harness has no mirror of the v45 shrink-first pipeline. Option 1 and Option S report the machine's current state and the DSI comparison, but they do not simulate the plan, the pre-shrink, the extension path, or the whole-layout assertion. That is by design: those paths are destructive and cannot be simulated read-only.
 
+## v50 patch 5 validation
+
+This development revision needs two distinct kinds of evidence. Parser checks and isolated regressions can establish the contracts below without executing the production repair pipeline. A disposable Windows VM is needed to exercise actual partition, BitLocker, reagentc and reboot transitions. The v50.4 field logs and the existing harness success counts are baseline evidence, not v50.5 test results.
+
+### Isolated regressions
+
+- **RestoreWork and backup cleanup:** refuse directory and child reparse points, unexpected files and subdirectories before deleting expected content. Cover the initial RestoreWork cleanup as well as all later exits. Test WIM-only backups, optional malformed metadata, arbitrary valid selected-directory names, read-only expected files, and a NonInteractive listing that makes no filesystem changes.
+- **Harness source bindings:** production readers with an empty `$PSScriptRoot` return unavailable and the dependent diagnostic reports SKIP. Mutating a required command argument or fail-closed catch must fail its binding assertion; adding the old text in a comment must not make it pass.
+- **Layout assessment:** an enabled dedicated partition must meet the existing reuse rule and be confirmed unencrypted; an accepted foreign hash does not bypass either check. The HP 14s fixture fails on measured free space, independently of the new-partition creation bucket. A suitable dedicated layout avoids partition work. Encryption alone must not force repartitioning when an adequate partition can be reused and prepared.
+- **Registered locations:** exercise the real parser and resolver for drive-letter, GLOBALROOT and volume-GUID paths, including custom folders. Preserve the full folder when locating the WIM and comparing routes. Two folders on one partition must compare differently. An unresolved enabled route must refuse target preparation/copying rather than being treated as an independent target. An empty or absent native location with Enabled status cannot use a stale registry value; Disabled-state fallback remains supported.
+- **Ownership and byte preservation:** a foreign accepted hash never becomes `CurrentImageHash`. Copy-only relocation retains the expected SHA256, skips servicing/export, and preserves any legitimate prior manager ownership separately.
+- **Deferral reassessment:** freeing enough space within the same formerly proposed 500 MiB bucket permits reassessment. Geometry or target-identity changes invalidate a stale capacity refusal. Execution and verification failures have bounded retries; they do not become indefinite capacity refusals.
+- **Pending-operation recovery:** unavailable or untrusted records, missing or changed source bytes, state-write failure, DSI change, stale partition numbers, and interruption during each persisted phase must retain the protected source or refuse mutation. Ordinary workspace/checkpoint cleanup must not delete an unresolved relocation source. Last-resort fallback independently refuses an enabled route that is unresolvable when that helper observes it, including a route lost after the earlier orchestration check.
+
+An isolated test result applies to the exercised fixture and extracted functions. It does not establish that Windows will accept a particular resize or that the resulting WinRE will boot.
+
+### Recorded isolated results
+
+The following suites passed under Windows PowerShell 5.1 and PowerShell 7 during local patch 5 implementation on 2026-10-23–24. They extract the relevant functions/AST and use isolated fixtures; they do not execute a live Repair deployment, the full hardware/network harness or recovery boot.
+
+| Suite | Result | Scope |
+|---|---|---|
+| [`Test-BackupCleanup.ps1`](../tests/Test-BackupCleanup.ps1) | 29 PASS | Backup allowlist, ancestry/child junctions, read-only files, relative paths, no-mutation listing and nonrecursive empty-directory removal. |
+| [`Test-RestoreCleanup.ps1`](../tests/Test-RestoreCleanup.ps1) | 29 PASS | All seven production call sites and preparation abort; rollback allowlist, actual junctions, read-only files and replacement/new-child race fixtures. |
+| [`Test-HarnessBindings.ps1`](../tests/Test-HarnessBindings.ps1) | 60 PASS | Production contracts, mutation fixtures, scriptless readers, exact location-helper mirrors, full-directory state extraction and actual diagnostic Check 2 execution; Enabled blank/absent location refusal in both readers. |
+| [`Test-DeploymentSafety.ps1`](../tests/Test-DeploymentSafety.ps1) | 131 PASS | Actual main predicates and extracted layout/journal/deployment contracts with mocked storage, DISM, registration, lock and state providers; ownership, interruption, backoff and failure fixtures, including route loss before last-resort fallback and actual target-selector enumeration failures that must not enter replacement. |
+| [`Test-DeploymentProviders.ps1`](../tests/Test-DeploymentProviders.ps1) | 25 PASS | Exact UTC timestamp parsing, BitLocker-provider fallback, deployment ACL construction and ownership-scoped mount/workspace cleanup; native tools and ACL writes mocked. |
+| [`Test-PartitionPreparation.ps1`](../tests/Test-PartitionPreparation.ps1) | 15 PASS | Actual preparation helper with mocked storage: journal-before-shrink, prepare-before-disable, source drift, reserve checks, geometry restoration and post-deletion failure reporting. |
+| [`Test-WinRELocations.ps1`](../tests/Test-WinRELocations.ps1) | 51 PASS | Real parser, resolver, state reader, matcher, fingerprint and deployment flow; directory aliases, nested decoy WIMs, stale registry masking (including Enabled blank/absent native locations), copy-after-disable, custom-folder Restore/rollback and native path quoting. All providers mocked; proven missing folders remain repairable and missing volume roots refuse. |
+| [`Test-OemPackHashes.ps1`](../tests/Test-OemPackHashes.ps1) | 72 PASS | Actual production/harness downloaders and Lenovo/Dell builder checksum publication; surrounding whitespace, malformed/blank supplied digests, mismatches, dual hashes, failed requests and empty downloads; selected Dell packs, supplied XML whitespace and single-pack Current alias on both runtimes. All network/filesystem providers mocked. |
+| [`Test-MaintenanceInstall.ps1`](../tests/Test-MaintenanceInstall.ps1) | 65 PASS | Actual wrapper install control flow and shared trust policy; owner/ACE/reparse checks, protected descriptors, creation races, hash/registration failure and retained staging after partial publication. Filesystem/task providers are instrumented or mocked; actual nonprivileged CMD export, launcher JSON and command-length checks run. |
+| [`Test-VirtualDiskSafety.ps1`](../tests/Test-VirtualDiskSafety.ps1) | 23 PASS | Actual source with mocked providers: ordinary guest OS-disk eligibility, non-OS sweep suppression and file-backed/unsupported-bus preservation, plus the unchanged native-boot topology refusal. These fixtures do not validate native boot or real partition operations. |
+| [`Test-InfHardwareIds.ps1`](../tests/Test-InfHardwareIds.ps1) | 14 PASS | Actual INF parser, controller enumerator and applicability chain: the observed Hyper-V VMBUS model line, legacy prefixes, case/duplicate handling and multiple IDs; wrong or missing IDs, comment/unreferenced decoys, unreadable INFs and provider failures remain refused. All PnP/filesystem providers mocked. |
+
+The location suite imports and reruns the deployment-safety fixtures as prerequisites; those 131 checks are counted once in the 514-check total across eleven suites. Separate read-only probes on the workspace volume confirmed actual DOS/volume-GUID directory resolution and metadata access under both runtimes. They did not inspect or modify WinRE and are not recovery-boot evidence.
+
+Follow-up review reproduced two pre-fix behaviors in isolated source-extracted fixtures: last-resort fallback disabled an enabled route that became unresolvable after a creation failure, and diagnostic Check 2 falsely failed a valid drive-letter location. The added tests reject those behaviors while retaining fallback recovery for a known partition with an unreadable WIM. These are mocked-provider results, not reports of the inconsistent native state occurring on Windows hardware.
+
+The current eleven-suite/514-check rerun, including the Restore reporting clarification, is retained under `v50.5\Isolated Regression 2026-10-24_112509`, with all 22 runtime/suite invocations exiting zero. The preceding VMBUS-fix run remains under `v50.5\Isolated Regression 2026-10-24_020021`. Earlier nine-suite/477-check evidence remains under `v50.5\Isolated Regression 2026-10-23_211654`; the intermediate ten-suite/500-check record references the additional virtual-disk logs under `v50.5\Final Verification 2026-10-24_013703`. These results use Windows PowerShell 5.1.26100.9711 and PowerShell 7.6.8. A native fresh maintenance-installation core run is recorded below; the isolated failure fixtures do not inject real filesystem failures or register an actual task.
+
+No passing isolated count closes the VM gate below. The deployment suite does not perform actual partition, WinRE/DISM, protected-journal or deployment-lock operations, and does not boot WinRE.
+
+### Recorded prerelease field results — 2026-10-23
+
+The eight logs supplied on 2026-10-23 covered four machines, with every recorded manager run ending in a SUCCESS summary. Their numbered folders under `v50.5\Prerelease Test Run` were subsequently reused for the 24 October batch below; this table retains the earlier review rather than describing the files currently there. The staged production-script SHA256 in the earlier Repair/Restore runs was `A30A3F8767453AE089FC57DC91E9A1FCEA161CAA8DDB9B4A1D27DF8B437CE1E8`; it matched the repository script before the checksum and work-summary corrections described below. These results apply to that snapshot. The harness logs identify v40 but do not record their source-file hash.
+
+| Folder / machine | Observed production work | Harness evidence |
+|---|---|---|
+| 1 — ASUS, i5-11400 | Two successful fast paths; successful DryRun; 756.4 MiB WIM backup with hash/sidecar verification; Restore verified that the target already matched and performed no replacement. User-owned OEM-parent warning and USB-disk preservation behaved as documented. | Option S state-file parity: 1 PASS, 0 FAIL, 0 SKIP. |
+| 2 — Dell Pro 16 PC16250, Ultra 5 235U | Serviced deployment in 5m41s; C: shrank 101 MiB before disable; recovery replaced from 1000 to 1100 MiB. Dell A10 injection verified 64 new packages and 49/49 package-INF matches. One later fast path succeeded. | System diagnostic: 23 PASS, 0 FAIL, 0 SKIP; recovery free space 272.9 MiB. |
+| 3 — HP EliteBook 840 G9, i7-1255U | Serviced deployment in 6m44s; C: shrank 301 MiB before disable; recovery replaced from 1000 to 1300 MiB. SoftPaq exit 1168 produced 195 INFs; injection verified 190 new packages and 153/153 package-INF matches. One later fast path succeeded. | System diagnostic: 23 PASS, 0 FAIL, 0 SKIP; recovery free space 349.2 MiB. |
+| 4 — Lenovo 21MW / ThinkBook 16 G7 ARP, Ryzen 7 7735HS | Serviced deployment in 3m00s; C: shrank 101 MiB before disable; recovery replaced from 1000 to 1100 MiB. No OEM-map entry or VMD injection; all three storage controllers matched candidate INFs. Three later fast paths succeeded. | System diagnostic: 23 PASS, 0 FAIL, 0 SKIP; recovery free space 306.1 MiB. |
+
+The three full deployments classified their starting image as `Foreign-No-Drivers`, then serviced it. All three observed C: encryption state True before replacement; the later diagnostics showed EncryptionInProgress with ProtectionStatus Off. Those observations establish successful dedicated replacement despite OS encryption, not encrypted-target reuse. Copy hashes, Enabled registration, saved state, LKG refresh and cleanup were verified in the logs. Checks 18–22 passed on all three diagnostic machines. Dell's first manifest timeout recovered; the HP extractor's nonzero exit was accepted only after usable output was verified. ASUS DryRun reported an unknown source build while retaining the correct metadata/hash and fast-path decision.
+
+These logs exposed an inaccurate empty Work performed summary after real work; the follow-up reporting fix records actual completed copies and verification without inventing servicing on copy-only runs. Generated Dell/HP/Lenovo maps also parsed successfully (6/5/926 entries). One Lenovo 20JV / DS121687 checksum had leading whitespace; the builder and both downloaders now normalize edges and refuse supplied malformed hashes. Those edge cases retain isolated regression coverage. The 24 October field runs below exercise populated deployment summaries and an ordinary hash-verified Lenovo download, not the whitespace case or builder publication. The existing generated maps were left untouched.
+
+Those runs do not establish recovery boot, transactional Restore replacement/rollback, preserved-foreign relocation, OS-fallback migration, encrypted dedicated-target reuse, missing-location refusal on hardware, or interrupted/post-deletion failure recovery. The ASUS Restore was a verified no-op. The scope concern about Restore's local workspace was independently disproved using the actual deployment function with mocked providers on both runtimes; it does not require a live different-image Restore merely to settle PowerShell scope semantics.
+
+### Recorded prerelease field results — 2026-10-24
+
+Six new logs in `v50.5\Prerelease Test Run\1` through `3` contain seven Repair invocations: three serviced deployments and four subsequent fast paths, all with SUCCESS summaries. Every invocation staged production SHA256 `9CD1EE4D247F21546EAFD4BA7304234CD600B2BB21637B4B2C00B3BB3CFC89B6`, matching the tested production snapshot. Hash-verified copies of these logs and their manifest are retained under `v50.5\Field Validation 2026-10-24_152641`. Harness logs identify v40 without a source-file hash.
+
+| Folder / machine | Observed production work | Harness evidence |
+|---|---|---|
+| 1 — HP ProBook 4 G1i 16, Ultra 5 225U | Serviced deployment in 5m44s; C: shrank 301 MiB before disable; recovery replaced from 1000 to 1300 MiB. HP sp173204 produced 195 INFs despite extractor exit 1168; injection verified 190 new packages and 153/153 package-INF matches. One later fast path succeeded. | Diagnostic: 23 PASS, 0 FAIL, 0 SKIP; recovery free space 349.8 MiB. |
+| 2 — Lenovo ThinkPad L15 Gen 4, MT 21H4, i7-1355U | Serviced deployment in 2m56s; C: shrank 101 MiB before disable; recovery replaced from 1000 to 1100 MiB. No OEM-map entry or VMD injection; all three storage controllers matched candidate INFs. Two later fast paths succeeded. | Diagnostic: 23 PASS, 0 FAIL, 0 SKIP; recovery free space 306.7 MiB. |
+| 3 — Lenovo ThinkPad L16 Gen 1, MT 21L3, Ultra 7 155U | Serviced deployment in 3m39s; C: shrank 101 MiB before disable; recovery replaced from 1000 to 1100 MiB. Lenovo package SHA256 verified; injection added 14 packages with 14/14 package-INF matches. One later fast path succeeded. | Diagnostic repeated twice: 46 cumulative PASS, 0 FAIL, 0 SKIP; 23 checks per repetition, recovery free space 303.2 MiB. |
+
+All three starting images were `Foreign-No-Drivers` and were serviced. Each deployment verified candidate storage-ID matches, the new unencrypted recovery partition, copied WIM hashes, Enabled registration, saved state and the LKG copy. Later fast paths accepted matching state and reported no byte drift. C: was reported encrypted before replacement; subsequent diagnostics showed EncryptionInProgress with protection off. The logs establish successful dedicated replacement during OS encryption, not encrypted-target reuse or recovery boot. HP's download had no supplied integrity digest; Lenovo's supplied SHA256 was verified. No secondary disks were present, so these runs do not test the non-OS sweep exclusions.
+
+The deployment Work performed summaries now include completed copies and final verification. The diagnostic wording has since been clarified to include the existing USB/unsupported-bus sweep exclusions, remove stale current-version references and avoid implying that an INF match proves bootability; no partition or driver policy changed. The 60-check harness-binding suite passed again on both PowerShell runtimes after that wording change; those logs are retained with this field record. The recorded 92 diagnostic passes are four repetitions of the 23-check diagnostic across three machines, separate from the 514 isolated checks above. Native manager-process exit codes were not captured independently.
+
+These runs do not establish preserved-image relocation, OS-fallback migration, encrypted dedicated-target reuse, transactional Restore replacement/rollback, missing-location refusal, malformed-checksum rejection, maintenance installation, interrupted/post-deletion failure recovery or actual WinRE boot. The disposable-VM gates below remain open.
+
+### Disposable Windows transitions
+
+Use a snapshot or full disk image before each destructive exercise. Record the original layout, BitLocker conversion/protection state, registered route and WIM SHA256; retain the complete resulting logs.
+
+| Starting condition or injected failure | Expected evidence |
+|---|---|
+| Accepted foreign WinRE on decrypted C:; safe dedicated target available | Byte-identical image on an adequately sized dedicated partition; registration checked; foreign ownership remains separate. |
+| Accepted foreign WinRE on encrypted C: | Safe dedicated preparation is attempted without decrypting C:; failures before switching retain the old registration and verified source. Do not assume the old OS-fallback route is bootable. |
+| Current manager-owned image; layout alone is inadequate | Copy-only transition; no strip, injection, ResetBase, provenance write or export. |
+| Adequate dedicated foreign image | No unnecessary partition work; observed status and preservation are reported separately. |
+| Adequately sized encrypted dedicated target | Healthy-layout exit refused; reuse and in-place preparation attempted where safe, without requiring repartitioning solely because of encryption. Unknown state does not prove eligibility. |
+| Active dedicated route expressed by drive letter or alternate volume spelling | Active target identified before any WIM replacement; disable precedes active-target copying, and the exact registered folder is retained. |
+| Shrink or pre-delete verification fails | Old route and recoverable image remain; accurate deferral/retry behavior. |
+| Active recovery partition is deleted, then creation, format, attributes or drive-letter assignment fails | Retained independent source and durable operation record; no false rollback or healthy-route claim; fatal failure when no acceptable route can be verified. |
+| Deployment, `/setreimage` or `/enable` fails | Verify the actual post-failure destination/registration, retain recovery material and task where unresolved, and report the correct code. |
+| Dedicated creation actually fails; C: fully decrypted, geometry verified, no acceptable existing route | A last-resort OS route is accepted only after location/hash/enable/state checks; warning 2, retained Registered journal/candidate/task and one-hour retry delay. Preflight deferral and encrypted C: do not authorize it. |
+| State persistence fails after a valid dedicated route is established | Keep the valid route; retain the source and operation record; report the persistence failure. |
+| Process kill or reboot between persisted phases | Next Repair run inspects current layout and expected bytes before acting; no blind replay of old partition numbers. |
+| Recovery boot after successful registration | Actually enter WinRE and verify that the OS disk and expected inputs are usable. `Enabled` and matching SHA256 alone do not establish this. |
+
+On 2026-10-24, PowerShell Direct verified the disposable `Windows (x64)` guest: Windows 11 Pro build 26300, one GPT virtual disk, C: already fully encrypted with protection off, and an Enabled WinRE route on a 917 MiB recovery partition. Both the original post-OOBE checkpoint and a powered-off authenticated baseline were saved. Baseline inventory is retained under `v50.5\Hyper-V Baseline 2026-10-24_012341`; test records are under `v50.5\VM Validation 2026-10-24`. Some starts initially failed with host-memory error `0x8007000E`; later starts succeeded at the unchanged 4096 MiB setting.
+
+The first actual Repair used `E905E53D0C1749559E80A77DFD3252F638B3960368425C66D82AAEF3CCEE84CC` and exited 2 before partition work: the applicability check falsely rejected the Hyper-V SCSI controller. Registration, geometry and the registered WIM hash remained unchanged. A read-only probe found its required VMBUS ID in `wstorvsc.inf` line 35; the parser fix has 14 isolated cases. The subsequent A3E758… `ControlFixed` attempt failed inside the external test runner because its `Storage` module could not load, before production ran. It is not a production deployment result. Completed results for that tested production snapshot follow.
+
+### Recorded Hyper-V validation
+
+Recorded on 2026-10-24. Evidence: `v50.5\VM Validation 2026-10-24_155531`, including `verified-VM-results.md`, per-case logs, runner/post-state records and boot screenshots. Production remained SHA256 `9CD1EE4D247F21546EAFD4BA7304234CD600B2BB21637B4B2C00B3BB3CFC89B6` throughout these cases.
+
+| Case | Recorded outcome |
+|---|---|
+| `ControlCurrent` | Production/runner 0; real 917→1100 MiB recovery replacement, Enabled registration and saved state. Original outer exit field is null, not independently measured 0. |
+| Control recovery boot | WinRE menus and `X:\Windows` command prompt captured; guest OS disk and SYSTEM hive readable. Returning to Windows retained Enabled registration and exact AC5E080A… WIM hash. |
+| `NewPartitionCurrent` → `NewPartitionRetry` | Three injected creation failures after actual old-recovery deletion: fatal 3, C: size restored, WinRE Disabled; candidate/journal/task retained. Normal retry exited 0 and deployed that exact FECAA125… candidate. |
+| `FormatVolumeCurrent` → `FormatVolumeRetry` | One injected format failure after real partition creation: orphan removed, C: size restored, fatal 3 with recovery material retained. Normal retry exited 0 with the exact 06871360… candidate. |
+| `InterruptedCurrent` | PID 4904 forcibly killed during a 30-second test-provider hold after deletion; exit -1, no runner-finally result. Journal/candidate/task survived, C: remained shrunk. After reboot, the actual task ran as SYSTEM, 16:43:08–16:45:50, with Scheduler event 201 result 0 and event 102 completion. No manual Repair launch; no additional shrink. Registered/saved hash matched retained 0DE3F537…; pending material/task removed. |
+| `ForeignPreserveCurrent` | Fourteen actual non-inbox drivers classified `Foreign-With-Drivers`; unchanged 817429179-byte WIM relocated 917→1100 MiB. Production/runner/outer exit 2, `PRESERVED-DEDICATED`, Enabled; deployed/accepted hash 4AE2BD8F…, `CurrentImageHash` empty. Pending material/task/staging removed. |
+| `MaintenanceNativeCurrent` | Actual install core/native providers exited 0. Trusted installed 9CD1… copy, SYSTEM principal and boot+5m / every-30-days-at-03:00 triggers verified. The exact newly registered task was then removed; installed file retained. Full menu/UAC and scheduled task execution were not tested. |
+
+After these runs, source comments were corrected and only the summary renderer changed executable production code: empty lists on unresolved outcomes now say `(none recorded; see detailed log)`. Extracted-renderer checks verify that correction separately; the native results above remain bound to 9CD1…. Final source SHA256: `1995348FF178BF0F1FD3B48740519475D4C66511FAFCC56FB2FB8CBB22FF48E9`; eight renderer checks pass under each PowerShell runtime, and the other 124 executable function bodies and executable tokens outside the renderer are identical.
+
+The foreign fixture was prepared separately from a verified baseline WIM and an official Lenovo 14-driver WinPE pack. Production then preserved those completed fixture bytes; this was not a captured vendor field image.
+
+Scope: one adjacent C: | Recovery GPT guest, encrypted/unlocked C: with protection Off. Process-local fault overrides did not persist across reboot. The two immediate manual retries removed only the archived execution-deferral marker, preserving journal/candidate; no clock change or cooldown-expiry test. Restoring C: size did not restore deleted recovery content. The interruption case separately proves automatic boot-task recovery.
+
+This records specific live post-deletion failures and recovery, not an atomic transaction or a completed transition matrix. These cases do not deliberately exercise all four historical v46 hardenings. Intervening-anchor/MBR failures, fully decrypted last-resort fallback, protection-On/locked BitLocker, native boot, encrypted-target reuse and other failure sites remain unverified. The accepted-foreign fast-path repeat and booting the preserved WIM were not run. Control boot proves that candidate's boot and storage access, not every recovery tool or physical-device driver. Retain the [failure-test procedure and gate](#the-post-deletion-failure-test-gating) for unexercised scope.
+
 ## v45 destructive-path regression (recommended)
 
 The v45 patch 1 changes to `Ensure-AdequateRecoveryPartition` are the largest rework of the destructive path since v43. The reorder moves the shrink into the reversible window; the geometry model changes from deficit-plus-slack to single-boundary; the plan gains several validity checks; the deletion loop reorders the active partition last; a post-delete extension path with a safe fallback replaces the pre-delete extend; and a whole-layout assertion verifies the created partition's geometry. The happy path through these code paths has been exercised end-to-end on a disposable Hyper-V VM (2026-10-02 08:56).
@@ -780,9 +911,9 @@ The v46 patch 1 cycle added three physical-hardware exercises on top of the VM r
 
 **The plan-rejection check has been exercised in the rejecting case.** The Lenovo IdeaPad 3 15IAU7 that motivated v46 patch 1 took the v45 patch 1 pipeline on physical hardware and the post-delete geometry check in `Ensure-AdequateRecoveryPartition` (`$plannedEnd -gt ($diskSizeNow - 1MB)`) correctly rejected the plan: `Get-PartitionPlan` had computed `tailEnd` from a factory-provided partition ending exactly 1 MiB past the disk-end reserve, `AlignedManagedExtentEnd` landed 1 MiB past the reserve, and the post-delete check refused to proceed. The machine fell into OS-fallback with a state file that matched the failing `DesiredStateId`, so subsequent scheduled runs accepted the state and did not retry — the machine stayed in OS-fallback until an operator manually deleted the state file. Under v46 patch 1's clamp the same layout produces a valid plan; the second full-update run (after the state-file reset) reached `DEDICATED`. This is the first physical-hardware failure of the v45 destructive path, and the first time the post-delete check fired outside a test harness.
 
-### v47 patch 1 destructive-path coverage (recommended next step)
+### v47 patch 1 destructive-path coverage (historical)
 
-The v47 non-destructive paths are field-verified on the ASUS PRIME H510M-D. The v47-specific code paths that remain unexercised on any storage — physical or virtual — are:
+This subsection records coverage at v47 patch 1; the [patch 5 results above](#recorded-prerelease-field-results--2026-10-24) supersede later claims about current coverage. At v47 patch 1 the ASUS PRIME H510M-D covered the non-destructive paths; the gaps then were:
 
 - **The strip stage with a non-zero third-party driver set.** The ASUS run's strip was a no-op. The loop that removes published OEM#.inf entries one at a time, re-enumerates, and reaches zero was validated by an earlier real-machine F1/F2/F3 experiment, but has not been exercised inside a v47 production run.
 - **The strip-failure abort path.** The candidate-rejection path (dismount `-Discard`, checkpoint rollback to Step 2, stale-artifact cleanup) has not run in the field.
@@ -794,7 +925,7 @@ The v47 non-destructive paths are field-verified on the ASUS PRIME H510M-D. The 
 
 The v45 destructive-path VM test documented below remains the recommended next step before broad rollout under v47. It should be followed by a canary on a machine with an OEM driver pack so the strip-and-reinject loop runs against a non-empty set. These paths are covered by inspection, by the earlier F1/F2/F3 strip experiment, and by the mocked-geometry test plan documented below.
 
-**v48 patch 1 coverage.** The intervening-anchor happy path is field-verified on the AMD Ryzen 7 5825U machine that motivated it (2026-10-06), on the exact `C: | D: | Recovery` layout. The v48-specific code paths that remain unexercised on any storage are: the intervening-anchor post-deletion failure behaviour (the same class of residual documented for the non-intervening path); the v48 multi-intervening rejection and surplus rejection; the transactional WIM replacement's rollback branch (a copy failure mid-replacement); the architecture gate on ARM64 hardware; and, from v48 patch 2, the source-WIM hash cache fix on the enable-only fallthrough path. The remaining v47 gaps also stand: the strip stage against a non-zero third-party driver set, the OEM pack or VMD injection paths, the metadata-triggered rebuild branch, the pre-`/disable` race-detector abort branch, and the WIM_READY checkpoint save/resume round trip. The deliberate post-deletion failure test remains the gate for future changes to the post-deletion segment. See the "v48 patch 1 destructive-path coverage" section below.
+**v48 patch 1 coverage (historical).** The intervening-anchor happy path is field-verified on the AMD Ryzen 7 5825U machine that motivated it (2026-10-06), on the exact `C: | D: | Recovery` layout. The v48-specific code paths that remain unexercised on any storage are: the intervening-anchor post-deletion failure behaviour (the same class of residual documented for the non-intervening path); the v48 multi-intervening rejection and surplus rejection; the transactional WIM replacement's rollback branch (a copy failure mid-replacement); the architecture gate on ARM64 hardware; and, from v48 patch 2, the source-WIM hash cache fix on the enable-only fallthrough path. The remaining v47 gaps also stand: the strip stage against a non-zero third-party driver set, the OEM pack or VMD injection paths, the metadata-triggered rebuild branch, the pre-`/disable` race-detector abort branch, and the WIM_READY checkpoint save/resume round trip. The deliberate post-deletion failure test remains the gate for future changes to the post-deletion segment. See the "v48 patch 1 destructive-path coverage" section below.
 
 ### v48 patch 1 destructive-path coverage
 
@@ -811,14 +942,14 @@ The v48 patch 1 release introduces five changes: intervening-partition handling,
 
 The v49 release introduces several pre-deployment gates, post-run persistence features, and the backup / restore actions. The happy path for the interim features (backup, restore, resume task on clean completion) is exercised by the wrapper's own smoke tests. The gates and the interruption paths below are the v49 coverage that remains.
 
-- **Source-ownership classification.** Unexercised in the field. The classification runs before the strip stage. The test shape: prepare four VMs, one for each ownership class, and confirm the classification decision matches the expected class. In particular, a `Foreign-With-Drivers` source should be preserved as-is (strip stage skipped) rather than stripped and re-injected. The `Manager-Owned` and `Manager-Lineage` classes should be stripped and re-injected. The `Foreign-No-Drivers` class should be stripped (a no-op) and re-injected. Record the class the production log reports and the strip-stage decision.
-- **Never-downgrade storage-driver check.** Unexercised in the field. The check runs during the injection stage. The test shape: a VM whose registered WinRE carries a version N storage driver, and a candidate package that resolves to version N-1 of the same driver. Confirm the whole candidate is discarded — the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, the state file records `ForeignSourceAcceptedHash`, and the run exits `EXIT_WARNING` — and that the log names the driver, the source version, and the candidate version. Confirm the reverse (a candidate with a newer version) is injected normally.
-- **Pre-deployment storage-applicability gate.** Unexercised in the field — it has never fired. This gate is the last refusal before the WIM is written to the active route: every present SCSIAdapter-class device on the machine must have at least one INF in the candidate whose `HardwareID` or `CompatibleID` prefix-matches one of the device's IDs. The test shape: a VM whose controller is deliberately absent from the manifest's VMD patterns and from the OEM pack's INFs, and a candidate image prepared from the manifest. Confirm the gate refuses the candidate, the run exits `EXIT_WARNING`, and the log names the candidate image path, the machine's storage controllers, and the fact that no INF matched. This is the highest-signal v49 test because the gate has never fired in the field.
-- **Native-boot VHDX fail-closed gate.** Unexercised on VHDX-boot hardware. The test shape: a Windows VM booted from a native VHDX rather than a physical or pass-through volume. Confirm the gate refuses before any destructive operation and the run exits `EXIT_WARNING` with the topology-named refusal. Confirm the log line names the VHDX topology and the specific operations the manager does not support under it.
+- **Source-ownership classification.** Serviced patch 5 deployments exercised `Foreign-No-Drivers`, and the byte-preserved `Foreign-With-Drivers` relocation is recorded above; the complete four-class transition matrix remains unverified in disposable Windows tests. The classification runs before the strip stage. The test shape: prepare four VMs, one for each ownership class, and confirm the classification decision matches the expected class. In particular, a `Foreign-With-Drivers` source should be preserved as-is (strip stage skipped) rather than stripped and re-injected. The `Manager-Owned` and `Manager-Lineage` classes should be stripped and re-injected. The `Foreign-No-Drivers` class should be stripped (a no-op) and re-injected. Record the class the production log reports and the strip-stage decision.
+- **Never-downgrade storage-driver check.** Unexercised in the field. The check runs during the injection stage. The test shape: a VM whose registered WinRE carries a version N storage driver, and a candidate package that resolves to version N-1 of the same driver. Confirm servicing edits are discarded, the original hash-verified source is preserved, and the log names the driver and both versions. Patch 5 then assesses dedicated layout independently; record relocation/deferral, accepted ownership fields and the actual final exit code. Confirm the reverse (a candidate with a newer version) is injected normally.
+- **Pre-deployment storage-applicability gate.** The earlier Hyper-V false-positive refusal is recorded above; a deliberately missing-driver candidate still needs the negative fixture below. This gate is the last refusal before the WIM is written to the active route: every present SCSIAdapter-class device on the machine must have at least one INF in the candidate whose `HardwareID` or `CompatibleID` prefix-matches one of the device's IDs. The test shape: a VM whose controller is deliberately absent from the manifest's VMD patterns and from the OEM pack's INFs, and a candidate image prepared from the manifest. Confirm the gate refuses the candidate, the run exits `EXIT_WARNING`, and the log names the candidate image path, the machine's storage controllers, and the fact that no INF matched. Record the deliberately missing controller separately from the earlier parser false positive.
+- **Native-boot VHDX fail-closed gate.** Unexercised on native-boot hardware. The fixture must expose a `File Backed Virtual` OS disk and a separate nonvirtual disk to the running OS; an ordinary Hyper-V VM backed by a host VHDX is not this topology. Invoke the default Repair action and confirm `EXIT_WARNING` with the topology-named refusal before Repair partition or WinRE changes. Earlier logging/staging can occur. This fixture does not establish Backup/Restore coverage because those actions dispatch before the gate.
 - **Backup action.** Exercised on the clean path by the wrapper. The failure branches (a source-WIM read error, a destination-write error, a copy hash mismatch, a drive-letter exhaustion) have not been exercised. Test each against a VM: mock the source read to fail, mock the destination write to fail, tamper with the copy to cause a hash mismatch, and exhaust drive letters. Confirm the run exits with a non-zero code, the machine state is unchanged, and the log names the specific failure point.
-- **Restore action.** Exercised on the clean path by the wrapper. The three mid-transformation failure paths - the WIM-deployment failure when the re-enable attempt after the failure does not return `ok` (v50 patch 3), `/setreimage` failing after the WIM has been replaced, and `/enable` returning failed/bitlocker after the WIM is in place - have not been exercised. Test each against a VM: mock the transactional helper's copy to fail and the follow-up re-enable to return non-`ok`, mock `/setreimage` to return non-zero after the WIM has been written, and mock `/enable` to return a terminal failure after the WIM is in place. Confirm in each case that the resume task's persist flag is set, that the transactional helper leaves the machine's previous WIM in place (either by completing the rollback or by reporting a rollback-restore failure), and that the machine's end state matches one of the two documented outcomes. For the WIM-deployment failure path specifically, the v50 patch 3 follow-up adds a hash-comparison step: the branch captures the target WIM's SHA256 before the deploy attempt and again after the failure, and either preserves the state file, checkpoint, and deferral marker (when the two hashes match, so the target is provably unchanged) or invalidates them and sets the resume-task persist flag unconditionally (when the two hashes differ, or either hash is unavailable). The test should exercise both outcomes: mock the failure so the transactional helper leaves the target unchanged, and confirm the three markers survive; then mock the failure so the target ends up different or unreadable, and confirm the markers are invalidated and the persist flag is set.
-- **Temporary resume task persist triggers.** Exercised on the clean-completion path only — the task is registered and then deleted. The six interruption classes (outer catch, Ctrl+C, the three restore failure paths, hard kill, reboot) have not been exercised. The Ctrl+C trigger is the load-bearing one and is high-signal. Test each: force an unhandled exception, send Ctrl+C during a run, invoke the three restore failure paths above, kill the PowerShell process mid-run (`Stop-Process -Force`), and reboot the VM mid-run. Confirm in each case that the resume task is preserved, that it fires on the next boot (or within the hour), and that the resume run completes the interrupted operation.
-- **Stable install location and copy-hash verification.** Exercised on the clean path by the wrapper. The copy-hash mismatch refusal branch has not been exercised. Test by mocking the copy to introduce a byte discrepancy (or by racing an AV/EDR product that alters the copy in place). Confirm the install step refuses to register the task, the log names the source and destination hashes, and the installed copy is left in place.
+- **Restore action.** Exercised on the clean path by the wrapper. The three mid-transformation failure paths - the WIM-deployment failure when the re-enable attempt after the failure does not return `ok` (v50 patch 3), `/setreimage` failing after the WIM has been replaced, and `/enable` returning failed/bitlocker after the WIM is in place - have not been exercised. Test each against a VM: mock the transactional helper's copy to fail and the follow-up re-enable to return non-`ok`, mock `/setreimage` to return non-zero after the WIM has been written, and mock `/enable` to return a terminal failure after the WIM is in place. Confirm the persist flag and actual end state in each case. A copy failure attempts rollback and can fail to restore it; later `/setreimage` or `/enable` failures leave the replacement bytes in place. Record copy, rollback, registration and enable outcomes separately. For the WIM-deployment failure path specifically, the v50 patch 3 follow-up adds a hash-comparison step: the branch captures the target WIM's SHA256 before the deploy attempt and again after the failure, and either preserves the state file, checkpoint, and deferral marker (when the two hashes match, so the target is provably unchanged) or invalidates them and sets the resume-task persist flag unconditionally (when the two hashes differ, or either hash is unavailable). The test should exercise both outcomes: mock the failure so the transactional helper leaves the target unchanged, and confirm the three markers survive; then mock the failure so the target ends up different or unreadable, and confirm the markers are invalidated and the persist flag is set.
+- **Temporary resume task persist triggers.** Clean completion and a real post-deletion forced kill followed by automatic SYSTEM boot resume are recorded above. Other interruption phases, Ctrl+C, outer-catch and Restore failure combinations still need their own evidence. The Ctrl+C trigger is the load-bearing one and is high-signal. Test each: force an unhandled exception, send Ctrl+C during a run, invoke the three restore failure paths above, kill the PowerShell process mid-run (`Stop-Process -Force`), and reboot the VM mid-run. Confirm in each case that the resume task is preserved, that it fires on the next boot (or within the hour), and that the resume run completes the interrupted operation.
+- **Stable install location, trust and copy-hash verification.** Earlier wrapper runs exercised the original clean-copy path. Patch 5's native fresh installation is recorded above; updates and real installation-failure paths still require their own Windows VM confirmation. Isolated fixtures must cover untrusted/reparse parents and files, creation races, staging/hash failure and retained previous bytes/task. On the VM, confirm both a fresh install and an update register the verified installed path as SYSTEM; refusal must not repair an untrusted existing ACL automatically. A pre-publication failure must leave an earlier installed copy intact. Record staging and final-file failures separately.
 
 Each of these tests should be recorded with the same data the v45 / v46 tests record: the VM setup, the branch that fired (with the log line), the machine's end state, the exit code, and any divergence from the documented behavior.
 
@@ -835,82 +966,33 @@ The v46 patch 2 cycle added four post-review hardenings of `Ensure-AdequateRecov
 
 ### The post-deletion failure test (gating)
 
-This test exercises the one residual corner the project has not closed: a failure of `New-Partition` or `Format-Volume` **after** the existing recovery partition has been deleted, on a machine whose C: is encrypted, with no successful retry. In that corner, `Remove-OrphanPartition` cleans up the newly created partition, `Restore-OSPartitionSize` restores C:'s geometry, the run falls through to OS-fallback, and the OS-fallback gate defers because C: is encrypted. The machine ends with neither a dedicated recovery partition nor OS-fallback.
+The original v45 failure case remains the motivating test: an active recovery partition is deleted, every subsequent creation or formatting attempt fails, and encrypted C: prevents OS-fallback. Restoring the size of C: cannot recreate the deleted recovery partition. Patch 5 adds an independent protected WIM and pending-operation record, accurate fatal reporting, and a resumable fresh assessment; it does not make partition replacement atomic.
 
-The corner is the one place where **Rule 1 (never break Windows RE)** and **Rule 2 (never leave a machine without a working recovery route)** conflict. Rule 2 cannot be *guaranteed* in this case; it holds in the two ordinary cases (the destructive attempt succeeds, or it fails before deletion), but a post-deletion failure on an encrypted-C: machine reaches the corner. The v45 shrink-first reorder narrowed the trigger set — a shrink failure no longer reaches the corner because the shrink runs before deletion — but the corner itself is not closed. Closing it is the eventual post-failure check, gated on this test.
-
-The corner is documented in the `[v45 patch 1]` CHANGELOG entry, in [troubleshooting.md](troubleshooting.md) under "The OS-fallback route deferred because C: is encrypted", and in [architecture.md](architecture.md) as the residual failure mode the eventual post-failure check will close. **No future change to the post-deletion segment of `Ensure-AdequateRecoveryPartition` should ship until this test has been run and its result recorded.** See [CONTRIBUTING.md](../CONTRIBUTING.md) for the scope of the gate.
+**No change to the post-deletion segment may ship until this deliberate failure test runs and its result is recorded.** The isolated suites above exercise mocked providers and do not close this gate. See [CONTRIBUTING](../CONTRIBUTING.md#the-remaining-gated-scope).
 
 **Setup.**
 
-- A disposable VM with Windows 11 24H2 or later and C: encrypted. The corner requires C: to be encrypted so the OS-fallback gate defers; the specific state can be `FullyEncrypted + Protection Off` (Waiting-for-Activation) or `EncryptionInProgress`. The state must not be `FullyDecrypted`.
-- A type-coded recovery partition on the OS disk that the plan will delete. The partition must be smaller than the required bucket (so `Find-SuitableRecoveryPartition` rejects it and the destructive path is entered), or the state file must be absent or stale (so a rebuild is forced).
-- A deterministic way to fail `New-Partition` or `Format-Volume` after the deletion loop. Mocking the cmdlet is the deterministic option; a storage-level failure, ACL denial, or filesystem-level write failure is the realistic option.
-- Snapshot-restorable VM. The corner's end state is a machine with no working recovery route, so the VM must be discardable.
+- Use a disposable Windows VM that can be restored from a snapshot or full disk image. Save the original partition layout, registered WinRE location/status, active WIM hash and BitLocker conversion/protection state.
+- Start with an active, type-coded dedicated recovery partition that fails the reuse rule and is included in the planner's deletion set. A stale state file alone does not force partition replacement when the existing partition is adequate.
+- Encrypt C: and confirm it is not FullyDecrypted. Do not run this exercise on a personal or production machine.
+- Inject failure at New-Partition or Format-Volume only after the deletion loop. Ensure all creation retries fail. Keep an uninjected run and snapshot for comparison.
 
-**Procedure.**
+**Procedure and expected evidence.**
 
-1. Snapshot the VM.
-2. Apply the failure injection (mock `New-Partition`, mock `Format-Volume`, or arrange the storage-level condition that will cause the failure).
-3. Run `WinRE.ps1`.
-4. Capture the full log.
+1. Run the patch 5 Repair action and retain its complete log and actual process exit code.
+2. Before any partition mutation, verify that the protected independent candidate and its journal exist, that the expected SHA256 matches, and that the recorded OS identity matches the VM. Capture the journal again after failure.
+3. Verify shrink-before-disable sequencing and actual deletion of the active recovery partition. If failure occurs earlier, the test has not reached the gated case.
+4. For creation failure, verify the bounded three attempts. For formatting failure, verify orphan removal. Check whether restoring the resize target to its original size actually succeeds; record partial restoration as such.
+5. Verify that encrypted C: prevents fallback and that an unverified or missing recovery route returns **3 (fatal)**. Warning 2 is insufficient for the loss of the active route. The protected WIM, journal and resume task must remain.
+6. Reboot with the injection still active. Verify that the pending operation is read before ordinary servicing/network preparation and that current topology is reassessed without replaying stale partition numbers. Record any retry delay.
+7. Remove the injection and retry. Verify a single adequate dedicated partition, the registered destination's exact expected hash, Enabled status, ownership fields and durable state read-back. Only then may the journal and candidate be retired.
+8. Boot the resulting WinRE and verify storage access. Registration and hash checks alone do not prove recovery boot.
 
-**Expected sequence.**
+Repeat on a fully decrypted OS volume to exercise the constrained last-resort fallback: actual dedicated creation failure, verified geometry and no acceptable route to retain are required. A verified OS-fallback returns warning 2 and keeps the Registered journal, candidate and task for a later dedicated retry. Capacity/preflight deferral must never trigger fallback.
 
-For a `New-Partition` failure:
+Also repeat on the supported intervening-anchor layout. Record the anchor's original and final geometry separately from C:. A successful size restore is not proof that a deleted partition or its contents were restored.
 
-```
-[INFO] Pre-deletion inventory:
-[INFO]   Disk 0 Part 4: size 1000 MiB, label='Recovery', used=... MiB, isWinRELocation=YES
-…
-[INFO] Confirmed deletion of partition 4 on disk 0
-…
-[WARN] New-Partition attempt 1 failed: …
-[WARN] New-Partition attempt 2 failed: …
-[WARN] New-Partition attempt 3 failed: …
-[ERROR] New-Partition failed after 3 attempts
-…
-[WARN] ================================================================================
-[WARN] Dedicated recovery partition creation failed after all attempts.
-[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
-[WARN] This is NOT equivalent to a dedicated recovery partition.
-[WARN] WinRE will function but with reduced resilience. Exit code will be 2.
-[WARN] ================================================================================
-…
-[WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=True). …
-```
-
-For a `Format-Volume` failure, the analogous sequence: the deletion block, then `[ERROR] Format-Volume failed: …`, then `[INFO] Removing orphan partition …`, then the OS-fallback deferral.
-
-In both cases, `Restore-OSPartitionSize` runs after the failure and restores C: to its recorded original size. The log should show the restore.
-
-**Expected end state.**
-
-- Exit code **2** (`EXIT_WARNING`).
-- No recovery partition on the OS disk. `Get-Partition` shows only the EFI, MSR, and Windows partitions.
-- WinRE reports `Disabled` (`reagentc /info`). The `reagentc /disable` call completed earlier in the sequence and there is no subsequent `/enable`.
-- The fallback WIM at `C:\Recovery\WindowsRE\winre.wim` is present if a prior run had written it, absent otherwise. It is not re-deployed on this run.
-- The state file at `C:\Recovery\OEM\winre_state.json` is unchanged from before the run (the fast-path rewrite is not reached because the pipeline aborted).
-- No deferral marker at `C:\Recovery\OEM\winre_partition_deferred.json` — this corner is reached via the OS-fallback path, not via a pre-shrink deferral, so the marker is not written.
-
-**What to record.**
-
-- The machine setup (vendor/model if using a physical machine, but a Hyper-V VM is expected; Windows build; C: encryption state via `manage-bde -status C:`).
-- Which cmdlet was forced to fail (`New-Partition` or `Format-Volume`) and the injection method.
-- Whether the deletion loop completed before the failure.
-- Whether `Restore-OSPartitionSize` ran and succeeded.
-- Whether the OS-fallback gate deferred (identify the log line).
-- The exact end state (the five points above).
-- Whether the exit code is 2.
-- Any divergence from the expected sequence above.
-
-**Interpretation.**
-
-**If the test confirms the corner fires as documented** — the log matches the expected sequence and the end state is as described — record the result. From that point the design of the fix (a post-failure check in the post-deletion segment, as the CHANGELOG entries describe) can proceed with real field data on the corner's exact signature and end state.
-
-**If the test reveals behavior different from the documented corner** — different log sequence, different end state, or the corner does not fire at all — investigate before designing the fix. The documented behavior may need revision, and the CHANGELOG entry, this section, and [troubleshooting.md](troubleshooting.md) would need to be corrected to match observed behavior.
-
-**If the failure injection does not reach the corner** — the run succeeds despite the injection, or fails earlier in the pipeline — the injection was not effective at the intended failure point. Adjust the injection and re-run.
+Record the Windows build, script version, injection point/method, partition inventories, hashes, native-tool results, persisted phases, exit code, task state, and recovery-boot result. Investigate any divergence before release; update the documentation from observed evidence rather than accepting the expected result as proof.
 
 ### Paths that need coverage
 
@@ -919,7 +1001,7 @@ In both cases, `Restore-OSPartitionSize` runs after the failure and restores C: 
 - **Whole-layout assertion.** `New-Partition` returns success but the actual geometry does not match the plan (wrong offset, wrong size, overlap, or a trailing extent that exceeds one alignment block); `Assert-RecoveryPartitionLayout` fires, `Remove-OrphanPartition` deletes the newly created partition, and the function returns `$null`.
 - **Deletion-failure route restoration.** A deletion fails mid-loop while WinRE is disabled; the script restores C: to its original size, calls `Restore-PreviousWinRERoute`, and either returns `Deferred` (route restored) or `$null` (route not restorable). `Test-WinRELocationMatches` handles the GLOBALROOT-vs-Volume-GUID form difference.
 - **Plan validation edge cases.** Each rejected layout (blocking non-recovery partition after C:, non-contiguous recovery partition, recovery-typed partition over 2 GiB, cross-disk inventory, insufficient aligned space) returns `Deferred` without touching WinRE or any partition.
-- **Deferral marker lifecycle.** The marker is written on a retry-suppressible deferral; a subsequent run honors it while the route is functional and does not repeat the pre-shrink retries; a run where the fast path would fire clears the marker and exits `EXIT_SUCCESS`; a `DesiredStateId` change clears the marker on read.
+- **Deferral marker lifecycle.** Capacity refusals are reassessed on each attempt. Execution failures use a one-hour retry delay with bounded work per attempt; an expired, legacy or invalid future timestamp cannot suppress work indefinitely. A verified adequate dedicated route can commit before checking the delay. An unresolved journal and candidate survive ordinary marker or DSI changes.
 - **MBR support.** The destructive path on an MBR disk uses `-MbrType 0x27` at creation and `set id=27` in `Set-RecoveryPartitionAttributes`. The MBR attribute-application branch was exercised on a Win10 MBR VM (2026-10-02 09:41, reuse path); the MBR destructive path has not been exercised on any storage.
 
 Each of these tests exists to protect a specific invariant from `architecture.md`. The pre-shrink and deletion-failure tests are direct exercises of **Rule 2** — a failing pre-shrink must leave the old recovery route intact, and a failing deletion must attempt to restore it. The whole-layout assertion and the plan-validation edge cases are **Rule 1** tests — the destructive sequence must refuse to proceed on a layout it cannot prove safe. The deferral marker lifecycle is a **Rule 4** test — the marker is the mechanism by which "do no work unless needed" is enforced across a run that has deferred. The MBR test confirms **Rule 1** on a partition style that has not yet seen a field exercise.
@@ -933,7 +1015,7 @@ Each test needs a different starting state. Use a snapshot-restorable VM; the de
 - **Whole-layout assertion.** Mock `New-Partition` to return a partition at the wrong offset or size, or use a VM whose storage layout causes the resize to land off-boundary.
 - **Deletion-failure route restoration.** Mock `Remove-Partition` to fail on a non-active partition while the active partition remains in the deletion list. Verify the active partition was deleted last and that `Restore-PreviousWinRERoute` was attempted.
 - **Plan validation edge cases.** Construct each rejected layout on a VM's virtual disk and verify the plan returns `Deferred` with no partition or WinRE change.
-- **Deferral marker lifecycle.** Run the pre-shrink failure test, re-run without fixing the constraint (the marker is honored), then mock the fast-path conditions to be met or fix the constraint so the machine converges (the marker is cleared and the run exits `EXIT_SUCCESS`).
+- **Deferral marker lifecycle.** Run the pre-shrink failure test, re-run during its execution delay, then re-run after expiry. Separately trigger a capacity refusal and free enough space without changing DSI; the next run must reassess it. Confirm that none of these operations deletes the unresolved journal or candidate.
 - **MBR.** Set up an MBR VM with a type-coded recovery partition; run the full-update path and verify the created partition carries MBR type `0x27`.
 - **Post-deletion failure.** See "The post-deletion failure test" above — the setup, procedure, expected sequence, end state, and recording requirements are all documented there.
 - **v49 pre-deployment gates.** See "v49 destructive-path coverage" above — the setup, expected behavior, and high-signal branches are documented there.
@@ -967,7 +1049,7 @@ For diagnostic output added to Option 1 or its sub-sections, use `Write-Diag` fo
 
 When adding a check to the parser self-test, use the pattern of the existing checks: enumerate the object's expected properties, compare against the observed shape, record `PASS` when all are present, `FAIL` when one is missing, and `SKIP` when the state the check inspects is legitimately absent. A check that a machine can be in without fault should SKIP rather than FAIL — for example, the `Get-StorageControllerDevices` shape check (v28) SKIPs on zero devices because a VM with no SCSIAdapter-class devices is a valid configuration.
 
-Do not add tests that modify the machine's state. The harness's contract with the operator is that it is read-only.
+Do not add tests that modify the machine's state. The harness may manage its own scratch artifacts, but must not modify the live WinRE configuration, partitions, BitLocker, drive letters or deployment state.
 
 ## Related documents
 

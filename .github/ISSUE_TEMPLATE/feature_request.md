@@ -24,6 +24,8 @@ labels: ['enhancement', 'needs-triage']
 - Would this alter any exit-code semantics?
 - Does it touch the partition lifecycle, BitLocker state, the state file, the checkpoint file (`C:\ProgramData\OEM\Logs\winre_checkpoint.txt`), or the deferral marker (`C:\Recovery\OEM\winre_partition_deferred.json`)? The checkpoint file carries the source-content binding (v47) and the marker governs retry suppression (v45); both are part of the deployment's persistence surface.
 
+For relocation or persistence changes, describe the effect on ownership, protected recovery material, journal phases, retry/fallback conditions and cleanup using the [current pending-operation requirements](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CONTRIBUTING.md#patch-5-pending-operation-review). Trust or privileged-installation changes must also account for the [three-copy trust-check invariant](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CONTRIBUTING.md#the-three-copy-trust-check-invariant).
+
 ### If this feature would touch one of the v49 gates or persistence features
 
 v49 introduced a set of pre-deployment gates and post-run persistence features. If your feature would interact with any of them, say so explicitly:
@@ -69,7 +71,7 @@ v50 patch 3 extended the manager config and resume-task trust checks, added a sh
 
 ---
 
-**On the design invariants.** WinRE Manager's design is organized around four rules, in this order — see [`docs/architecture.md`](docs/architecture.md) for the full hierarchy:
+**On the design invariants.** WinRE Manager's design is organized around four rules, in this order — see [`docs/architecture.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/docs/architecture.md) for the full hierarchy:
 
 1. **Never break Windows RE.**
 2. **Never leave a machine without a working recovery route** — to the extent the machine, its OS, and its storage stack allow.
@@ -78,4 +80,4 @@ v50 patch 3 extended the manager config and resume-task trust checks, added a sh
 
 If your feature would serve one of these rules, say so — it helps the maintainer weigh it against the rest of the backlog. If your feature would **weaken** any of rules 1–3, say so explicitly; it will need a field case to justify it.
 
-**If the feature would touch the destructive sequence** (`Get-PartitionPlan`, `Ensure-AdequateRecoveryPartition`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, the `New-Partition` / `Format-Volume` / `Set-RecoveryPartitionAttributes` calls and their failure paths, `Remove-OrphanPartition`, `Restore-OSPartitionSize`, `Restore-PreviousWinRERoute`, `Assert-RecoveryPartitionLayout`, `Remove-StrayRecoveryPartitions`, and any caller of those functions), be aware that any eventual PR will be gated. The gate is on the deliberate post-deletion failure test documented in [`docs/testing.md`](docs/testing.md); see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the scope. A feature that would change the post-deletion segment cannot ship until that test has run and its result is recorded.
+**If the feature would touch the destructive sequence** (`Get-PartitionPlan`, `Ensure-AdequateRecoveryPartition`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, the `New-Partition` / `Format-Volume` / `Set-RecoveryPartitionAttributes` calls and their failure paths, `Remove-OrphanPartition`, `Restore-OSPartitionSize`, `Restore-PreviousWinRERoute`, `Assert-RecoveryPartitionLayout`, `Remove-StrayRecoveryPartitions`, and any caller of those functions), be aware that any eventual PR will be gated. The gate is on the deliberate post-deletion failure test documented in [`docs/testing.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/docs/testing.md); see [`CONTRIBUTING.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CONTRIBUTING.md) for the scope. A feature that would change the post-deletion segment cannot ship until that test has run and its result is recorded.

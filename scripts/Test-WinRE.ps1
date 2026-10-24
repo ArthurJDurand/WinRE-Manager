@@ -19,6 +19,10 @@
         Get-ProductionScriptVersion; the harness reports the DSI
         comparison as SKIP when the reader cannot resolve it)
       - Get-LocalInputsId (v48 three-field locally-computable hash)
+      - ConvertFrom-WinRELocation, Get-WinRELocationFromInfo,
+        Get-WinREPathAttributes, and Resolve-WinRELocationToPartition
+        (complete registered paths, including their folder suffixes;
+        resolution is read-only and assigns no drive letters)
       - Compare-WimServicingMetadata (v47 Version/SPBuild/SPLevel/
         Architecture comparator used by production's
         Select-BaseWinRESource for source selection; the harness
@@ -75,22 +79,12 @@
           directly and print its raw output, so that Microsoft format
           drift and non-English OS rendering are visible in the
           diagnostic even when the cmdlet's classification would
-          succeed. Two instances are deliberate:
+          succeed. The raw-output case is:
             - Get-WinREState captures the full reagentc /info text as
               RawInfo; Show-SystemDiagnostic prints it verbatim before
               the parsed status/location/version block, and the
               parser self-test's regex failure hypotheses cite the raw
               text alongside the current OS locale.
-            - Test-PlanAdjacencyReadOnly's anchor BitLocker check
-              calls manage-bde -status directly instead of going
-              through production's Test-VolumeAccessibleForResize
-              (which queries Get-BitLockerVolume first and only falls
-              back to manage-bde when the cmdlet returns nothing).
-              The direct call exposes the raw conversion-status and
-              lock-status lines; the harness verdict may therefore
-              differ from production's on a machine where the cmdlet
-              and the native tool classify differently, and that
-              difference is the diagnostic.
 
       (c) An explicit, documented functional difference. Where the
           harness deliberately differs from production - for example,
@@ -98,6 +92,20 @@
           to exercise the download path, whereas production further
           filters on VMD hardware presence - the difference is stated
           in the function's header comment.
+
+          Test-PlanAdjacencyReadOnly's anchor BitLocker check calls
+          manage-bde -status directly instead of going through
+          production's Test-VolumeAccessibleForResize (which queries
+          Get-BitLockerVolume first and falls back to manage-bde if
+          the cmdlet is unavailable, throws, or returns nothing).
+          This preview parses the native output without printing that
+          anchor command's raw text. Its verdict may differ from
+          production's when the cmdlet and native tool classify the
+          same volume differently.
+
+          Download and extraction mirrors omit production's DryRun-only
+          early returns. The harness has no DryRun mode and exercises
+          the actual download/extraction path within its test directory.
 
       (d) An output-shape-aligned helper whose implementation may
           differ. Two functions produce output that is deliberately
@@ -133,8 +141,11 @@
     the fail-closed `$null` return, the empty-metadata IsNullOrWhiteSpace
     guard, the Win32_ComputerSystem query source, and the combined-string
     construction the harness's mirror and Option 1 sweep-suppression
-    preview depend on. These read WinRE.ps1 if it is adjacent and SKIP
-    when it is not. They are not mirrors; they are invariant-level guards
+    preview depend on. They inspect executable syntax and its enclosing
+    control flow; comments and unrelated commands cannot satisfy them.
+    These read WinRE.ps1 if it is adjacent and SKIP when it is not or
+    when the harness has no script directory (for example, pasted code).
+    They are not mirrors; they are invariant-level guards
     against the mirror-drift class named in the preceding paragraph.
 
 .PARAMETER TestDir
@@ -147,7 +158,46 @@
     Run "all relevant for this machine" once and exit.
 
 .NOTES
-    Version : 39
+    Version : 40
+
+    v40 changes vs v39:
+    1. Production readers return null when $PSScriptRoot is unavailable,
+       allowing pasted/selection execution to report SKIP instead of a
+       Join-Path binding error. Path resolution is inside their try blocks.
+    2. Replaced substring-based mirror bindings (checks 18-20) with AST
+       contracts. Check 18 binds the unfiltered Get-Disk command's own
+       -ErrorAction Stop and other-disk filter to its fail-closed catch.
+       Check 19 binds executable software-device filters and the array
+       return. Check 20 binds executable signatures to the matching loop,
+       the actual CIM query and its catch, and the empty-metadata guard.
+       Comments or a different command cannot satisfy those contracts.
+    3. Menu title and startup Rule bumped 39 -> 40.
+    4. Mirrored v50 patch 5's complete WinRE location parsing and
+       read-only partition resolution, including absolute drive-letter
+       paths. Get-WinREState retains the registered folder rather than
+       truncating the location to its partition or volume root. Enabled
+       status with no reported location cannot use registry fallback. The
+       active-WIM preview probes only that exact directory; a literal
+       root is not expanded to a conventional Recovery\WindowsRE folder.
+       Check 2 parses the exact native location field with those same
+       helpers, accepting drive-letter routes and ignoring unrelated
+       recovery-image fields rather than scanning for a root substring.
+    5. The diagnostic classification describes partition layout only.
+       DEDICATED does not assert image ownership, driver applicability,
+       capacity, encryption suitability, or successful recovery boot.
+       Production's PRESERVED-DEDICATED additionally describes an image
+       preservation decision; this read-only classifier does not make
+       that decision or claim to preview production's operating mode.
+    6. Check 22 probes positive and negative Int64 deltas outside the
+       Int32 range in the vulnerable arithmetic, retaining separate
+       safe shrink and extend calculations.
+    7. Mirrored production's OEM checksum metadata handling: trim edge
+       whitespace, validate supplied SHA256/MD5 formats before download,
+       and continue verifying the downloaded bytes. Missing hashes retain
+       the existing no-hash policy. Download/extraction mirrors deliberately
+       omit production's DryRun-only early returns.
+    8. Clarified the diagnostic's internal-disk sweep exclusions and
+       storage-applicability advisory; no partition or driver policy change.
 
     v39 changes vs v38:
     1. Tightened check 18 to verify the specific Get-Disk -ErrorAction Stop
@@ -1029,6 +1079,8 @@ function Get-VmdPresence {
 }
 
 # =========================== DOWNLOAD HELPERS (based on WinRE.ps1) ===========================
+# Intentional difference: production's DryRun-only download early return
+# is omitted because this harness has no DryRun mode.
 function Get-DownloadFileName {
     param([Parameter(Mandatory)][string]$Url, [string]$FallbackName = "oem_pack")
     try {
@@ -1055,6 +1107,23 @@ function Invoke-OemPackDownload {
         [string]$ExpectedMD5,
         [int]$MaxRetries = 3
     )
+
+    # Vendor metadata can pad a valid digest with whitespace. Normalize only
+    # its edges; a supplied malformed/blank digest must not become no-hash mode.
+    if ($ExpectedSHA256) {
+        $ExpectedSHA256 = $ExpectedSHA256.Trim()
+        if ($ExpectedSHA256 -notmatch '^[a-fA-F0-9]{64}$') {
+            Say 'Invalid expected SHA256 metadata; download refused.' -Level ERROR
+            return $false
+        }
+    }
+    if ($ExpectedMD5) {
+        $ExpectedMD5 = $ExpectedMD5.Trim()
+        if ($ExpectedMD5 -notmatch '^[a-fA-F0-9]{32}$') {
+            Say 'Invalid expected MD5 metadata; download refused.' -Level ERROR
+            return $false
+        }
+    }
 
     if (Test-Path $DestinationPath) {
         Say "Removing existing file before download: $DestinationPath"
@@ -1146,6 +1215,8 @@ function Invoke-OemPackDownload {
 }
 
 # =========================== EXTRACTION HELPERS (based on WinRE.ps1) ===========================
+# Intentional difference: production's DryRun-only extraction early returns
+# are omitted because this harness has no DryRun mode.
 # Extraction destinations are cleared before each extraction (v18 change
 # #5) to prevent stale INF files from a previous run satisfying the
 # INF-count success test. The Lenovo "non-zero exit but INFs present"
@@ -1269,9 +1340,10 @@ function Get-IntelProcessorGeneration {
 # caller can report the comparison as indeterminate rather than
 # substituting a stale default.
 function Get-ProductionScriptVersion {
-    $productionPath = Join-Path $PSScriptRoot "WinRE.ps1"
-    if (-not (Test-Path -LiteralPath $productionPath -PathType Leaf)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { return $null }
     try {
+        $productionPath = Join-Path $PSScriptRoot "WinRE.ps1"
+        if (-not (Test-Path -LiteralPath $productionPath -PathType Leaf)) { return $null }
         $match = [regex]::Match(
             (Get-Content -LiteralPath $productionPath -Raw),
             '(?m)^\s*\$ScriptVersion\s*=\s*(\d+)'
@@ -1283,14 +1355,15 @@ function Get-ProductionScriptVersion {
 
 # Read the body of a specific function from the adjacent WinRE.ps1, for
 # source-level mirror-binding assertions. Returns $null when the script
-# is not adjacent or the function is not found. The extraction stops at
-# the first line-start "}" after the function header, which matches the
-# brace-at-column-zero convention used throughout WinRE.ps1.
+# is not adjacent, no script directory is available, or the function is
+# not found. Parser extraction includes the entire function rather than
+# relying on a brace-at-column-zero convention.
 function Get-ProductionFunctionText {
     param([Parameter(Mandatory)][string]$FunctionName)
-    $productionPath = Join-Path $PSScriptRoot "WinRE.ps1"
-    if (-not (Test-Path -LiteralPath $productionPath -PathType Leaf)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { return $null }
     try {
+        $productionPath = Join-Path $PSScriptRoot "WinRE.ps1"
+        if (-not (Test-Path -LiteralPath $productionPath -PathType Leaf)) { return $null }
         # Extract the function body via the PowerShell parser rather than
         # a brace-at-column-0 regex. A future function-body change (a
         # here-string containing '}' at column 0, a nested code block)
@@ -1309,6 +1382,172 @@ function Get-ProductionFunctionText {
         if ($funcAst) { return $funcAst.Extent.Text }
     } catch { }
     return $null
+}
+
+# v40: executable contracts for checks 18-20. This parses text only; it
+# never imports or invokes production functions. AST-specific checks bind
+# a command to its own arguments and catch, and a signature to the array
+# actually consumed by the matching loop. This is deliberately narrower
+# than a general equivalence proof; a legitimate structural rewrite needs
+# the corresponding contract and mirror reviewed together.
+function Get-ProductionBindingIssues {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Test-NativeBootVirtualTopology', 'Get-StorageControllerDevices', 'Test-RunningInVirtualMachine')][string]$FunctionName,
+        [Parameter(Mandatory)][string]$FunctionText
+    )
+    $issues = [System.Collections.Generic.List[string]]::new()
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($FunctionText, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { return 'production function could not be parsed' }
+    $func = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $FunctionName }, $true)
+    if (-not $func) { return 'production function definition not found' }
+
+    function Test-VariableNode($Node, [string]$Name) {
+        return ($Node -is [System.Management.Automation.Language.VariableExpressionAst] -and $Node.VariablePath.UserPath -eq $Name)
+    }
+    function Test-MemberNode($Node, [string]$Variable, [string]$Member) {
+        return ($Node -is [System.Management.Automation.Language.MemberExpressionAst] -and
+            (Test-VariableNode $Node.Expression $Variable) -and $Node.Member.Value -eq $Member)
+    }
+    function Test-ReturnVariable($Block, [string]$Name) {
+        return (@($Block.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.ReturnStatementAst] -and
+                $_.Pipeline -and $_.Pipeline.PipelineElements.Count -eq 1 -and
+                (Test-VariableNode $_.Pipeline.PipelineElements[0].Expression $Name)
+        }).Count -gt 0)
+    }
+    function Test-StopParameter($Command) {
+        $elements = $Command.CommandElements
+        for ($i = 1; $i -lt $elements.Count; $i++) {
+            if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $elements[$i].ParameterName -eq 'ErrorAction') {
+                $argument = if ($elements[$i].Argument) { $elements[$i].Argument } elseif ($i + 1 -lt $elements.Count) { $elements[$i + 1] } else { $null }
+                return ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $argument.Value -eq 'Stop')
+            }
+        }
+        return $false
+    }
+    function Get-EnclosingTry($Node) {
+        $parent = $Node.Parent
+        while ($parent -and $parent -isnot [System.Management.Automation.Language.TryStatementAst]) { $parent = $parent.Parent }
+        if ($parent -and $Node.Extent.StartOffset -ge $parent.Body.Extent.StartOffset -and $Node.Extent.EndOffset -le $parent.Body.Extent.EndOffset) { return $parent }
+        return $null
+    }
+
+    if ($FunctionName -eq 'Test-NativeBootVirtualTopology') {
+        $calls = @($func.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Get-Disk' -and
+                -not @($node.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Number' }).Count
+        }, $true))
+        if ($calls.Count -ne 1) { $issues.Add('expected exactly one unfiltered Get-Disk command') }
+        else {
+            $command = $calls[0]
+            if (-not (Test-StopParameter $command)) { $issues.Add('unfiltered Get-Disk command does not carry -ErrorAction Stop') }
+            $filter = $command.Parent.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Where-Object' -and
+                    $null -ne $node.Find({
+                        param($comparison)
+                        $comparison -is [System.Management.Automation.Language.BinaryExpressionAst] -and $comparison.Operator -eq 'Ine' -and
+                            (Test-MemberNode $comparison.Left '_' 'Number') -and (Test-MemberNode $comparison.Right 'osDisk' 'Number')
+                    }, $true)
+            }, $true)
+            if (-not $filter) { $issues.Add('unfiltered Get-Disk pipeline lacks the other-disk number filter') }
+            $try = Get-EnclosingTry $command
+            $failClosed = $false
+            if ($try) {
+                foreach ($catch in $try.CatchClauses) {
+                    $assignment = @($catch.Body.Statements | Where-Object {
+                        $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                            (Test-MemberNode $_.Left 'result' 'IsNativeBootVirtual') -and
+                            (Test-VariableNode $_.Right.Expression 'true')
+                    })
+                    if ($assignment -and (Test-ReturnVariable $catch.Body 'result')) { $failClosed = $true }
+                }
+            }
+            if (-not $failClosed) { $issues.Add('unfiltered-enumeration catch must set IsNativeBootVirtual true and return result') }
+        }
+    } elseif ($FunctionName -eq 'Get-StorageControllerDevices') {
+        $arrayReturn = $func.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.ReturnStatementAst] -and $node.Pipeline -and
+                $node.Pipeline.PipelineElements.Count -eq 1 -and
+                $node.Pipeline.PipelineElements[0].Expression -is [System.Management.Automation.Language.ArrayLiteralAst] -and
+                $node.Pipeline.PipelineElements[0].Expression.Elements.Count -eq 1 -and
+                (Test-VariableNode $node.Pipeline.PipelineElements[0].Expression.Elements[0] 'result')
+        }, $true)
+        if (-not $arrayReturn) { $issues.Add('missing executable unary-comma return of result') }
+        foreach ($pattern in @('^\{[0-9A-Fa-f-]+\}\\', '^SWD\\')) {
+            $filter = $func.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.PipelineElements[0].Expression -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                    $node.Clauses[0].Item1.PipelineElements[0].Expression.Operator -eq 'Or' -and
+                    $null -ne $node.Clauses[0].Item1.Find({
+                        param($comparison)
+                        $comparison -is [System.Management.Automation.Language.BinaryExpressionAst] -and $comparison.Operator -eq 'Imatch' -and
+                            (Test-MemberNode $comparison.Left 'dev' 'InstanceId') -and $comparison.Right.Value -ceq $pattern
+                    }, $true) -and
+                    $null -ne $node.Clauses[0].Item2.Find({ param($statement) $statement -is [System.Management.Automation.Language.ContinueStatementAst] }, $true)
+            }, $true)
+            if (-not $filter) { $issues.Add("missing executable software-device skip for '$pattern'") }
+        }
+    } else {
+        $requiredSignatures = @('VMware', 'VirtualBox', 'innotek', 'Microsoft Corporation.*Virtual Machine', 'Xen', 'QEMU', 'Parallels', 'Bochs', 'KVM', 'bhyve')
+        $signatureAssignment = $func.Find({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and (Test-VariableNode $node.Left 'signatures') }, $true)
+        $actualSignatures = if ($signatureAssignment) { @($signatureAssignment.Right.FindAll({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value }) } else { @() }
+        if (($actualSignatures -join "`n") -cne ($requiredSignatures -join "`n")) { $issues.Add('executable signatures array differs from the ten-signature mirror') }
+        $loop = $func.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+                (Test-VariableNode $node.Variable 'sig') -and $node.Condition.Extent.Text.Trim() -eq '$signatures' -and
+                $null -ne $node.Body.Find({
+                    param($branch)
+                    $branch -is [System.Management.Automation.Language.IfStatementAst] -and
+                        $null -ne $branch.Clauses[0].Item1.Find({
+                            param($comparison)
+                            $comparison -is [System.Management.Automation.Language.BinaryExpressionAst] -and $comparison.Operator -eq 'Imatch' -and
+                                (Test-VariableNode $comparison.Left 'combined') -and (Test-VariableNode $comparison.Right 'sig')
+                        }, $true) -and (Test-ReturnVariable $branch.Clauses[0].Item2 'true')
+                }, $true)
+        }, $true)
+        if (-not $loop) { $issues.Add('signatures array is not consumed by the guest-detection match/true-return loop') }
+        $combined = $func.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and (Test-VariableNode $node.Left 'combined') -and
+                $node.Right.Expression -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+                $node.Right.Expression.Value -eq '$mfg $mdl'
+        }, $true)
+        if (-not $combined) { $issues.Add('missing executable manufacturer/model combined-string assignment') }
+        $queries = @($func.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Get-CimInstance' -and
+                @($node.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $_.Value -eq 'Win32_ComputerSystem' }).Count -gt 0
+        }, $true))
+        $queryProtected = $false
+        if ($queries.Count -eq 1 -and (Test-StopParameter $queries[0])) {
+            $try = Get-EnclosingTry $queries[0]
+            if ($try) { foreach ($catch in $try.CatchClauses) { if (Test-ReturnVariable $catch.Body 'null') { $queryProtected = $true } } }
+        }
+        if (-not $queryProtected) { $issues.Add('Win32_ComputerSystem query must use ErrorAction Stop with its own null-return catch') }
+        $emptyGuard = $func.Find({
+            param($node)
+            if ($node -isnot [System.Management.Automation.Language.IfStatementAst]) { return $false }
+            $condition = $node.Clauses[0].Item1.PipelineElements[0].Expression
+            if ($condition -isnot [System.Management.Automation.Language.BinaryExpressionAst] -or $condition.Operator -ne 'And') { return $false }
+            $members = @($condition.FindAll({
+                param($part)
+                $part -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $part.Static -and
+                    $part.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and $part.Expression.TypeName.FullName -eq 'string' -and
+                    $part.Member.Value -eq 'IsNullOrWhiteSpace' -and $part.Arguments.Count -eq 1
+            }, $true))
+            return ($members.Count -eq 2 -and (Test-VariableNode $members[0].Arguments[0] 'mfg') -and
+                (Test-VariableNode $members[1].Arguments[0] 'mdl') -and (Test-ReturnVariable $node.Clauses[0].Item2 'null'))
+        }, $true)
+        if (-not $emptyGuard) { $issues.Add('missing manufacturer/model empty-metadata condition with its own null return') }
+    }
+    return $issues.ToArray()
 }
 
 function Get-DesiredStateId {
@@ -1470,30 +1709,143 @@ function Get-WinREState {
     $info = & cmd /c "reagentc /info 2>&1"
     $statusLine = $info | Select-String -Pattern '(Enabled|Disabled)' | Select-Object -First 1
     $status = if ($statusLine) { $statusLine.Matches.Value } else { "Unknown" }
-    $locationLine = $info | Select-String -Pattern '(\\\\\?\\GLOBALROOT\\device\\harddisk\d+\\partition\d+\\|\\\\\?\\Volume\{[a-fA-F0-9\-]+\}\\?)' | Select-Object -First 1
-    $location = if ($locationLine) { $locationLine.Matches.Value.Trim() } else { $null }
-    if (-not $location) {
-        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WinRE"
+    # Keep the entire registered directory. A partition root is not proof
+    # that Recovery\WindowsRE (or any other folder) is the registered route.
+    $location = Get-WinRELocationFromInfo -Info $info
+    # Enabled status requires affirmative evidence of its current route.
+    # A registry value cannot establish where an unreported active WIM is.
+    if (-not $location -and $status -ne 'Enabled') {
+        $regPath  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WinRE"
         $location = (Get-ItemProperty -Path $regPath -Name "WinRELocation" -ErrorAction SilentlyContinue).WinRELocation
     }
-    # Mirrors production v46 patch 2. Version line absent when WinRE is
-    # Disabled or suppressed. Informational only - not part of DSI.
+    # v46 patch 2: extract Windows RE Version so the caller can log which
+    # build is currently registered before any destructive work happens.
+    # Absent when WinRE is Disabled or reagentc suppresses the line.
+    # Informational only - not part of DesiredStateId and not used in any
+    # gate.
     $versionLine = $info | Select-String -Pattern 'Windows RE Version:\s*([\d\.]+)' | Select-Object -First 1
     $version = if ($versionLine) { $versionLine.Matches.Groups[1].Value } else { $null }
     return @{ Status = $status; Location = $location; Version = $version; RawInfo = $info }
 }
 
-function Resolve-WinRELocationToPartition {
-    param([string]$Location)
-    if (-not $Location) { return $null }
-    if ($Location -match 'harddisk(\d+)\\partition(\d+)') {
-        return Get-Partition -DiskNumber ([int]$Matches[1]) -PartitionNumber ([int]$Matches[2]) -ErrorAction SilentlyContinue
+function ConvertFrom-WinRELocation {
+    param([AllowNull()][string]$Location)
+    if ([string]::IsNullOrWhiteSpace($Location)) { return $null }
+    # Do not Trim() path components: trailing spaces/dots are Win32 aliases,
+    # not evidence that two registered directories are identical.
+    $result = @{}
+    if ($Location -match '^\\\\\?\\GLOBALROOT\\device\\harddisk(?<disk>\d+)\\partition(?<part>\d+)(?<suffix>\\.*)?$') {
+        $diskNumber = 0; $partitionNumber = 0
+        if (-not [int]::TryParse($Matches.disk, [ref]$diskNumber) -or
+            -not [int]::TryParse($Matches.part, [ref]$partitionNumber) -or $partitionNumber -lt 1) { return $null }
+        $suffix = [string]$Matches.suffix
+        $result = @{ Kind='GlobalRoot'; DiskNumber=$diskNumber; PartitionNumber=$partitionNumber
+            Root="\\?\GLOBALROOT\device\harddisk$diskNumber\partition$partitionNumber\" }
+    } elseif ($Location -match '^\\\\\?\\Volume\{(?<volume>[a-fA-F0-9-]+)\}(?<suffix>\\.*)?$') {
+        $volumeGuid = [guid]::Empty
+        if (-not [guid]::TryParse($Matches.volume, [ref]$volumeGuid) -or $volumeGuid -eq [guid]::Empty) { return $null }
+        $suffix = [string]$Matches.suffix
+        $volumeId = "\\?\Volume{$($volumeGuid.ToString('D'))}\"
+        $result = @{ Kind='VolumeGuid'; VolumeId=$volumeId; Root=$volumeId }
+    } elseif ($Location -match '^(?<drive>[A-Za-z]):(?<suffix>\\.*)$') {
+        $suffix = [string]$Matches.suffix
+        $driveLetter = $Matches.drive.ToUpperInvariant()
+        $result = @{ Kind='DriveLetter'; DriveLetter=$driveLetter; Root="${driveLetter}:\" }
+    } else { return $null }
+    $relative = $suffix.TrimStart('\').TrimEnd('\')
+    # Percent and exclamation expansion are also refused: registered paths
+    # are later supplied to reagentc through cmd, not interpreted as shell text.
+    if ($suffix.StartsWith('\\') -or $relative -match '\\\\|[/:<>"|?*%!\x00-\x1F]') { return $null }
+    foreach ($segment in @($relative -split '\\')) {
+        if ($segment -in @('.','..') -or $segment -match '[. ]$') { return $null }
     }
-    if ($Location -match 'Volume\{([a-fA-F0-9-]+)\}') {
-        $vol = Get-Volume -UniqueId "\\?\Volume{$($Matches[1])}\" -ErrorAction SilentlyContinue
-        if ($vol) { return Get-Partition -Volume $vol -ErrorAction SilentlyContinue }
+    $result.RelativePath = $relative
+    $result.NormalizedPath = $result.Root + $relative
+    return $result
+}
+
+function Get-WinRELocationFromInfo {
+    param([AllowNull()][object[]]$Info)
+    foreach ($line in $Info) {
+        # Match the location field, not a recovery/custom-image path on a
+        # different line. Preserve spaces in the folder. Ambiguous trailing
+        # spaces are refused rather than silently canonicalized.
+        if ([string]$line -match '^\s*Windows RE location:\s*(?<path>[^\r\n]+)$') {
+            $path = $Matches.path
+            if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+            $parsed = ConvertFrom-WinRELocation -Location $path
+            if ($parsed) { return $parsed.NormalizedPath }
+            # A nonempty reported location remains authoritative even when
+            # unsupported. Keep it for a fail-closed resolver refusal; a stale
+            # registry value must not disguise an invalid current route.
+            return $path
+        }
     }
     return $null
+}
+
+function Get-WinREPathAttributes {
+    param([Parameter(Mandatory)][string]$Path)
+    # Literal extended volume paths work without assigning a drive letter.
+    # Distinguish proven absence from denied/indeterminate metadata. A
+    # missing registered directory must remain repairable when its volume
+    # and existing ancestors are known; it must not mean a different folder.
+    try { return [IO.File]::GetAttributes($Path) } catch {
+        $cause = $_.Exception.GetBaseException()
+        if ($cause -is [IO.FileNotFoundException] -or $cause -is [IO.DirectoryNotFoundException]) { return $null }
+        throw
+    }
+}
+
+function Resolve-WinRELocationToPartition {
+    param([string]$Location)
+    $parsed = ConvertFrom-WinRELocation -Location $Location
+    if (-not $parsed) { return $null }
+    try {
+        if ($parsed.Kind -eq 'GlobalRoot') {
+            $parts = @(Get-Partition -DiskNumber $parsed.DiskNumber -PartitionNumber $parsed.PartitionNumber -ErrorAction Stop)
+            if ($parts.Count -ne 1) { return $null }
+            $volumes = @(Get-Volume -Partition $parts[0] -ErrorAction Stop)
+        } elseif ($parsed.Kind -eq 'VolumeGuid') {
+            $volumes = @(Get-Volume -UniqueId $parsed.VolumeId -ErrorAction Stop)
+            if ($volumes.Count -ne 1) { return $null }
+            $parts = @(Get-Partition -Volume $volumes[0] -ErrorAction Stop)
+        } else {
+            $parts = @(Get-Partition -DriveLetter $parsed.DriveLetter -ErrorAction Stop)
+            $volumes = @(Get-Volume -DriveLetter $parsed.DriveLetter -ErrorAction Stop)
+            if ($parts.Count -ne 1 -or $volumes.Count -ne 1) { return $null }
+        }
+        if ($parts.Count -ne 1 -or $volumes.Count -ne 1) { return $null }
+        $volumeRoot = ConvertFrom-WinRELocation -Location ([string]$volumes[0].UniqueId)
+        if (-not $volumeRoot -or $volumeRoot.Kind -ne 'VolumeGuid' -or $volumeRoot.RelativePath) { return $null }
+        # Resolve folder components through the physical volume root. Refuse
+        # junctions and directory mounts even when they alias the same volume;
+        # partition identity alone cannot prove relative-folder identity.
+        $current = $volumeRoot.Root
+        $attributes = Get-WinREPathAttributes -Path $current
+        if ($null -eq $attributes -or -not ($attributes -band [IO.FileAttributes]::Directory) -or ($attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+        $existingRelative = ''
+        if ($parsed.RelativePath) {
+            foreach ($segment in ($parsed.RelativePath -split '\\')) {
+                $current = $current.TrimEnd('\') + '\' + $segment
+                $attributes = Get-WinREPathAttributes -Path $current
+                if ($null -eq $attributes) { break }
+                if (-not ($attributes -band [IO.FileAttributes]::Directory) -or ($attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+                $existingRelative = if ($existingRelative) { $existingRelative + '\' + $segment } else { $segment }
+            }
+        }
+        if ($parsed.Kind -eq 'DriveLetter') {
+            # Probe the nearest proven-existing directory when the route's
+            # final folder is missing. A denied read never takes this path.
+            $folderVolumes = @(Get-Volume -FilePath ($parsed.Root + $existingRelative) -ErrorAction Stop)
+            if ($folderVolumes.Count -ne 1 -or -not $volumes[0].UniqueId -or
+                $folderVolumes[0].UniqueId -ne $volumes[0].UniqueId) { return $null }
+            $folderParts = @(Get-Partition -Volume $folderVolumes[0] -ErrorAction Stop)
+            if ($folderParts.Count -ne 1 -or $folderParts[0].DiskNumber -ne $parts[0].DiskNumber -or
+                $folderParts[0].PartitionNumber -ne $parts[0].PartitionNumber) { return $null }
+        }
+        return $parts[0]
+    } catch { return $null }
 }
 
 function Get-OSPartition {
@@ -1660,17 +2012,15 @@ function Get-HarnessPartitionRef {
 # validation fails, the anchor rejection reason becomes the plan rejection. The separation
 # rejection is only reported when no intervening anchor was established.
 #
-# Deliberate difference from production (category (b), raw-output
-# diagnostic): the anchor BitLocker check below calls manage-bde
+# Deliberate difference from production (category (c), provider choice):
+# the anchor BitLocker check below calls manage-bde
 # -status directly rather than going through production's
 # Test-VolumeAccessibleForResize, which queries Get-BitLockerVolume
-# first and only falls back to manage-bde when the cmdlet returns
-# nothing. The direct call is a diagnostic choice: it exposes the raw
-# conversion-status and lock-status lines so Microsoft format drift
-# and non-English OS rendering are visible to the operator. The
-# harness verdict may therefore differ from production's when the
-# cmdlet and the native tool classify differently; that difference is
-# itself the observation the harness exists to surface.
+# first and falls back to manage-bde if the cmdlet is unavailable,
+# throws, or returns nothing. This preview parses that native output
+# without printing the anchor command's raw text. Its verdict may
+# therefore differ from production's when the cmdlet and native tool
+# classify the same volume differently.
 function Test-PlanAdjacencyReadOnly {
     param(
         [Parameter(Mandatory)]$OSDisk,
@@ -2020,6 +2370,9 @@ function Show-SystemDiagnostic {
         }
         $isActiveOSDisk = ($osPart -and $activePart.DiskNumber -eq $osPart.DiskNumber)
 
+        # This verdict describes layout, not image ownership or the
+        # production servicing/preservation decision. PRESERVED-DEDICATED
+        # is therefore not inferred from a dedicated partition alone.
         if ($isActiveOSPart) {
             Write-KV "Classification" "OS-FALLBACK (WinRE is on the OS partition)" "Yellow"
         } elseif ($isTypedRecovery -and $isActiveOSDisk) {
@@ -2282,9 +2635,9 @@ function Show-SystemDiagnostic {
         Write-KV "Production verdict" "physical (sweep runs)" "Green"
         Write-Diag "           No known hypervisor signature matched. Production would" "DarkGray"
         Write-Diag "           run the non-OS-disk recovery-partition sweep on the next" "DarkGray"
-        Write-Diag "           run: type-coded recovery partitions <= 2048 MiB on non-OS" "DarkGray"
-        Write-Diag "           disks would be deleted. File Backed Virtual (mounted" "DarkGray"
-        Write-Diag "           VHD/VHDX) disks are preserved individually." "DarkGray"
+        Write-Diag "           run: type-coded recovery partitions <= 2048 MiB on eligible" "DarkGray"
+        Write-Diag "           internal non-OS disks would be targeted. Mounted VHD/VHDX" "DarkGray"
+        Write-Diag "           and unsupported-bus disks (including USB) are preserved." "DarkGray"
     }
 
     # Enumerate the dispositions of every non-OS recovery partition
@@ -2416,23 +2769,17 @@ function Show-SystemDiagnostic {
     Write-Diag "  ─────────────────────────────────────────────────────────────────" "DarkGray"
     $activeWimPath = $null
     $activeWimSize = 0
-    if ($wreState.Location) {
-        $locationBase = $wreState.Location.TrimEnd('\')
-        # v24: probe both forms. reagentc /info may return a partition
-        # root (in which case \Recovery\WindowsRE\winre.wim is correct)
-        # or a path that already includes Recovery\WindowsRE (in which
-        # case \winre.wim is correct). Production's
-        # Ensure-RecoveryPartitionAccess handles both; the harness
-        # must match.
-        foreach ($cand in @(
-            (Join-Path $locationBase "Recovery\WindowsRE\winre.wim"),
-            (Join-Path $locationBase "winre.wim")
-        )) {
+    if ($wreState.Location -and $activePart) {
+        $parsedLocation = ConvertFrom-WinRELocation -Location $wreState.Location
+        # Inspect only the registered directory. A literal partition root
+        # means root\winre.wim; a conventional or nested Recovery folder
+        # is not proof that its WIM is the active registered image.
+        if ($parsedLocation) {
+            $cand = Join-Path $parsedLocation.NormalizedPath 'winre.wim'
             if (Test-Path -LiteralPath $cand -PathType Leaf) {
                 try {
                     $activeWimPath = $cand
                     $activeWimSize = (Get-Item -LiteralPath $cand -Force).Length
-                    break
                 } catch { }
             }
         }
@@ -2581,7 +2928,7 @@ function Show-SystemDiagnostic {
             Write-KV "Classification" "could not resolve target partition to a volume" "Yellow"
         }
     } else {
-        Write-Diag "  WinRE is not registered to a partition (Disabled, or unresolved)." "Yellow"
+        Write-Diag "  Could not resolve the WinRE location to a partition (status=$($wreState.Status))." "Yellow"
         Write-Diag "  If the plan is OS-fallback, production checks C: directly." "Yellow"
     }
 
@@ -2643,9 +2990,9 @@ function Show-SystemDiagnostic {
             # devices but the manifest's VMD patterns did not match any
             # of them. This is the exact ASUS-incident shape: a controller
             # exists, the manifest does not recognize it, and production
-            # v49 will classify VMD as absent and inject no VMD driver.
-            # The v49 storage-applicability gate is the last check before
-            # deployment and will refuse the candidate if it has no INF
+            # will classify VMD as absent and inject no VMD driver.
+            # The storage-applicability gate runs before deployment
+            # and will refuse the candidate if it has no INF
             # matching the machine's controller IDs. The advisory below
             # is operator-facing only; production does not depend on the
             # operator to make the decision.
@@ -2654,11 +3001,11 @@ function Show-SystemDiagnostic {
                 Write-Diag "  NOTE: VMD hardware was NOT detected, but $($controllers.Count) SCSIAdapter-class device(s) are present." "Yellow"
                 Write-Diag "        Compare the device IDs above against the manifest patterns." "Yellow"
                 Write-Diag "        If a device's ID is a VMD controller the manifest does not" "Yellow"
-                Write-Diag "        list, production v49 classifies VMD as absent and injects" "Yellow"
-                Write-Diag "        no VMD driver for that controller. The v49 storage-applicability" "Yellow"
-                Write-Diag "        gate is the last check before deployment: if the candidate" "Yellow"
+                Write-Diag "        list, production classifies VMD as absent and injects" "Yellow"
+                Write-Diag "        no VMD driver for that controller. Before deployment, the" "Yellow"
+                Write-Diag "        storage-applicability gate checks the candidate: if the" "Yellow"
                 Write-Diag "        image contains no INF matching the controller's IDs, the" "Yellow"
-                Write-Diag "        run will defer rather than deploy an unusable image." "Yellow"
+                Write-Diag "        run will defer. An INF match does not prove recovery boot." "Yellow"
             }
         }
     }
@@ -2708,25 +3055,25 @@ function Show-SystemDiagnostic {
         Write-Diag "          partition change. See the raw reagentc output above." "Yellow"
     }
 
-    # Check 2: reagentc /info location regex
-    $locPattern = '(\\\\\?\\GLOBALROOT\\device\\harddisk\d+\\partition\d+\\|\\\\\?\\Volume\{[a-fA-F0-9\-]+\}\\?)'
-    $locHits = @($wreState.RawInfo | Select-String -Pattern $locPattern)
-    if ($locHits.Count -gt 0) {
-        $matched = ($locHits | Select-Object -First 1).Matches.Value.Trim()
+    # Check 2: reagentc /info exact location-field parser, without registry fallback
+    $reportedLocation = Get-WinRELocationFromInfo -Info $wreState.RawInfo
+    $parsedReportedLocation = ConvertFrom-WinRELocation -Location $reportedLocation
+    if ($parsedReportedLocation) {
+        $matched = $parsedReportedLocation.NormalizedPath
         Write-Host "  " -NoNewline
         Write-Host "[OK]  " -NoNewline -ForegroundColor Green
-        Write-Host "reagentc location regex matched '$matched'" -ForegroundColor Gray
+        Write-Host "reagentc location parser accepted '$matched'" -ForegroundColor Gray
         Record "Parser: reagentc location" $true "matched '$matched'"
     } elseif ($wreState.Status -eq 'Enabled') {
         Write-Host "  " -NoNewline
         Write-Host "[FAIL]" -NoNewline -ForegroundColor Red
-        Write-Host " reagentc location regex did not match any line (WinRE is Enabled)" -ForegroundColor Gray
-        Record "Parser: reagentc location" $false "no match while Enabled"
+        Write-Host " reagentc location field is missing or invalid (WinRE is Enabled)" -ForegroundColor Gray
+        Record "Parser: reagentc location" $false "missing or invalid location while Enabled"
     } else {
         Write-Host "  " -NoNewline
         Write-Host "[SKIP]" -NoNewline -ForegroundColor DarkGray
-        Write-Host " reagentc location line not present (WinRE status=$($wreState.Status))" -ForegroundColor Gray
-        Record "Parser: reagentc location" $false -State "SKIP" -Detail "no location line (WinRE $($wreState.Status))"
+        Write-Host " reagentc location field is missing or invalid (WinRE status=$($wreState.Status))" -ForegroundColor Gray
+        Record "Parser: reagentc location" $false -State "SKIP" -Detail "missing or invalid location (WinRE $($wreState.Status))"
     }
 
     # Check 2b (v22): reagentc Windows RE Version regex, mirrors
@@ -3252,19 +3599,7 @@ function Show-SystemDiagnostic {
             Write-Host " Test-NativeBootVirtualTopology fail-closed shape: WinRE.ps1 not adjacent" -ForegroundColor Gray
             Record "Parser: VHDX gate fail-closed" $false -State "SKIP" -Detail "production script not adjacent"
         } else {
-            $issues = @()
-            if (-not $vhdBody.Contains('Get-Disk -ErrorAction Stop')) {
-                $issues += "unfiltered Get-Disk enumeration does not use Get-Disk -ErrorAction Stop"
-            }
-            if (-not $vhdBody.Contains('Where-Object { $_.Number -ne $osDisk.Number }')) {
-                $issues += "unfiltered Get-Disk enumeration missing the Where-Object filter for other disks"
-            }
-            if (-not $vhdBody.Contains('IsNativeBootVirtual = $true')) {
-                $issues += "gate does not set IsNativeBootVirtual = `$true anywhere (fail-closed return missing)"
-            }
-            if (-not $vhdBody.Contains('Could not enumerate all disks')) {
-                $issues += "unfiltered-enumeration catch block missing the indeterminate-topology reason text"
-            }
+            $issues = @(Get-ProductionBindingIssues -FunctionName 'Test-NativeBootVirtualTopology' -FunctionText $vhdBody)
             if ($issues.Count -eq 0) {
                 Write-Host "  " -NoNewline
                 Write-Host "[OK]  " -NoNewline -ForegroundColor Green
@@ -3303,16 +3638,7 @@ function Show-SystemDiagnostic {
             Write-Host " Get-StorageControllerDevices mirror binding: WinRE.ps1 not adjacent" -ForegroundColor Gray
             Record "Parser: StorageControllerDevices mirror binding" $false -State "SKIP" -Detail "production script not adjacent"
         } else {
-            $issues = @()
-            if (-not $scBody.Contains('return ,$result')) {
-                $issues += "missing unary-comma return (return ,`$result)"
-            }
-            if (-not $scBody.Contains('[0-9A-Fa-f-]')) {
-                $issues += "missing {GUID} software-device filter regex"
-            }
-            if (-not $scBody.Contains('^SWD')) {
-                $issues += "missing SWD software-device filter regex"
-            }
+            $issues = @(Get-ProductionBindingIssues -FunctionName 'Get-StorageControllerDevices' -FunctionText $scBody)
             if ($issues.Count -eq 0) {
                 Write-Host "  " -NoNewline
                 Write-Host "[OK]  " -NoNewline -ForegroundColor Green
@@ -3349,44 +3675,7 @@ function Show-SystemDiagnostic {
             Write-Host " Test-RunningInVirtualMachine mirror binding: WinRE.ps1 not adjacent" -ForegroundColor Gray
             Record "Parser: Test-RunningInVirtualMachine mirror binding" $false -State "SKIP" -Detail "production script not adjacent"
         } else {
-            $issues = @()
-            $requiredSignatures = @(
-                'VMware',
-                'VirtualBox',
-                'innotek',
-                'Microsoft Corporation.*Virtual Machine',
-                'Xen',
-                'QEMU',
-                'Parallels',
-                'Bochs',
-                'KVM',
-                'bhyve'
-            )
-            foreach ($sig in $requiredSignatures) {
-                if (-not $vmBody.Contains("'$sig'")) {
-                    $issues += "missing signature '$sig'"
-                }
-            }
-            if (-not $vmBody.Contains('Get-CimInstance Win32_ComputerSystem')) {
-                $issues += "missing Win32_ComputerSystem query source"
-            }
-            if (-not $vmBody.Contains('return $null')) {
-                $issues += "missing fail-closed return `$null path"
-            }
-            # v37: the empty-metadata fail-closed guard is what makes the
-            # 'return $null' path reachable for the Win32_ComputerSystem
-            # case where the query succeeds but both Manufacturer and
-            # Model come back empty or whitespace. Production added it in
-            # v50 patch 2 alongside the hypervisor-suppression boundary;
-            # the harness mirror now includes the same guard, and this
-            # assertion binds the pair so a future production edit that
-            # drops the guard is caught here.
-            if (-not $vmBody.Contains('IsNullOrWhiteSpace')) {
-                $issues += "missing empty-metadata fail-closed guard (IsNullOrWhiteSpace check)"
-            }
-            if (-not $vmBody.Contains('$combined = "$mfg $mdl"')) {
-                $issues += "missing combined-string construction"
-            }
+            $issues = @(Get-ProductionBindingIssues -FunctionName 'Test-RunningInVirtualMachine' -FunctionText $vmBody)
             if ($issues.Count -eq 0) {
                 Write-Host "  " -NoNewline
                 Write-Host "[OK]  " -NoNewline -ForegroundColor Green
@@ -3451,8 +3740,8 @@ function Show-SystemDiagnostic {
     # Check 21 verifies the source pattern is present. Check 22 exercises
     # the arithmetic with a delta that exceeds the Int32 range (in both
     # directions) to confirm the safe form computes correctly, and to
-    # confirm that the pre-patch [Math]::Max form would have thrown on the
-    # same input. Catches an off-by-one or wrong-direction rewrite that
+    # confirm that the pre-patch [Math]::Max form throws on oversized
+    # positive and negative deltas. Catches a wrong-direction rewrite that
     # still matches check 21's source pattern.
     try {
         $bigDelta = [int64]3000000000
@@ -3468,11 +3757,12 @@ function Show-SystemDiagnostic {
         $plannedOSSizeExtend = $bigDelta
         $safeExtend = if ($plannedOSSizeExtend -gt $osSizeExtend) { [int64]($plannedOSSizeExtend - $osSizeExtend) } else { [int64]0 }
 
-        # Confirm the vulnerable form would have thrown on the same input
+        # Confirm the vulnerable form throws for both signs outside Int32.
         $wouldThrowShrink = $false
         try { $null = [Math]::Max(0, $bigDelta) } catch { $wouldThrowShrink = $true }
+        $negativeDelta = [int64](-$bigDelta)
         $wouldThrowExtend = $false
-        try { $null = [Math]::Max(0, $bigDelta) } catch { $wouldThrowExtend = $true }
+        try { $null = [Math]::Max(0, $negativeDelta) } catch { $wouldThrowExtend = $true }
 
         if ($safeShrink -ne $bigDelta) { $int32Issues += "safe shrink returned $safeShrink, expected $bigDelta" }
         if ($safeExtend -ne $bigDelta) { $int32Issues += "safe extend returned $safeExtend, expected $bigDelta" }
@@ -4319,7 +4609,7 @@ function Show-Menu {
     Write-Host ("═" * 66) -NoNewline -ForegroundColor DarkGray
     Write-Host "╗" -ForegroundColor DarkGray
     Write-Host "  ║ " -NoNewline -ForegroundColor DarkGray
-    $titleContent = "WinRE Manager Test Harness (v39)"
+    $titleContent = "WinRE Manager Test Harness (v40)"
     Write-Host $titleContent -NoNewline -ForegroundColor Cyan
     Write-Host (" " * [Math]::Max(0, 65 - $titleContent.Length)) -NoNewline
     Write-Host "║" -ForegroundColor DarkGray
@@ -4367,7 +4657,7 @@ function Show-Menu {
 
 # =========================== ENTRY ===========================
 New-Item -Path $TestDir -ItemType Directory -Force | Out-Null
-Rule "WinRE Manager test harness v39"
+Rule "WinRE Manager test harness v40"
 Say "Working dir: $TestDir"
 Say "Run log: $(if ($Script:HarnessLogPath) { $Script:HarnessLogPath } else { '(unavailable - %TEMP% not set)' })"
 if ($Script:TestDirWasPreexisting -and $Script:TestDirInitialEntryCount -gt 0) {

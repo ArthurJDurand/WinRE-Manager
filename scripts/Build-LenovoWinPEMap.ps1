@@ -46,6 +46,18 @@ function Write-T {
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $M" -ForegroundColor $c
 }
 
+# Vendor metadata occasionally pads a digest with whitespace. Missing hashes
+# retain the existing policy; supplied malformed hashes must stop publication.
+function ConvertTo-LenovoSHA256 {
+    param([AllowNull()][AllowEmptyString()][string]$Value, [string]$Context)
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    $normalized = $Value.Trim()
+    if ($normalized -notmatch '^[a-fA-F0-9]{64}$') {
+        throw "Invalid SHA256 metadata for Lenovo $Context; refusing to publish the map."
+    }
+    return $normalized
+}
+
 function Extract-JsonObject {
     param([string]$Text, [int]$StartBrace)
     $depth = 0; $inString = $false; $escape = $false
@@ -93,9 +105,9 @@ if (-not (Test-Path $CiExe)) {
     try {
         # Trust model (documented in SECURITY.md): the curl-impersonate
         # release artifact is resolved via the GitHub Releases API rather
-        # than pinned to a specific version. GitHub enforces 2FA on the
-        # release owner account and serves release assets from
-        # github.com / objects.githubusercontent.com. A pinned SHA256
+        # than pinned to a specific version. Release assets are fetched
+        # over HTTPS from allowlisted GitHub hosts; this does not verify
+        # the binary's publisher or the upstream account's 2FA. A pinned SHA256
         # would be stronger but requires manual maintenance across
         # releases; the project chose to consume the release endpoint
         # directly and records this choice in SECURITY.md.
@@ -280,6 +292,9 @@ foreach ($entry in $uniqueDsIds.GetEnumerator()) {
     }
 
     if ($resolved) {
+        # Keep validation outside the page-parser catch so a malformed digest
+        # cannot be swallowed and published, or mistaken for a missing pack.
+        $resolved.SHA256 = ConvertTo-LenovoSHA256 -Value $resolved.SHA256 -Context $dsId
         $dsIdCache[$dsId] = $resolved
         Write-T "  OK: $($resolved.Name)" -L SUCCESS
     } else {

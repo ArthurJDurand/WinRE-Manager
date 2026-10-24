@@ -13,6 +13,8 @@
 - [ ] `ScriptVersion` bumped because a `DesiredStateId` input changed (a new hardware property or a new deployment input is now part of the ID)
 - [ ] If bumped, `DesiredStateId` will change and healthy machines rebuild once
 - [ ] If bumped because a `DesiredStateId` input changed, the new `CHANGELOG.md` entry includes a `Migration Note` section describing the expected fleet behaviour and the rollback procedure
+- [ ] For relocation or persistence changes, reviewed the [current pending-operation requirements](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CONTRIBUTING.md#patch-5-pending-operation-review), including source ownership, retained recovery material, retry/fallback conditions and cleanup
+- [ ] For trust or privileged-installation changes, reviewed the [three-copy trust-check invariant](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CONTRIBUTING.md#the-three-copy-trust-check-invariant)
 
 ## Changelog
 
@@ -23,7 +25,7 @@
 
 ## Testing
 
-- [ ] Parser check passes: `[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\WinRE.ps1).Path, [ref]$null, [ref]$null)` (throws on any syntax error; preferred form per `CONTRIBUTING.md` style section)
+- [ ] The [CONTRIBUTING parser check](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CONTRIBUTING.md#testing) passes: capture `ParseFile`'s error output and fail if any parse errors are present.
 - [ ] `.\scripts\WinRE.ps1 -DryRun` completes
 - [ ] `.\scripts\Test-WinRE.ps1 -NonInteractive` completes with exit code 0 (v25+; a non-zero exit means the harness recorded FAILs)
 - [ ] `.\scripts\Test-WinRE.ps1` completes interactively (menu path exercised)
@@ -96,15 +98,15 @@ A change to any of these that is not covered by an existing field case still req
 
 The destructive sequence covers `Get-PartitionPlan`, `Ensure-AdequateRecoveryPartition`, `Invoke-OSPartitionShrink`, `Invoke-OSPartitionExtend`, the `New-Partition` / `Format-Volume` / `Set-RecoveryPartitionAttributes` calls, `Remove-OrphanPartition`, `Restore-OSPartitionSize`, `Restore-PreviousWinRERoute`, `Assert-RecoveryPartitionLayout`, `Remove-StrayRecoveryPartitions`, and any caller of those functions. **Delete this subsection if it does not apply.**
 
-- [ ] I have named **which of the four design invariants this PR preserves** — see below for the four rules, and [`docs/architecture.md`](docs/architecture.md) for the full hierarchy and the enforcement tables.
+- [ ] I have named **which of the four design invariants this PR preserves** — see below for the four rules, and [`docs/architecture.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/docs/architecture.md) for the full hierarchy and the enforcement tables.
 - [ ] I have named **which of the four design invariants this PR strengthens**.
 - [ ] I confirm this PR **does not weaken any of rules 1–3**.
-- [ ] I have included the **test result that demonstrates the change behaves as claimed** — or, if the required test is the post-deletion failure test described in [`docs/testing.md`](docs/testing.md), I have said so explicitly and noted that this PR is **blocked until that test runs and its result is recorded**.
-- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v50 patch 3. v50 patch 1 does not touch the destructive sequence and did not modify the gate. v50 patch 2 modifies `Remove-StrayRecoveryPartitions` (the non-OS sweep suppression boundary and the `File Backed Virtual` protection), which is on the broader destructive-sequence list in this template, but not the post-deletion segment that the gate protects; the gate's scope is unchanged. v50 patch 3 modifies `Remove-StrayRecoveryPartitions` (positive post-deletion verification) and the recovery-volume drive-letter normalization block in `Main` (OS-disk scope); the former is on the broader destructive-sequence list. Neither touches the post-deletion segment that the gate protects, and the gate's scope is unchanged.
+- [ ] I have included the **test result that demonstrates the change behaves as claimed** — or, if the required test is the post-deletion failure test described in [`docs/testing.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/docs/testing.md), I have said so explicitly and noted that this PR is **blocked until that test runs and its result is recorded**.
+- [ ] If the post-deletion segment of `Ensure-AdequateRecoveryPartition` (the `New-Partition`, `Format-Volume`, `Set-RecoveryPartitionAttributes`, and drive-letter-assignment steps and their failure paths) is touched: the deliberate post-deletion failure test has been run and its result is recorded. Per [`CONTRIBUTING.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/CONTRIBUTING.md#the-remaining-gated-scope), the four v46 patch 2 hardenings are treated as inside this gate, and the gate's scope has not changed since v46 patch 2 through v50 patch 3. v50 patch 1 does not touch the destructive sequence and did not modify the gate. v50 patch 2 modifies `Remove-StrayRecoveryPartitions` (the non-OS sweep suppression boundary and the `File Backed Virtual` protection), which is on the broader destructive-sequence list in this template, but not the post-deletion segment that the gate protects; the gate's scope is unchanged. v50 patch 3 modifies `Remove-StrayRecoveryPartitions` (positive post-deletion verification) and the recovery-volume drive-letter normalization block in `Main` (OS-disk scope); the former is on the broader destructive-sequence list. Neither touches the post-deletion segment that the gate protects, and the gate's scope is unchanged.
 
 ## Invariants
 
-WinRE Manager's design is organized around four rules, in this order. See [`docs/architecture.md`](docs/architecture.md) for the hierarchy, the enforcement tables, and the reasoning behind each.
+WinRE Manager's design is organized around four rules, in this order. See [`docs/architecture.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/docs/architecture.md) for the hierarchy, the enforcement tables, and the reasoning behind each.
 
 1. **Never break Windows RE.**
 2. **Never leave a machine without a working recovery route** — to the extent the machine, its OS, and its storage stack allow.
@@ -113,7 +115,7 @@ WinRE Manager's design is organized around four rules, in this order. See [`docs
 
 Rules 1–3 are invariants: no PR may weaken them. Rule 4 is the working rule by which 1–3 are enforced on the fast path, the enable-only path, and the destructive path.
 
-- [ ] I have read the four design invariants in [`docs/architecture.md`](docs/architecture.md) and the "Critical lessons (do not regress)" section in `scripts/WinRE.ps1`
+- [ ] I have read the four design invariants in [`docs/architecture.md`](https://github.com/ArthurJDurand/WinRE-Manager/blob/main/docs/architecture.md) and the "Critical lessons (do not regress)" section in `scripts/WinRE.ps1`
 - [ ] This change does not weaken any invariant without a new field case
 - [ ] Any destructive operation either verifies preconditions and restores geometry on failure, or sets `$Script:GeometryRestoreFailed`
 - [ ] Any `try/catch` either logs, sets a state flag, or both

@@ -4,6 +4,12 @@
 .DESCRIPTION
     Downloads the Dell catalog CAB, extracts the XML with 7-Zip,
     filters for type=winpe packages, and emits a map keyed by WinPE family.
+    Selected packs' supplied SHA256/MD5 values are trimmed and validated
+    before publication. Missing hashes retain the existing policy.
+.NOTES
+    Malformed supplied hashes stop publication without replacing the previous
+    map. Superseded catalog entries that are not published do not veto a build.
+    Current alias selection also supports a single selected pack on PowerShell 5.1.
 #>
 
 $ErrorActionPreference = "Continue"
@@ -41,6 +47,23 @@ function Write-T {
     param([string]$M, [string]$L = "INFO")
     $c = switch ($L) { "ERROR"{"Red"} "WARN"{"Yellow"} "SUCCESS"{"Green"} "FOUND"{"Cyan"} default{"Gray"} }
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $M" -ForegroundColor $c
+}
+
+# Keep absent hashes distinct from supplied malformed metadata. Validate only
+# selected packs, so an unused historical catalog entry cannot block the map.
+function ConvertTo-DellChecksum {
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('SHA256','MD5')][string]$Algorithm,
+        [string]$Context
+    )
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    $normalized = $Value.Trim()
+    $expectedLength = if ($Algorithm -eq 'SHA256') { 64 } else { 32 }
+    if ($normalized.Length -ne $expectedLength -or $normalized -notmatch '^[a-fA-F0-9]+$') {
+        throw "Invalid $Algorithm metadata for Dell $Context; refusing to publish the map."
+    }
+    return $normalized
 }
 
 # Stale-workspace cleanup. Recreate the workspace fresh on every run so that
@@ -85,8 +108,11 @@ $xmlPath = Join-Path $extractDir "DriverPackCatalog.xml"
 if (-not (Test-Path $xmlPath)) { Write-T "DriverPackCatalog.xml not found" -L ERROR; return }
 Write-T "XML extracted: $((Get-Item $xmlPath).Length) bytes" -L SUCCESS
 
-# Parse XML
-[xml]$catalog = Get-Content $xmlPath -Raw
+# Preserve whitespace-only supplied hash content until checksum validation;
+# the usual [xml] cast would silently turn such an element into an empty one.
+$catalog = [System.Xml.XmlDocument]::new()
+$catalog.PreserveWhitespace = $true
+$catalog.LoadXml((Get-Content -LiteralPath $xmlPath -Raw))
 
 $base = "$($catalog.DriverPackManifest.baseLocation)".Trim()
 if ($base -notmatch '^https?://') { $base = "https://$base" }
@@ -107,7 +133,7 @@ foreach ($pkg in $winpeAll) {
     $sha256 = ""
     try {
         $hashNode = $pkg.Cryptography.Hash | Where-Object { $_.algorithm -eq 'SHA256' } | Select-Object -First 1
-        if ($hashNode) { $sha256 = "$($hashNode.InnerText)".Trim() }
+        if ($hashNode) { $sha256 = "$($hashNode.InnerText)" }
     } catch { }
 
     $parsed += [PSCustomObject]@{
@@ -158,6 +184,10 @@ foreach ($gen in @('WinPE11','WinPE10','WinPE5','WinPE4','WinPE3')) {
 $jsonPacks = @{}
 foreach ($gen in $packs.Keys) {
     $p = $packs[$gen]
+    # Outside the catalog-parser catch: supplied malformed values must stop
+    # publication rather than silently becoming an absent hash.
+    $p.SHA256 = ConvertTo-DellChecksum -Value $p.SHA256 -Algorithm SHA256 -Context $p.Name
+    $p.MD5 = ConvertTo-DellChecksum -Value $p.MD5 -Algorithm MD5 -Context $p.Name
     $jsonPacks[$gen] = @{
         name        = $p.Name
         dellVersion = $p.DellVersion
@@ -171,7 +201,7 @@ foreach ($gen in $packs.Keys) {
 }
 
 # Also set 'Current' alias based on newest across all
-$allSorted = $packs.Values | Sort-Object { try { [DateTime]$_.Date } catch { [DateTime]::MinValue } } -Descending
+$allSorted = @($packs.Values | Sort-Object { try { [DateTime]$_.Date } catch { [DateTime]::MinValue } } -Descending)
 if ($allSorted.Count -gt 0) {
     $newest = $allSorted | Select-Object -First 1
     $newestGen = Get-WinPEGeneration -Name $newest.Name

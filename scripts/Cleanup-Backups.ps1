@@ -26,9 +26,11 @@
     model in WinRE.ps1's Get-ManagerConfig and Set-ManagerConfig.
 
     The listing is read-only until the operator confirms deletion with the
-    word DELETE. Deletion uses Remove-Item -LiteralPath -Recurse -Force and
-    is verified: each deletion is followed by a Test-Path that must return
-    false for the operation to be considered successful.
+    word DELETE. Each selected backup is checked in full before deletion:
+    only winre.wim and an optional backup.json are allowed. Subdirectories,
+    reparse points, unexpected files, and unreadable inventories are refused.
+    Files are deleted individually, then the empty directory is removed
+    nonrecursively. Deletion is verified before it is reported as successful.
 
     Empty-directory cleanup after deletion:
       - Timestamped subdirectories (leaf matches yyyy-MM-dd_HHmmss) that are
@@ -36,10 +38,9 @@
       - The default root C:\Backup\WindowsRE is removed if it is empty.
       - C:\Backup is then removed if it too is empty.
       - A drive root is never removed.
-      - A reparse point is never recursed through: Remove-Item -Recurse
-        on a directory junction or symlink can traverse into the target
-        on some PowerShell builds, so the link itself is skipped and its
-        target is left untouched.
+      - Selected backup deletion rejects reparse points in the backup's
+        ancestor chain and its direct children. Empty-directory cleanup
+        skips reparse points. No deletion recursively traverses a directory.
       - A non-empty directory is never removed.
 
     Launched elevated by the wrapper's existing elevated-command mechanism.
@@ -246,9 +247,108 @@ function Remove-IfEmptyDirectory {
     } catch { return $false }
     if ($inner.Count -ne 0) { return $false }
     try {
-        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        [System.IO.Directory]::Delete($Path, $false)
         return $true
     } catch { return $false }
+}
+
+# v50 patch 5: a selected backup may have an operator-chosen directory
+# name and may have no usable sidecar. Neither changes the deletion
+# boundary: exactly winre.wim and optional backup.json, with no descendants.
+# Validate the entire inventory before deleting anything, and revalidate
+# the path and remaining inventory before each mutation. These snapshots
+# reduce replacement races; they are not an atomic filesystem transaction.
+function Remove-BackupDirectorySafely {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RootPath
+    )
+
+    # Resolve through the PowerShell filesystem provider so relative roots
+    # use the caller's current location, not .NET's process directory.
+    $selectedDirectory = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $rootDirectory = Get-Item -LiteralPath $RootPath -Force -ErrorAction Stop
+    if ($selectedDirectory -isnot [System.IO.DirectoryInfo] -or $rootDirectory -isnot [System.IO.DirectoryInfo]) {
+        throw 'The selected backup and its root must be filesystem directories.'
+    }
+    $fullPath = $selectedDirectory.FullName.TrimEnd('\')
+    $fullRoot = $rootDirectory.FullName.TrimEnd('\')
+    $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath).TrimEnd('\')
+    if ([string]::Equals($fullPath, $volumeRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to remove a drive root.'
+    }
+    $parentPath = [System.IO.Path]::GetDirectoryName($fullPath).TrimEnd('\')
+    if (-not [string]::Equals($parentPath, $fullRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The selected backup is not a direct child of its enumerated backup root.'
+    }
+
+    # Get-Item on each ancestor inspects the link itself rather than
+    # trusting a parent path that might redirect to a different tree.
+    $assertDirectoryChain = {
+        $currentPath = $fullPath
+        while ($currentPath) {
+            $directory = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+            if (-not $directory.PSIsContainer -or
+                (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                throw "Refusing a non-directory or reparse point in the backup path: $currentPath"
+            }
+            $currentPath = [System.IO.Path]::GetDirectoryName($directory.FullName.TrimEnd('\'))
+        }
+    }
+    $getInventory = {
+        & $assertDirectoryChain
+        $children = @(Get-ChildItem -LiteralPath $fullPath -Force -ErrorAction Stop)
+        foreach ($child in $children) {
+            if ($child.PSIsContainer -or
+                (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+                (@('winre.wim', 'backup.json') -notcontains $child.Name)) {
+                throw "Refusing an unexpected file, subdirectory, or reparse point: $($child.FullName)"
+            }
+        }
+        return $children
+    }
+
+    $inventory = @(& $getInventory)
+    if (@($inventory | Where-Object { $_.Name -ieq 'winre.wim' }).Count -ne 1) {
+        throw 'The selected backup no longer contains winre.wim.'
+    }
+    $remainingNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($child in $inventory) { [void]$remainingNames.Add($child.Name) }
+    foreach ($child in $inventory) {
+        $currentInventory = @(& $getInventory)
+        if ($currentInventory.Count -ne $remainingNames.Count) {
+            throw 'The backup inventory changed during deletion; remaining files were retained.'
+        }
+        foreach ($currentChild in $currentInventory) {
+            if (-not $remainingNames.Contains($currentChild.Name)) {
+                throw 'The backup inventory changed during deletion; remaining files were retained.'
+            }
+        }
+        # File.Delete refuses directories. Unlike Remove-Item on a
+        # directory, it cannot prompt for or perform recursive removal if
+        # an entry changes type after the last inventory check.
+        $childPath = Join-Path $fullPath $child.Name
+        $currentFile = @($currentInventory | Where-Object { $_.Name -ieq $child.Name })[0]
+        if (($currentFile.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+            # Preserve the old -Force behaviour for genuine read-only
+            # backup files, after the complete inventory passed again.
+            [System.IO.File]::SetAttributes($childPath,
+                [System.IO.FileAttributes]($currentFile.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
+        }
+        [System.IO.File]::Delete($childPath)
+        [void]$remainingNames.Remove($child.Name)
+    }
+    $finalInventory = @(& $getInventory)
+    if ($finalInventory.Count -ne 0) {
+        throw 'The backup directory is no longer empty; it was retained.'
+    }
+    # The nonrecursive overload refuses a newly added child instead of
+    # descending into it, even if the final inventory is already stale.
+    [System.IO.Directory]::Delete($fullPath, $false)
+    if (Test-Path -LiteralPath $fullPath -ErrorAction Stop) {
+        throw 'The selected backup directory still exists after deletion.'
+    }
+    return $true
 }
 
 Write-Header 'WinRE Manager - Clean Up Backups'
@@ -272,7 +372,7 @@ if (-not $roots -or $roots.Count -eq 0) {
 
 Write-Host 'Backup roots:' -ForegroundColor Gray
 foreach ($r in $roots) { Write-Host "  $r" -ForegroundColor Gray }
-Write-Host 'A valid backup contains both winre.wim and backup.json.' -ForegroundColor DarkGray
+Write-Host 'A valid backup contains winre.wim; backup.json is optional.' -ForegroundColor DarkGray
 Write-Host ''
 
 # Enumerate backups across all roots.
@@ -288,9 +388,8 @@ foreach ($root in $roots) {
     foreach ($dir in $subdirs) {
         # v50 patch 3: reject reparse-point candidates during discovery.
         # A junction or symlink under a backup root is not a valid backup
-        # directory, and the deletion path uses Remove-Item -Recurse which
-        # must not traverse a reparse point. This matches the helper's
-        # own stated policy on empty-directory cleanup.
+        # directory. The guarded deletion helper also checks the complete
+        # direct-child inventory before removing any file.
         try {
             $dItem = Get-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
             if (($dItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -339,6 +438,11 @@ foreach ($root in $roots) {
 if ($backups.Count -eq 0) {
     Write-Host 'No valid backups found.' -ForegroundColor Green
     Write-Host 'A valid backup contains winre.wim; backup.json is optional.' -ForegroundColor DarkGray
+    # v50 patch 5: listing-only means no empty-directory pruning either.
+    if ($NonInteractive) {
+        Write-Host 'Non-interactive mode: listing only.' -ForegroundColor DarkGray
+        exit 0
+    }
     # v50 patch 3: run the empty timestamp-directory pruning loop even
     # when no valid backups exist, so a root with stale empty timestamp
     # directories from a previous interrupted run is cleaned up.
@@ -461,24 +565,8 @@ Write-Host ''
 $okCount   = 0
 $failCount = 0
 foreach ($b in $toDelete) {
-    # v50 patch 3: revalidate reparse-point status immediately before
-    # deletion. The discovery-time check was a snapshot; the directory
-    # could have been replaced between discovery and deletion.
     try {
-        $bItem = Get-Item -LiteralPath $b.Path -Force -ErrorAction Stop
-        if (($bItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Write-Host ("  Skipping reparse point (refusing to recurse): {0}" -f $b.Name) -ForegroundColor Red
-            $failCount++
-            continue
-        }
-    } catch {
-        Write-Host ("  Could not stat {0}: {1}" -f $b.Name, $_.Exception.Message) -ForegroundColor Red
-        $failCount++
-        continue
-    }
-    try {
-        Remove-Item -LiteralPath $b.Path -Recurse -Force -ErrorAction Stop
-        if (-not (Test-Path -LiteralPath $b.Path)) {
+        if (Remove-BackupDirectorySafely -Path $b.Path -RootPath $b.Root) {
             Write-Host ("  Deleted: {0}" -f $b.Name) -ForegroundColor Green
             $okCount++
         } else {

@@ -1,6 +1,6 @@
 ---
 title: "Troubleshooting — WinRE Manager"
-description: "Per-symptom playbook for WinRE Manager: log signatures, causes, and recovery steps for every failure mode the script produces."
+description: "Diagnose WinRE Manager warnings and failures using logs, exit codes, recovery status and safe next steps for interrupted deployments."
 ---
 
 # Troubleshooting
@@ -43,7 +43,7 @@ A full-update run additionally logs:
 - **The registered-versus-deployed metadata comparison** at the drift detector: `Registered WinRE metadata: <ver>|<sp>; last deployed: <ver>|<sp>` (or `(none)` on the first v47 run).
 - **The deployed metadata anchor written at state-write time**: `Deployed WinRE metadata: <ver>|<sp>`.
 
-The program lock is acquired first, immediately after the banner. The log records `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on success, `Another WinRE Manager instance is already running (program lock file is exclusively held). …` if a second instance is running, and `Could not set up program lock at <path> : <error> - proceeding without single-instance protection; concurrent runs may collide` if the lock could not be acquired for a non-contention reason. Under `-DryRun` the lock is skipped and the log records `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances`. See "The script exited with a rename error (concurrent instance)" below for the full discussion.
+The program lock is acquired first, immediately after the banner. The log records `Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on success, `Another WinRE Manager instance is already running (program lock file is exclusively held). …` if a second instance is running, and `Could not set up program lock at <path> : <error> - Backup may continue, but Repair and Restore require exclusive ownership` on a non-contention failure. Patch 5 live Repair and Restore refuse without the exclusive handle. Under `-DryRun` the lock is skipped and the log records `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances`. See "The script exited with a rename error (concurrent instance)" below for the full discussion.
 
 Several additional lines are logged on the full-update path; the elevation guard adds one on its refusal path. The **elevation guard** (v48 patch 2) either logs `FATAL: WinRE Manager requires an elevated (Administrator) PowerShell session.` and exits before the program lock and before hardware probes, or passes silently. On refusal it creates the log directory itself so its FATAL message has somewhere to be written. The **architecture gate** logs either `Unsupported OS architecture '<arch>': this manager supports x64 only.` and exits `EXIT_WARNING`, or `Architecture gate passed: x64` and continues. The **`LocalInputsId`** is logged as `LocalInputsId: <hash>` immediately after the architecture gate. On the intervening-anchor path, the **anchor plan** is logged as `Intervening-anchor plan: anchor is disk <n> part <m>; anchor shrink <N> MiB -> planned anchor size <M> MiB; recovery partition will be created at offset <O> MiB`. The **transactional WIM replacement** logs `Preserving existing target ... as rollback copy at <path>` when the target had a pre-existing WIM, and either `Rollback copy restored to <path>` or `rollback restore hash verification failed` depending on the outcome. See the corresponding sections below.
 
@@ -67,7 +67,7 @@ The v50 patch 2 release adds one more suppression boundary with its own section 
 
 - **The non-OS sweep suppression boundary** — `Remove-StrayRecoveryPartitions` suppresses the entire non-OS-disk sweep when the running OS is detected inside a known hypervisor (via `Test-RunningInVirtualMachine`), and preserves any non-OS disk whose `BusType` is `File Backed Virtual` individually regardless of the hypervisor detection result. Neither suppression changes the run's exit code. See "The non-OS sweep was suppressed (v50 patch 2)" below.
 
-The v50 patch 4 release adds three more failure modes with their own sections below: the **Step 5 fail-closed guard** on an indeterminate WinRE status (fires before `reagentc /disable` in the full-update path's Step 5 deployment region; sets the resume task's persist flag; exits `EXIT_FATAL` — see "The Step 5 deployment refused because the WinRE status was indeterminate (v50 patch 4)"); the **resume-script staging warn or refusal** (`Remove-StagingDirectorySafely` refuses to clear a staging directory whose contents are unexpected, a subdirectory, a reparse point, or a non-directory path; the warn-only parent-chain check logs when `C:\Recovery\OEM` or `C:\Recovery` fails the SYSTEM trust policy but does not refuse registration — see "The resume-script staging warned or refused (v50 patch 4)"); and the **resume-task staging lifecycle flags** (`$Script:ResumeTaskCompromiseUnresolved` forces a fatal exit when the staging path cannot be verified and an existing task cannot be positively confirmed as removed — see "The resume-task staging lifecycle flags forced a fatal exit (v50 patch 4)").
+The v50 patch 4 release introduced the historical **Step 5 fail-closed guard**, **resume-script staging warn or refusal**, and **resume-task staging lifecycle flags** documented below. Patch 5 moved indeterminate-status checks into `Main` and pending deployment; the Step 5 section retains its historical heading but documents current messages and outcomes. Staging still refuses unsafe contents, warns about an untrusted parent chain, and fails before destructive repair when an unsafe staging path and an unverified leftover SYSTEM task cannot be reconciled.
 
 One startup guard then runs before any state-modifying action: the Audit Mode guard. It logs a distinct deferral message when it fires. Under the v43 patch 5 (further revision 5) policy, BitLocker state is not consulted at startup — the target volume is not known until the classifier has resolved the reagentc-registered location, and the BitLocker decision is made where the action is taken. Two places consult BitLocker state as part of a decision: the enable-only path and the full-update deploy step prepare the **target recovery partition** through `Set-RecoveryPartitionReadyForWinRE`; and the OS-fallback route checks C: through the OS-fallback gate. Each logs a distinct message; see the corresponding sections below. The destructive path reads C:'s BitLocker state only for diagnostic logging and does not gate on it — only the OS-fallback route does, because on that route the target volume *is* C:.
 
@@ -230,7 +230,7 @@ The guard uses `PROCESSOR_ARCHITECTURE` with `PROCESSOR_ARCHITEW6432` taking pre
 
 Additional variants of the same prefix fire when the OS partition, OS disk, or OS disk BusType cannot be resolved, or when another disk's BusType is unreadable. The refusal always precedes any partition or WinRE change; the state file is unchanged.
 
-**Cause.** The v49 native-boot VHDX fail-closed gate refuses to run destructive operations when the OS volume is on a native-boot VHDX. `Resize-Partition` and `New-Partition` against a VHDX-backed volume have different semantics than against a physical disk; the pipeline has not been validated under that topology, and a partial sequence that fails mid-way would leave the machine without a working recovery route. The refusal is protective.
+**Cause.** The v49 native-boot VHDX fail-closed gate refuses to run destructive operations when the OS volume is on a native-boot VHDX. The gate identifies a `File Backed Virtual` OS disk with other visible nonvirtual disks. Ordinary Hyper-V or VirtualBox guests are not refused merely because their disks are stored in virtual-disk files; native-boot support remains a separate policy decision. The refusal is protective.
 
 **This is a stable deferral.** A VHDX-boot machine will continue to exit 2 on every run until the manager adds support for the topology or the machine is converted. Do not retry expecting a different result.
 
@@ -249,7 +249,7 @@ A `FriendlyName` that names a `.vhdx` file and a `BusType` of `File Backed Virtu
 
 **Symptom.** The script runs, exits with code 2 (`EXIT_WARNING`), and the machine is completely unchanged — no partition was touched, no WIM was deployed, WinRE is still in whatever state it was before the run, and no state file was written. The script has done nothing wrong; it has deferred.
 
-**Log signature.** Two lines at the very top of the run, immediately after the `========== WinRE Manager Started (v50 patch 3) ==========` banner, the `*** DRY RUN MODE ***` line if `-DryRun` was passed, and the program-lock line (`Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on a live run, or `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances` under `-DryRun`):
+**Log signature.** Two lines at the very top of the run, immediately after the versioned `WinRE Manager Started` banner, the `*** DRY RUN MODE ***` line if `-DryRun` was passed, and the program-lock line (`Acquired program lock at C:\ProgramData\OEM\Logs\WinREManager.lock` on a live run, or `[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances` under `-DryRun`):
 
 ```
 [WARN] Deferring WinRE Manager: Windows is not in a normal-running state (Setup\State\ImageState=<value>). reagentc /enable is blocked with 0x4c7 during Audit Mode, OOBE, and the sysprep generalize/specialize phases regardless of WIM correctness. No WinRE or partition changes will be made.
@@ -423,49 +423,23 @@ Followed by the dismount, checkpoint rollback to Step 2, and removal of `base.wi
 
 ## The source-ownership classification preserved a foreign WIM (v49)
 
-**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no WIM was deployed, no partition was touched, WinRE was not disabled. The mounted source was classified as a foreign WIM that a vendor populated with its own drivers, and the manager preserved the source rather than normalize it. The pipeline exited after the classification step, before the strip stage, before injection, before export, and before any partition work.
+**Symptom.** The log classifies the source as `Foreign-With-Drivers`: the WIM contains third-party drivers and has no positive manager-ownership evidence. This means its bytes are preserved. It does not establish that WinRE is enabled or that its partition has enough servicing space.
 
-**Log signature.** The classification decision is logged once per candidate source, prefixed `Source-ownership classification:`. The `Foreign-With-Drivers` preservation adds a second line:
+**What patch 5 does.** The servicing candidate is dismounted with `-Discard`; there is no strip, injection, ResetBase, provenance write or export of the preserved image. The recovery layout is assessed independently. An adequate dedicated route avoids unnecessary partition work. An OS-hosted image or undersized dedicated partition can enter unchanged-image relocation using the independently verified source. Before preserved-image relocation, a read-only mount checks storage-driver applicability and is discarded.
 
-```
-[INFO] Source-ownership classification: Foreign-With-Drivers - no positive ownership evidence; source contains <n> third-party driver(s)
-[WARN] Preserving foreign source: third-party drivers present and no positive ownership evidence. No strip, no injection, no deployment. The existing WinRE route remains intact.
-```
+The HP 14s-dq2xxx v50.4 logs illustrate the distinction: its foreign image was preserved, but its recovery partition had only about 114.6 MiB free and failed the 250 MiB reuse requirement. The 1300 MiB creation bucket is a separate calculation; neither ample C: free space nor `Enabled` proves that the subsequent shrink or recovery boot will succeed.
 
-The other three classes log a single line, for example:
+**Resolution.** Read the final layout, registration, hash-verification and pending-operation outcome. `PRESERVED-DEDICATED` means the preserved image is on a suitable dedicated layout with the required checks completed; a warning or pending operation needs the condition named in the log resolved. Do not infer functionality solely from the preservation message. `ForeignSourceAcceptedHash` records accepted bytes separately from `CurrentImageHash`; relocating the WIM grants no ownership.
 
-```
-[INFO] Source-ownership classification: Foreign-No-Drivers - no positive ownership evidence; source contains zero third-party drivers (strip would be a no-op)
-[INFO] Source-ownership classification: Manager-Owned - staged source hash matches state.CurrentImageHash (<hash>)
-[INFO] Source-ownership classification: Manager-Lineage - valid provenance marker present (LineageId=<id>)
-```
-
-**Cause.** The v49 source-ownership classification runs before the strip stage and decides whether the strip-and-reinject pipeline runs at all. The rule is: a source WIM that a vendor populated with its own third-party drivers is preserved as-is. The manager will not strip and re-inject over a foreign WIM. When the classification is `Foreign-With-Drivers`, the pipeline exits immediately: the mounted image is dismounted with `-Discard`, the staged artifacts (`base.wim` and any `winre_optimized.wim`) are removed, the state file records `ForeignSourceAcceptedHash` set to the source's hash, and the run exits `EXIT_WARNING`. No WIM is exported and no WIM is deployed. This is a deliberate narrowing of the v47 strip-everything-then-inject policy: the strip now applies only to manager-owned images, manager-lineage images, and in-box WIMs with no third-party drivers.
-
-The typical field trigger is a machine whose registered WinRE was deployed by a vendor tool (Dell, HP, Lenovo factory-image utilities) rather than by the manager, and that carries vendor-injected third-party drivers. Under v47 the manager would have stripped them and injected the current recipe. Under v49 it preserves them and exits without deploying.
-
-**The run exits `EXIT_WARNING` but is not a failure.** The machine's existing WinRE route is left completely intact — the manager did not touch the currently-registered image or the partition it lives on. The state file records `ForeignSourceAcceptedHash`, so subsequent runs recognize the preserved source and take the fast path rather than re-classifying it.
-
-**Resolution.** No action is required for the machine to be functional — the existing WinRE route is preserved. If the operator specifically wants the manager's recipe applied, the source must be replaced with one that classifies as `Manager-Owned`, `Manager-Lineage`, or `Foreign-No-Drivers` — for example by using the LKG copy at `C:\Recovery\WindowsRE\winre.wim` (if it is a manager-owned image) or the GitHub cold-start source (an in-box image with no third-party drivers). Deleting the state file and re-running with the LKG or GitHub source available forces a rebuild against a manager-owned source on the next run.
+Deleting the state file does not turn a foreign image into a manager-owned one. If servicing it with the manager's recipe is the intended administrative change, provide an appropriate positively owned or in-box source and review the resulting plan. Preserve any unresolved pending-operation record and candidate first.
 
 ## The never-downgrade storage-driver check discarded the candidate (v49)
 
-**Symptom.** The run exits with code 2 (`EXIT_WARNING`) and the machine is untouched: no WIM was deployed, no partition was touched, WinRE was not disabled. The never-downgrade check detected that the candidate would inject a version-downgrade of a storage-class driver, and the whole candidate was discarded. The pipeline exited before the storage-applicability gate.
+**Symptom.** The log names an INF basename and source/candidate versions where the prepared candidate would replace a storage driver with an older version. The entire servicing candidate is discarded rather than retaining a partly normalized image.
 
-**Log signature.** The check logs a single header line, followed by one detail line per detected downgrade:
+**Cause.** After injection, the check compares storage-class drivers with the pre-strip inventory by INF basename. On a downgrade, the candidate is dismounted with `-Discard` and the original source bytes are preserved. Patch 5 evaluates the source's recovery layout independently and can relocate that unchanged source. Preservation therefore does not imply that no partition work occurred, nor that the source was already enabled or bootable.
 
-```
-[WARN] Never-downgrade invariant: candidate image would replace an existing storage driver with an older version. Preserving the source; no deployment.
-[WARN]   Downgrade: <inf-basename> : source <source-version> -> candidate <candidate-version>
-```
-
-There is no partial-normalize path in v49: the whole source is preserved rather than a single driver retained.
-
-**Cause.** The v49 never-downgrade storage-driver check runs after injection completes and before ResetBase, comparing each storage-class driver in the final image against the pre-strip inventory, matched by INF basename. If any post-injection driver would be older than the source's version of the same basename, the whole candidate is discarded: the mounted image is dismounted with `-Discard`, `base.wim` and `winre_optimized.wim` are removed, the checkpoint rolls back to `Step=2`, the state file records `ForeignSourceAcceptedHash` set to the preserved source's hash, and the run exits `EXIT_WARNING`. No WIM is deployed. This prevents a Windows Update-delivered storage driver from being silently replaced by an older copy on the next scheduled run — a scenario where the manifest or a vendor pack carries a stale driver that would regress the recovery environment's ability to see the OS disk. The response is deliberately conservative: the whole source is preserved rather than a partial fix.
-
-**The run exits `EXIT_WARNING` but is not a failure.** The machine's existing WinRE route is left completely intact — the manager did not touch the currently-registered image or the partition it lives on. The state file records `ForeignSourceAcceptedHash`, so subsequent runs recognize the accepted source and take the fast path.
-
-**Resolution.** No action is required for the machine to be functional — the existing WinRE route is preserved. If the operator believes the check's version comparison is wrong — for example, the "older" driver is genuinely newer under the vendor's versioning scheme — file a bug with the INF name, the two version strings, and the vendor's versioning documentation for the driver. To apply the manager's recipe, the manifest or OEM pack must be updated to resolve a newer version of the same driver (or to omit the stale driver), then the state file must be deleted and the run repeated.
+**Resolution.** Inspect the final route and any pending-deployment outcome. If the driver version comparison is unexpected, report the INF basename, both version strings and the vendor's versioning evidence. To produce a serviced replacement, correct the stale manifest/OEM package before re-running. Do not erase an unresolved pending record merely to force the new recipe: that operation still owns its recovery candidate.
 
 ## The pre-deployment storage-applicability gate refused the candidate (v49)
 
@@ -930,7 +904,7 @@ The harness reports the computed `LocalInputsId` in Option S alongside the store
 - **The currently registered WIM cannot be read.** `reagentc /info` reports a location but no readable `winre.wim` is there, or the file is ACL-denied.
 - **The destination directory is not writable** by the running account, or does not exist and cannot be created.
 - **The source hash and the copy hash do not match** — the same class of failure the copy-integrity check catches in the rebuild pipeline.
-- **A drive letter could not be assigned** to reach the registered location (all 26 letters exhausted, mapped network drive conflict, or the disk is offline).
+- **A drive letter could not be assigned** to reach the registered location (all available candidate letters exhausted, mapped network drive conflict, or the disk is offline).
 - **The destination drive letter does not resolve to a known local or mapped drive** (v50). The v50 patch 1 free-space preflight runs before the destination directory is created and bails out when the destination drive letter does not resolve. The log line reads `Backup cannot proceed: destination drive letter <letter> in <path> does not resolve to a known local or mapped drive.` This usually means the destination was specified with a drive letter that is not currently mounted, or a mapped network drive that is not currently connected.
 - **The destination volume has insufficient free space** for the WIM plus the 100 MiB margin (v50). The v50 patch 1 free-space preflight refuses when the available free space is less than the source WIM's size plus 100 MiB. The log line reads `Backup cannot proceed: destination <destRoot> has insufficient free space (<n> MiB free, need <n> MiB). No backup was written.` The preflight uses `Get-Volume` for a local drive and `Get-PSDrive` for a mapped network drive; if neither resolves, the check is skipped and the copy proceeds with any space-related failure surfaced by `Copy-Item`.
 
@@ -989,6 +963,26 @@ The three mid-transformation failure paths — the WIM-deployment failure when t
 
 **Field status.** This action is new in v49. The three mid-transformation failure paths have not been exercised in the field. If you see any, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — the project wants field data on the transactional-helper rollback behavior on real storage.
 
+## A pending deployment needs review (v50 patch 5)
+
+**Symptom.** The summary reports `PENDING DEPLOYMENT` or a deferral with retained recovery material. The record is `%ProgramData%\OEM\WinRE-Manager\pending-deployment.json`; its protected candidate is `%ProgramData%\OEM\WinRE-Manager\PendingDeployment\pending.wim`. The temporary resume task remains registered while the operation is unresolved. A verified last-resort `OS-FALLBACK` result also retains the `Registered` record, candidate and task; it is not a completed dedicated deployment.
+
+**What it means.** The manager has pinned expected image bytes for an incomplete transition. The record survives DSI changes and ordinary servicing scratch cleanup. `Prepared`, `MutationStarted`, `Copied`, `Registered` and `Verified` are persisted observations, not guarantees about the route now present. Even a `Verified` record can remain when state persistence or record retirement fails.
+
+**Resolution.** Keep the record, candidate and logs together. Read the first specific error rather than resetting the state files. Resolve the named capacity, topology, source-integrity, trust, registration or state-write condition, then re-run Repair or allow the resume task. Resume verifies current disk/volume identity and bytes before acting; it does not blindly replay old partition numbers.
+
+An untrusted, malformed or unreadable existing record causes refusal. A missing or changed candidate also causes refusal; supplying a different WIM under the same name does not satisfy the original accepted hash. If source bytes cannot be recovered, use a separately verified backup or Windows recovery media and review the actual disk layout before manual repair.
+
+A good new dedicated route can remain active while persistence cleanup needs attention. The manager must retain that route and its recovery material rather than restore an older location merely because the journal or state write failed. Conversely, restoring C: or an anchor to its former size does not restore a deleted recovery partition. A fatal outcome after mutation needs investigation; it is not proof of safe fallback.
+
+Before downgrading to a release that does not understand the journal, resolve the pending operation and preserve a disk image or other appropriate recovery material. Reverting the script does not reverse physical partition changes.
+
+## Restore or backup cleanup refused unexpected content (v50 patch 5)
+
+RestoreWork cleanup accepts the expected rollback WIM only. Backup cleanup accepts `winre.wim` and optional `backup.json` in the selected direct child of a discovered backup root. Both refuse unexpected files, subdirectories and reparse points before deleting expected files individually. Backup cleanup also checks ancestry and rechecks inventory before each deletion; these checks reduce races without promising an atomic transaction.
+
+Inspect the exact refused path and contents. Retain anything whose purpose is unknown and move operator-owned unrelated content only after reviewing it. A failed cleanup can leave files for inspection; it does not authorize a recursive deletion. Cleanup's `-NonInteractive` path is listing-only, including the no-backups case.
+
 ## The temporary resume task is still registered (v49)
 
 **Symptom.** A scheduled task named `WinRE Manager - Resume` is present on the machine outside of an in-flight Repair or Restore run. The task was registered by a previous run and was not deleted on that run's completion, which means the previous run was interrupted — by Ctrl+C, by a hard kill, by a reboot mid-run, or by an unhandled exception.
@@ -1016,20 +1010,12 @@ Under gist-bootstrap or paste-into-console invocation (no `$PSCommandPath`):
 
 On clean completion the task is deleted; on interruption it is preserved.
 
-**Cause.** Every Repair or Restore run registers the temporary `WinRE Manager - Resume` task. It is deleted on clean completion. The persist decision is made by OR-merging two independent signals in the `finally` block: `$Script:ResumeTaskShouldPersist` (set by the outer catch on an unhandled exception, and by `Invoke-RestoreAction`'s three mid-transformation failure paths) and `[WinRECancelKeyProbe]::ShouldPersist` (set by the compiled `ConsoleCancelKeyPress` delegate introduced in v49 patch 1). Three cases set a persist signal directly:
+**Cause.** Live Repair and Restore attempt temporary-task registration when the script path and staging checks permit it. Patch 5 retains recovery material and a registered task while a pending operation remains unresolved. Pending-record validation fails closed; pending deployment arms retention before target work and releases it only after the destination and durable state are verified. Restore failures, the outer exception handler and unresolved owned-mount cleanup can also request retention.
 
-1. The outer catch, on an unhandled exception — sets `$Script:ResumeTaskShouldPersist`.
-2. The compiled `ConsoleCancelKeyPress` delegate, on Ctrl+C — sets `[WinRECancelKeyProbe]::ShouldPersist`. This is the load-bearing case, because PowerShell runs `finally` blocks but bypasses `catch` blocks on Ctrl+C, and because the event callback runs on a thread-pool thread that cannot safely mutate PowerShell session state (hence the compiled delegate and the static field rather than a scriptblock).
-3. `Invoke-RestoreAction`'s three mid-transformation failure paths — the WIM-deployment failure when the re-enable attempt after the failure does not return `ok` (v50 patch 3; a `reboot` result does not confirm WinRE is enabled, so the persist condition is `-ne 'ok'`, not `-ne 'ok' -and -ne 'reboot'`), `/setreimage` failing after the WIM has been replaced, and `/enable` returning failed/bitlocker after the WIM is in place — set `$Script:ResumeTaskShouldPersist`.
+The `finally` block combines `$Script:ResumeTaskShouldPersist` with the compiled `[WinRECancelKeyProbe]::ShouldPersist` Ctrl+C signal. The compiled signal is needed because PowerShell can run `finally` while bypassing `catch` on Ctrl+C, and the event callback cannot safely mutate PowerShell session state. If a hard kill or reboot prevents `finally` from running, an already registered task remains without consulting either signal.
 
-   As of v50 patch 4, thirteen more persist sites join this same category: the Step 5 fail-closed guard on an indeterminate WinRE status, and twelve additional full-update exit sites where the operation has changed recovery state but cannot positively verify an acceptable final recovery route (WIM deployment failure on the dedicated target; `reagentc /setreimage` failure after deployment; terminal enable failure; the three `Restore-PreviousWinRERoute` failures inside `Ensure-AdequateRecoveryPartition` for `reagentc /disable` failure, `/disable` verification failure, and recovery-partition deletion failure; the five final-verification exits — `$finalPart` unresolvable after three attempts, WinRE ends on the OS partition without OS-fallback deployment, WinRE ends on an unexpected partition, WinRE reports Enabled with an empty location, BitLocker error on the final enable attempt; and the OS-fallback encryption cascade). The literal string `$Script:ResumeTaskShouldPersist = $true` appears eighteen times in `scripts/WinRE.ps1`. The invariant: **when the full-update operation has changed recovery state and the script cannot positively verify an acceptable final recovery route, the resume task must not be unregistered.**
+Task presence is a recovery signal, not a count of interruption classes or proof that every registration succeeded. Read the current log and pending record to identify the unresolved operation. See the [retention contract](state-and-idempotency.md#the-temporary-resume-task).
 
-Two further interruption classes leave the task registered without setting either signal, because the `finally` block never runs to consult them:
-
-4. A hard kill (e.g. `taskkill /F`).
-5. A reboot mid-run, where the OS terminates PowerShell.
-
-If the task is present, one of the five interruption classes occurred.
 
 **Resolution.**
 
@@ -1056,7 +1042,7 @@ If the task is present, one of the five interruption classes occurred.
 
 6. **Under `$PSCommandPath`-less invocation** (gist bootstrap via `Invoke-RestMethod | Invoke-Expression`, or paste-into-console), the task is not registered at all; the log records an INFO line stating the guard skipped it. This is by design. Do not expect a resume task from a gist-bootstrap run.
 
-7. **If the log shows `Could not register the Ctrl+C handler for the resume task`**, the compiled Ctrl+C delegate could not be registered on this run. The v49 patch 1 fix replaced the pre-fix `[Console]::CancelKeyPress += { ... }` scriptblock subscription — which always failed on PowerShell 5.1 with `The property 'CancelKeyPress' cannot be found on this object`, causing the `finally` block to read `$false` and delete the resume task on exactly the Ctrl+C interruption it existed for — with a compiled C# delegate (`WinRECancelKeyProbe`) whose callback sets a `volatile static bool`. Registration of the compiled delegate is expected to succeed on both PowerShell 5.1 and 7.x; the WARN is emitted only when the `Add-Type` or `Register()` step throws. When it fires, the Ctrl+C persistence signal is unavailable for this run, and the resume task is deleted on a Ctrl+C interruption; the other persist signals (the outer catch, and the three mid-transformation restore failure paths) continue to work normally. A hard kill (`taskkill /F`) and a reboot mid-run leave the task registered regardless, because the `finally` block never runs to consult any signal. The WARN is emitted once per Repair or Restore run. The Ctrl+C preservation path has been field-verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09) with the compiled delegate in place; see the v49 patch 1 entry in `CHANGELOG.md`.
+7. **If the log shows `Could not register the Ctrl+C handler for the resume task`**, the compiled Ctrl+C delegate could not be registered on this run. The v49 patch 1 fix replaced the pre-fix `[Console]::CancelKeyPress += { ... }` scriptblock subscription — which always failed on PowerShell 5.1 with `The property 'CancelKeyPress' cannot be found on this object`, causing the `finally` block to read `$false` and delete the resume task on exactly the Ctrl+C interruption it existed for — with a compiled C# delegate (`WinRECancelKeyProbe`) whose callback sets a `volatile static bool`. Registration of the compiled delegate is expected to succeed on both PowerShell 5.1 and 7.x; the WARN is emitted only when the `Add-Type` or `Register()` step throws. When it fires, Ctrl+C alone cannot retain the task. Despite the warning's unconditional removal wording, pending-operation retention and other persist conditions still apply. A hard kill (`taskkill /F`) and a reboot mid-run leave the task registered regardless, because the `finally` block never runs to consult any signal. The WARN is emitted once per Repair or Restore run. The Ctrl+C preservation path has been field-verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09) with the compiled delegate in place; see the v49 patch 1 entry in `CHANGELOG.md`.
 
 **Field status.** The resume task is new in v49 patch 1. Field verification is partially complete: the Ctrl+C preservation path and the clean-completion removal of the resume task were verified on physical hardware (ASUS PRIME H510M-D, 2026-10-09). The other persist and interruption paths — the outer catch, the three `Invoke-RestoreAction` mid-transformation failure paths (the WIM-deployment failure when the re-enable attempt after the failure does not return `ok`, added in v50 patch 3; `/setreimage` failing after the WIM has been replaced; and `/enable` returning failed/bitlocker after the WIM is in place), a hard kill, and a reboot mid-run — have not been exercised in the field. If you see the task present, capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — include the invocation context, which interruption occurred, and whether the resume run subsequently completed the operation.
 
@@ -1126,49 +1112,30 @@ The residual — a non-admin who modifies the running script *before* this eleva
 
 ## The Step 5 deployment refused because the WinRE status was indeterminate (v50 patch 4)
 
-**Symptom.** The run exits with code 3 (`EXIT_FATAL`) before `reagentc /disable` at Step 5. The machine may have already been modified — the pre-shrink may have executed inside `Ensure-AdequateRecoveryPartition`, and partition deletion may have occurred. The temporary resume task was preserved (the guard sets `$Script:ResumeTaskShouldPersist = $true`), so the next boot or the T+1h one-shot will re-invoke the script.
+This heading preserves the name of the patch 4 guard for historical logs. Patch 5 replaced its inline Step 5 implementation with status checks in `Main` and `Invoke-PendingWinREDeployment`.
 
-**Log signature.**
+**Symptom and current signatures.** Direct status refusals return code 3 (`EXIT_FATAL`). Look for one of these summary fields; they are logged at INFO as part of the run summary:
 
 ```
-[ERROR] WinRE status could not be determined at Step 5 ('<status>') - refusing to deploy without positive confirmation of the current WinRE state
+[INFO] Why:            WinRE status is indeterminate; refusing repair before fast-path, enable-only or servicing decisions
+[INFO] Why:            WinRE status is indeterminate; no target preparation or route switch attempted
+[INFO] Why:            WinRE status became indeterminate during verification; no target preparation attempted
 ```
 
-The `<status>` value is whatever `reagentc /info` reported — typically `Unknown` when the parser could not classify the status line.
+Later pending-deployment rechecks can instead log:
 
-**Cause.** The v50 patch 4 Step 5 fail-closed guard fires when the current WinRE status is neither `Enabled` nor `Disabled`. This is the fifth instance of the fail-closed defect class named in `.NOTES` since v49 patch 2: an indeterminate status means the disable block cannot know whether WinRE needs to be disabled before deployment. Proceeding would risk deploying a WIM while the old route is still registered, or skipping a `/disable` that was necessary. By the time the guard fires, the full-update operation has already changed recovery state, so the persist flag ensures the machine has a self-healing hook.
+```
+[ERROR] Pending deployment stopped: Current WinRE route cannot be verified before target preparation.
+[ERROR] Pending deployment stopped: WinRE status became indeterminate before the route switch.
+```
 
-Common causes of an indeterminate status:
+Catch branches for a verified new route or a different registered image return fatal 3; the earlier pre-mutation source-change refusal returns warning 2. Otherwise, those caught failures return warning 2 only when no geometry-restore failure is recorded and either the previous route is verified or the journal remains `Prepared`; otherwise they return fatal 3. An unresolved operation retains its independent candidate and journal and preserves a registered resume task. Earlier attempts may already have changed partitions; refusal before work on this attempt does not mean the machine is unchanged.
 
-- **Non-English OS.** `reagentc /info` emits a translated status value (`Aktiviert`, `Désactivé`, etc.) that the parser does not recognize. The parser regex matches only the English `Enabled` and `Disabled`.
-- **Structural `reagentc` format change.** A Windows build changed the output format such that neither status word appears on the line the parser looks at.
-- **`reagentc /info` itself failed.** The command returned an error rather than output; `Get-WinREState` returns `Unknown`.
+**Cause.** `Get-WinREState` could not establish `Enabled` or `Disabled`, or a later status/route recheck failed. Common causes are translated `reagentc` status text, a changed output format, or a failed `reagentc /info` command. The pending-deployment function arms retention on entry, before these checks. This preserves the fail-closed behavior introduced by patch 4 without its old variable names or log signature.
 
-**Resolution.**
+**Resolution.** Capture raw `reagentc /info` output, the OS UI language, the full manager log and any pending-operation record. Resolve the query/parser failure before retrying. A transient failure may clear; a structural mismatch will recur on the next boot-task attempt. Do not delete the protected candidate or journal, or force `/disable` or `/enable`, to bypass an unknown recovery state. If staging or task registration failed, automatic resume is not assured. Inspect the actual task and staged script; a still-valid earlier task may remain.
 
-1. **Inspect the raw `reagentc /info` output.**
-
-   ```powershell
-   reagentc /info
-   ```
-
-   Look at the `Windows RE status:` line. If it reads `Enabled` or `Disabled` in English, the parser should have recognized it — file a bug. If it reads a translated value or the line is missing, the cause is identified.
-
-2. **If the resume task is preserved (the normal case on this path):** the next boot or the T+1h one-shot will re-invoke the script with the same indeterminate status. If the status was transient (a `reagentc` failure that has since cleared), the resume will proceed normally. If the status is structural (a non-English OS or a format change), the resume will hit the same guard — do not rely on the resume in that case.
-
-3. **If you are on a non-English OS:** the manager does not currently support localized `reagentc` output. File a bug with the raw `reagentc /info` output and the OS locale; the parser needs to be extended to recognize the localized status values.
-
-4. **If the status is transient (a `reagentc` failure that has since cleared):** delete the state file and re-run.
-
-   ```powershell
-   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
-   ```
-
-   The next run re-queries the status, gets a clean answer, and proceeds.
-
-**What NOT to do.** Do not manually call `reagentc /disable` or `/enable` to work around the guard. The guard fires because the current recovery state is unknown; manual reagentc calls against an unknown state can leave the machine in a state the pipeline cannot recover from. Capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section.
-
-**Field status.** The guard's FATAL branch is code-inspected but not exercised in the field. The v50 patch 4 field run on the ASUS test machine (2026-10-19) reached Step 5 with `Status=Enabled` and did not fire the guard. A machine with an indeterminate status is the case the guard exists for.
+**Field status.** The recorded hardware/VM runs do not establish these indeterminate-status branches. Report the raw native output and observed exit code if one occurs.
 
 ## The resume-script staging warned or refused (v50 patch 4)
 
@@ -1194,7 +1161,7 @@ The `[INFO] Resume-script staging: staged <src> -> C:\Recovery\OEM\Resume\WinRE.
 
 **Cause.** The v50 patch 4 staging lifecycle hardening adds two new behaviors:
 
-- `Remove-StagingDirectorySafely` refuses reparse points, subdirectories, unexpected content, or a non-directory path. The refusal skips the resume task rather than risking a recursive delete that could follow a junction into an attacker-chosen target.
+- `Remove-StagingDirectorySafely` refuses reparse points, subdirectories, unexpected content, or a non-directory path. The refusal avoids recursive deletion of unexpected content. Isolated Windows PowerShell 5.1 junction probes preserved target files; they did not demonstrate the previously proposed target-deletion exploit.
 - The warn-only parent-chain trust check logs but does not refuse. A strict check would disable self-healing on machines where the parent ACL is imperfect; the field observation on the project's ASUS test machine (2026-10-19) showed `C:\Recovery\OEM` user-owned, and the warning is the correct response rather than a refusal. The residual — a local user with `Modify` on the parent chain can replace the staged directory between task registration and task execution — is documented in [SECURITY.md](../SECURITY.md) and accepted rather than closed.
 
 **Sub-case B is expected on the project's ASUS test machine** and on any machine whose `C:\Recovery\OEM` or `C:\Recovery` is user-owned or has a permissive inherited ACE. It does not indicate a bug.
@@ -1302,17 +1269,19 @@ Script: C:\ProgramData\OEM\WinRE-Manager\WinRE.ps1
 SHA256: <installed-copy-hash>
 ```
 
-On a copy-hash mismatch the wrapper refuses to register the task and the installed copy is left in place:
+On a copy-hash mismatch the wrapper refuses to register the task:
 
 ```
-Install copy hash mismatch. Source=<source-hash> Copy=<installed-copy-hash>
+Install staging hash mismatch. Source=<source-hash> Copy=<staged-copy-hash>
 ```
 
-**Cause.** The v49 wrapper's install step copies the local `WinRE.ps1` to a stable location at `C:\ProgramData\OEM\WinRE-Manager\`, SHA256-verifies the copy against the source, and refuses to register the permanent `Maintain Windows RE` task if the copy's hash does not match. This is a security property: it ensures the task is registered against a copy whose bytes match the operator's source, not a copy that was tampered with or partially written. A mismatch means the copy did not complete, or the destination file was modified between the copy and the hash verification, or an antivirus/EDR product altered the copy in place.
+**Cause.** The installer verifies that the copied bytes match the operator's source. A mismatch can indicate a failed write, a changing source or interference with the destination. Patch 5 stages and verifies the source before publishing the installed copy, so a staging failure leaves a previous installation intact. It also rejects untrusted permissions or a reparse point in the destination path, and verifies the final file before registering the SYSTEM task.
+
+A final-file failure instead reports `Installed script hash mismatch. Source=<source-hash> Copy=<installed-copy-hash>`. If publication failed, retain the reported protected staging file and inspect the installed path before relying on an existing maintenance task; a native replacement failure does not guarantee the old destination survived., inspect its ownership, ACLs and reparse status. Existing `C:\ProgramData\OEM` or `WinRE-Manager` directories may contain other software's files or the backup catalogue. Have an administrator establish why that path is untrusted before repairing it; the installer does not take ownership or change an existing directory's permissions automatically. Repeated installation attempts do not resolve a permission-policy refusal. See [the installation security policy](../SECURITY.md#scope) and [deployment](deployment.md#the-wrappers-stable-install-location-v49).
 
 **Resolution.**
 
-1. **Re-run the install.** The wrapper's install option is idempotent — running it again overwrites the installed copy with the current source and re-verifies. A transient copy failure (e.g. antivirus scanning the file mid-write) often resolves on a retry.
+1. **Re-run the install after resolving the reported condition.** Reinstallation validates the destination and publishes a verified copy of the current source. A transient write or sharing failure may resolve on retry.
 
 2. **If the mismatch recurs**, manually inspect the installed copy:
 
@@ -1321,7 +1290,7 @@ Install copy hash mismatch. Source=<source-hash> Copy=<installed-copy-hash>
    Get-FileHash .\scripts\WinRE.ps1 -Algorithm SHA256
    ```
 
-   Compare the two hashes. If they differ on-disk, the destination is being altered by an external process. Add `C:\ProgramData\OEM\WinRE-Manager\` to the AV/EDR exclusion list and re-run.
+   Compare the two hashes with the failure phase. A staging refusal may leave a valid older installed version, so a difference alone does not establish tampering. Investigate source changes, filesystem errors and relevant AV/EDR events before retrying.
 
 3. **For a source-file issue**, verify the local `WinRE.ps1` is not open in an editor or otherwise locked. Save any pending edits and re-run the install.
 
@@ -1437,6 +1406,8 @@ The most common trigger is a **manual invocation** of `WinRE.ps1` (from an inter
 3. If you need a read-only diagnostic that is safe to run concurrently with any number of other processes, use `scripts\Test-WinRE.ps1`. The harness does not acquire the lock.
 
 **The lock file persists on disk.** `C:\ProgramData\OEM\Logs\WinREManager.lock` remains between runs and is empty by design — nothing is ever written to it. **Its existence does not indicate a running instance.** Only an active exclusive handle on the file blocks a second instance. Do not delete the lock file to "free" a stuck process; deletion has no effect on the handle and the file will simply be recreated. If you need to know whether an instance is currently running, check Task Scheduler for the scheduled task's "Last Run Result" column and look for a live `powershell.exe` process, not the lock file.
+
+**Historical behavior before v50 patch 5 — the narrow non-contention case.** Patch 5 refuses live Repair and Restore without the exclusive program lock; the following rename-after-lock-failure sequence describes earlier revisions.
 
 **Symptom (v44 patch 4 and later — the narrow non-contention case).** The script exits with code 3 (`EXIT_FATAL`) on the rename error, because the lock could not be acquired for a reason other than contention. On the same run, an earlier line in the log records the lock failure.
 
@@ -1618,114 +1589,27 @@ As of v49, the never-downgrade storage-driver check runs after injection complet
 5. **Fix the underlying cause** — update the manifest or map gist, correct the download URL, install a missing dependency (7-Zip, `curl-impersonate` for the Lenovo builder), or resolve the network/proxy problem.
 6. **Re-run `WinRE.ps1`.** The checkpoint is already at step 2 and the `WorkDir` was cleaned by the gate (including the v44 patch 3 `base.wim` cleanup); the next run re-acquires the base WIM and re-runs injection from a clean image.
 
-**What NOT to do.** Do not attempt to force the pipeline past the gate by editing the script. The gate is the mechanism that prevents a broken WIM from reaching the recovery partition. A machine in this state has a functional existing WinRE or a functional existing state file — whatever it had before the run is still in place. The cost of waiting is one pipeline run after the injection failure is resolved; the cost of bypassing the gate is a recovery environment that cannot see the OS disk.
+**What NOT to do.** Do not attempt to force the pipeline past the gate by editing the script. The gate is the mechanism that prevents a broken WIM from reaching the recovery partition. The pre-deployment refusal retains the previous route and state; it does not prove that either was healthy before the run. The cost of waiting is one pipeline run after the injection failure is resolved; the cost of bypassing the gate is a recovery environment that cannot see the OS disk.
 
-**Not to be confused with the strip-failure abort (v47 patch 1), the source-ownership preservation (v49), or the Audit Mode or OS-fallback BitLocker deferrals.** All exit with code 2 and leave the state file unchanged, but the log signature is distinct. The strip-failure abort reads `Strip stage failed - candidate rejected.` The source-ownership preservation is not an abort — the run continues. The injection-failure gate reads `Image injection did not complete. Stopping before Step 4 and before any deployment.` The Audit Mode deferral reads `Deferring WinRE Manager: Windows is not in a normal-running state`. The OS-fallback BitLocker deferral reads `OS-fallback deferred: C: could not be confirmed fully decrypted`. The strip stage runs between mount and injection; the source-ownership classification runs before the strip; the injection gate runs after the strip succeeded. A field engineer reading the log will see the difference immediately.
+**Distinguish the strip-failure abort, preserved-source handling and setup/fallback refusals by the log.** Patch 5 preservation can continue into layout repair and state persistence; it is not uniformly an unchanged-state exit with code 2. The strip-failure abort reads `Strip stage failed - candidate rejected.` The source-ownership preservation is not an abort — the run continues. The injection-failure gate reads `Image injection did not complete. Stopping before Step 4 and before any deployment.` The Audit Mode deferral reads `Deferring WinRE Manager: Windows is not in a normal-running state`. The OS-fallback BitLocker deferral reads `OS-fallback deferred: C: could not be confirmed fully decrypted`. The strip stage runs between mount and injection; the source-ownership classification runs before the strip; the injection gate runs after the strip succeeded. A field engineer reading the log will see the difference immediately.
 
 ## The OS-fallback route deferred because C: is encrypted
 
-**Symptom.** The script chose the OS-fallback route — dedicated-partition creation failed and the script fell back to `C:\Recovery\WindowsRE` — and then exited with code 2 (`EXIT_WARNING`) without deploying the WIM. The machine is unchanged: no new WIM at `C:\Recovery\WindowsRE`, no `reagentc` call made, and the state file is unchanged (or absent).
+**Symptom.** WinRE is registered on the OS partition, or an older run attempted to fall back to `C:\Recovery\WindowsRE`, while C: could not be confirmed fully decrypted. Earlier releases log `OS-fallback deferred: C: could not be confirmed fully decrypted`. A pre-existing `Enabled` result does not establish that an OS-hosted WIM remains available during recovery boot.
 
-**Log signature (simple form).**
+**Patch 5 policy.** An OS-hosted WIM is a layout-remediation condition for every ownership class. The manager first evaluates safe dedicated migration; C: encryption is not a blanket veto on that transition. A separate, unencrypted recovery partition is the supported arrangement for WinRE with BitLocker. The manager does not decrypt C: or change its protectors. [Microsoft WinRE guidance](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-recovery-environment--windows-re--technical-reference?view=windows-11).
 
-```
-[WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=<state>). reagentc will refuse to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state.
-```
+A last-resort OS route can be created only after actual dedicated creation failure, verified geometry, fully decrypted C:, and no acceptable previous or readable enabled route to retain. It is verified by actual location, expected bytes and saved fallback state, then reports warning and retains operation material. An encrypted C: never passes that fallback gate.
 
-**The compound signature — post-deletion failure (v45 patch 1).** When the OS-fallback deferral is reached via a post-deletion destructive failure — the existing type-coded recovery partition was deleted, and a later step failed — the log shows the deletion first, then the failure, then the OS-fallback deferral in the same run. The most common post-deletion failure points under v45 patch 1 are `New-Partition` failure and `Format-Volume` failure. The corner is also reachable when the whole-layout assertion (`Assert-RecoveryPartitionLayout`), drive-letter availability, drive-letter assignment, in-place decryption of the new partition, the post-delete extension fallback, the post-delete geometry verification, the planned-extent-available re-check, or the delete loop itself fails and the previous route could not be restored. (The v45 reorder moved the shrink into the reversible window, so a shrink failure no longer deletes the old partition and no longer reaches this corner; see the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-and-v47-patch-1-added-reasons) section above.) The full sequence for the post-deletion case is:
+**Resolution.** Capture both conversion and protection status using `manage-bde -status C:` or `Get-BitLockerVolume`. Then read the dedicated-plan or pending-operation failure named in the log. Insufficient shrink capacity, unsupported geometry, indeterminate storage state, source-integrity failure and a failed registration switch need different remedies. Finishing encryption or suspending protection is not evidence that an OS-hosted recovery route is now dependable. Decrypting C: is not the default repair recommendation.
 
-```
-[INFO] Pre-deletion inventory:
-[INFO]   Disk 0 Part 4: size 1000 MiB, label='Recovery', used=735.9 MiB, isWinRELocation=YES
-…
-[INFO] Confirmed deletion of partition 4 on disk 0
-…
-[WARN] New-Partition attempt 1 failed: …
-[WARN] New-Partition attempt 2 failed: …
-[WARN] New-Partition attempt 3 failed: …
-[ERROR] New-Partition failed after 3 attempts
-…
-[WARN] ================================================================================
-[WARN] Dedicated recovery partition creation failed after all attempts.
-[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
-[WARN] This is NOT equivalent to a dedicated recovery partition.
-[WARN] WinRE will function but with reduced resilience. Exit code will be 2.
-[WARN] ================================================================================
-…
-[WARN] OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=True). …
-```
+If a failure occurred after the active recovery partition was deleted, treat it as an interrupted recovery operation. Retain `pending-deployment.json`, its protected `pending.wim` and the resume task, and follow the [pending-deployment guidance](#a-pending-deployment-needs-review-v50-patch-5). Geometry restoration alone does not restore the deleted partition or its image. A fatal result means an acceptable route could not be verified; do not describe the machine as merely waiting on a healthy fallback.
 
-or the analogous sequence for `Format-Volume`:
-
-```
-[ERROR] Format-Volume failed: …
-[INFO] Removed orphan partition <disk>/<part> after Format-Volume failure (main path)
-…
-[WARN] ================================================================================
-[WARN] Dedicated recovery partition creation failed after all attempts.
-[WARN] Falling back to C:\Recovery\WindowsRE (OS-partition recovery location).
-[WARN] This is NOT equivalent to a dedicated recovery partition.
-[WARN] WinRE will function but with reduced resilience. Exit code will be 2.
-[WARN] ================================================================================
-```
-
-followed by the OS-fallback deferral.
-
-This compound signature means the machine is now in the **post-deletion residual corner**: the existing type-coded recovery partition has been deleted, and the OS-fallback route has refused because C: is encrypted. The machine ends this run with neither a dedicated recovery partition nor a working OS-fallback registration — the residual failure mode that the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries document. The v45 reorder narrowed the corner: only post-deletion failures now reach it, whereas v44 also reached it via shrink failures after deletion.
-
-**This corner has not been exercised in the field.** No logged run has yet shown a destructive attempt that failed *after* deletion with C: encrypted. [testing.md](testing.md) documents the deliberate post-deletion failure test that will gate any future change to the destructive path. **If you see this signature on a machine, please capture the full log and file a bug per the [Reporting a bug](#reporting-a-bug) section — it is a case the project wants field data on.** Include the machine's end state (partition count, WinRE status, whether any working recovery route exists) and C:'s encryption state at the moment of the run.
-
-**Why the script does not reinstate the pre-destructive C: guard.** The v44 patch 3 guard deferred every destructive replacement on every encrypted-C: machine, including the machines where the destructive attempt would have succeeded. The correct fix is a **post-failure** check in the post-deletion failure branches that handles the corner *after* the destructive attempt fails, not a pre-destructive veto. The guard's predicate — "is C: encrypted?" — cannot distinguish a destructive attempt that will succeed from one that will fail. See the `[v44 patch 7]` and `[v45 patch 1]` CHANGELOG entries for the full reasoning and the field evidence.
-
-**Cause.** On the OS-fallback route the target volume *is* the OS volume. reagentc refuses to enable WinRE on an encrypted OS volume, always — this is a hard OS check, not something the script can work around. The gate exists to prevent the script from deploying a WIM it cannot register.
-
-The `<state>` in the log line is the value returned by `Test-VolumeEncrypted -MountPoint "C:"` at the moment the gate fired. Because the gate only fires when the classifier did not return exactly `$false`, the value is either `True` (the classifier is confident C: is encrypted or not fully decrypted) or empty (`$null` — the classifier could not determine the state). Either way, the script treats the machine as not-ready for OS-fallback deployment and defers. The script never modifies C:'s BitLocker state.
-
-**Why the script does not decrypt C:.** Decrypting the OS volume is hours of I/O, changes the recovery key relationship, and the OS volume is the user's data. Removing encryption from the OS volume as a side effect of a WinRE repair is not a change the script is authorised to make. The operator resolves the state.
-
-**Resolution.** From an elevated PowerShell:
-
-```powershell
-manage-bde -status C:
-```
-
-Read the `Conversion Status:` line and act accordingly:
-
-- **`Fully Encrypted` with `Protection On`** — the volume is fully encrypted and protection is armed. To use the OS-fallback route you must **decrypt C:**, because reagentc refuses to enable WinRE on an encrypted OS volume regardless of the protector state:
-
-  ```powershell
-  manage-bde -off C:
-  ```
-
-  Wait for `Conversion Status:` to read `Fully Decrypted`, then re-run `WinRE.ps1`. On a 256 GB SSD this typically takes 30–90 minutes.
-
-  Note that **adding a key protector or arming protection does not resolve this state** — those actions make C: *more* protected, not less. The OS-fallback route requires `FullyDecrypted`.
-
-  If decrypting C: is not an option, the alternative is the **dedicated-partition route**, which does not depend on C:'s BitLocker state. The script already attempted the dedicated-partition route and failed, which is why it fell back to OS-fallback. The way to use the dedicated-partition route is to resolve whatever caused the destructive failure (insufficient space on C:, a layout problem, etc.) and free the constraint so a retry can succeed. See the ["The destructive replacement was deferred before partition deletion"](#the-destructive-replacement-was-deferred-before-partition-deletion-v45-patch-1-v46-patch-2-and-v47-patch-1-added-reasons) section above for the constraint-specific resolutions.
-
-- **`Fully Encrypted` with `Protection Off`** — the machine is in a suspended or Waiting-for-Activation state. To use the OS-fallback route you must still decrypt C: (`manage-bde -off C:`), because reagentc refuses on a `FullyEncrypted` volume regardless of protection state.
-
-- **`Encryption In Progress` or `Encryption Paused`** — the Device Encryption service is still working. Wait for it to finish, or abort it:
-
-  ```powershell
-  manage-bde -off C:
-  ```
-
-  Then wait for `Conversion Status:` to read `Fully Decrypted`.
-
-- **`Decryption In Progress` or `Decryption Paused`** — the encryption service is already stopping. Wait for it to finish.
-
-- **`Fully Decrypted`** — this state should not have triggered the deferral. If it did, re-run `WinRE.ps1`; the previous classification may have hit a transient state.
-
-Once `manage-bde -status C:` reads `Fully Decrypted`, re-run `WinRE.ps1`.
-
-**Do not** attempt to defeat the gate by editing the state file. The gate is the mechanism that prevents the script from deploying a WIM to a target it cannot register. The cost of waiting is one pipeline run; the cost of bypassing the gate is a machine with an unreachable WinRE registration.
-
-**Note.** This gate is only reached on the OS-fallback route. The enable-only and dedicated-partition routes never depend on C:'s BitLocker state, because their target volume is the recovery partition. If you are seeing a related deferral on the enable-only or dedicated-partition route, see the "Target recovery partition could not be made unencrypted" section below.
+Older compound signatures (`Pre-deletion inventory`, confirmed deletion, creation/format failure, then OS-fallback refusal) remain historical evidence for the post-deletion corner. They do not demonstrate patch 5 failure handling. The deliberate VM failure test remains a release gate.
 
 ## Target recovery partition could not be made unencrypted
 
-**Symptom.** The script prepared the target recovery partition via `Set-RecoveryPartitionReadyForWinRE` and the helper reported that the partition could not be made unencrypted. On the **enable-only** path the run exits with code 2 (`EXIT_WARNING`) and the state file is updated with `LastEnableResult = "failed"`. On the **full-update** path the run exits with code 3 (`EXIT_FATAL`) and no state file is written.
+**Symptom.** `Set-RecoveryPartitionReadyForWinRE` could not confirm that the target partition is ready and fully decrypted. The enable-only path records `LastEnableResult = "failed"`, increments its failure counter and returns warning 2. Pending deployment retains recovery material. Catch branches for a verified new route or a different registered image return fatal 3; the earlier pre-mutation source-change refusal returns warning 2. Other caught failures return warning 2 only when no geometry-restore failure is recorded and either the previous route is verified or the journal remains `Prepared`, otherwise fatal 3. It does not commit a new healthy deployment state; an earlier state file can remain or be invalidated according to recovery verification.
 
 **Log signature (enable-only path).**
 
@@ -1734,11 +1618,21 @@ Once `manage-bde -status C:` reads `Fully Decrypted`, re-run `WinRE.ps1`.
 [WARN] Re-run after the target volume is decrypted, or after the Device Encryption service has stabilised.
 ```
 
-**Log signature (full-update path).**
+**Log signatures (pending deployment).** A target-readiness failure is wrapped by the pending-deployment catch:
 
 ```
-[ERROR] FATAL: Could not make target recovery partition unencrypted
+[ERROR] Pending deployment stopped: Dedicated target could not be confirmed ready and fully decrypted.
 ```
+
+The helper logs the specific cause first, for example:
+
+```
+[ERROR] Target partition <letter>: did not decrypt within <seconds>s (last state=<state>) - refusing to call reagentc /enable against an encrypted volume
+[ERROR] Set-RecoveryPartitionReadyForWinRE: no drive letter available for target partition
+[ERROR] Set-RecoveryPartitionReadyForWinRE: could not assign a drive letter to <disk>/<partition>
+```
+
+A failure while preparing a newly created partition can instead log `Could not make newly created recovery partition unencrypted - aborting recovery partition creation`. That branch removes the orphan where possible and returns creation failure; if no verified fallback can be established, the pending catch logs `Dedicated target creation failed; recovery material retained. No unverified OS-fallback switch was attempted.` after the `Pending deployment stopped:` prefix.
 
 **Cause.** `Set-RecoveryPartitionReadyForWinRE` runs `manage-bde -off` against the target partition and polls `Test-VolumeEncrypted` at 5-second intervals up to a 300-second timeout. The failure means one of:
 
@@ -2130,7 +2024,7 @@ The last form is the per-letter diagnostic — the error from the last of the th
 - **`No drive letter available`** — `Get-AvailableDriveLetter` returned nothing because every letter from D: to Z: is already reserved. Reservations are checked against `Get-Volume`, the Mount Manager's DOS Devices registry key (which is where mapped network drives and `subst` reservations live), and a `Test-Path` fallback. A letter reserved by `net use` or `subst` is now correctly seen as in-use and skipped.
 - **`Exhausted all candidate letters`** — the letter loop tried every candidate and none of the three assignment methods took. The `All three methods failed for <letter>: - <diagnostic>` line immediately above names the specific reason.
 - **`target partition <n>/<m> no longer exists`** — the target partition was deleted mid-search. Rare; usually indicates a concurrent process removed it.
-- **`target disk <n> is <offline|status>`** — the disk the target partition lives on has gone offline or is in a non-Online state. The function refuses to burn through 26 letters against a target that cannot accept one.
+- **`target disk <n> is <offline|status>`** — the disk the target partition lives on has gone offline or is in a non-Online state. The function refuses to burn through every candidate letter against a target that cannot accept one.
 
 **Resolution.** Manual. The script calls `Remove-OrphanPartition` on the new partition and returns `$null`. The main flow falls through to OS-fallback.
 
@@ -2213,38 +2107,18 @@ If the state file is repeatedly disappearing on a machine that has already taken
 
 ## The machine is in OS-fallback and stays there
 
-**Symptom.** The state file records `UsedOSFallback: true` and the script keeps exiting with code 2 without re-attempting the dedicated partition.
+**Symptom.** The active `winre.wim` is on C:, commonly under `C:\Recovery\WindowsRE`. The state may record `UsedOSFallback = true`.
 
-**Cause.** This is deliberate. The `DesiredStateId`-scoped retry policy (v41) preserves the OS-fallback outcome for the current state so that a machine that cannot complete the destructive path does not re-run it on every run. Under v45 patch 1 the trigger set for reaching OS-fallback has narrowed: the shrink runs in the reversible window and a failed pre-shrink now returns a retry-suppressed `Deferred` with the old route preserved, so it no longer reaches OS-fallback. The v45 causes for OS-fallback are post-delete failures where the previous route could not be restored, or where the post-delete extension fallback was unavailable.
-
-**Resolution.** If you want the machine to retry:
-
-1. The most common reason to re-arm the retry is a `ScriptVersion` bump, a manifest `version` change, a change in CPU generation, or a change in VMD presence — any of which changes the `DesiredStateId`. Ship one of those, or wait for the next one.
-2. Alternatively, delete `C:\Recovery\OEM\winre_state.json` manually. The next run will treat the state as absent and re-run the full-update path.
-3. Or change the hardware in a way that changes `Manufacturer` / `Model` / `MachineType`. Not recommended.
-
-Do not edit the state file's `UsedOSFallback` field and leave the rest in place; that will not change the `DesiredStateId` and the fast path will continue to fire.
-
-**Special case.** A machine that reached OS-fallback because of the pre-patch-5 Device Encryption failure (Section 1) has this exact state. Do not try to force the retry by editing the state file. Follow the Section 1 recovery procedure.
-
-**Not to be confused with a deferral.** A machine on which an Audit Mode, VMD-query-indeterminate, OS-fallback BitLocker, pre-shrink, race-detector abort, injection-failure, or offline-fallback deferral fired will also exit with code 2 and will also leave the state file as-is, but `UsedOSFallback` is not set — the state file is simply unchanged.
+In v50 patch 4 and earlier, matching state could keep this route on the fast path until a deployment-input change or manual reset. **Patch 5 changes that policy:** matching DSI and foreign acceptance do not make OS-fallback converged. The run assesses current dedicated capacity and safety conditions. A currently blocked attempt reports its actual reason and retains recovery material.
 
 ### OS-fallback, retrying the dedicated path
 
-In v44 the path into OS-fallback was a failed OS shrink. In v45 patch 1 the shrink runs in the reversible window: a failed pre-shrink now returns a retry-suppressed `Deferred` with the old route preserved and no longer reaches OS-fallback. A machine that reaches OS-fallback under v45 has done so because a post-delete step failed and the run could not recover the previous dedicated-partition route. Freeing C: space may still help — a plan-time rejection is one possible cause of a post-delete failure — but the primary diagnostic is the log line naming the specific post-delete failure.
+1. Read the current log and the diagnostic harness output. Identify the actual constraint; free space alone does not prove that `Resize-Partition` will succeed.
+2. Resolve that constraint. Patch 5 reassesses capacity using actual requirements, without requiring a DSI change or waiting for a coarse free-space bucket to change.
+3. Re-run Repair. An existing pending operation takes precedence and must validate its original candidate and current topology before resuming.
+4. Inspect the final registered location, image-hash result, capacity and enable outcome. Registration checks do not replace a recovery-boot test.
 
-To make an OS-fallback machine attempt the dedicated path again:
-
-1. Read the log for the specific post-delete failure that produced the OS-fallback outcome. The compound-signature section above and the `New-Partition` and `Format-Volume` sections name the common causes and their resolutions.
-2. Free up space on C: if the machine has less than the required bucket size plus a margin. The bucket size is `WIM size + 250 MiB + 30 MiB`, rounded up to the next 100 MiB boundary, minimum 1000 MiB.
-3. Delete both the state file and the deferral marker (if present) to force the next run to re-attempt:
-
-   ```powershell
-   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_state.json" -Force -ErrorAction SilentlyContinue
-   Remove-Item "$env:SystemDrive\Recovery\OEM\winre_partition_deferred.json" -Force -ErrorAction SilentlyContinue
-   ```
-
-4. Re-run `WinRE.ps1`. The next run will compute a new `DesiredStateId` and take the full-update path. If the underlying cause is resolved, the destructive replacement succeeds and the machine ends in a `DEDICATED` state. If a pre-shrink deferral fires instead, the machine stays in OS-fallback — the pre-shrink deferral preserves whatever route is currently registered, which in this case is the OS-fallback route. Address the pre-shrink constraint named in the log, then delete the marker file to retry.
+Do not delete `pending-deployment.json` or its candidate to force a retry. Routine state/deferral-file deletion is no longer the first-line remedy for freed-space cases. For an older script, upgrade only after preserving the existing logs and recovery image; use the release-specific instructions below for historical failures.
 
 ### The v45 plan-rejection corner (fixed in v46 patch 1)
 
@@ -2427,11 +2301,15 @@ The v49 features and their log lines are catalogued in the feature-specific sect
 - **The temporary resume task.** If the task is present after a run, include the invocation context (interactive vs SYSTEM, `$PSCommandPath` populated vs null), which interruption occurred (Ctrl+C, hard kill, reboot, or an exception in the outer catch), whether the task was left registered, and — if the resume run subsequently completed the operation — the log from the resume run. The Ctrl+C trigger is the load-bearing one; it was verified end-to-end on the ASUS PRIME H510M-D (2026-10-09). The other interruption classes — the outer catch, the three `Invoke-RestoreAction` mid-transformation failure paths (WIM-deployment failure, `/setreimage` failure, `/enable` failure), a hard kill, and a reboot mid-run — have not been exercised in the field.
 - **The stable install location.** Include the source path, the installed path, the source hash, the installed hash, and whether the task was registered against the installed copy. If the install step refused because the copy hash did not match, include the two hashes and the AV/EDR product name if one is in use.
 
+### v50 patch 5 specific bug data
+
+Include the observed registered route, dedicated partition size/free space, preservation/managed disposition, expected-versus-observed image-hash result, and the first precise error. If a pending record exists, include its schema version, phase and relevant logged verification outcome; redact sensitive paths. Preserve the record and candidate. State clearly whether the result came from an isolated regression, personal-machine run, disposable VM or actual recovery boot. Existing v50.4 success logs are baseline evidence, not validation of patch 5.
+
 ### v50 patch 4 specific bug data
 
 The v50 patch 4 release adds five new failure-mode signatures. Include the exact strings as they appear in your log, plus the surrounding context the individual section asks for.
 
-- **The Step 5 fail-closed guard on an indeterminate WinRE status.** Include the raw `reagentc /info` output, the OS UI language (to rule out a localized status value), and the resume task's presence. The guard's FATAL branch has not been exercised in the field; a field log of it is high-signal.
+- **An indeterminate WinRE-status refusal (historically the Step 5 guard).** Include the current summary `Why:` field or `Pending deployment stopped:` line, raw `reagentc /info` output, OS UI language, exit code, pending record and resume-task presence. The recorded hardware/VM runs do not establish these branches.
 - **The resume-script staging warn-only parent chain.** Include the exact WARN line and the ACL of the parent directory from `Get-Acl -Path '<anc>' | Format-List Owner, AccessToString`. The warning is expected on machines with an imperfect parent ACL; the ACL is what distinguishes "expected" from "unexpected on this machine".
 - **The resume-script staging directory safe-clear refusal.** Include the exact refusal line, the output of `Get-ChildItem C:\Recovery\OEM\Resume -Force`, and the staging directory's attributes from `Get-Item C:\Recovery\OEM\Resume -Force | Format-List Name, Attributes`.
 - **The resume-task staging lifecycle flags FATAL exit.** Include the exact FATAL line, the task's state from `Get-ScheduledTask -TaskName 'WinRE Manager - Resume'`, and the staging directory contents. This branch has not been exercised in the field.

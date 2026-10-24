@@ -3,7 +3,59 @@
     Self-Healing Windows Recovery Environment (WinRE) Manager - Production
 
 .NOTES
-    Version : 50.4 (v50 patch 4)
+    Version : 50.5 (v50 patch 5; final review and release pending)
+
+    Patch 5:
+            - One adequately sized dedicated recovery partition is the target
+                for every image class. Existing reuse and new creation sizing
+                remain separate; v51 placement policy and the 2 GiB ceiling
+                are unchanged. Encrypted OS-fallback is never a healthy endpoint.
+            - Current manager-owned images can relocate without servicing.
+                Foreign and never-downgrade preservation copies exact original
+                bytes; no strip, injection, ResetBase, provenance write or export.
+                A preserved hash never manufactures CurrentImageHash ownership.
+            - INF hardware-ID parsing includes VMBUS so an in-box Hyper-V
+                storage driver can satisfy the existing applicability check.
+                Controller selection and ID matching remain unchanged.
+            - Recovery-target selection uses terminating OS-disk enumeration.
+                A provider error or partial inventory cannot look like an absent
+                reusable target and authorize unnecessary partition replacement.
+            - pending-deployment.json owns a protected independent pending.wim.
+                Journal, source hash, OS identity and every read-back field are
+                checked. Replay precedes ordinary checkpoints and network/DSI
+                lookup; unknown or changed sources fail closed. Flush and atomic
+                replacement improve durability but are not a disk transaction.
+            - Prepare a separate target before disabling the old route whenever
+                the deletion set permits. Active-partition replacement remains
+                non-atomic. Retain recovery material until route AND state verify;
+                a persistence failure never undoes a verified new route.
+            - Capacity is freshly assessed. Execution failures use bounded
+                attempts and a one-hour retry backoff, not permanent DSI suppression.
+                Backoff never downgrades an unresolved lost route to warning.
+                Unknown WinRE status refuses both ordinary and pending repair.
+            - All seven RestoreWork deletions and selected backup deletions use
+                complete inventories and nonrecursive removal. Harness v40 fixes
+                scriptless-reader guards and executable AST binding assertions.
+                A matching-backup Restore confirms image equivalence without
+                implying that WinRE is enabled.
+                Empty summary lists on unresolved runs mean no entries were
+                recorded, not that no work or partition changes occurred.
+            - Final dismounts require exclusive ownership and exact mount/source/
+                index matches. DryRun and lock-contending runs do not dismount.
+            - Full registered directories survive DOS/GLOBALROOT/volume-GUID
+                parsing. Equivalence requires partition AND folder; unsupported
+                paths and reparse aliases refuse before target preparation.
+                A nonempty invalid reported route cannot use registry fallback.
+                Enabled status also requires a reported route; an empty or
+                absent location cannot be replaced by a stale registry path.
+                Last-resort fallback rechecks enabled route resolution before
+                its own mutation rather than relying on the caller's earlier check.
+                Backup, Restore and registration repair use that exact folder.
+            - The wrapper's permanent SYSTEM-task install checks destination
+                trust and reparse ancestry, stages protected verified bytes and
+                verifies the published file before registration. Existing untrusted
+                permissions are refused, not silently replaced. Its shared _T
+                helper also gates the Restore picker's config read.
 
     Full history, design, and troubleshooting:
       CHANGELOG.md, docs/architecture.md, docs/deployment.md,
@@ -35,8 +87,9 @@
                 operator can act on the log without re-running the harness.
                 A rejection that says a layout is wrong without naming
                 which partition is wrong is a log the operator cannot act on.
-            - Pre-shrink deferral preserves the old route. Its sidecar marker only
-                suppresses retries while that route and its registered WIM are valid.
+            - Pre-shrink deferral preserves the old route where rollback verifies.
+                Fresh capacity checks replace DSI-only suppression; execution
+                failures use bounded retry intervals and retain pending material.
             - The destructive sequence fails closed before ANY mutation when
                 the active WinRE route is Enabled but its registered location
                 is empty or cannot be resolved to a partition. Route
@@ -54,7 +107,9 @@
                 that cannot be verified against C: is not accepted; the assertion
                 is the last check before Format-Volume.
             - Checkpoint advancement requires successful injection. Step 4 records
-                WIM_READY before base.wim cleanup; partition/deploy work is not resumed.
+                WIM_READY before base.wim cleanup. Servicing checkpoints do not
+                replay partitions; the separate deployment journal re-inventories
+                the disk and verifies its survivor copy before resuming deployment.
             - Scratch uses fixed NTFS volumes on allowlisted internal/virtual buses.
                 USB, SD/MMC, network, FireWire, Fibre Channel, and unknown buses are out.
             - Indeterminate VMD detection defers. Network requests use the timeout.
@@ -123,7 +178,7 @@
                 requires its DriveLetter to match. The function bails
                 out immediately if the target partition no longer
                 exists or if its disk is offline / not Online, rather
-                than retrying all 26 letters against a target that
+                than retrying every candidate letter against a target that
                 cannot accept a letter. When all three methods fail
                 for a given letter, the error from the last method is
                 logged, so the operator sees why the search is
@@ -237,9 +292,11 @@
                 third-party drivers to strip). A source classified
                 Foreign-With-Drivers (no positive ownership evidence and
                 third-party drivers present) is preserved: no strip, no
-                injection, no deployment; the state file records
+                injection or export. Byte-identical relocation remains allowed;
+                the state file records
                 ForeignSourceAcceptedHash so subsequent runs recognize
-                the accepted foreign source and exit cleanly. A marker
+                the accepted foreign source, reassess layout and exit cleanly
+                only when the dedicated layout is adequate. A marker
                 whose LineageId matches no known value is treated as
                 absent: the source is preserved rather than stripped.
                 This closes the ASUS class of failure, in which
@@ -253,10 +310,11 @@
                 older than the source version, the injected changes
                 are discarded and the entire source is preserved. The
                 state file records the accepted foreign hash so
-                subsequent runs recognize the preserved source and
-                exit cleanly. The conservative response is to preserve
-                the entire image and exit EXIT_WARNING rather than
-                attempt a partial normalize; finer-grained coexistence
+                subsequent runs recognize the preserved source while still
+                checking dedicated layout. The entire original image is
+                preserved; relocation can proceed without partial normalization.
+                Newly classified preservation reports EXIT_WARNING;
+                finer-grained coexistence
                 handling awaits the two-version experiment described
                 in the known gaps.
 
@@ -320,10 +378,10 @@
                 and re-enable. It is a crash-recovery hook, not a
                 retry-until-success mechanism: a clean exit deletes
                 the task and leaves the state file to govern the
-                next scheduled run, except for the mid-transformation
-                failure paths noted below (the three original Restore
-                paths, twelve full-update exits added in v50 patch 4,
-                and the Step 5 fail-closed guard).
+                next scheduled run, except for unresolved Restore failures,
+                an indeterminate recovery status, and pending deployment.
+                Patch 5 centralizes deployment persistence; the older
+                v50 patch 4 exit-site counts are historical evidence.
                 Registration failure
                 is a non-fatal warning in the log and a
                 ChangesNotMade line in the run summary; it does not
@@ -445,8 +503,8 @@
                 not apply, not to trust their principals generally.
                 The identical logic exists in three copies: WinRE.ps1's
                 Test-PathTrustedForSystem, Cleanup-Backups.ps1's local
-                copy, and the inline _T helper inside WinRE-Manager.cmd's
-                RESTORE TARGET_COMMAND. Any future change to this
+                copy, and WinRE-Manager.cmd's shared _T payload used by
+                Restore and permanent maintenance install. Any future change to this
                 logic must land in all three.
 
             - Resume-script staging (v50 patch 3). The crash-
@@ -520,20 +578,9 @@
                 mid-flow failure window is not proven closed by test
                 evidence. This gap closes when the deliberate post-deletion
                 failure test is run and its result is recorded.
-            - Free-space deferrals are deliberately retry-suppressed:
-                when the pre-shrink free-space check rejects, the run
-                writes a deferral marker and does not retry on the next
-                scheduled run even if free space has since been freed.
-                This suppresses the full rebuild that would otherwise
-                run before reaching the same rejection point, at the
-                cost of requiring operator intervention when free space
-                changes. The operator path is to free space and then
-                delete C:\Recovery\OEM\winre_state.json and
-                C:\Recovery\OEM\winre_partition_deferred.json to force
-                a retry. A targeted re-evaluation (marker caches the
-                resize target identity and planned shrink; next run
-                re-reads free space and retries only if resolved) is a
-                future candidate.
+            - Patch 5 condition-aware retry and durable recovery are covered
+                by isolated tests; deliberate partition-failure, interruption
+                and actual WinRE boot tests on disposable Windows remain required.
             - v49 provenance marker survival is not yet proven. The
                 marker is written into the mounted image under
                 Sources\Recovery\WinRE-Manager\provenance.json during
@@ -666,7 +713,7 @@ $EXIT_WARNING          = 2
 $EXIT_FATAL            = 3
 
 $ScriptVersion    = 50
-$ScriptPatchLevel = "4"
+$ScriptPatchLevel = "5"
 
 # =========================== CONFIG ===========================
 $DriverManifestUrl         = "https://gist.github.com/52250179/4d98029c7b39240cdb860ee3c78c3ca9/raw"
@@ -708,6 +755,8 @@ $ResumeStagedDir           = "$env:SystemDrive\Recovery\OEM\Resume"
 $ResumeStagedScriptPath    = "$ResumeStagedDir\WinRE.ps1"
 $StateFileName             = "winre_state.json"
 $PartitionDeferralFileName = "winre_partition_deferred.json"
+$PendingDeploymentPath     = "$ManagerConfigDir\pending-deployment.json"
+$PendingDeploymentDir      = "$ManagerConfigDir\PendingDeployment"
 $CheckpointFile            = "$LogDir\winre_checkpoint.txt"
 $WinREFreeSpaceMiB         = 250
 $NewPartitionFilesystemMiB = 30
@@ -749,6 +798,11 @@ $Script:nonFatalWarning        = $false
 $Script:ImageInjectionComplete = $true
 $Script:UsedOSFallback         = $false
 $Script:GeometryRestoreFailed  = $false
+$Script:OwnsWimWork            = $false
+$Script:PendingDeploymentPresent = $false
+$Script:PendingDeployment      = $null
+$Script:DeploymentCandidateLock = $null
+$Script:FallbackVerifiedDuringAttempt = $false
 $Script:CachedHardware         = $null
 $Script:LenovoWinPEMap         = $null
 $Script:HPWinPEMap             = $null
@@ -806,17 +860,8 @@ $Script:ForeignSourceAcceptedHash = $null
 # dispatcher (so an interrupted Restore is recoverable), and before
 # hardware detection. Deleted in the finally block on a clean
 # terminal exit unless a persist signal fired: either this flag
-# was set (by the outer catch on an unhandled exception; by any of
-# the following mid-transformation failure paths:
-# Invoke-RestoreAction's three v49 patch 1 paths (/setreimage
-# after WIM replacement, /enable returning failed/bitlocker, or
-# the v50 patch 3 WIM-deployment failure path where re-enable did
-# not return 'ok'); the twelve full-update exits added in v50
-# patch 4 (WIM deployment, setreimage, terminal enable, three
-# Restore-PreviousWinRERoute failures inside
-# Ensure-AdequateRecoveryPartition, five final-verification exits,
-# and the OS-fallback encryption cascade); or the Step 5
-# fail-closed guard introduced in v50 patch 4), or the
+# was set (by the outer catch, unresolved Restore failures,
+# indeterminate WinRE status, or the pending-deployment owner), or the
 # C# Ctrl+C probe's static field was set (a compiled
 # ConsoleCancelKeyPress delegate; PowerShell runs finally blocks
 # but bypasses catch blocks on Ctrl+C, so a compiled delegate is
@@ -919,7 +964,7 @@ function Write-Narration {
 #   ChangesMade     list of concrete machine-level changes
 #   ChangesNotMade  list of changes explicitly not made (preservation,
 #                   deferral, DryRun)
-#   OperatingMode   "DEDICATED" | "OS-FALLBACK" | "PRESERVED" | "N/A"
+#   OperatingMode   "DEDICATED" | "OS-FALLBACK" | "PRESERVED-DEDICATED" | "N/A"
 #   NextAction      operator-facing next step, or "No action required."
 #   StartTime       when Initialize-RunSummary was called
 #
@@ -966,6 +1011,8 @@ function Write-RunSummary {
     $whyText           = if ($Script:RunSummary.Why)           { $Script:RunSummary.Why }           else { "(not set)" }
     $modeText          = if ($Script:RunSummary.OperatingMode) { $Script:RunSummary.OperatingMode } else { "(not set)" }
     $nextText          = if ($Script:RunSummary.NextAction)    { $Script:RunSummary.NextAction }    else { "(not set)" }
+    # An early failure can leave these lists empty after real partition changes.
+    $emptyListText     = if ($resultText -in @('SUCCESS', 'DRY_RUN')) { "(none)" } else { "(none recorded; see detailed log)" }
 
     Write-Log "============================================================"
     Write-Log "WINRE MANAGER RUN SUMMARY"
@@ -978,14 +1025,14 @@ function Write-RunSummary {
         Write-Log "Work performed:"
         foreach ($line in $Script:RunSummary.WorkPerformed) { Write-Log "  - $line" }
     } else {
-        Write-Log "Work performed: (none)"
+        Write-Log "Work performed: $emptyListText"
     }
 
     if ($Script:RunSummary.ChangesMade.Count -gt 0) {
         Write-Log "Changes made:"
         foreach ($line in $Script:RunSummary.ChangesMade) { Write-Log "  - $line" }
     } else {
-        Write-Log "Changes made: (none)"
+        Write-Log "Changes made: $emptyListText"
     }
 
     if ($Script:RunSummary.ChangesNotMade.Count -gt 0) {
@@ -1037,13 +1084,18 @@ function Write-FileAtomically {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Content,
-        [int]$MaxRetries = 3
+        [int]$MaxRetries = 3,
+        [switch]$Durable
     )
     $dir = Split-Path $Path -Parent
     if ($dir -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
     $tempFile = Join-Path $dir ("{0}.tmp_{1}" -f (Split-Path $Path -Leaf), [guid]::NewGuid().ToString('N').Substring(0,8))
     try {
         [System.IO.File]::WriteAllText($tempFile, $Content, [System.Text.UTF8Encoding]::new($false))
+        if ($Durable) {
+            $flushStream = [IO.File]::Open($tempFile, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            try { $flushStream.Flush($true) } finally { $flushStream.Dispose() }
+        }
     } catch {
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
         throw "Atomic write temp failed: $_"
@@ -1328,24 +1380,74 @@ function Remove-StagingDirectorySafely {
     )
     if (-not $Path) { return $false }
     if ($Path -match '^[A-Za-z]:\\?$') { return $false }
-    if (-not (Test-Path -LiteralPath $Path)) { return $true }
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
     $item = $null
-    try { $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { return $false }
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-    if (-not $item.PSIsContainer) { return $false }
-    $children = @()
-    try { $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) } catch { return $false }
-    foreach ($c in $children) {
-        if (($c.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-        if ($c.PSIsContainer) { return $false }
-        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($c.Name, $ExpectedLeafName)) { return $false }
+    try { $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { return $true }
+    catch {
+        Write-Log "Safe staging cleanup could not inspect '$Path': $_" -Level WARN
+        return $false
     }
-    foreach ($c in $children) {
-        try { Remove-Item -LiteralPath $c.FullName -Force -ErrorAction Stop } catch { return $false }
+    if ($item -isnot [System.IO.DirectoryInfo]) { return $false }
+    $fullPath = $item.FullName.TrimEnd('\')
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($fullPath, [IO.Path]::GetPathRoot($item.FullName).TrimEnd('\'))) { return $false }
+
+    # v50 patch 5: recheck ancestors and the complete singleton inventory
+    # before each deletion. Snapshots reduce replacement races; the final
+    # nonrecursive .NET deletion refuses any newly added child.
+    $readInventory = {
+        $currentPath = $fullPath
+        while ($currentPath) {
+            $directory = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+            if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "Unsafe staging-directory ancestry: $currentPath"
+            }
+            $currentPath = [IO.Path]::GetDirectoryName($directory.FullName.TrimEnd('\'))
+        }
+        $entries = @(Get-ChildItem -LiteralPath $fullPath -Force -ErrorAction Stop)
+        if ($entries.Count -gt 1) { throw 'The staging directory contains more than the permitted singleton file.' }
+        foreach ($entry in $entries) {
+            if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                -not [StringComparer]::OrdinalIgnoreCase.Equals($entry.Name, $ExpectedLeafName)) {
+                throw "Unexpected staging-directory entry: $($entry.FullName)"
+            }
+        }
+        return $entries
     }
-    try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { return $false }
-    return $true
+    try {
+        $children = @(& $readInventory)
+        foreach ($child in $children) {
+            $currentChildren = @(& $readInventory)
+            if ($currentChildren.Count -ne $children.Count) { throw 'The staging inventory changed during cleanup.' }
+            $childPath = Join-Path $fullPath $child.Name
+            if ($currentChildren[0].Attributes -band [IO.FileAttributes]::ReadOnly) {
+                [IO.File]::SetAttributes($childPath,
+                    [IO.FileAttributes]($currentChildren[0].Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+            }
+            # File.Delete cannot recursively remove a directory if the
+            # previously checked file changes type before this call.
+            [IO.File]::Delete($childPath)
+        }
+        if (@(& $readInventory).Count -ne 0) { throw 'The staging directory is no longer empty.' }
+        [IO.Directory]::Delete($fullPath, $false)
+        return (-not (Test-Path -LiteralPath $fullPath -ErrorAction Stop))
+    } catch {
+        Write-Log "Safe staging cleanup refused or failed at '$Path': $_" -Level WARN
+        return $false
+    }
+}
+
+# RestoreWork has one permitted file. Refusals must be visible, and the
+# preparation caller must not continue into a directory it could not clear.
+function Remove-RestoreWorkspaceSafely {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Script:DryRun) { Write-Log "[DRY RUN] Would safely clear RestoreWork: $Path"; return $true }
+    $removed = (Test-DeploymentPathWithoutReparse -Path $Path) -and
+               (Remove-StagingDirectorySafely -Path $Path -ExpectedLeafName 'winre_rollback.wim')
+    if (-not $removed) {
+        Write-Log "RestoreWork cleanup refused or failed at '$Path'; unexpected contents or reparse points are preserved for inspection." -Level WARN
+        $Script:nonFatalWarning = $true
+    }
+    return $removed
 }
 
 # --- Resume-script staging (v50 patch 3) ---
@@ -1452,7 +1554,9 @@ function Initialize-ResumeScriptStaging {
         $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, $rights, $inherit, $noProp, $allow)))
         $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($adminsSid, $rights, $inherit, $noProp, $allow)))
         $sec.SetOwner($adminsSid)
-        [System.IO.Directory]::CreateDirectory($StagedDir, $sec) | Out-Null
+        if ($PSVersionTable.PSEdition -eq 'Core') {
+            [IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new($StagedDir), $sec)
+        } else { [System.IO.Directory]::CreateDirectory($StagedDir, $sec) | Out-Null }
     } catch {
         Write-Log "Resume-script staging: could not create $StagedDir with a strict DACL: $_ - refusing to register the resume task" -Level WARN
         return $null
@@ -1661,9 +1765,12 @@ function Get-WinREState {
     $info = & cmd /c "reagentc /info 2>&1"
     $statusLine = $info | Select-String -Pattern '(Enabled|Disabled)' | Select-Object -First 1
     $status = if ($statusLine) { $statusLine.Matches.Value } else { "Unknown" }
-    $locationLine = $info | Select-String -Pattern '(\\\\\?\\GLOBALROOT\\device\\harddisk\d+\\partition\d+\\|\\\\\?\\Volume\{[a-fA-F0-9\-]+\}\\?)' | Select-Object -First 1
-    $location = if ($locationLine) { $locationLine.Matches.Value.Trim() } else { $null }
-    if (-not $location) {
+    # Keep the entire registered directory. A partition root is not proof
+    # that Recovery\WindowsRE (or any other folder) is the registered route.
+    $location = Get-WinRELocationFromInfo -Info $info
+    # Enabled status requires affirmative evidence of its current route.
+    # A registry value cannot establish where an unreported active WIM is.
+    if (-not $location -and $status -ne 'Enabled') {
         $regPath  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WinRE"
         $location = (Get-ItemProperty -Path $regPath -Name "WinRELocation" -ErrorAction SilentlyContinue).WinRELocation
     }
@@ -1677,17 +1784,135 @@ function Get-WinREState {
     return @{ Status = $status; Location = $location; Version = $version }
 }
 
-function Resolve-WinRELocationToPartition {
-    param([string]$Location)
-    if (-not $Location) { return $null }
-    if ($Location -match 'harddisk(\d+)\\partition(\d+)') {
-        return Get-Partition -DiskNumber ([int]$Matches[1]) -PartitionNumber ([int]$Matches[2]) -ErrorAction SilentlyContinue
+function ConvertFrom-WinRELocation {
+    param([AllowNull()][string]$Location)
+    if ([string]::IsNullOrWhiteSpace($Location)) { return $null }
+    # Do not Trim() path components: trailing spaces/dots are Win32 aliases,
+    # not evidence that two registered directories are identical.
+    $result = @{}
+    if ($Location -match '^\\\\\?\\GLOBALROOT\\device\\harddisk(?<disk>\d+)\\partition(?<part>\d+)(?<suffix>\\.*)?$') {
+        $diskNumber = 0; $partitionNumber = 0
+        if (-not [int]::TryParse($Matches.disk, [ref]$diskNumber) -or
+            -not [int]::TryParse($Matches.part, [ref]$partitionNumber) -or $partitionNumber -lt 1) { return $null }
+        $suffix = [string]$Matches.suffix
+        $result = @{ Kind='GlobalRoot'; DiskNumber=$diskNumber; PartitionNumber=$partitionNumber
+            Root="\\?\GLOBALROOT\device\harddisk$diskNumber\partition$partitionNumber\" }
+    } elseif ($Location -match '^\\\\\?\\Volume\{(?<volume>[a-fA-F0-9-]+)\}(?<suffix>\\.*)?$') {
+        $volumeGuid = [guid]::Empty
+        if (-not [guid]::TryParse($Matches.volume, [ref]$volumeGuid) -or $volumeGuid -eq [guid]::Empty) { return $null }
+        $suffix = [string]$Matches.suffix
+        $volumeId = "\\?\Volume{$($volumeGuid.ToString('D'))}\"
+        $result = @{ Kind='VolumeGuid'; VolumeId=$volumeId; Root=$volumeId }
+    } elseif ($Location -match '^(?<drive>[A-Za-z]):(?<suffix>\\.*)$') {
+        $suffix = [string]$Matches.suffix
+        $driveLetter = $Matches.drive.ToUpperInvariant()
+        $result = @{ Kind='DriveLetter'; DriveLetter=$driveLetter; Root="${driveLetter}:\" }
+    } else { return $null }
+    $relative = $suffix.TrimStart('\').TrimEnd('\')
+    # Percent and exclamation expansion are also refused: registered paths
+    # are later supplied to reagentc through cmd, not interpreted as shell text.
+    if ($suffix.StartsWith('\\') -or $relative -match '\\\\|[/:<>"|?*%!\x00-\x1F]') { return $null }
+    foreach ($segment in @($relative -split '\\')) {
+        if ($segment -in @('.','..') -or $segment -match '[. ]$') { return $null }
     }
-    if ($Location -match 'Volume\{([a-fA-F0-9-]+)\}') {
-        $vol = Get-Volume -UniqueId "\\?\Volume{$($Matches[1])}\" -ErrorAction SilentlyContinue
-        if ($vol) { return Get-Partition -Volume $vol -ErrorAction SilentlyContinue }
+    $result.RelativePath = $relative
+    $result.NormalizedPath = $result.Root + $relative
+    return $result
+}
+
+function Get-WinRELocationFromInfo {
+    param([AllowNull()][object[]]$Info)
+    foreach ($line in $Info) {
+        # Match the location field, not a recovery/custom-image path on a
+        # different line. Preserve spaces in the folder. Ambiguous trailing
+        # spaces are refused rather than silently canonicalized.
+        if ([string]$line -match '^\s*Windows RE location:\s*(?<path>[^\r\n]+)$') {
+            $path = $Matches.path
+            if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+            $parsed = ConvertFrom-WinRELocation -Location $path
+            if ($parsed) { return $parsed.NormalizedPath }
+            # A nonempty reported location remains authoritative even when
+            # unsupported. Keep it for a fail-closed resolver refusal; a stale
+            # registry value must not disguise an invalid current route.
+            return $path
+        }
     }
     return $null
+}
+
+function ConvertTo-WinREPathArgument {
+    param([Parameter(Mandatory)][string]$Path)
+    $parsed = ConvertFrom-WinRELocation -Location $Path
+    if (-not $parsed) { throw 'Cannot quote an unsupported WinRE registration path.' }
+    # Windows native argv parsing consumes pairs of backslashes before a
+    # closing quote. Double a root's trailing backslash so it remains a
+    # backslash, rather than escaping the closing quote in the child process.
+    $escaped = [regex]::Replace($parsed.NormalizedPath, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+function Get-WinREPathAttributes {
+    param([Parameter(Mandatory)][string]$Path)
+    # Literal extended volume paths work without assigning a drive letter.
+    # Distinguish proven absence from denied/indeterminate metadata. A
+    # missing registered directory must remain repairable when its volume
+    # and existing ancestors are known; it must not mean a different folder.
+    try { return [IO.File]::GetAttributes($Path) } catch {
+        $cause = $_.Exception.GetBaseException()
+        if ($cause -is [IO.FileNotFoundException] -or $cause -is [IO.DirectoryNotFoundException]) { return $null }
+        throw
+    }
+}
+
+function Resolve-WinRELocationToPartition {
+    param([string]$Location)
+    $parsed = ConvertFrom-WinRELocation -Location $Location
+    if (-not $parsed) { return $null }
+    try {
+        if ($parsed.Kind -eq 'GlobalRoot') {
+            $parts = @(Get-Partition -DiskNumber $parsed.DiskNumber -PartitionNumber $parsed.PartitionNumber -ErrorAction Stop)
+            if ($parts.Count -ne 1) { return $null }
+            $volumes = @(Get-Volume -Partition $parts[0] -ErrorAction Stop)
+        } elseif ($parsed.Kind -eq 'VolumeGuid') {
+            $volumes = @(Get-Volume -UniqueId $parsed.VolumeId -ErrorAction Stop)
+            if ($volumes.Count -ne 1) { return $null }
+            $parts = @(Get-Partition -Volume $volumes[0] -ErrorAction Stop)
+        } else {
+            $parts = @(Get-Partition -DriveLetter $parsed.DriveLetter -ErrorAction Stop)
+            $volumes = @(Get-Volume -DriveLetter $parsed.DriveLetter -ErrorAction Stop)
+            if ($parts.Count -ne 1 -or $volumes.Count -ne 1) { return $null }
+        }
+        if ($parts.Count -ne 1 -or $volumes.Count -ne 1) { return $null }
+        $volumeRoot = ConvertFrom-WinRELocation -Location ([string]$volumes[0].UniqueId)
+        if (-not $volumeRoot -or $volumeRoot.Kind -ne 'VolumeGuid' -or $volumeRoot.RelativePath) { return $null }
+        # Resolve folder components through the physical volume root. Refuse
+        # junctions and directory mounts even when they alias the same volume;
+        # partition identity alone cannot prove relative-folder identity.
+        $current = $volumeRoot.Root
+        $attributes = Get-WinREPathAttributes -Path $current
+        if ($null -eq $attributes -or -not ($attributes -band [IO.FileAttributes]::Directory) -or ($attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+        $existingRelative = ''
+        if ($parsed.RelativePath) {
+            foreach ($segment in ($parsed.RelativePath -split '\\')) {
+                $current = $current.TrimEnd('\') + '\' + $segment
+                $attributes = Get-WinREPathAttributes -Path $current
+                if ($null -eq $attributes) { break }
+                if (-not ($attributes -band [IO.FileAttributes]::Directory) -or ($attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+                $existingRelative = if ($existingRelative) { $existingRelative + '\' + $segment } else { $segment }
+            }
+        }
+        if ($parsed.Kind -eq 'DriveLetter') {
+            # Probe the nearest proven-existing directory when the route's
+            # final folder is missing. A denied read never takes this path.
+            $folderVolumes = @(Get-Volume -FilePath ($parsed.Root + $existingRelative) -ErrorAction Stop)
+            if ($folderVolumes.Count -ne 1 -or -not $volumes[0].UniqueId -or
+                $folderVolumes[0].UniqueId -ne $volumes[0].UniqueId) { return $null }
+            $folderParts = @(Get-Partition -Volume $folderVolumes[0] -ErrorAction Stop)
+            if ($folderParts.Count -ne 1 -or $folderParts[0].DiskNumber -ne $parts[0].DiskNumber -or
+                $folderParts[0].PartitionNumber -ne $parts[0].PartitionNumber) { return $null }
+        }
+        return $parts[0]
+    } catch { return $null }
 }
 
 function Get-OSPartition {
@@ -1901,8 +2126,8 @@ function Invoke-DriveLetterAssignment {
     foreach ($letterChar in $candidates) {
         # Bail out if the target partition itself is gone or its disk
         # is not online. Every assignment method would fail identically,
-        # and retrying all 26 letters would burn three method attempts
-        # per letter and emit 26 WARN lines for a target that cannot
+        # and retrying every candidate letter would burn three method attempts
+        # per letter and emit repeated WARN lines for a target that cannot
         # accept a letter.
         if (-not (Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue)) {
             Write-Log "Invoke-DriveLetterAssignment: target partition $DiskNumber/$PartitionNumber no longer exists - aborting letter search" -Level ERROR
@@ -2080,7 +2305,10 @@ function Ensure-RecoveryPartitionAccess {
 function Test-VolumeEncrypted {
     param([string]$MountPoint)
 
-    $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
+    $blv = $null
+    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+        try { $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction Stop } catch { }
+    }
     if ($blv) {
         $prot = $blv.ProtectionStatus
         if ($prot -eq 'On' -or $prot -eq 'ProtectionOn' -or $prot -eq 1) { return $true }
@@ -2133,7 +2361,10 @@ function Test-VolumeEncrypted {
 function Test-VolumeAccessibleForResize {
     param([Parameter(Mandatory)][string]$MountPoint)
 
-    $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
+    $blv = $null
+    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+        try { $blv = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction Stop } catch { }
+    }
     if ($blv) {
         $vs = [string]$blv.VolumeStatus
         if ($vs -eq 'FullyDecrypted') { return $true }
@@ -3462,7 +3693,9 @@ function Ensure-AdequateRecoveryPartition {
         # Failure to resolve the path is treated as fail-closed:
         # the function defers rather than proceeding without the
         # source-lifetime guarantee.
-        [AllowNull()][string]$ProtectedSourcePath = $null
+        [AllowNull()][string]$ProtectedSourcePath = $null,
+        [AllowNull()][string]$ExpectedSourceHash = $null,
+        [switch]$PrepareBeforeDisable
     )
 
     # Dynamic sizing: WIM + 250 MiB free-space + 30 MiB filesystem, rounded
@@ -3493,6 +3726,10 @@ function Ensure-AdequateRecoveryPartition {
     if (-not $plan.Valid) {
         Write-Log "Dedicated recovery partition plan rejected: $($plan.Reason). No partition or WinRE changes were made." -Level WARN
         return @{ Status = "Deferred"; Reason = $plan.Reason }
+    }
+    if ($ExpectedSourceHash -and (-not $ProtectedSourcePath -or
+        (Get-LiveWimHash -WimPath $ProtectedSourcePath) -ne $ExpectedSourceHash)) {
+        return @{ Status = 'Deferred'; Reason = 'protected source differs from original expected hash' }
     }
 
     # Source-lifetime guard. When the caller identifies the file the
@@ -3602,7 +3839,11 @@ function Ensure-AdequateRecoveryPartition {
     # and the 2026-09-29 test established that C: encryption does not
     # block dedicated-partition work. The OS-fallback route retains its
     # own separate C: gate.
-    $willDestroyCurrentRoute = ($stateBefore.Status -eq "Enabled") -or ($deletableParts.Count -gt 0)
+    $activeInDeletionSet = ($activePartForInventory -and @($deletableParts | Where-Object {
+        $_.DiskNumber -eq $activePartForInventory.DiskNumber -and $_.PartitionNumber -eq $activePartForInventory.PartitionNumber
+    }).Count -gt 0)
+    $deferDisable = ($PrepareBeforeDisable -and -not $activeInDeletionSet)
+    $willDestroyCurrentRoute = (($stateBefore.Status -eq "Enabled") -and -not $deferDisable) -or ($deletableParts.Count -gt 0)
     if ($willDestroyCurrentRoute) {
         $cEnc = Test-VolumeEncrypted -MountPoint "C:"
 
@@ -3614,6 +3855,17 @@ function Ensure-AdequateRecoveryPartition {
         }
     }
 
+    if ($Script:PendingDeployment) {
+        $Script:PendingDeployment.Phase = 'MutationStarted'
+        $Script:PendingDeployment.PlannedTargetOffset = [int64]$plan.PlannedPartitionStart
+        $Script:PendingDeployment.PlannedTargetSize = [int64]$plan.PlannedPartitionSize
+        $Script:PendingDeployment.ResizeTargetGuid = [string]$resizeTarget.Guid
+        $Script:PendingDeployment.ResizeTargetOffset = [int64]$resizeTarget.Offset
+        $Script:PendingDeployment.ResizeTargetInitialSize = [int64]$resizeTargetInitialSize
+        $Script:PendingDeployment.ResizeTargetPlannedSize = [int64]$resizeTargetPlannedSize
+        $Script:PendingDeployment.RecoveryInventoryJson = (@($deletableParts | Select-Object PartitionNumber, Guid, Offset, Size, GptType, MbrType) | ConvertTo-Json -Compress -Depth 3)
+        Write-PendingDeployment -Record $Script:PendingDeployment
+    }
     if ($resizeBytes -gt 0) {
         # Pre-shrink free-space verification (v45 patch 1). The shrink
         # reduces the resize target's capacity. We refuse to shrink when
@@ -3711,7 +3963,19 @@ function Ensure-AdequateRecoveryPartition {
         Write-Log "Partition plan requires no resize; existing partition geometry will be preserved"
     }
 
-    if ($stateBefore.Status -eq "Enabled") {
+    # Re-bind the survivor copy AFTER shrink and BEFORE disable/delete.
+    if ($ExpectedSourceHash -and (Get-LiveWimHash -WimPath $ProtectedSourcePath) -ne $ExpectedSourceHash) {
+        Restore-OSPartitionSize -Reason 'protected source changed after pre-shrink' -TargetSizeBytes $resizeTargetInitialSize `
+            -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
+        return @{ Status = 'Deferred'; Reason = 'protected source changed after pre-shrink' }
+    }
+    if ($stateBefore.Status -eq 'Enabled' -and $deferDisable -and
+        -not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'prepare dedicated target before disable')) {
+        Restore-OSPartitionSize -Reason 'registered source changed before target preparation' -TargetSizeBytes $resizeTargetInitialSize `
+            -DiskNumber $resizeTarget.DiskNumber -PartitionNumber $resizeTarget.PartitionNumber | Out-Null
+        return @{ Status = 'Deferred'; Reason = 'registered source changed before target preparation' }
+    }
+    if ($stateBefore.Status -eq "Enabled" -and -not $deferDisable) {
         if ($Script:DryRun) {
             Write-Log "[DRY RUN] Would disable WinRE before partition recreation"
         } else {
@@ -3734,8 +3998,10 @@ function Ensure-AdequateRecoveryPartition {
                 # Invalidate staged work: the checkpoint and its WIM are tied
                 # to a source that is now known to have drifted.
                 Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
-                Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
-                Remove-ItemIfExist "$WorkDir\base.wim"
+                if (-not $Script:PendingDeploymentPresent) {
+                    Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
+                    Remove-ItemIfExist "$WorkDir\base.wim"
+                }
                 return @{ Status = "Deferred"; Reason = "registered source changed before disable" }
             }
             Write-Log "Disabling WinRE before partition recreation"
@@ -4127,8 +4393,12 @@ function Find-SuitableRecoveryPartition {
     $osDisk = Get-OSDisk
     if (-not $osDisk) { Write-Log "Find-SuitableRecoveryPartition: no OS disk" -Level WARN; return $null }
 
+    # This query decides whether to reuse or replace a partition. Unlike
+    # general discovery (which tolerates empty removable-media readers),
+    # an unreadable OS-disk inventory must stop selection rather than look
+    # like there is no reusable target and trigger unnecessary replacement.
     $parts = @(
-        Get-RecoveryPartitions -DiskNumber $osDisk.Number |
+        Get-Partition -DiskNumber $osDisk.Number -ErrorAction Stop |
             Where-Object {
                 ($_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or
                 ($_.MbrType -eq 0x27)
@@ -4219,7 +4489,8 @@ function Deploy-WimTransactional {
     param(
         [Parameter(Mandatory)][string]$SourceWim,
         [Parameter(Mandatory)][string]$TargetPath,
-        [Parameter(Mandatory)][string]$TargetDescription
+        [Parameter(Mandatory)][string]$TargetDescription,
+        [AllowNull()][string]$ExpectedSourceHash = $null
     )
 
     # Reset script-scope rollback pointer so a stale value from a
@@ -4238,6 +4509,10 @@ function Deploy-WimTransactional {
     }
     if (-not $srcHash) {
         Write-Log "Deploy-WimTransactional ($TargetDescription): could not hash source WIM $SourceWim" -Level ERROR
+        return $false
+    }
+    if ($ExpectedSourceHash -and $srcHash -ne $ExpectedSourceHash) {
+        Write-Log "Deploy-WimTransactional ($TargetDescription): source differs from its original expected SHA256; refusing deployment." -Level ERROR
         return $false
     }
 
@@ -4343,7 +4618,8 @@ function Deploy-WimTransactional {
 function Deploy-WimToPartition {
     param(
         [Parameter(Mandatory)][hashtable]$Partition,
-        [Parameter(Mandatory)][string]$SourceWim
+        [Parameter(Mandatory)][string]$SourceWim,
+        [AllowNull()][string]$ExpectedSourceHash = $null
     )
     $letter = $Partition.DriveLetter
     if (-not $letter) { Write-Log "Deploy-WimToPartition: partition has no letter" -Level ERROR; return $false }
@@ -4356,6 +4632,7 @@ function Deploy-WimToPartition {
     $dstFull = $null
     try { $dstFull = [System.IO.Path]::GetFullPath($target) } catch { }
     if ($srcFull -and $dstFull -and $srcFull -eq $dstFull) {
+        if ($ExpectedSourceHash -and (Get-LiveWimHash -WimPath $SourceWim) -ne $ExpectedSourceHash) { return $false }
         Write-Log "Source and target are the same file ($SourceWim) - nothing to copy"
         return $true
     }
@@ -4363,7 +4640,7 @@ function Deploy-WimToPartition {
     New-DirectoryIfNotExists $targetDir
 
     $desc = "recovery partition disk $($Partition.DiskNumber) part $($Partition.PartitionNumber)"
-    return (Deploy-WimTransactional -SourceWim $SourceWim -TargetPath $target -TargetDescription $desc)
+    return (Deploy-WimTransactional -SourceWim $SourceWim -TargetPath $target -TargetDescription $desc -ExpectedSourceHash $ExpectedSourceHash)
 }
 
 # =========================== ENABLE WINRE ===========================
@@ -4441,19 +4718,17 @@ function Invoke-ReagentcEnable {
     return "failed"
 }
 
-# Compare two WinRE locations for equivalence. String-compares first;
-# falls back to resolving both to a disk/partition identity, because
-# reagentc may report the same volume in either the GLOBALROOT or the
-# Volume-GUID form after a disable/enable cycle.
+# A route is a partition AND its complete registered directory. Different
+# root spellings may be equivalent; different folders on one volume are not.
 function Test-WinRELocationMatches {
     param(
         [AllowEmptyString()][string]$LocationA,
         [AllowEmptyString()][string]$LocationB
     )
-    if (-not $LocationA -or -not $LocationB) { return $false }
-    $normA = $LocationA.TrimEnd('\')
-    $normB = $LocationB.TrimEnd('\')
-    if ([System.StringComparer]::OrdinalIgnoreCase.Equals($normA, $normB)) { return $true }
+    $parsedA = ConvertFrom-WinRELocation -Location $LocationA
+    $parsedB = ConvertFrom-WinRELocation -Location $LocationB
+    if (-not $parsedA -or -not $parsedB -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($parsedA.RelativePath, $parsedB.RelativePath)) { return $false }
     $partA = Resolve-WinRELocationToPartition -Location $LocationA
     $partB = Resolve-WinRELocationToPartition -Location $LocationB
     if ($partA -and $partB -and
@@ -4494,7 +4769,9 @@ function Restore-PreviousWinRERoute {
             Write-Log "Cannot restore previous OS-fallback route: C: is not confirmed fully decrypted (Test-VolumeEncrypted=$cEncrypted)" -Level WARN
             return $false
         }
-        $reRegisterPath = "$env:SystemDrive\Recovery\WindowsRE"
+        $priorPath = ConvertFrom-WinRELocation -Location $PreviousState.Location
+        if (-not $priorPath) { return $false }
+        $reRegisterPath = "$env:SystemDrive\" + $priorPath.RelativePath
         $enableResult = Invoke-ReagentcEnable -ReRegisterPath $reRegisterPath
     } else {
         $isTypedRecovery = ($previousPart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($previousPart.MbrType -eq 0x27)
@@ -4506,7 +4783,9 @@ function Restore-PreviousWinRERoute {
             Write-Log "Cannot restore previous WinRE route: target partition is not ready for reagentc" -Level ERROR
             return $false
         }
-        $reRegisterPath = "\\?\GLOBALROOT\device\harddisk$($previousPart.DiskNumber)\partition$($previousPart.PartitionNumber)\Recovery\WindowsRE"
+        $priorPath = ConvertFrom-WinRELocation -Location $PreviousState.Location
+        if (-not $priorPath) { return $false }
+        $reRegisterPath = "\\?\GLOBALROOT\device\harddisk$($previousPart.DiskNumber)\partition$($previousPart.PartitionNumber)\" + $priorPath.RelativePath
         $enableResult = Invoke-ReagentcEnable -AllowTempLetter -Partition @{ DiskNumber = $previousPart.DiskNumber; PartitionNumber = $previousPart.PartitionNumber } -ReRegisterPath $reRegisterPath
     }
 
@@ -4556,7 +4835,8 @@ function Invoke-ReAgentRegistrationRepair {
         return $false
     }
 
-    $reSetOutput = cmd /c "reagentc /setreimage /path `"$ReRegisterPath`" 2>&1"
+    $pathArgument = ConvertTo-WinREPathArgument -Path $ReRegisterPath
+    $reSetOutput = cmd /c "reagentc /setreimage /path $pathArgument 2>&1"
     $reSetExit = $LASTEXITCODE
     Write-Log "reagentc /setreimage (repair, exit $reSetExit): $reSetOutput"
     if ($reSetExit -ne 0) {
@@ -4705,8 +4985,8 @@ function Get-WimBuild {
 
 function Get-LiveWimHash {
     param([string]$WimPath)
-    if ($WimPath -and (Test-Path -Path $WimPath -PathType Leaf)) {
-        try { return (Get-FileHash -Path $WimPath -Algorithm SHA256).Hash }
+    if ($WimPath -and (Test-Path -LiteralPath $WimPath -PathType Leaf)) {
+        try { return (Get-FileHash -LiteralPath $WimPath -Algorithm SHA256).Hash }
         catch { return $null }
     }
     return $null
@@ -5033,19 +5313,8 @@ function Assert-RegisteredWinREUnchanged {
         param($state)
         if (-not $state -or $state.Status -ne 'Enabled' -or -not $state.Location) { return $null }
         try {
-            $tempLoc = @(Ensure-RecoveryPartitionAccess -TargetDir $state.Location)[0]
-            if (-not $tempLoc) { return $null }
-            # Probe both forms: the resolver returns a drive root when the
-            # registered location was a raw partition path, and returns the
-            # subpath directly when the registered location already
-            # included Recovery\WindowsRE. Only one candidate resolves to a
-            # real file on a given machine.
-            foreach ($cand in @(Join-Path $tempLoc "Recovery\WindowsRE\winre.wim"; Join-Path $tempLoc "winre.wim")) {
-                if (Test-Path -Path $cand -PathType Leaf -ErrorAction SilentlyContinue) {
-                    $h = Get-LiveWimHash -WimPath $cand
-                    if ($h) { return $h }
-                }
-            }
+            $image = Get-RegisteredDeploymentImage -WinREState $state
+            if ($image) { return $image.Hash }
         } catch { }
         return $null
     }
@@ -5080,9 +5349,7 @@ function Assert-RegisteredWinREUnchanged {
         # redirect to a different location (even one whose WIM is also
         # unreadable) or a servicing bump means the registered source is
         # not the one we captured; defer to re-evaluate.
-        $capturedLocU = if ($Captured.Location) { $Captured.Location.TrimEnd('\') } else { '' }
-        $nowLocU      = if ($nowForUnreadable.Location) { $nowForUnreadable.Location.TrimEnd('\') } else { '' }
-        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($capturedLocU, $nowLocU)) {
+        if (-not (Test-WinRELocationMatches -LocationA $Captured.Location -LocationB $nowForUnreadable.Location)) {
             Write-Log "Registered-source recheck at $CalledFrom : registered WIM was unreadable at capture time; registered location changed from $($Captured.Location) to $($nowForUnreadable.Location) - deferring to re-evaluate source selection" -Level WARN
             return $false
         }
@@ -5106,9 +5373,7 @@ function Assert-RegisteredWinREUnchanged {
         return $false
     }
 
-    $capturedLoc = if ($Captured.Location) { $Captured.Location.TrimEnd('\') } else { '' }
-    $nowLoc      = if ($now.Location)      { $now.Location.TrimEnd('\')      } else { '' }
-    $locChanged  = -not [System.StringComparer]::OrdinalIgnoreCase.Equals($capturedLoc, $nowLoc)
+    $locChanged = -not (Test-WinRELocationMatches -LocationA $Captured.Location -LocationB $now.Location)
     $verChanged  = ($now.Version -ne $Captured.Version)
 
     $hashChanged = $false
@@ -5323,6 +5588,9 @@ function Get-LocalInputsId {
 }
 
 # =========================== STATE FILE ===========================
+# Legacy state relies on deployment ACLs, not an ACL check in these readers.
+# Protect both the file and its ancestor chain; see SECURITY.md's state-file
+# trust limitation. The protected pending-deployment store is separate.
 # v50: sibling of Get-StaleWinREStateImageHash that also returns the
 # stale state file's LineageId. Read in isolation, used only by the
 # source-ownership classifier to extend Manager-Owned recognition and
@@ -5494,8 +5762,18 @@ function Write-WinREState {
         return
     }
 
-    Write-FileAtomically -Path $path -Content $stateJson
+    Write-FileAtomically -Path $path -Content $stateJson -Durable
     Write-Log "Wrote state file: $path (PendingReboot=$PendingReboot, UsedOSFallback=$UsedOSFallback, RepairAttempts=$RepairAttempts)"
+}
+
+function ConvertFrom-DeploymentJson {
+    param([Parameter(Mandatory)][string]$Json)
+    # PowerShell 7.5+ otherwise converts ISO timestamps to DateTime,
+    # changing exact journal read-back and losing UTC on later string casts.
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+        return (ConvertFrom-Json -InputObject $Json -DateKind String -ErrorAction Stop)
+    }
+    return (ConvertFrom-Json -InputObject $Json -ErrorAction Stop)
 }
 
 function Read-PartitionDeferral {
@@ -5504,9 +5782,12 @@ function Read-PartitionDeferral {
     $path = "$env:SystemDrive\Recovery\OEM\$PartitionDeferralFileName"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     try {
-        $marker = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $marker = ConvertFrom-DeploymentJson -Json (Get-Content -LiteralPath $path -Raw -ErrorAction Stop)
         if ($marker.DesiredStateId -eq $CurrentDesiredStateId -and $marker.DesiredStateId) {
-            return @{ DesiredStateId = [string]$marker.DesiredStateId; Since = [string]$marker.Since }
+            # Legacy markers have no category/backoff. They never suppress
+            # a fresh assessment. Capacity predicates are re-read by Ensure.
+            return @{ DesiredStateId = [string]$marker.DesiredStateId; Since = [string]$marker.Since
+                Category = [string]$marker.Category; Reason = [string]$marker.Reason; RetryAfterUtc = [string]$marker.RetryAfterUtc }
         }
         Write-Log "Partition deferral marker is stale for the current DesiredStateId; clearing it"
         Remove-ItemIfExist $path
@@ -5518,12 +5799,20 @@ function Read-PartitionDeferral {
 }
 
 function Write-PartitionDeferral {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$DesiredStateId)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DesiredStateId,
+        [string]$Reason,
+        [ValidateSet('Capacity','Execution')][string]$Category = 'Execution'
+    )
 
     $path = "$env:SystemDrive\Recovery\OEM\$PartitionDeferralFileName"
     $marker = @{
         DesiredStateId = $DesiredStateId
         Since          = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        SchemaVersion  = 2
+        Category       = $Category
+        Reason         = $Reason
+        RetryAfterUtc  = $(if ($Category -eq 'Execution') { [DateTime]::UtcNow.AddHours(1).ToString('o') } else { $null })
     }
     if ($Script:DryRun) { Write-Log "[DRY RUN] Would write partition deferral marker"; return }
     try {
@@ -5603,7 +5892,7 @@ function Clear-PartitionDeferral {
 # not apply, not to trust their principals generally. The identical
 # logic exists in three copies: here, in Cleanup-Backups.ps1's local
 # Test-PathTrustedForSystem, and in the inline _T helper inside
-# WinRE-Manager.cmd's RESTORE TARGET_COMMAND. Any future change to
+# WinRE-Manager.cmd's shared Restore/Install payload. Any future change to
 # this logic must land in all three.
 #
 # Returns $true only when both conditions hold. Fail-closed on
@@ -6085,7 +6374,7 @@ function Get-HardwareIdsFromInf {
     if ($modelSectionNames.Count -eq 0) { return @() }
 
     # Pass 3: extract HWIDs from each model section and its per-arch variants.
-    $busPrefixes = @('PCI\','USB\','ACPI\','SCSI\','IDE\','SWC\','ROOT\','HDAUDIO\','MONITOR\','DISPLAY\','MF\')
+    $busPrefixes = @('PCI\','USB\','ACPI\','SCSI\','IDE\','SWC\','ROOT\','HDAUDIO\','MONITOR\','DISPLAY\','MF\','VMBUS\')
     $candidateSections = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($ref in $modelSectionNames) {
         [void]$candidateSections.Add($ref)
@@ -6710,6 +6999,23 @@ function Invoke-OemPackDownload {
         return $true
     }
 
+    # Vendor metadata can pad a valid digest with whitespace. Normalize only
+    # its edges; a supplied malformed/blank digest must not become no-hash mode.
+    if ($ExpectedSHA256) {
+        $ExpectedSHA256 = $ExpectedSHA256.Trim()
+        if ($ExpectedSHA256 -notmatch '^[a-fA-F0-9]{64}$') {
+            Write-Log 'Invalid expected SHA256 metadata; download refused.' -Level ERROR
+            return $false
+        }
+    }
+    if ($ExpectedMD5) {
+        $ExpectedMD5 = $ExpectedMD5.Trim()
+        if ($ExpectedMD5 -notmatch '^[a-fA-F0-9]{32}$') {
+            Write-Log 'Invalid expected MD5 metadata; download refused.' -Level ERROR
+            return $false
+        }
+    }
+
     if (Test-Path $DestinationPath) {
         Write-Log "Removing existing file before download: $DestinationPath"
         Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue
@@ -6905,17 +7211,8 @@ function Invoke-BackupAction {
         return $EXIT_WARNING
     }
 
-    $wimPath = $null
-    $accessPath = @(Ensure-RecoveryPartitionAccess -TargetDir $currentState.Location)[0]
-    if ($accessPath) {
-        foreach ($cand in @((Join-Path $accessPath "Recovery\WindowsRE\winre.wim"), (Join-Path $accessPath "winre.wim"))) {
-            if (Test-Path -LiteralPath $cand -PathType Leaf) { $wimPath = $cand; break }
-        }
-    }
-    if (-not $wimPath) {
-        $canonical = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
-        if (Test-Path -LiteralPath $canonical -PathType Leaf) { $wimPath = $canonical }
-    }
+    $registeredImage = Get-RegisteredDeploymentImage -WinREState $currentState
+    $wimPath = if ($registeredImage) { $registeredImage.Path } else { $null }
     if (-not $wimPath) {
         Write-Log "Backup cannot proceed: no readable winre.wim found at the registered location ($($currentState.Location))." -Level ERROR
         Set-RunSummaryField -Field 'Result' -Value 'WARNING'
@@ -7107,6 +7404,7 @@ function Invoke-BackupAction {
     Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
     Set-RunSummaryField -Field 'Why' -Value 'WinRE WIM backed up successfully'
     Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
+    Add-RunSummaryLine -Field 'WorkPerformed' -Line 'Copied and hash-verified the registered recovery image and wrote its backup sidecar.'
     Add-RunSummaryLine -Field 'ChangesMade' -Line "Backup directory: $destDir"
     Add-RunSummaryLine -Field 'ChangesMade' -Line "WIM: $destWim ($([math]::Round($sourceSize/1MB,1)) MiB)"
     Add-RunSummaryLine -Field 'ChangesMade' -Line "SHA256: $sourceHash"
@@ -7122,7 +7420,7 @@ function Invoke-RestoreAction {
     Write-Narration "Restore: writing a backed-up Windows RE image back to the currently-registered route."
 
     if (-not $BackupPath) {
-        Write-Log "Restore requires -BackupPath (a directory containing winre.wim and backup.json)." -Level ERROR
+        Write-Log "Restore requires -BackupPath (a directory containing winre.wim; backup.json is optional)." -Level ERROR
         Set-RunSummaryField -Field 'Result' -Value 'WARNING'
         Set-RunSummaryField -Field 'Why' -Value 'No backup path provided'
         Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
@@ -7195,6 +7493,7 @@ function Invoke-RestoreAction {
     }
 
     $targetPart = Resolve-WinRELocationToPartition -Location $stateNow.Location
+    $registeredFolder = ConvertFrom-WinRELocation -Location $stateNow.Location
     $osPart = Get-OSPartition
 
     $isOSFallback = $false
@@ -7206,7 +7505,7 @@ function Invoke-RestoreAction {
         $targetPart.DiskNumber -eq $osPart.DiskNumber -and
         $targetPart.PartitionNumber -eq $osPart.PartitionNumber) {
         $isOSFallback = $true
-        $targetDir = "$env:SystemDrive\Recovery\WindowsRE"
+        $targetDir = "$env:SystemDrive\" + $registeredFolder.RelativePath
         $permanentPath = $targetDir
     } elseif ($targetPart) {
         $isTyped = ($targetPart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or ($targetPart.MbrType -eq 0x27)
@@ -7245,8 +7544,8 @@ function Invoke-RestoreAction {
                 if (-not $Script:tempDriveLetters.Contains($assigned)) { $Script:tempDriveLetters.Add($assigned) }
             }
         }
-        $targetDir = "${targetLetter}:\Recovery\WindowsRE"
-        $permanentPath = "\\?\GLOBALROOT\device\harddisk$($targetPart.DiskNumber)\partition$($targetPart.PartitionNumber)\Recovery\WindowsRE"
+        $targetDir = "${targetLetter}:\" + $registeredFolder.RelativePath
+        $permanentPath = "\\?\GLOBALROOT\device\harddisk$($targetPart.DiskNumber)\partition$($targetPart.PartitionNumber)\" + $registeredFolder.RelativePath
     } else {
         Write-Log "Restore cannot proceed: the registered WinRE location ($($stateNow.Location)) could not be resolved to a partition. Run the default repair action first." -Level ERROR
         Set-RunSummaryField -Field 'Result' -Value 'WARNING'
@@ -7275,12 +7574,12 @@ function Invoke-RestoreAction {
     if (Test-Path -LiteralPath $targetWim -PathType Leaf) {
         $preRestoreTargetHash = Get-LiveWimHash -WimPath $targetWim
         if ($preRestoreTargetHash -and $preRestoreTargetHash -eq $srcHash) {
-            Write-Log "Target already matches the backup WIM (SHA256=$srcHash) - nothing to do"
+            Write-Log "Target already matches the backup WIM (SHA256=$srcHash) - no image replacement needed; WinRE status remains $($stateNow.Status)"
             Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
-            Set-RunSummaryField -Field 'Why' -Value 'Target already matches backup'
+            Set-RunSummaryField -Field 'Why' -Value 'Backup image already present; WinRE registration unchanged'
             Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
-            Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
-            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Target already matched the backup; no changes made.'
+            Set-RunSummaryField -Field 'NextAction' -Value 'No image replacement needed. Run Repair if WinRE needs to be enabled or its recovery layout checked.'
+            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'The backup already matched the target; WIM bytes and WinRE registration were left unchanged.'
             return $EXIT_SUCCESS
         }
     }
@@ -7316,8 +7615,8 @@ function Invoke-RestoreAction {
     $restoreWorkDir = Join-Path $env:SystemDrive 'Recovery\OEM\RestoreWork'
     if (-not $Script:DryRun) {
         try {
-            if (Test-Path -LiteralPath $restoreWorkDir -PathType Container) {
-                Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue
+            if (-not (Remove-RestoreWorkspaceSafely -Path $restoreWorkDir)) {
+                throw 'RestoreWork contains unexpected content, unsafe ancestry or could not be safely cleared.'
             }
             New-Item -Path $restoreWorkDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
         } catch {
@@ -7355,7 +7654,7 @@ function Invoke-RestoreAction {
     # the next run may resolve it.
     if ($preRestoreState.Status -ne 'Enabled' -and $preRestoreState.Status -ne 'Disabled') {
         Write-Log "Restore cannot proceed: WinRE status is indeterminate (reagentc /info reported '$($preRestoreState.Status)'). Refusing to replace the active WIM without positive confirmation of the current WinRE state." -Level ERROR
-        try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Remove-RestoreWorkspaceSafely -Path $restoreWorkDir | Out-Null
         Set-RunSummaryField -Field 'Result' -Value 'WARNING'
         Set-RunSummaryField -Field 'Why' -Value "WinRE status is indeterminate ($($preRestoreState.Status))"
         Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
@@ -7370,7 +7669,7 @@ function Invoke-RestoreAction {
         Write-Log "reagentc /disable: exit=$disExit, output=$disOut"
         if ($disExit -ne 0) {
             Write-Log "Restore aborted: reagentc /disable failed (exit $disExit). The existing WinRE route is intact; no changes were made." -Level ERROR
-            try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+            Remove-RestoreWorkspaceSafely -Path $restoreWorkDir | Out-Null
             Set-RunSummaryField -Field 'Result' -Value 'FATAL'
             Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable failed'
             Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
@@ -7381,7 +7680,7 @@ function Invoke-RestoreAction {
         $verifyDisabled = Get-WinREState
         if ($verifyDisabled.Status -ne 'Disabled') {
             Write-Log "Restore aborted: WinRE still reports $($verifyDisabled.Status) after reagentc /disable." -Level ERROR
-            try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+            Remove-RestoreWorkspaceSafely -Path $restoreWorkDir | Out-Null
             Set-RunSummaryField -Field 'Result' -Value 'FATAL'
             Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable verification failed'
             Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
@@ -7392,16 +7691,17 @@ function Invoke-RestoreAction {
     }
 
     # ---- Transactional replacement ----
+    # Same-script function calls inherit this local workspace through the
+    # PowerShell call chain, so transactional rollback stays in RestoreWork.
     $prevWorkDir = $WorkDir
     $WorkDir = $restoreWorkDir
     $deployOk = $false
     try {
-        if ($isOSFallback) {
-            New-DirectoryIfNotExists $targetDir
-            $deployOk = Deploy-WimTransactional -SourceWim $srcWim -TargetPath $targetWim -TargetDescription "OS-fallback restore target"
-        } else {
-            $deployOk = Deploy-WimToPartition -Partition @{ DriveLetter = $targetLetter; DiskNumber = $targetPart.DiskNumber; PartitionNumber = $targetPart.PartitionNumber } -SourceWim $srcWim
-        }
+        New-DirectoryIfNotExists $targetDir
+        # Restore the exact registered directory, including a custom folder.
+        # Deploy-WimToPartition intentionally targets the standard repair
+        # folder and must not redirect a Restore to a different WIM.
+        $deployOk = Deploy-WimTransactional -SourceWim $srcWim -TargetPath $targetWim -TargetDescription "registered restore target" -ExpectedSourceHash $srcHash
     } finally {
         $WorkDir = $prevWorkDir
     }
@@ -7467,7 +7767,7 @@ function Invoke-RestoreAction {
             Clear-PartitionDeferral
             Add-RunSummaryLine -Field 'ChangesMade' -Line 'The target WIM was replaced or damaged by the failed deploy; state file, checkpoint, and deferral marker were deleted.'
         }
-        try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Remove-RestoreWorkspaceSafely -Path $restoreWorkDir | Out-Null
         Set-RunSummaryField -Field 'Result' -Value 'FATAL'
         Set-RunSummaryField -Field 'Why' -Value 'WIM replacement failed'
         Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
@@ -7476,7 +7776,8 @@ function Invoke-RestoreAction {
     Write-Log "Restore: target WIM replaced and hash-verified"
 
     # ---- setreimage ----
-    $reSetOutput = cmd /c "reagentc /setreimage /path `"$permanentPath`" 2>&1"
+    $pathArgument = ConvertTo-WinREPathArgument -Path $permanentPath
+    $reSetOutput = cmd /c "reagentc /setreimage /path $pathArgument 2>&1"
     $reSetExit = $LASTEXITCODE
     Write-Log "reagentc /setreimage: exit=$reSetExit, output=$reSetOutput"
     if ($reSetExit -ne 0) {
@@ -7497,7 +7798,7 @@ function Invoke-RestoreAction {
         Remove-ItemIfExist $statePath
         Remove-ItemIfExist $CheckpointFile
         Clear-PartitionDeferral
-        try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+        Remove-RestoreWorkspaceSafely -Path $restoreWorkDir | Out-Null
         Set-RunSummaryField -Field 'Result' -Value 'FATAL'
         Set-RunSummaryField -Field 'Why' -Value 'reagentc /setreimage failed after WIM replacement'
         Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($isOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
@@ -7521,7 +7822,7 @@ function Invoke-RestoreAction {
     Remove-ItemIfExist $CheckpointFile
     Clear-PartitionDeferral
 
-    try { Remove-Item -LiteralPath $restoreWorkDir -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+    Remove-RestoreWorkspaceSafely -Path $restoreWorkDir | Out-Null
 
     if ($enableResult -eq 'ok') {
         Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
@@ -7557,6 +7858,843 @@ function Invoke-RestoreAction {
     Add-RunSummaryLine -Field 'ChangesMade' -Line "Restored WIM to $targetWim"
     Add-RunSummaryLine -Field 'ChangesMade' -Line 'Deleted state file, checkpoint, and partition deferral marker.'
     return $EXIT_WARNING
+}
+
+# =========================== DURABLE DEPLOYMENT (v50 patch 5) ===========================
+# The journal owns pending.wim until route AND state verification complete.
+# It is independent of servicing checkpoints and DesiredStateId acceptance.
+# Neither a stale DSI nor an unreadable journal authorizes workspace cleanup.
+function Test-DeploymentPathWithoutReparse {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $current = [IO.Path]::GetFullPath($Path)
+        if ($current -notmatch '^[A-Za-z]:\\') { return $false }
+        while ($current) {
+            if (Test-Path -LiteralPath $current) {
+                $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            }
+            $parent = Split-Path -Path $current -Parent
+            if (-not $parent -or $parent -eq $current) { break }
+            $current = $parent
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Test-DeploymentStoreTrusted {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-PathTrustedForSystem -Path $Path -Kind Directory)) { return $false }
+    # The shared directory policy deliberately permits create-new rights.
+    # This store must also exclude them: users must not pre-create a DISM
+    # mount directory or candidate beneath an otherwise trusted parent.
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $createMask = [Security.AccessControl.FileSystemRights]::WriteData -bor [Security.AccessControl.FileSystemRights]::AppendData
+        $trusted = @('S-1-5-18','S-1-5-32-544')
+        foreach ($ace in $acl.Access) {
+            if ($ace.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            if ($ace.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or -not ($ace.FileSystemRights -band $createMask)) { continue }
+            $sid = $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            if ($sid -notin $trusted) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Initialize-DeploymentJournalDirectory {
+    param([switch]$IncludeCandidateDirectory)
+    $dir = Split-Path -Path $PendingDeploymentPath -Parent
+    if (-not (Test-DeploymentPathWithoutReparse -Path $dir)) { throw 'Deployment journal ancestry contains a reparse point.' }
+    $paths = @((Split-Path $dir -Parent), $dir)
+    if ($IncludeCandidateDirectory) { $paths += $PendingDeploymentDir }
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path) {
+            if (-not (Test-PathTrustedForSystem -Path $path -Kind Directory)) { throw "Untrusted deployment journal directory: $path" }
+        } else {
+            $sec = New-Object Security.AccessControl.DirectorySecurity
+            $sec.SetAccessRuleProtection($true, $false)
+            $admins = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+            $sec.SetOwner($admins)
+            foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+                $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+                $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+                $sec.AddAccessRule($rule)
+            }
+            if ($PSVersionTable.PSEdition -eq 'Core') {
+                [IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new($path), $sec)
+            } else { [IO.Directory]::CreateDirectory($path, $sec) | Out-Null }
+            if (-not (Test-PathTrustedForSystem -Path $path -Kind Directory)) { throw "Journal directory trust verification failed: $path" }
+        }
+    }
+    if ($IncludeCandidateDirectory -and -not (Test-DeploymentStoreTrusted -Path $PendingDeploymentDir)) {
+        throw 'Pending deployment store permits untrusted creation or modification.'
+    }
+}
+
+function Assert-DeploymentCandidate {
+    param([Parameter(Mandatory)][hashtable]$Record)
+    $operationGuid = [guid]::Empty
+    if (-not [guid]::TryParse([string]$Record.OperationId, [ref]$operationGuid) -or $operationGuid -eq [guid]::Empty -or
+        $Record.SchemaVersion -ne 1 -or $Record.Mode -notin @('Managed','Preserved') -or
+        $Record.Phase -notin @('Prepared','MutationStarted','Copied','Registered','Verified') -or
+        $Record.ExpectedSourceHash -notmatch '^[A-Fa-f0-9]{64}$' -or -not $Record.DesiredStateId -or
+        $Record.PreviousStatus -notin @('Enabled','Disabled','Unknown')) { throw 'Invalid pending deployment schema, mode, phase or hash.' }
+    foreach ($value in $Record.Values) {
+        if ($value -is [Collections.IDictionary] -or $value -is [array] -or
+            ($null -ne $value -and $value.GetType().FullName -eq 'System.Management.Automation.PSCustomObject')) {
+            throw 'Invalid pending deployment non-scalar field.'
+        }
+    }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals((Join-Path $PendingDeploymentDir 'pending.wim'), [string]$Record.CandidatePath) -or
+        -not (Test-DeploymentPathWithoutReparse -Path $Record.CandidatePath) -or
+        -not (Test-DeploymentStoreTrusted -Path $PendingDeploymentDir) -or
+        -not (Test-PathTrustedForSystem -Path $Record.CandidatePath -Kind File)) {
+        throw 'Pending candidate is not the trusted, fixed deployment file.'
+    }
+    $disk = Get-OSDisk
+    $part = Get-OSPartition
+    $volume = if ($part) { Get-Volume -Partition $part -ErrorAction Stop } else { $null }
+    if (-not $disk -or -not $part -or -not $volume -or -not $Record.OSDiskId -or -not $Record.OSVolumeId -or
+        [string]$disk.UniqueId -ne [string]$Record.OSDiskId -or [string]$volume.UniqueId -ne [string]$Record.OSVolumeId -or
+        [int64]$part.Offset -ne [int64]$Record.OSPartitionOffset) { throw 'Pending deployment belongs to a different or indeterminate OS disk/volume.' }
+    if ((Get-LiveWimHash -WimPath $Record.CandidatePath) -ne $Record.ExpectedSourceHash) { throw 'Pending candidate is missing, unreadable or differs from its original expected hash.' }
+}
+
+function Read-PendingDeployment {
+    # Probe ancestry first: a missing leaf behind a junction is not absence.
+    # Any probe exception leaves the persistence flag armed.
+    $priorPersist = $Script:ResumeTaskShouldPersist
+    $Script:ResumeTaskShouldPersist = $true
+    if (-not (Test-DeploymentPathWithoutReparse -Path $PendingDeploymentPath)) { throw 'Pending journal ancestry is unsafe; recovery material has been retained.' }
+    $entry = Get-Item -LiteralPath $PendingDeploymentPath -Force -ErrorAction SilentlyContinue -ErrorVariable probeErrors
+    if (-not $entry) {
+        $unexpected = @($probeErrors | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' })
+        if ($unexpected.Count -gt 0) { throw 'Pending journal could not be safely inspected.' }
+        $Script:PendingDeploymentPresent = $false
+        $Script:ResumeTaskShouldPersist = $priorPersist
+        return $null
+    }
+    $Script:PendingDeploymentPresent = $true
+    foreach ($path in @((Split-Path (Split-Path $PendingDeploymentPath -Parent) -Parent), (Split-Path $PendingDeploymentPath -Parent))) {
+        if (-not (Test-PathTrustedForSystem -Path $path -Kind Directory)) { throw "Untrusted pending journal ancestor: $path" }
+    }
+    if (-not (Test-PathTrustedForSystem -Path $PendingDeploymentPath -Kind File)) { throw 'Pending deployment journal is not trusted.' }
+    $parsed = ConvertFrom-DeploymentJson -Json (Get-Content -LiteralPath $PendingDeploymentPath -Raw -ErrorAction Stop)
+    $record = @{}
+    foreach ($property in $parsed.PSObject.Properties) { $record[$property.Name] = $property.Value }
+    Assert-DeploymentCandidate -Record $record
+    return $record
+}
+
+function Write-PendingDeployment {
+    param([Parameter(Mandatory)][hashtable]$Record)
+    if ($Script:DryRun) { return }
+    Initialize-DeploymentJournalDirectory
+    if (Test-Path -LiteralPath $PendingDeploymentPath) {
+        if (-not (Test-PathTrustedForSystem -Path $PendingDeploymentPath -Kind File)) { throw 'Refusing to replace an untrusted pending journal.' }
+    }
+    $Record.UpdatedUtc = [DateTime]::UtcNow.ToString('o')
+    Write-FileAtomically -Path $PendingDeploymentPath -Content ($Record | ConvertTo-Json -Depth 5) -Durable
+    Set-DeploymentFileSecurity -Path $PendingDeploymentPath
+    $readback = Read-PendingDeployment
+    if (-not $readback -or $readback.OperationId -ne $Record.OperationId -or $readback.Phase -ne $Record.Phase -or
+        $readback.ExpectedSourceHash -ne $Record.ExpectedSourceHash) { throw 'Pending journal read-back verification failed.' }
+    foreach ($key in $Record.Keys) {
+        if ([string]$readback[$key] -cne [string]$Record[$key]) { throw "Pending journal field '$key' did not survive read-back unchanged." }
+    }
+    $Script:PendingDeployment = $Record
+}
+
+# Read-only: no temporary drive-letter assignment and no encryption changes.
+function Get-RecoveryLayoutAssessment {
+    param([Parameter(Mandatory)][hashtable]$WinREState, [string]$WimPath)
+    $result = @{ Suitable = $false; Reason = 'registered image or partition unavailable' }
+    try {
+        $disk = Get-OSDisk
+        $osPart = Get-OSPartition
+        $active = Resolve-WinRELocationToPartition -Location $WinREState.Location
+        if (-not $disk -or -not $osPart -or -not $active -or -not $WimPath) { return $result }
+        $parts = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop | Where-Object {
+            $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' -or $_.MbrType -eq 0x27
+        })
+        if ($parts.Count -ne 1 -or $active.DiskNumber -ne $disk.Number -or
+            $active.PartitionNumber -ne $parts[0].PartitionNumber -or $active.PartitionNumber -eq $osPart.PartitionNumber) {
+            $result.Reason = 'route is not the single dedicated OS-disk recovery partition'; return $result
+        }
+        $wimBytes = [int64](Get-Item -LiteralPath $WimPath -Force -ErrorAction Stop).Length
+        $required = [int64](([Math]::Ceiling($wimBytes / 1MB) + $WinREFreeSpaceMiB) * 1MB)
+        $vol = Get-Volume -Partition $active -ErrorAction Stop
+        if (-not $vol -or $vol.FileSystem -ne 'NTFS' -or $active.Size -gt ($MaxManagedRecoveryPartitionMiB * 1MB) -or
+            $active.Size -lt $required -or ([int64]$vol.SizeRemaining + $wimBytes) -lt $required) {
+            $result.Reason = 'dedicated partition does not satisfy the existing reuse capacity/type/ceiling checks'; return $result
+        }
+        $mountPoint = if ($vol.DriveLetter) { "$($vol.DriveLetter):" } else { $vol.UniqueId }
+        if (-not $mountPoint -or (Test-VolumeEncrypted -MountPoint $mountPoint) -ne $false) {
+            $result.Reason = 'dedicated target encryption is not confirmed fully decrypted'; return $result
+        }
+        $result.Suitable = $true
+        $result.Reason = 'single dedicated partition meets the reuse rule'
+        return $result
+    } catch { $result.Reason = "layout assessment indeterminate: $_"; return $result }
+}
+
+function Get-RegisteredDeploymentImage {
+    param([Parameter(Mandatory)][hashtable]$WinREState)
+    $folder = ConvertFrom-WinRELocation -Location $WinREState.Location
+    if (-not $folder -or -not (Resolve-WinRELocationToPartition -Location $folder.NormalizedPath)) { return $null }
+    $access = @(Ensure-RecoveryPartitionAccess -TargetDir $folder.NormalizedPath)[0]
+    if (-not $access) { return $null }
+    $path = Join-Path $access 'winre.wim'
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $hash = Get-LiveWimHash -WimPath $path
+        if ($hash) { return @{ Path = $path; Hash = $hash } }
+    }
+    return $null
+}
+
+function Test-PreviousDeploymentRoute {
+    param([Parameter(Mandatory)][hashtable]$Record)
+    if ($Record.PreviousStatus -ne 'Enabled' -or -not $Record.PreviousHash) { return $false }
+    $now = Get-WinREState
+    if ($now.Status -ne 'Enabled' -or -not (Test-WinRELocationMatches -LocationA $now.Location -LocationB $Record.PreviousLocation)) { return $false }
+    $image = Get-RegisteredDeploymentImage -WinREState $now
+    return ($image -and $image.Hash -eq $Record.PreviousHash)
+}
+
+function Test-PreservedCandidateApplicability {
+    param([Parameter(Mandatory)][hashtable]$Record)
+    Assert-DeploymentCandidate -Record $Record
+    $Script:OwnsWimWork = $true
+    $mount = Join-Path (Split-Path $Record.CandidatePath -Parent) 'preserve_mount'
+    if (-not (Test-DeploymentPathWithoutReparse -Path $mount)) { throw 'Unsafe preservation mount directory.' }
+    # A leftover mount may be a hard-killed previous verification. Discard
+    # it explicitly; never save a preserved image or recursively clear it.
+    $mounted = @(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object { $_.Path -eq $mount })
+    foreach ($image in $mounted) {
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$image.ImagePath, [string]$Record.CandidatePath) -or $image.ImageIndex -ne 1) {
+            throw 'An unrelated mounted image occupies the preservation mount directory.'
+        }
+        Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null
+    }
+    New-DirectoryIfNotExists $mount
+    try {
+        Mount-WindowsImage -ImagePath $Record.CandidatePath -Index 1 -Path $mount -ReadOnly -ErrorAction Stop | Out-Null
+        $gate = Test-StorageDriverApplicability -MountDir $mount
+        if (-not $gate.Applicable) { throw "Preserved image storage applicability refused: $($gate.Reason)" }
+    } finally {
+        $mountedNow = @(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object { $_.Path -eq $mount })
+        foreach ($image in $mountedNow) {
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$image.ImagePath, [string]$Record.CandidatePath) -or $image.ImageIndex -ne 1) {
+                throw 'An unrelated image appeared at the preservation mount; it was left untouched.'
+            }
+            Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null
+        }
+    }
+    Assert-DeploymentCandidate -Record $Record
+}
+
+function Dismount-OwnedWinREImages {
+    param([Parameter(Mandatory)][string]$Workspace)
+    if ($Script:DryRun -or -not $Script:ProgramLockStream -or -not $Script:OwnsWimWork) { return }
+    $owned = @(
+        @{ Path = (Join-Path $Workspace 'mount'); Image = (Join-Path $Workspace 'base.wim') },
+        @{ Path = (Join-Path $PendingDeploymentDir 'preserve_mount'); Image = (Join-Path $PendingDeploymentDir 'pending.wim') }
+    )
+    try {
+        foreach ($mounted in @(Get-WindowsImage -Mounted -ErrorAction Stop)) {
+            foreach ($entry in $owned) {
+                if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$mounted.Path, $entry.Path) -and
+                    [StringComparer]::OrdinalIgnoreCase.Equals([string]$mounted.ImagePath, $entry.Image) -and $mounted.ImageIndex -eq 1) {
+                    Dismount-WindowsImage -Path $mounted.Path -Discard -ErrorAction Stop | Out-Null
+                }
+            }
+        }
+    } catch {
+        Write-Log "Owned image cleanup could not complete: $_" -Level WARN
+        $Script:ResumeTaskShouldPersist = $true
+    }
+}
+
+function Remove-CompletedServicingWorkspace {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    $allowed = @(Get-WorkDirCandidates | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals($_.Path, $Path) })
+    if ($allowed.Count -ne 1 -or -not (Test-DeploymentPathWithoutReparse -Path $Path)) {
+        Write-Log "Completed servicing workspace was retained because its identity could not be verified: $Path" -Level WARN
+        $Script:nonFatalWarning = $true; return
+    }
+    # Walk explicitly, refusing every reparse point before any removal.
+    # Delete only observed files, then empty directories deepest-first.
+    try {
+        $mounted = @(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object {
+            [string]$_.Path -eq $Path -or ([string]$_.Path).StartsWith($Path.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($mounted.Count -gt 0) { throw 'A WIM is still mounted in the completed workspace.' }
+        $directories = [Collections.Generic.List[string]]::new()
+        $files = [Collections.Generic.List[string]]::new()
+        $pending = [Collections.Generic.Stack[string]]::new()
+        $pending.Push($Path)
+        while ($pending.Count -gt 0) {
+            $directory = $pending.Pop()
+            if (-not (Test-DeploymentPathWithoutReparse -Path $directory)) { throw 'Workspace ancestry changed during inventory.' }
+            $directories.Add($directory)
+            foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse point in completed workspace.' }
+                if ($item.PSIsContainer) { $pending.Push($item.FullName) } else { $files.Add($item.FullName) }
+            }
+        }
+        foreach ($file in $files) {
+            if (-not (Test-DeploymentPathWithoutReparse -Path $file)) { throw 'Workspace ancestry changed during cleanup.' }
+            $item = Get-Item -LiteralPath $file -Force -ErrorAction Stop
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Workspace file changed into a directory or reparse point.' }
+            [IO.File]::SetAttributes($file, ($item.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+            [IO.File]::Delete($file)
+        }
+        for ($index = $directories.Count - 1; $index -ge 0; $index--) {
+            if (-not (Test-DeploymentPathWithoutReparse -Path $directories[$index])) { throw 'Workspace directory ancestry changed during cleanup.' }
+            [IO.Directory]::Delete($directories[$index], $false)
+        }
+        Remove-EmptyWorkspaceParent -WorkspacePath $Path
+    } catch {
+        Write-Log "Completed workspace cleanup stopped without recursion: $_" -Level WARN
+        $Script:nonFatalWarning = $true
+    }
+}
+
+# Only a last resort after dedicated creation actually failed. A verified
+# old route is retained instead. The pending journal is NEVER retired here.
+function Invoke-LastResortOSFallback {
+    param([Parameter(Mandatory)][hashtable]$Record)
+    if ($Script:GeometryRestoreFailed -or (Test-VolumeEncrypted -MountPoint $env:SystemDrive) -ne $false -or
+        (Test-PreviousDeploymentRoute -Record $Record)) { return $false }
+    $now = Get-WinREState
+    # Target creation may have taken time or failed after the caller checked
+    # the route. Re-prove its identity here before disabling an enabled WIM.
+    if ($now.Status -eq 'Enabled' -and -not (Resolve-WinRELocationToPartition -Location $now.Location)) {
+        Write-Log 'Last-resort OS-fallback refused: the currently enabled WinRE route cannot be resolved safely.' -Level WARN
+        return $false
+    }
+    $image = Get-RegisteredDeploymentImage -WinREState $now
+    if ($now.Status -notin @('Enabled','Disabled') -or ($now.Status -eq 'Enabled' -and $image)) { return $false }
+    Assert-DeploymentCandidate -Record $Record
+    $Record.Phase = 'MutationStarted'
+    Write-PendingDeployment -Record $Record
+    if ($now.Status -eq 'Enabled') {
+        $output = cmd /c 'reagentc /disable 2>&1'
+        if ($LASTEXITCODE -ne 0 -or (Get-WinREState).Status -ne 'Disabled') { throw "Last-resort disable failed: $output" }
+    }
+    $folder = "$env:SystemDrive\Recovery\WindowsRE"
+    if (-not (Test-DeploymentPathWithoutReparse -Path $folder)) { throw 'Unsafe OS-fallback directory ancestry.' }
+    New-DirectoryIfNotExists $folder
+    if (-not (Deploy-WimTransactional -SourceWim $Record.CandidatePath -TargetPath (Join-Path $folder 'winre.wim') `
+        -TargetDescription 'last-resort OS-fallback' -ExpectedSourceHash $Record.ExpectedSourceHash)) { throw 'Last-resort WIM copy failed.' }
+    $pathArgument = ConvertTo-WinREPathArgument -Path $folder
+    $output = cmd /c "reagentc /setreimage /path $pathArgument 2>&1"
+    if ($LASTEXITCODE -ne 0) { throw "Last-resort registration failed: $output" }
+    $enable = Invoke-ReagentcEnable -ReRegisterPath $folder
+    $now = Get-WinREState
+    $image = Get-RegisteredDeploymentImage -WinREState $now
+    $part = Resolve-WinRELocationToPartition -Location $now.Location
+    $os = Get-OSPartition
+    if ($enable -ne 'ok' -or $now.Status -ne 'Enabled' -or -not $image -or $image.Hash -ne $Record.ExpectedSourceHash -or
+        -not $part -or $part.DiskNumber -ne $os.DiskNumber -or $part.PartitionNumber -ne $os.PartitionNumber) {
+        throw 'Last-resort OS-fallback route could not be verified.'
+    }
+    $Script:FallbackVerifiedDuringAttempt = $true
+    $ownedHash = if ($Record.Mode -eq 'Managed') { $Record.ExpectedSourceHash } else { $Record.PriorManagedHash }
+    if ($Record.Mode -eq 'Preserved' -and $ownedHash -eq $Record.ExpectedSourceHash) { $ownedHash = $null }
+    $accepted = if ($Record.Mode -eq 'Preserved') { $Record.ExpectedSourceHash } else { $null }
+    Write-WinREState -Hash $ownedHash -DriverVersion $Record.DriverVersion -DesiredStateId $Record.DesiredStateId `
+        -UsedOSFallback $true -ForeignSourceAcceptedHash $accepted -DeployedWinREMetadata $Record.DeployedWinREMetadata `
+        -LocalInputsId $Record.LocalInputsId -LineageId $Record.LineageId
+    $saved = Get-Content -LiteralPath "$env:SystemDrive\Recovery\OEM\$StateFileName" -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if (-not $saved.UsedOSFallback -or [string]$saved.CurrentImageHash -ne [string]$ownedHash -or
+        [string]$saved.ForeignSourceAcceptedHash -ne [string]$accepted -or $saved.DesiredStateId -ne $Record.DesiredStateId) {
+        throw 'OS-fallback state did not survive read-back; journal and candidate retained.'
+    }
+    $Record.PreviousStatus = $now.Status
+    $Record.PreviousLocation = $now.Location
+    $Record.PreviousHash = $image.Hash
+    $Record.Phase = 'Registered'
+    Write-PendingDeployment -Record $Record
+    Write-PartitionDeferral -DesiredStateId $Record.DesiredStateId -Category Execution -Reason 'Dedicated creation failed; verified OS-fallback remains a temporary last resort'
+    $Script:UsedOSFallback = $true
+    Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+    Set-RunSummaryField -Field 'Decision' -Value 'DEGRADED FALLBACK'
+    Set-RunSummaryField -Field 'OperatingMode' -Value 'OS-FALLBACK'
+    Set-RunSummaryField -Field 'Why' -Value 'Dedicated creation failed; fully-decrypted OS-fallback registration and bytes verified'
+    Set-RunSummaryField -Field 'NextAction' -Value 'Resolve the dedicated-partition failure and re-run. Candidate, journal and resume task remain.'
+    return $true
+}
+
+function Complete-PendingWinREDeployment {
+    param([Parameter(Mandatory)][hashtable]$Record)
+    Assert-DeploymentCandidate -Record $Record
+    $now = Get-WinREState
+    $image = Get-RegisteredDeploymentImage -WinREState $now
+    $layout = if ($image) { Get-RecoveryLayoutAssessment -WinREState $now -WimPath $image.Path } else { $null }
+    if ($now.Status -ne 'Enabled' -or -not $image -or $image.Hash -ne $Record.ExpectedSourceHash -or -not $layout.Suitable) {
+        throw 'The registered dedicated route, its expected bytes and its capacity could not all be verified.'
+    }
+    if ($Script:GeometryRestoreFailed) { throw 'Partition geometry remains unverified; deployment cannot be committed.' }
+    $target = Resolve-WinRELocationToPartition -Location $now.Location
+    $disk = Get-OSDisk
+    if (-not (Set-RecoveryPartitionAttributes -DiskNumber $target.DiskNumber -PartitionNumber $target.PartitionNumber -Style $disk.PartitionStyle)) {
+        throw 'Dedicated target attributes could not be confirmed.'
+    }
+    $Record.Phase = 'Verified'
+    Write-PendingDeployment -Record $Record
+    $commitState = Get-WinREState
+    $commitImage = Get-RegisteredDeploymentImage -WinREState $commitState
+    if ($commitState.Status -ne 'Enabled' -or -not $commitImage -or $commitImage.Hash -ne $Record.ExpectedSourceHash -or
+        -not (Test-WinRELocationMatches -LocationA $commitState.Location -LocationB $now.Location)) {
+        throw 'Registered image or route changed immediately before state commit.'
+    }
+    $managedHash = if ($Record.Mode -eq 'Managed') { $Record.ExpectedSourceHash } else { $Record.PriorManagedHash }
+    # A preservation decision never manufactures positive ownership.
+    if ($Record.Mode -eq 'Preserved' -and $managedHash -eq $Record.ExpectedSourceHash) { $managedHash = $null }
+    $foreignHash = if ($Record.Mode -eq 'Preserved') { $Record.ExpectedSourceHash } else { $null }
+    Write-WinREState -Hash $managedHash -DriverVersion $Record.DriverVersion -DesiredStateId $Record.DesiredStateId `
+        -PendingReboot $false -UsedOSFallback $false -RepairAttempts 0 -LastEnableResult 'ok' -EnableFailureAttempts 0 `
+        -DeployedDiskNumber $target.DiskNumber -DeployedPartitionNumber $target.PartitionNumber `
+        -DeployedWinREMetadata $Record.DeployedWinREMetadata -LocalInputsId $Record.LocalInputsId `
+        -ForeignSourceAcceptedHash $foreignHash -LineageId $Record.LineageId
+    $statePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
+    $saved = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($saved.DesiredStateId -ne $Record.DesiredStateId -or [string]$saved.CurrentImageHash -ne [string]$managedHash -or
+        [string]$saved.ForeignSourceAcceptedHash -ne [string]$foreignHash -or $saved.UsedOSFallback -or $saved.PendingReboot -or
+        $saved.DeployedDiskNumber -ne $target.DiskNumber -or $saved.DeployedPartitionNumber -ne $target.PartitionNumber) {
+        throw 'State read-back did not match the verified deployment; retaining recovery material.'
+    }
+    Add-RunSummaryLine -Field 'WorkPerformed' -Line 'Verified dedicated WinRE registration, image bytes, servicing capacity and saved state.'
+    # Only manager-owned bytes may refresh the manager-owned LKG. A failed
+    # LKG copy does not roll back a successfully verified active route.
+    if ($Record.Mode -eq 'Managed') {
+        $lkg = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
+        New-DirectoryIfNotExists (Split-Path $lkg -Parent)
+        if (-not (Deploy-WimTransactional -SourceWim $Record.CandidatePath -TargetPath $lkg -TargetDescription 'manager-owned LKG' -ExpectedSourceHash $Record.ExpectedSourceHash)) {
+            Write-Log 'Verified dedicated route committed, but refreshing the manager-owned LKG failed.' -Level WARN
+            $Script:nonFatalWarning = $true
+        }
+    }
+    # Retire the durable owner FIRST. If retirement fails, keep the WIM
+    # and task, even though the route and state have already committed.
+    Remove-Item -LiteralPath $PendingDeploymentPath -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $PendingDeploymentPath) { throw 'Pending journal could not be retired.' }
+    $Script:PendingDeploymentPresent = $false
+    $Script:PendingDeployment = $null
+    $Script:ResumeTaskShouldPersist = $false
+    $cleanupSteps = @(
+        { Clear-PartitionDeferral },
+        { Remove-ItemIfExist $CheckpointFile },
+        {
+            if ($Script:DeploymentCandidateLock) { $Script:DeploymentCandidateLock.Dispose(); $Script:DeploymentCandidateLock = $null }
+            Remove-ItemIfExist $Record.CandidatePath
+        },
+        { if ($Script:RollbackWimPath) { Remove-ItemIfExist $Script:RollbackWimPath; $Script:RollbackWimPath = $null } },
+        { Remove-CompletedServicingWorkspace -Path $Record.ServicingWorkDir }
+    )
+    foreach ($cleanupStep in $cleanupSteps) {
+        try { & $cleanupStep } catch {
+            Write-Log "Verified deployment committed; post-commit cleanup failed: $_" -Level WARN
+            $Script:nonFatalWarning = $true
+        }
+    }
+    try {
+        if (-not (Remove-StrayRecoveryPartitions -OSDiskNumber $disk.Number)) { $Script:nonFatalWarning = $true }
+    } catch { Write-Log "Post-commit stray recovery cleanup failed: $_" -Level WARN; $Script:nonFatalWarning = $true }
+    $Script:UsedOSFallback = $false
+    $mode = if ($Record.Mode -eq 'Preserved') { 'PRESERVED-DEDICATED' } else { 'DEDICATED' }
+    $deployedBuild = 'unknown'
+    try { $deployedBuild = ([version]($Record.DeployedWinREMetadata -split '\|')[0]).Build } catch { }
+    Write-Log "Post-deploy WIM build: $deployedBuild"
+    Write-Log "Final deployed WinRE SHA256: $($Record.ExpectedSourceHash)"
+    Write-Log "Operating mode: $mode; image handling: $($Record.ImageHandling)"
+    Set-RunSummaryField -Field 'OperatingMode' -Value $mode
+    Set-RunSummaryField -Field 'Decision' -Value 'DEPLOYMENT VERIFIED'
+    Set-RunSummaryField -Field 'Result' -Value $(if ($Script:nonFatalWarning) { 'WARNING' } else { 'SUCCESS' })
+    Set-RunSummaryField -Field 'Why' -Value 'Dedicated registration, WIM hash, reuse capacity and saved state verified'
+    Set-RunSummaryField -Field 'NextAction' -Value $(if ($Script:nonFatalWarning) { 'Review the warnings above. The dedicated registration and image were verified.' } else { 'No action required.' })
+    Add-RunSummaryLine -Field 'ChangesMade' -Line "Verified $mode route on disk $($target.DiskNumber), partition $($target.PartitionNumber)."
+    return $(if ($Script:nonFatalWarning) { $EXIT_WARNING } else { $EXIT_SUCCESS })
+}
+
+function Open-DeploymentCandidateReadLock {
+    param([Parameter(Mandatory)][string]$Path)
+    return [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+}
+
+function Set-DeploymentFileSecurity {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Path -ne $PendingDeploymentPath -and $Path -ne (Join-Path $PendingDeploymentDir 'pending.wim')) {
+        throw 'Deployment ACL changes are limited to the journal and its fixed candidate.'
+    }
+    if (-not (Test-DeploymentPathWithoutReparse -Path $Path)) { throw 'Unsafe deployment file ancestry.' }
+    $acl = New-Object Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $admins = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $acl.SetOwner($admins)
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    if (-not (Test-PathTrustedForSystem -Path $Path -Kind File)) { throw 'Deployment file ACL did not verify.' }
+}
+
+function Sync-DeploymentCandidate {
+    param([Parameter(Mandatory)][string]$Path)
+    Set-DeploymentFileSecurity -Path $Path
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) {
+        [IO.File]::SetAttributes($Path, ($item.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+    }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try { $stream.Flush($true) } finally { $stream.Dispose() }
+}
+
+function Invoke-PendingWinREDeployment {
+    param([Parameter(Mandatory)][hashtable]$Record)
+    $Script:ResumeTaskShouldPersist = $true
+    $Script:PendingDeploymentPresent = $true
+    $Script:PendingDeployment = $Record
+    $Script:FallbackVerifiedDuringAttempt = $false
+    $phaseAtEntry = [string]$Record.Phase
+    $Script:WorkDir = Split-Path $Record.CandidatePath -Parent
+    if ($Script:DryRun) {
+        Write-Log '[DRY RUN] Pending deployment owns its workspace; would validate and resume it before ordinary servicing.'
+        Set-RunSummaryField -Field 'Result' -Value 'DRY_RUN'
+        Set-RunSummaryField -Field 'Decision' -Value 'PENDING DEPLOYMENT'
+        return $EXIT_SUCCESS
+    }
+    try {
+        Assert-DeploymentCandidate -Record $Record
+        $Script:DeploymentCandidateLock = Open-DeploymentCandidateReadLock -Path $Record.CandidatePath
+        Assert-DeploymentCandidate -Record $Record
+        $entryState = Get-WinREState
+        if ($entryState.Status -notin @('Enabled','Disabled')) {
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'WinRE status is indeterminate; no target preparation or route switch attempted'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Resolve the WinRE status query failure and re-run; recovery material is retained.'
+            return $EXIT_FATAL
+        }
+        if ($entryState.Status -eq 'Enabled' -and
+            -not (Resolve-WinRELocationToPartition -Location $entryState.Location)) {
+            throw 'Enabled WinRE route cannot be resolved safely; no target selection or preparation was attempted.'
+        }
+        if ($Record.Mode -eq 'Preserved' -or $Record.LocalInputsId -ne $Script:LocalInputsId) {
+            Test-PreservedCandidateApplicability -Record $Record
+        }
+        # A crash after enable or state persistence needs only verification
+        # and commit, not another disable/copy cycle.
+        $now = Get-WinREState
+        $activeImage = Get-RegisteredDeploymentImage -WinREState $now
+        if ($now.Status -eq 'Enabled' -and $activeImage -and $activeImage.Hash -ne $Record.ExpectedSourceHash -and
+            ($activeImage.Hash -ne $Record.PreviousHash -or
+             -not (Test-WinRELocationMatches -LocationA $now.Location -LocationB $Record.PreviousLocation))) {
+            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+            Set-RunSummaryField -Field 'Decision' -Value 'SOURCE CHANGED'
+            Set-RunSummaryField -Field 'Why' -Value 'A different readable image is now registered; the pending candidate will not overwrite it'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Review the changed source and pending journal before retrying. Both images are retained.'
+            return $EXIT_WARNING
+        }
+        # A previous attempt may have established a verified last-resort
+        # route before an interruption. Capture it as the rollback route
+        # for this attempt; never restore an older, now-missing partition.
+        $currentPart = Resolve-WinRELocationToPartition -Location $now.Location
+        if ($now.Status -eq 'Enabled' -and -not $currentPart) {
+            throw 'Enabled WinRE route became unresolvable before target selection.'
+        }
+        $currentOS = Get-OSPartition
+        if ($now.Status -eq 'Enabled' -and $activeImage -and $activeImage.Hash -eq $Record.ExpectedSourceHash -and
+            $currentPart -and $currentPart.DiskNumber -eq $currentOS.DiskNumber -and $currentPart.PartitionNumber -eq $currentOS.PartitionNumber -and
+            (Test-VolumeEncrypted -MountPoint $env:SystemDrive) -eq $false) {
+            $Record.PreviousStatus = $now.Status; $Record.PreviousLocation = $now.Location; $Record.PreviousHash = $activeImage.Hash
+            Write-PendingDeployment -Record $Record
+        }
+        if ($now.Status -eq 'Enabled' -and $activeImage -and $activeImage.Hash -eq $Record.ExpectedSourceHash -and
+            (Get-RecoveryLayoutAssessment -WinREState $now -WimPath $activeImage.Path).Suitable) {
+            return (Complete-PendingWinREDeployment -Record $Record)
+        }
+        if ($now.Status -notin @('Enabled','Disabled')) {
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Why' -Value 'WinRE status became indeterminate during verification; no target preparation attempted'
+            return $EXIT_FATAL
+        }
+        $deferral = Read-PartitionDeferral -CurrentDesiredStateId $Record.DesiredStateId
+        $retryAfter = [DateTime]::MinValue
+        if ($deferral -and $deferral.Category -eq 'Execution' -and
+            [DateTime]::TryParse($deferral.RetryAfterUtc, [ref]$retryAfter) -and
+            $retryAfter.ToUniversalTime() -gt [DateTime]::UtcNow -and
+            $retryAfter.ToUniversalTime() -le [DateTime]::UtcNow.AddHours(1)) {
+            # A cooldown limits work; it cannot turn an unresolved loss of
+            # the active route on a prior attempt into a mere warning.
+            $backoffCode = if ($phaseAtEntry -eq 'Prepared' -or (Test-PreviousDeploymentRoute -Record $Record)) { $EXIT_WARNING } else { $EXIT_FATAL }
+            Set-RunSummaryField -Field 'Result' -Value $(if ($backoffCode -eq $EXIT_FATAL) { 'FATAL' } else { 'WARNING' })
+            Set-RunSummaryField -Field 'Decision' -Value 'RETRY BACKOFF'
+            Set-RunSummaryField -Field 'Why' -Value $deferral.Reason
+            Set-RunSummaryField -Field 'NextAction' -Value "Retry after $($deferral.RetryAfterUtc), or remove the deferral marker to retry immediately."
+            return $backoffCode
+        }
+        $Script:RegisteredSourceFingerprint = Get-RegisteredWinREFingerprint -WinREState $now `
+            -RegisteredWimPath $(if ($activeImage) { $activeImage.Path } else { $null }) `
+            -RegisteredWimHash $(if ($activeImage) { $activeImage.Hash } else { $null })
+        $requiredMiB = [int][Math]::Ceiling((Get-Item -LiteralPath $Record.CandidatePath -Force -ErrorAction Stop).Length / 1MB)
+        $target = Find-SuitableRecoveryPartition -RequiredWimSizeMB $requiredMiB
+        if (-not $target) {
+            $created = Ensure-AdequateRecoveryPartition -RequiredWimSizeMB $requiredMiB `
+                -ProtectedSourcePath $Record.CandidatePath -ExpectedSourceHash $Record.ExpectedSourceHash -PrepareBeforeDisable
+            if ($created -and $created.Status -eq 'Deferred') {
+                if ($created.RetrySuppressible) {
+                    Write-PartitionDeferral -DesiredStateId $Record.DesiredStateId -Reason $created.Reason `
+                        -Category $(if ($created.Reason -like 'post-shrink free space below minimum*') { 'Capacity' } else { 'Execution' })
+                }
+                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+                Set-RunSummaryField -Field 'Decision' -Value 'DEFERRED'
+                Set-RunSummaryField -Field 'Why' -Value $created.Reason
+                Set-RunSummaryField -Field 'NextAction' -Value 'Resolve the reported condition and re-run; the pending image is retained.'
+                if ($Script:GeometryRestoreFailed -or
+                    ($phaseAtEntry -ne 'Prepared' -and -not (Test-PreviousDeploymentRoute -Record $Record))) {
+                    Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+                    return $EXIT_FATAL
+                }
+                return $EXIT_WARNING
+            }
+            if (-not $created -or $created.Status -ne 'Created') {
+                if (Invoke-LastResortOSFallback -Record $Record) { return $EXIT_WARNING }
+                throw 'Dedicated target creation failed; recovery material retained. No unverified OS-fallback switch was attempted.'
+            }
+            $target = $created
+        }
+        Assert-DeploymentCandidate -Record $Record
+        # Selection can take time and may assign a temporary drive letter.
+        # Re-prove the current active route before decryption or any target
+        # WIM mutation; never treat an unknown active partition as inactive.
+        $beforeReady = Get-WinREState
+        if ($beforeReady.Status -notin @('Enabled','Disabled') -or
+            ($beforeReady.Status -eq 'Enabled' -and
+             (-not (Resolve-WinRELocationToPartition -Location $beforeReady.Location) -or
+              -not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'pending target readiness')))) {
+            throw 'Current WinRE route cannot be verified before target preparation.'
+        }
+        $targetPart = Get-Partition -DiskNumber $target.DiskNumber -PartitionNumber $target.PartitionNumber -ErrorAction Stop
+        $Record.TargetPartitionGuid = [string]$targetPart.Guid
+        $Record.TargetOffset = [int64]$targetPart.Offset
+        $Record.TargetSize = [int64]$targetPart.Size
+        $Record.Phase = 'MutationStarted'
+        Write-PendingDeployment -Record $Record
+        if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $target.DiskNumber -PartitionNumber $target.PartitionNumber)) {
+            throw 'Dedicated target could not be confirmed ready and fully decrypted.'
+        }
+        $permanentPath = "\\?\GLOBALROOT\device\harddisk$($target.DiskNumber)\partition$($target.PartitionNumber)\Recovery\WindowsRE"
+        $current = Get-WinREState
+        $activePart = Resolve-WinRELocationToPartition -Location $current.Location
+        if ($current.Status -notin @('Enabled','Disabled') -or
+            ($current.Status -eq 'Enabled' -and -not $activePart)) {
+            throw 'Current WinRE route cannot be resolved before WIM copy; refusing to guess that the target is inactive.'
+        }
+        $targetIsActive = ($activePart -and $activePart.DiskNumber -eq $target.DiskNumber -and $activePart.PartitionNumber -eq $target.PartitionNumber)
+        $copyBeforeDisable = -not ($current.Status -eq 'Enabled' -and $targetIsActive)
+        if ($copyBeforeDisable) {
+            Assert-DeploymentCandidate -Record $Record
+            if (-not (Deploy-WimToPartition -Partition $target -SourceWim $Record.CandidatePath -ExpectedSourceHash $Record.ExpectedSourceHash)) {
+                throw 'Target WIM copy or expected-hash verification failed before registration switch.'
+            }
+            Add-RunSummaryLine -Field 'WorkPerformed' -Line 'Copied and hash-verified the recovery image on the dedicated target.'
+            $Record.Phase = 'Copied'
+            Write-PendingDeployment -Record $Record
+        }
+        $current = Get-WinREState
+        if ($current.Status -notin @('Enabled','Disabled')) { throw 'WinRE status became indeterminate before the route switch.' }
+        if ($current.Status -eq 'Enabled') {
+            if (-not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'pending deployment switch')) {
+                throw 'Registered source changed before the switch; candidate retained for inspection.'
+            }
+            Assert-DeploymentCandidate -Record $Record
+            $Record.Phase = 'MutationStarted'
+            Write-PendingDeployment -Record $Record
+            $output = cmd /c 'reagentc /disable 2>&1'
+            if ($LASTEXITCODE -ne 0 -or (Get-WinREState).Status -ne 'Disabled') { throw "WinRE disable failed: $output" }
+        }
+        if (-not $copyBeforeDisable) {
+            Assert-DeploymentCandidate -Record $Record
+            if (-not (Deploy-WimToPartition -Partition $target -SourceWim $Record.CandidatePath -ExpectedSourceHash $Record.ExpectedSourceHash)) { throw 'Active-target WIM deployment failed.' }
+            Add-RunSummaryLine -Field 'WorkPerformed' -Line 'Copied and hash-verified the recovery image on the dedicated target.'
+            $Record.Phase = 'Copied'
+            Write-PendingDeployment -Record $Record
+        }
+        # Re-read the actual destination immediately before registration.
+        $targetImage = Get-RegisteredDeploymentImage -WinREState @{ Location = $permanentPath; Status = 'Disabled' }
+        if (-not $targetImage -or $targetImage.Hash -ne $Record.ExpectedSourceHash) { throw 'Destination bytes changed before registration.' }
+        $pathArgument = ConvertTo-WinREPathArgument -Path $permanentPath
+        $output = cmd /c "reagentc /setreimage /path $pathArgument 2>&1"
+        if ($LASTEXITCODE -ne 0) { throw "WinRE registration failed: $output" }
+        $Record.Phase = 'Registered'
+        Write-PendingDeployment -Record $Record
+        $enable = Invoke-ReagentcEnable -AllowTempLetter -Partition $target -ReRegisterPath $permanentPath
+        if ($enable -eq 'reboot' -and (Get-WinREState).Status -ne 'Enabled') {
+            Set-RunSummaryField -Field 'Result' -Value 'REBOOT_REQUIRED'
+            Set-RunSummaryField -Field 'Decision' -Value 'PENDING DEPLOYMENT'
+            Set-RunSummaryField -Field 'Why' -Value 'Enable requires another boot; candidate and journal retained'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Reboot, then allow the resume task or re-run the manager.'
+            return $EXIT_REBOOT_REQUIRED
+        }
+        if ($enable -ne 'ok' -and (Get-WinREState).Status -ne 'Enabled') { throw "WinRE enable failed ($enable)." }
+        return (Complete-PendingWinREDeployment -Record $Record)
+    } catch {
+        Write-Log "Pending deployment stopped: $_" -Level ERROR
+        $verifiedNow = Get-WinREState
+        $verifiedImage = Get-RegisteredDeploymentImage -WinREState $verifiedNow
+        $newRouteGood = ($verifiedNow.Status -eq 'Enabled' -and $verifiedImage -and
+            $verifiedImage.Hash -eq $Record.ExpectedSourceHash -and
+            (Get-RecoveryLayoutAssessment -WinREState $verifiedNow -WimPath $verifiedImage.Path).Suitable)
+        if (-not $newRouteGood -and $Script:FallbackVerifiedDuringAttempt -and $verifiedNow.Status -eq 'Enabled' -and
+            $verifiedImage -and $verifiedImage.Hash -eq $Record.ExpectedSourceHash -and
+            (Test-VolumeEncrypted -MountPoint $env:SystemDrive) -eq $false) {
+            $verifiedPart = Resolve-WinRELocationToPartition -Location $verifiedNow.Location
+            $verifiedOS = Get-OSPartition
+            $newRouteGood = ($verifiedPart -and $verifiedPart.DiskNumber -eq $verifiedOS.DiskNumber -and $verifiedPart.PartitionNumber -eq $verifiedOS.PartitionNumber)
+        }
+        if ($newRouteGood) {
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Decision' -Value 'PERSISTENCE FAILURE'
+            Set-RunSummaryField -Field 'Why' -Value "New route registration and bytes are verified; persistence or cleanup failed: $_"
+            Set-RunSummaryField -Field 'NextAction' -Value 'Keep the verified route. Candidate and journal are retained for commit recovery.'
+            return $EXIT_FATAL
+        }
+        if ($verifiedNow.Status -eq 'Enabled' -and $verifiedImage -and
+            $verifiedImage.Hash -ne $Record.ExpectedSourceHash -and $verifiedImage.Hash -ne $Record.PreviousHash) {
+            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+            Set-RunSummaryField -Field 'Decision' -Value 'SOURCE CHANGED'
+            Set-RunSummaryField -Field 'Why' -Value 'A different readable image became registered during deployment; it was left untouched'
+            Set-RunSummaryField -Field 'NextAction' -Value 'Review the changed route and retained pending candidate before retrying.'
+            return $EXIT_FATAL
+        }
+        $oldIntact = Test-PreviousDeploymentRoute -Record $Record
+        if (-not $oldIntact -and $Record.PreviousStatus -eq 'Enabled' -and $Record.PreviousHash) {
+            # Restore-PreviousWinRERoute does not recreate deleted partitions.
+            # Its return is not sufficient: prove the previous bytes too.
+            $oldImage = Get-RegisteredDeploymentImage -WinREState @{ Status = 'Disabled'; Location = $Record.PreviousLocation }
+            if ($oldImage -and $oldImage.Hash -eq $Record.PreviousHash) {
+                Restore-PreviousWinRERoute -PreviousState @{ Status = $Record.PreviousStatus; Location = $Record.PreviousLocation } | Out-Null
+                $oldIntact = Test-PreviousDeploymentRoute -Record $Record
+            }
+        }
+        $beforeMutation = ($Record.Phase -eq 'Prepared')
+        $code = if (-not $Script:GeometryRestoreFailed -and ($oldIntact -or $beforeMutation)) { $EXIT_WARNING } else { $EXIT_FATAL }
+        Set-RunSummaryField -Field 'Result' -Value $(if ($code -eq $EXIT_WARNING) { 'WARNING' } else { 'FATAL' })
+        Set-RunSummaryField -Field 'Decision' -Value 'PENDING DEPLOYMENT'
+        Set-RunSummaryField -Field 'Why' -Value ([string]$_)
+        Set-RunSummaryField -Field 'NextAction' -Value 'Candidate, journal and resume task retained. Review the failure before retrying.'
+        try { Write-PartitionDeferral -DesiredStateId $Record.DesiredStateId -Reason ([string]$_) -Category Execution } catch { }
+        return $code
+    } finally {
+        if ($Script:DeploymentCandidateLock) { $Script:DeploymentCandidateLock.Dispose(); $Script:DeploymentCandidateLock = $null }
+    }
+}
+
+function Remove-UnjournaledDeploymentCopy {
+    # Only called for a copy created by THIS attempt, before Invoke can run.
+    # Never collect a pre-existing orphan or a candidate with any journal.
+    if ((Test-Path -LiteralPath $PendingDeploymentPath -ErrorAction Stop) -or
+        -not (Test-DeploymentStoreTrusted -Path $PendingDeploymentDir)) { return }
+    $path = Join-Path $PendingDeploymentDir 'pending.wim'
+    if (-not (Test-DeploymentPathWithoutReparse -Path $path)) { return }
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return }
+    [IO.File]::SetAttributes($path, ($item.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+    [IO.File]::Delete($path)
+}
+
+function Start-WinREDeployment {
+    param(
+        [Parameter(Mandatory)][string]$SourceWim,
+        [Parameter(Mandatory)][ValidateSet('Managed','Preserved')][string]$Mode,
+        [Parameter(Mandatory)][string]$ExpectedSourceHash,
+        [Parameter(Mandatory)][string]$DesiredStateId,
+        [string]$DriverVersion,
+        [hashtable]$PriorState = @{},
+        [switch]$CopyOnly
+    )
+    if ($Script:DryRun) {
+        Write-Log "[DRY RUN] Would stage a hash-bound $Mode candidate, assess dedicated capacity, prepare before switching where possible, and verify route/state."
+        Set-RunSummaryField -Field 'Result' -Value 'DRY_RUN'
+        Set-RunSummaryField -Field 'Decision' -Value 'RELOCATION PLAN'
+        return $EXIT_SUCCESS
+    }
+    if (Test-Path -LiteralPath $PendingDeploymentPath) { throw 'A pending deployment already owns its candidate; it must be resumed first.' }
+    if ($ExpectedSourceHash -notmatch '^[A-Fa-f0-9]{64}$' -or (Get-LiveWimHash -WimPath $SourceWim) -ne $ExpectedSourceHash) { throw 'Original deployment source hash is missing or changed.' }
+    if (-not $Script:RegisteredSourceFingerprint) {
+        $startingState = Get-WinREState
+        $startingImage = Get-RegisteredDeploymentImage -WinREState $startingState
+        $Script:RegisteredSourceFingerprint = Get-RegisteredWinREFingerprint -WinREState $startingState `
+            -RegisteredWimPath $(if ($startingImage) { $startingImage.Path } else { $null }) `
+            -RegisteredWimHash $(if ($startingImage) { $startingImage.Hash } else { $null })
+    }
+    if (-not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'protected candidate staging')) {
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Registered source changed before independent staging; no deployment attempted'
+        return $EXIT_WARNING
+    }
+    Initialize-DeploymentJournalDirectory -IncludeCandidateDirectory
+    $osPart = Get-OSPartition
+    $osVolume = Get-Volume -Partition $osPart -ErrorAction Stop
+    $requiredStagingBytes = [int64]((Get-Item -LiteralPath $SourceWim -Force -ErrorAction Stop).Length + 32MB)
+    if (-not (Test-Path -LiteralPath (Join-Path $PendingDeploymentDir 'pending.wim')) -and [int64]$osVolume.SizeRemaining -lt $requiredStagingBytes) {
+        Write-Log 'Deployment deferred: the OS volume lacks capacity for the protected independent candidate; original source retained.' -Level WARN
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Insufficient space for protected deployment staging'
+        return $EXIT_WARNING
+    }
+    $candidate = Join-Path $PendingDeploymentDir 'pending.wim'
+    if (-not (Test-DeploymentPathWithoutReparse -Path $candidate)) { throw 'Pending candidate ancestry is unsafe.' }
+    $newCopy = $false
+    if (Test-Path -LiteralPath $candidate) {
+        if (-not (Test-PathTrustedForSystem -Path $candidate -Kind File) -or (Get-LiveWimHash -WimPath $candidate) -ne $ExpectedSourceHash) {
+            throw 'Unclaimed pending.wim differs from this candidate; inspect it before retrying.'
+        }
+    } else { $newCopy = $true }
+    try {
+        if ($newCopy) { Copy-Item -LiteralPath $SourceWim -Destination $candidate -ErrorAction Stop }
+        # Flush the independent copy before a journal can authorize mutation.
+        # This improves power-loss durability; it is not a disk transaction.
+        Sync-DeploymentCandidate -Path $candidate
+        if ((Get-LiveWimHash -WimPath $candidate) -ne $ExpectedSourceHash) { throw 'Independent candidate copy failed original-hash verification.' }
+    } catch {
+        if ($newCopy) { try { Remove-UnjournaledDeploymentCopy } catch { Write-Log "Partial unjournaled candidate retained: $_" -Level WARN } }
+        throw
+    }
+    if (-not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'protected candidate staged')) {
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Registered source changed while staging; the protected copy is retained for inspection'
+        return $EXIT_WARNING
+    }
+    $previous = Get-WinREState
+    $previousImage = Get-RegisteredDeploymentImage -WinREState $previous
+    $osPart = Get-OSPartition
+    $osDisk = Get-OSDisk
+    $osVolume = Get-Volume -Partition $osPart -ErrorAction Stop
+    $metadata = Get-WimServicingMetadata -WimPath $candidate
+    $record = @{
+        SchemaVersion = 1; OperationId = [guid]::NewGuid().ToString('D'); Phase = 'Prepared'; Mode = $Mode
+        ImageHandling = $(if ($Mode -eq 'Preserved') { 'Preserved' } elseif ($CopyOnly) { 'CopyOnly' } else { 'Serviced' })
+        CandidatePath = $candidate; ExpectedSourceHash = $ExpectedSourceHash; DesiredStateId = $DesiredStateId
+        DriverVersion = $DriverVersion; PriorManagedHash = $PriorState.CurrentImageHash; LineageId = $Script:LineageId
+        LocalInputsId = $Script:LocalInputsId
+        DeployedWinREMetadata = $(if ($metadata) { "$($metadata.Version)|$($metadata.SPBuild)" } else { $null })
+        OSDiskId = [string]$osDisk.UniqueId; OSVolumeId = [string]$osVolume.UniqueId; OSPartitionOffset = [int64]$osPart.Offset
+        PreviousStatus = $previous.Status; PreviousLocation = $previous.Location
+        PreviousHash = $(if ($previousImage) { $previousImage.Hash } else { $null })
+        TargetPartitionGuid = $null; TargetOffset = $null; TargetSize = $null
+        ServicingWorkDir = $WorkDir
+    }
+    Assert-DeploymentCandidate -Record $record
+    try { Write-PendingDeployment -Record $record } catch {
+        if ($newCopy) { try { Remove-UnjournaledDeploymentCopy } catch { Write-Log "Unjournaled candidate retained: $_" -Level WARN } }
+        throw
+    }
+    return (Invoke-PendingWinREDeployment -Record $record)
 }
 
 # =========================== MAIN ===========================
@@ -7624,7 +8762,8 @@ try {
     # ---- Program lock (v44 patch 4) ----
     # Exclusive file handle at FileShare.None. Kernel-enforced, no DACL,
     # released on process exit even after a crash. Skipped under DryRun;
-    # non-contention failures log a WARN and proceed unprotected.
+    # Backup may proceed after a non-contention setup failure; Repair
+    # and Restore require the exclusive handle before dispatch.
     if (-not $Script:DryRun) {
         $lockPath = Join-Path $LogDir "WinREManager.lock"
         try {
@@ -7646,11 +8785,25 @@ try {
             Write-Log "Another WinRE Manager instance is already running (program lock file is exclusively held). Exiting without making any changes. This is not a deployment failure - the other instance is doing the work and will complete on its own. If you need to run manually, wait for the other instance to finish, or run scripts\Test-WinRE.ps1 for a read-only diagnostic that is safe to run concurrently." -Level WARN
             exit $EXIT_WARNING
         } catch {
-            Write-Log "Could not set up program lock at $lockPath : $_ - proceeding without single-instance protection; concurrent runs may collide" -Level WARN
+            Write-Log "Could not set up program lock at $lockPath : $_ - Backup may continue, but Repair and Restore require exclusive ownership" -Level WARN
             $Script:nonFatalWarning = $true
         }
     } else {
         Write-Log "[DRY RUN] Skipping program lock - DryRun is read-only and safe to run concurrently with other instances"
+    }
+
+    if (-not $Script:DryRun -and -not $Script:ProgramLockStream -and $Action -ne 'Backup') {
+        throw 'Exclusive program lock is unavailable; refusing concurrent repair or restore work.'
+    }
+
+    # Inspect durable ownership before any dispatch, checkpoint cleanup or
+    # DSI decision. Corrupt/untrusted records fail closed, never as absent.
+    $Script:PendingDeployment = Read-PendingDeployment
+    if ($Script:PendingDeployment -and $Action -ne 'Repair') {
+        Write-Log 'A pending deployment must be recovered with -Action Repair before Backup or Restore.' -Level WARN
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Pending deployment owns the recovery material'
+        exit $EXIT_WARNING
     }
 
     # ---- v49: action dispatcher ----
@@ -7813,6 +8966,11 @@ public static class WinRECancelKeyProbe {
     # between the last online run and a subsequent offline run.
     $Script:LocalInputsId = Get-LocalInputsId -Hardware $Hardware
     Write-Log "LocalInputsId: $($Script:LocalInputsId)"
+
+    if ($Script:PendingDeployment) {
+        $deploymentExit = Invoke-PendingWinREDeployment -Record $Script:PendingDeployment
+        exit $deploymentExit
+    }
 
     # ---- Driver manifest fetch (v44 patch 5) ----
     # Offline fallback: on fetch failure, trust the state file's stored
@@ -8047,6 +9205,13 @@ public static class WinRECancelKeyProbe {
 
     $WinREState = Get-WinREState
     Write-Log "WinRE status: $($WinREState.Status), Location: $($WinREState.Location), Version: $(if ($WinREState.Version) { $WinREState.Version } else { 'unknown' })"
+    if ($WinREState.Status -notin @('Enabled','Disabled')) {
+        $Script:ResumeTaskShouldPersist = $true
+        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
+        Set-RunSummaryField -Field 'Why' -Value 'WinRE status is indeterminate; refusing repair before fast-path, enable-only or servicing decisions'
+        Set-RunSummaryField -Field 'NextAction' -Value 'Resolve the reagentc status query failure and re-run.'
+        exit $EXIT_FATAL
+    }
     Write-Narration "Checking existing Windows RE configuration."
 
     $state = Read-WinREState -CurrentDesiredStateId $DesiredStateId
@@ -8086,8 +9251,31 @@ public static class WinRECancelKeyProbe {
         }
     }
 
+    # Layout repair takes precedence over attempts to re-enable OS-fallback
+    # or an undersized dedicated route. Positive, current ownership/hash
+    # evidence permits copy-only; all other cases still classify the image.
+    $earlyImage = Get-RegisteredDeploymentImage -WinREState $WinREState
+    $earlyLayout = Get-RecoveryLayoutAssessment -WinREState $WinREState -WimPath $(if ($earlyImage) { $earlyImage.Path } else { $null })
+    if (-not $earlyLayout.Suitable -and $earlyImage -and $state.DesiredStateId -eq $DesiredStateId) {
+        $acceptedForeign = ($state.ForeignSourceAcceptedHash -and $earlyImage.Hash -eq $state.ForeignSourceAcceptedHash)
+        $currentOwned = ($storedHash -and $earlyImage.Hash -eq $storedHash -and $storedDriverVersion -eq $ExpectedDriverSetVersion)
+        if ($currentOwned) {
+            $earlyMeta = Get-WimServicingMetadata -WimPath $earlyImage.Path
+            $currentOwned = ($earlyMeta -and $state.DeployedWinREMetadata -and
+                "$($earlyMeta.Version)|$($earlyMeta.SPBuild)" -eq $state.DeployedWinREMetadata)
+        }
+        if ($acceptedForeign -or $currentOwned) {
+            $deploymentExit = Start-WinREDeployment -SourceWim $earlyImage.Path `
+                -CopyOnly `
+                -Mode $(if ($acceptedForeign) { 'Preserved' } else { 'Managed' }) `
+                -ExpectedSourceHash $earlyImage.Hash -DesiredStateId $DesiredStateId `
+                -DriverVersion $storedDriverVersion -PriorState $state
+            exit $deploymentExit
+        }
+    }
+
     # ---- Pending-reboot repair ----
-    if ($state.PendingReboot -eq $true -and $state.DesiredStateId -eq $DesiredStateId) {
+    if ($earlyLayout.Suitable -and $state.PendingReboot -eq $true -and $state.DesiredStateId -eq $DesiredStateId) {
         if ($WinREState.Status -eq "Enabled") {
             Write-Log "Previous run's pending reboot completed - WinRE is now Enabled"
         } else {
@@ -8106,14 +9294,16 @@ public static class WinRECancelKeyProbe {
 
             $pendingPath = $null
             $pendingPartition = $null
-            if ($state.UsedOSFallback) {
-                $pendingPath = "$env:SystemDrive\Recovery\WindowsRE"
-            }
-            elseif ($state.DeployedDiskNumber -ne $null -and $state.DeployedPartitionNumber -ne $null) {
-                $pendingPath = "\\?\GLOBALROOT\device\harddisk$($state.DeployedDiskNumber)\partition$($state.DeployedPartitionNumber)\Recovery\WindowsRE"
+            $pendingCurrentPart = Resolve-WinRELocationToPartition -Location $WinREState.Location
+            $pendingFolder = ConvertFrom-WinRELocation -Location $WinREState.Location
+            # The dedicated-layout gate above was measured from the actual
+            # registration. Stored partition numbers and a standard-folder
+            # guess are not authority to repair a different route.
+            if ($pendingCurrentPart -and $pendingFolder) {
+                $pendingPath = "\\?\GLOBALROOT\device\harddisk$($pendingCurrentPart.DiskNumber)\partition$($pendingCurrentPart.PartitionNumber)\" + $pendingFolder.RelativePath
                 $pendingPartition = @{
-                    DiskNumber      = [int]$state.DeployedDiskNumber
-                    PartitionNumber = [int]$state.DeployedPartitionNumber
+                    DiskNumber      = [int]$pendingCurrentPart.DiskNumber
+                    PartitionNumber = [int]$pendingCurrentPart.PartitionNumber
                 }
             }
 
@@ -8170,15 +9360,14 @@ public static class WinRECancelKeyProbe {
                                      -PendingReboot $false `
                                      -DeployedDiskNumber $deployedDisk `
                                      -DeployedPartitionNumber $deployedPart `
-                                     -UsedOSFallback $state.UsedOSFallback `
+                                     -UsedOSFallback $false `
                                      -RepairAttempts 0
                     Remove-ItemIfExist $CheckpointFile
-                    Set-RunSummaryField -Field 'Result' -Value $(if ($state.UsedOSFallback) { 'WARNING' } else { 'SUCCESS' })
+                    Set-RunSummaryField -Field 'Result' -Value 'SUCCESS'
                     Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
                     Set-RunSummaryField -Field 'Why' -Value 'Pending-reboot registration repair succeeded'
-                    Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($state.UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+                    Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
                     Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
-                    if ($state.UsedOSFallback) { exit $EXIT_WARNING }
                     if ($Script:nonFatalWarning) { exit $EXIT_WARNING }
                     exit $EXIT_SUCCESS
                 }
@@ -8198,21 +9387,21 @@ public static class WinRECancelKeyProbe {
                              -PendingReboot $true `
                              -DeployedDiskNumber $deployedDisk `
                              -DeployedPartitionNumber $deployedPart `
-                             -UsedOSFallback $state.UsedOSFallback `
+                             -UsedOSFallback $false `
                              -RepairAttempts $repairAttempts
             Remove-ItemIfExist $CheckpointFile
             Write-Log "========== WinRE Manager completed - reboot still required =========="
             Set-RunSummaryField -Field 'Result' -Value 'REBOOT_REQUIRED'
             Set-RunSummaryField -Field 'Decision' -Value 'REPAIR'
             Set-RunSummaryField -Field 'Why' -Value "Pending-reboot repair attempt $repairAttempts of 3 did not confirm Enabled"
-            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($state.UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
+            Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
             Set-RunSummaryField -Field 'NextAction' -Value 'Reboot and re-run.'
             exit $EXIT_REBOOT_REQUIRED
         }
     }
 
     # ---- Enable-failure loop-breaker ----
-    if ($state.EnableFailureAttempts -ge 3 -and $state.LastEnableResult -in @("failed","bitlocker") -and $WinREState.Status -ne "Enabled") {
+    if ($earlyLayout.Suitable -and $state.EnableFailureAttempts -ge 3 -and $state.LastEnableResult -in @("failed","bitlocker") -and $WinREState.Status -ne "Enabled") {
         $loopVerb = if ($Script:DryRun) { "Would refuse to retry" } else { "Refusing to retry" }
         $loopStatePath = "$env:SystemDrive\Recovery\OEM\$StateFileName"
         Write-Log "$loopVerb reagentc /enable: it has failed on the last $($state.EnableFailureAttempts) consecutive runs and WinRE is still Disabled. Manual intervention is required." -Level ERROR
@@ -8232,28 +9421,11 @@ public static class WinRECancelKeyProbe {
     $ActiveLocationHash = $null
     $ActiveLocationWimPresent = $false
 
-    if ($WinREState.Location) {
-        $tempLocation = @(Ensure-RecoveryPartitionAccess -TargetDir $WinREState.Location)[0]
-        if ($tempLocation) {
-            # Probe both forms: the resolver returns a drive root when the
-            # registered location was a raw partition path, and returns the
-            # subpath directly when the registered location already
-            # included Recovery\WindowsRE. Only one candidate resolves to a
-            # real file on a given machine.
-            foreach ($cand in @(Join-Path $tempLocation "Recovery\WindowsRE\winre.wim"; Join-Path $tempLocation "winre.wim")) {
-                if (Test-Path -Path $cand -PathType Leaf -ErrorAction SilentlyContinue) {
-                    $candidateHash = Get-LiveWimHash -WimPath $cand
-                    if ($candidateHash) {
-                        $ActiveLocationImage = $cand
-                        $ActiveLocationHash = $candidateHash
-                        $ActiveLocationWimPresent = $true
-                        break
-                    } else {
-                        Write-Log "WinRE location candidate exists but is not readable: $cand - continuing search" -Level WARN
-                    }
-                }
-            }
-        }
+    $registeredImage = Get-RegisteredDeploymentImage -WinREState $WinREState
+    if ($registeredImage) {
+        $ActiveLocationImage = $registeredImage.Path
+        $ActiveLocationHash = $registeredImage.Hash
+        $ActiveLocationWimPresent = $true
     }
 
     $FallbackImage = $null
@@ -8368,7 +9540,7 @@ public static class WinRECancelKeyProbe {
     # v49: first branch. See comment above. Only fires when the registered
     # WIM hash matches the state-recorded foreign-accepted hash exactly.
     if ($state.ForeignSourceAcceptedHash -and $ActiveLocationHash -and $ActiveLocationHash -eq $state.ForeignSourceAcceptedHash) {
-        Write-Log "Registered WinRE hash matches a previously-accepted foreign source ($($state.ForeignSourceAcceptedHash)); the manager will not destructively normalize this foreign source. Taking the fast path."
+        Write-Log "Registered WinRE hash matches a previously-accepted foreign source ($($state.ForeignSourceAcceptedHash)); preserve its bytes and assess dedicated layout before choosing the control-flow path."
         $Script:ForeignSourceAccepted = $true
         $needInject = $false
     }
@@ -8497,156 +9669,54 @@ public static class WinRECancelKeyProbe {
         $needInject = $true
     }
 
-    $partitionDeferral = Read-PartitionDeferral -CurrentDesiredStateId $DesiredStateId
-    if ($partitionDeferral) {
-        $deferredRouteFunctional = Test-DeferredWinRERouteFunctional -WinREState $WinREState `
-                                     -ActiveLocationWimPresent $ActiveLocationWimPresent `
-                                     -ActiveOnRecovery $activeOnRecovery -ActiveOnOSFallback $activeOnOSFallback
-        $stagedCheckpoint = Get-Checkpoint -CheckpointFile $CheckpointFile -CurrentDesiredStateId $DesiredStateId
-        $stagedWimReady = $false
-        if (-not $registeredSourceChanged -and $stagedCheckpoint.Valid -and $stagedCheckpoint.WimReady -and $stagedCheckpoint.WorkDir) {
-            $stagedWorkspace = @(Get-WorkDirCandidates | Where-Object {
-                [System.StringComparer]::OrdinalIgnoreCase.Equals($_.Path.TrimEnd('\'), ([string]$stagedCheckpoint.WorkDir).TrimEnd('\'))
-            } | Select-Object -First 1)
-            $stagedWimReady = ($stagedWorkspace.Count -gt 0 -and
-                               (Test-Path -LiteralPath (Join-Path $stagedWorkspace[0].Path 'winre_optimized.wim') -PathType Leaf))
+    $layoutAssessment = Get-RecoveryLayoutAssessment -WinREState $WinREState -WimPath $ActiveLocationImage
+    if (-not $needInject -and -not $layoutAssessment.Suitable) {
+        if ($Script:ForeignSourceAccepted -or ($storedHash -and $ActiveLocationHash -eq $storedHash)) {
+            $deploymentExit = Start-WinREDeployment -SourceWim $ActiveLocationImage `
+                -CopyOnly `
+                -Mode $(if ($Script:ForeignSourceAccepted) { 'Preserved' } else { 'Managed' }) `
+                -ExpectedSourceHash $ActiveLocationHash -DesiredStateId $DesiredStateId `
+                -DriverVersion $storedDriverVersion -PriorState $state
+            exit $deploymentExit
         }
-        # The deferral marker's only job is to suppress a rebuild that the
-        # read-only geometry plan already knows will fail at the pre-shrink.
-        # Compute here whether the run would instead exit cleanly via the
-        # idempotent fast path (both stages of $needInject evaluation are
-        # reflected: stage 1 already set $needInject above; stage 2 would
-        # fire inside the fast path for count != 1 or active-location
-        # mismatches). If the fast path would fire, the marker is obsolete:
-        # clear it and fall through so the run exits EXIT_SUCCESS rather
-        # than being pinned at EXIT_WARNING.
-        $fastPathWillFire = (-not $needInject) -and
-                            ($WinREState.Status -eq "Enabled") -and
-                            (
-                                ($existingRecoveryParts.Count -eq 1 -and ($activeOnRecovery -or $activeOnOSFallback)) -or
-                                ($existingRecoveryParts.Count -eq 0 -and $state.UsedOSFallback -eq $true -and $activeOnOSFallback)
-                            )
-        if ($deferredRouteFunctional -and -not $fastPathWillFire) {
-            $since = if ($partitionDeferral.Since) { $partitionDeferral.Since } else { "unknown" }
-            $stagedNote = if ($stagedWimReady) { 'staged optimized WIM is available for immediate reuse' } else { 'no staged optimized WIM is present; the next successful run will re-service the image' }
-            Write-Log "Dedicated recovery creation was deferred for this DesiredStateId on $since. Existing WinRE route is Enabled and its registered WIM is readable; not repeating the same pre-shrink retries ($stagedNote). After resolving space/layout, delete $env:SystemDrive\Recovery\OEM\$StateFileName and $env:SystemDrive\Recovery\OEM\$PartitionDeferralFileName to retry." -Level WARN
-            $Script:UsedOSFallback = $activeOnOSFallback
-            $Script:nonFatalWarning = $true
-            # Intentionally preserve the staged workspace and checkpoint:
-            # the deferred route is still functional, the operator has not
-            # yet resolved the underlying issue, and the staged WIM stays
-            # available for the eventual successful run. The marker alone
-            # suppresses identical retries.
-            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
-            Set-RunSummaryField -Field 'Decision' -Value 'DEFERRED'
-            Set-RunSummaryField -Field 'Why' -Value "Dedicated recovery creation was deferred for this DesiredStateId on $since"
-            Set-RunSummaryField -Field 'OperatingMode' -Value 'DEDICATED'
-            Set-RunSummaryField -Field 'NextAction' -Value "Resolve the space/layout issue, then delete $env:SystemDrive\Recovery\OEM\$StateFileName and $env:SystemDrive\Recovery\OEM\$PartitionDeferralFileName to retry."
-            exit $EXIT_WARNING
-        }
-        if ($fastPathWillFire) {
-            # The machine is now in a state the fast path would accept
-            # cleanly. The marker's only purpose was to suppress a
-            # failing rebuild; with no rebuild required, it is obsolete.
-            # Clear it and fall through so the run can exit EXIT_SUCCESS
-            # rather than being pinned at EXIT_WARNING.
-            Write-Log "Partition deferral marker present for this DesiredStateId, but the machine is already in a healthy end state; clearing the marker and falling through to the fast path" -Level INFO
-            Clear-PartitionDeferral
-        } else {
-            $ignoreReason = 'the existing WinRE route is no longer proven functional'
-            Write-Log "Partition deferral marker ignored because $ignoreReason; normal repair evaluation will continue" -Level WARN
-            Clear-PartitionDeferral
-        }
+        # Recompressed/unknown ownership must be classified; layout need
+        # alone cannot authorize managed normalization or copy-only.
+        $needInject = $true
     }
 
     # ---- Idempotent fast path ----
-    # v44 patch 6: when accepting a stored OS-fallback state on the fast
-    # path, re-verify C: is still confirmed FullyDecrypted. The machine
-    # remains functional either way, but a state that has drifted is
-    # surfaced as EXIT_WARNING so an operator sees it.
-    #
-    # v48: no change. The fast path is agnostic to the intervening-anchor
-    # layout; it fires when the currently-registered route is valid and
-    # current. A machine with C: | D: | Recovery that needs no rebuild
-    # exits here cleanly. The intervening-anchor path is exercised only
-    # when a rebuild is required AND the existing recovery partition is
-    # not suitable.
-    $nothingToDo = $false
-    if (-not $needInject -and $WinREState.Status -eq "Enabled") {
-        if ($existingRecoveryParts.Count -ne 1) {
-            if ($existingRecoveryParts.Count -eq 0 -and $state.UsedOSFallback -eq $true -and $activeOnOSFallback) {
-                Write-Log "No recovery partition and state records OS-fallback for this DesiredStateId - preserving idempotent OS-fallback"
-                $Script:UsedOSFallback = $true
-                $osFbEncCheck = Test-VolumeEncrypted -MountPoint "C:"
-                if ($osFbEncCheck -ne $false) {
-                    Write-Log "OS-fallback fast path: C: is no longer confirmed fully decrypted (Test-VolumeEncrypted=$osFbEncCheck). The existing WinRE registration on C: remains functional, but the machine cannot be repaired by this script while C: is encrypted. Surfacing EXIT_WARNING." -Level WARN
-                    $Script:nonFatalWarning = $true
-                }
-                $nothingToDo = $true
-            } else {
-                if ($existingRecoveryParts.Count -gt 1) {
-                    Write-Log "Multiple ($($existingRecoveryParts.Count)) recovery partitions on boot disk - scheduling cleanup and consolidation"
-                } else {
-                    Write-Log "No recovery partition on boot disk - scheduling dedicated partition creation"
-                }
-                $needInject = $true
-            }
-        } elseif ($activeOnRecovery -and $activePart) {
-            if (-not $activePart.DriveLetter) {
-                $nothingToDo = $true
-            } else {
-                $driveLetterVerb = if ($Script:DryRun) { "Would remove" } else { "Removing" }
-                Write-Log "$driveLetterVerb temporary drive letter $($activePart.DriveLetter): (assigned for inspection)"
-                if (-not $Script:tempDriveLetters.Contains($activePart.DriveLetter)) { $Script:tempDriveLetters.Add($activePart.DriveLetter) }
-                if (-not $Script:DryRun) { Invoke-DriveLetterRemoval -Letter $activePart.DriveLetter | Out-Null }
-                $nothingToDo = $true
-            }
-        } elseif ($activeOnOSFallback) {
-            Write-Log "WinRE is enabled via OS-fallback (location: $($WinREState.Location))"
-            $Script:UsedOSFallback = $true
-            $osFbEncCheck = Test-VolumeEncrypted -MountPoint "C:"
-            if ($osFbEncCheck -ne $false) {
-                Write-Log "OS-fallback fast path: C: is no longer confirmed fully decrypted (Test-VolumeEncrypted=$osFbEncCheck). The existing WinRE registration on C: remains functional, but the machine cannot be repaired by this script while C: is encrypted. Surfacing EXIT_WARNING." -Level WARN
-                $Script:nonFatalWarning = $true
-            }
-            $nothingToDo = $true
-        }
-    }
-
+    # v50 patch 5: actual Enabled status and the existing reuse capacity
+    # rule are required for every image class. OS-fallback cannot converge
+    # here. Suitable dedicated foreign images need no partition work.
+    $nothingToDo = (-not $needInject -and $WinREState.Status -eq 'Enabled' -and $layoutAssessment.Suitable)
     if ($nothingToDo) {
         if ($Script:ForeignSourceAccepted) {
-            Write-Log "Operating mode: PRESERVED (foreign source accepted on a previous run; no normalization performed)"
-            Write-Narration "Nothing to do. The Windows recovery environment is a preserved foreign source and is functional."
-        } elseif ($Script:UsedOSFallback) {
-            Write-Log "Operating mode: OS-FALLBACK (degraded - WinRE is on the OS partition)"
-            Write-Narration "Nothing to do. The Windows recovery environment is healthy (OS-fallback mode)."
+            Write-Log "Operating mode: PRESERVED-DEDICATED (accepted foreign image; adequate dedicated layout and Enabled status observed)"
+            Write-Narration "The preserved Windows recovery image is enabled on an adequately sized dedicated partition."
         } else {
             Write-Log "Operating mode: DEDICATED (WinRE on dedicated recovery partition)"
             Write-Narration "Nothing to do. The Windows recovery environment is already healthy."
         }
         Remove-ItemIfExist $CheckpointFile
+        Clear-PartitionDeferral
 
         if ($osDisk) {
             Remove-StrayRecoveryPartitions -OSDiskNumber $osDisk.Number | Out-Null
         }
 
-        if ($state.PendingReboot -eq $true -or $state.RepairAttempts -gt 0 -or $state.EnableFailureAttempts -gt 0 -or $state.LastEnableResult -ne "ok") {
+        if ($state.UsedOSFallback -or $state.PendingReboot -eq $true -or $state.RepairAttempts -gt 0 -or $state.EnableFailureAttempts -gt 0 -or $state.LastEnableResult -ne "ok") {
             Write-Log "Clearing stale PendingReboot / RepairAttempts / enable-failure counters in state file"
             Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
                              -PendingReboot $false -UsedOSFallback $Script:UsedOSFallback `
-                             -DeployedDiskNumber $state.DeployedDiskNumber -DeployedPartitionNumber $state.DeployedPartitionNumber `
+                             -DeployedDiskNumber $activePart.DiskNumber -DeployedPartitionNumber $activePart.PartitionNumber `
                              -RepairAttempts 0
         }
 
-        $fastPathResult = if ($Script:ForeignSourceAccepted) { 'SUCCESS' }
-                          elseif ($Script:UsedOSFallback) { 'WARNING' }
-                          elseif ($Script:nonFatalWarning) { 'WARNING' }
+        $fastPathResult = if ($Script:nonFatalWarning) { 'WARNING' }
                           else { 'SUCCESS' }
-        $fastPathMode = if ($Script:ForeignSourceAccepted) { 'PRESERVED' }
-                        elseif ($Script:UsedOSFallback) { 'OS-FALLBACK' }
+        $fastPathMode = if ($Script:ForeignSourceAccepted) { 'PRESERVED-DEDICATED' }
                         else { 'DEDICATED' }
         $fastPathWhy = if ($Script:ForeignSourceAccepted) { 'Preserved foreign source matched the accepted hash' }
-                       elseif ($Script:UsedOSFallback) { 'OS-fallback route is healthy (degraded)' }
                        else { 'Recovery environment is already healthy' }
 
         Set-RunSummaryField -Field 'Result' -Value $fastPathResult
@@ -8656,7 +9726,6 @@ public static class WinRECancelKeyProbe {
         Set-RunSummaryField -Field 'NextAction' -Value 'No action required.'
         Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (fast path).'
 
-        if ($Script:UsedOSFallback) { exit $EXIT_WARNING }
         if ($Script:nonFatalWarning) { exit $EXIT_WARNING }
         exit $EXIT_SUCCESS
     }
@@ -8664,7 +9733,7 @@ public static class WinRECancelKeyProbe {
     # ============ ENABLE-ONLY PATH ============
     # Image current, WinRE disabled, reagentc registered on a recovery
     # partition. Prepare the target and enable.
-    $needEnableOnly = (-not $needInject -and $WinREState.Status -ne "Enabled" -and $activeOnRecovery)
+    $needEnableOnly = (-not $needInject -and $WinREState.Status -eq 'Disabled' -and $activeOnRecovery -and $layoutAssessment.Suitable)
     if ($needEnableOnly) {
         Write-Log "Enable-only path: image current, WinRE disabled, on recovery partition"
         Write-Narration "Enabling the existing recovery environment."
@@ -8703,8 +9772,11 @@ public static class WinRECancelKeyProbe {
             }
 
             if (-not $Script:DryRun) {
-                $permanentPath = "\\?\GLOBALROOT\device\harddisk$($targetPart.DiskNumber)\partition$($targetPart.PartitionNumber)\Recovery\WindowsRE"
-                $setImageOutput = cmd /c "reagentc /setreimage /path $permanentPath 2>&1"
+                $enableFolder = ConvertFrom-WinRELocation -Location $WinREState.Location
+                if (-not $enableFolder) { throw 'Enable-only registration folder cannot be interpreted safely.' }
+                $permanentPath = "\\?\GLOBALROOT\device\harddisk$($targetPart.DiskNumber)\partition$($targetPart.PartitionNumber)\" + $enableFolder.RelativePath
+                $pathArgument = ConvertTo-WinREPathArgument -Path $permanentPath
+                $setImageOutput = cmd /c "reagentc /setreimage /path $pathArgument 2>&1"
                 $setImageExit = $LASTEXITCODE
                 Write-Log "reagentc /setreimage: exit=$setImageExit, output=$setImageOutput"
                 if ($setImageExit -ne 0) {
@@ -9166,6 +10238,7 @@ public static class WinRECancelKeyProbe {
         Write-Narration "Mounting and customizing the recovery image."
         if ($OEMPackage -or $requiredDrivers.Count -gt 0) { if (-not (Test-Path $7Zip)) { Ensure-7Zip | Out-Null } }
         $MountDir = "$WorkDir\mount"
+        $Script:OwnsWimWork = $true
         Invoke-DismMount -ImageFile "$WorkDir\base.wim" -MountDir $MountDir -Index 1
 
         # ===== v49 source-ownership decision =====
@@ -9219,34 +10292,19 @@ public static class WinRECancelKeyProbe {
         Write-Log "Source-ownership classification: $($ownership.Class) - $($ownership.Reason)"
 
         if ($ownership.Class -eq 'Foreign-With-Drivers') {
-            Write-Log "Preserving foreign source: third-party drivers present and no positive ownership evidence. No strip, no injection, no deployment. The existing WinRE route remains intact." -Level WARN
-            try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
-            Remove-ItemIfExist $MountDir
-            Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
-            Remove-ItemIfExist "$WorkDir\base.wim"
-
-            $acceptedHash = if ($ActiveLocationHash) { $ActiveLocationHash } else { $Script:StagedWimSourceHash }
+            Write-Log 'Foreign source preserved byte-identically; assessing dedicated layout without strip, injection or export.' -Level WARN
+            Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction Stop | Out-Null
+            $acceptedHash = $Script:StagedWimSourceHash
+            if (-not $acceptedHash -or (Get-LiveWimHash -WimPath "$WorkDir\base.wim") -ne $acceptedHash) {
+                throw 'Preserved source no longer matches the source that was classified.'
+            }
             $Script:ForeignSourceAccepted = $true
             $Script:ForeignSourceAcceptedHash = $acceptedHash
             $Script:nonFatalWarning = $true
-
-            Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
-                             -PendingReboot $false `
-                             -DeployedDiskNumber $state.DeployedDiskNumber `
-                             -DeployedPartitionNumber $state.DeployedPartitionNumber `
-                             -UsedOSFallback $state.UsedOSFallback `
-                             -RepairAttempts 0 `
-                             -ForeignSourceAcceptedHash $acceptedHash
-            Remove-ItemIfExist $CheckpointFile
-
-            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
-            Set-RunSummaryField -Field 'Decision' -Value 'PRESERVED'
-            Set-RunSummaryField -Field 'Why' -Value 'Foreign WinRE source with third-party drivers preserved; no normalization performed'
-            Set-RunSummaryField -Field 'OperatingMode' -Value 'PRESERVED'
-            Set-RunSummaryField -Field 'NextAction' -Value 'No action required. The existing recovery image was preserved unmodified; WinRE registration status was not changed by this run.'
-            Add-RunSummaryLine -Field 'ChangesMade' -Line "State file records ForeignSourceAcceptedHash=$acceptedHash"
-            Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Image was preserved: no strip, no injection, no deployment.'
-            exit $EXIT_WARNING
+            $deploymentExit = Start-WinREDeployment -SourceWim "$WorkDir\base.wim" -Mode Preserved `
+                -ExpectedSourceHash $acceptedHash -DesiredStateId $DesiredStateId `
+                -DriverVersion $storedDriverVersion -PriorState $state
+            exit $deploymentExit
         }
 
         # v47: normalize the mounted image to zero third-party drivers
@@ -9481,38 +10539,20 @@ public static class WinRECancelKeyProbe {
             }
             $downgradeCheck = Test-StorageDriverWouldDowngrade -PreStripDrivers $preStripDrivers -PostInjectDrivers $postInjectDrivers
             if ($downgradeCheck.Downgrade) {
-                Write-Log "Never-downgrade invariant: candidate image would replace an existing storage driver with an older version. Preserving the source; no deployment." -Level WARN
-                foreach ($det in $downgradeCheck.Details) {
-                    Write-Log "  Downgrade: $det" -Level WARN
+                Write-Log 'Never-downgrade invariant: discarding the candidate edits and preserving the original source bytes.' -Level WARN
+                foreach ($detail in $downgradeCheck.Details) { Write-Log "  Downgrade: $detail" -Level WARN }
+                Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction Stop | Out-Null
+                $acceptedHash = $Script:StagedWimSourceHash
+                if (-not $acceptedHash -or (Get-LiveWimHash -WimPath "$WorkDir\base.wim") -ne $acceptedHash) {
+                    throw 'Never-downgrade source could not be verified after discard.'
                 }
-                try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
-                Remove-ItemIfExist $MountDir
-                Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
-                Remove-ItemIfExist "$WorkDir\base.wim"
-                Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
-
-                $acceptedHash = if ($ActiveLocationHash) { $ActiveLocationHash } else { $Script:StagedWimSourceHash }
                 $Script:ForeignSourceAccepted = $true
                 $Script:ForeignSourceAcceptedHash = $acceptedHash
                 $Script:nonFatalWarning = $true
-
-                Write-WinREState -Hash $storedHash -DriverVersion $storedDriverVersion -DesiredStateId $DesiredStateId `
-                                 -PendingReboot $false `
-                                 -DeployedDiskNumber $state.DeployedDiskNumber `
-                                 -DeployedPartitionNumber $state.DeployedPartitionNumber `
-                                 -UsedOSFallback $state.UsedOSFallback `
-                                 -RepairAttempts 0 `
-                                 -ForeignSourceAcceptedHash $acceptedHash
-                Remove-ItemIfExist $CheckpointFile
-
-                Set-RunSummaryField -Field 'Result' -Value 'WARNING'
-                Set-RunSummaryField -Field 'Decision' -Value 'PRESERVED'
-                Set-RunSummaryField -Field 'Why' -Value 'Never-downgrade invariant: candidate would replace a newer storage driver with an older one'
-                Set-RunSummaryField -Field 'OperatingMode' -Value 'PRESERVED'
-                Set-RunSummaryField -Field 'NextAction' -Value 'No action required. WinRE is functional; the manager will not perform the downgrade.'
-                Add-RunSummaryLine -Field 'ChangesMade' -Line "State file records ForeignSourceAcceptedHash=$acceptedHash"
-                Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'Image was preserved; no deployment performed.'
-                exit $EXIT_WARNING
+                $deploymentExit = Start-WinREDeployment -SourceWim "$WorkDir\base.wim" -Mode Preserved `
+                    -ExpectedSourceHash $acceptedHash -DesiredStateId $DesiredStateId `
+                    -DriverVersion $storedDriverVersion -PriorState $state
+                exit $deploymentExit
             }
         }
 
@@ -9649,522 +10689,22 @@ public static class WinRECancelKeyProbe {
     }
 
     $SourceWim = if ($needInject) { $OptimizedWim } else { $imageToCheck }
-    $finalSizeMB = Get-FileSizeMB -Path $SourceWim
-    if ($finalSizeMB -le 0) { Write-Log "Could not determine WIM size" -Level FATAL; Set-RunSummaryField -Field 'Result' -Value 'FATAL'; Set-RunSummaryField -Field 'Why' -Value 'Could not determine WIM size'; exit $EXIT_FATAL }
-    Write-Log "Source WIM: $SourceWim ($finalSizeMB MiB)"
-
-    # v48 patch 2: cache source-derived values before any operation that
-    # could make $SourceWim inaccessible. On the enable-only path's
-    # /setreimage failure -> full-update fallthrough (with
-    # $needInject = $false), $SourceWim points at the registered WIM on
-    # a recovery partition accessed via a temporary drive letter. That
-    # letter is removed later (before reagentc /enable), after which
-    # the path becomes unreadable. Caching the hash, build, and
-    # servicing metadata here keeps the state-write correct regardless
-    # of when the letter is removed. Without this cache, $finalHash
-    # would be $null on that path and the state file would not be
-    # written, forcing the next run to repeat the full-update pass.
-    $cachedSourceHash = Get-LiveWimHash $SourceWim
-    $cachedSourceBuild = Get-WimBuild -WimPath $SourceWim
-    $cachedSourceMetadata = Get-WimServicingMetadata -WimPath $SourceWim
-
-    $recoveryPartition = Find-SuitableRecoveryPartition -RequiredWimSizeMB $finalSizeMB
-
-    if (-not $recoveryPartition) {
-        Write-Log "No suitable existing recovery partition - attempting to create one"
-        $created = Ensure-AdequateRecoveryPartition -RequiredWimSizeMB $finalSizeMB -ProtectedSourcePath $SourceWim
-        if ($created -and $created.Status -eq "Deferred") {
-            Write-Log "Dedicated replacement deferred before partition deletion ($($created.Reason)). The existing WinRE route was preserved; not attempting OS-fallback." -Level WARN
-            if ($created.RetrySuppressible) {
-                Write-PartitionDeferral -DesiredStateId $DesiredStateId
-                Write-Log "Recorded retry-suppressing deferral for DesiredStateId $DesiredStateId; next run will verify the existing route before skipping identical retries. Delete $env:SystemDrive\Recovery\OEM\$StateFileName and $env:SystemDrive\Recovery\OEM\$PartitionDeferralFileName to force a retry."
-            }
-            $Script:nonFatalWarning = $true
-            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
-            Set-RunSummaryField -Field 'Decision' -Value 'DEFERRED'
-            Set-RunSummaryField -Field 'Why' -Value "Dedicated replacement deferred: $($created.Reason)"
-            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($Script:UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
-            Set-RunSummaryField -Field 'NextAction' -Value 'Resolve the deferral reason and re-run.'
-            exit $EXIT_WARNING
-        } elseif ($created -and $created.Status -eq "Created") {
-            $recoveryPartition = @{ DriveLetter = $created.DriveLetter; DiskNumber = $created.DiskNumber; PartitionNumber = $created.PartitionNumber; Partition = $null }
-            Clear-PartitionDeferral
-        } else {
-            Write-Log "================================================================================" -Level WARN
-            Write-Log "Dedicated recovery partition creation failed after all attempts." -Level WARN
-            Write-Log "Falling back to C:\Recovery\WindowsRE (OS-partition recovery location)." -Level WARN
-            Write-Log "This is NOT equivalent to a dedicated recovery partition." -Level WARN
-            Write-Log "WinRE will function but with reduced resilience. Exit code will be 2." -Level WARN
-            Write-Log "================================================================================" -Level WARN
-            $Script:UsedOSFallback = $true
-            $Script:nonFatalWarning = $true
-            $recoveryPartition = $null
-        }
+    if (-not $Script:ImageInjectionComplete) {
+        Write-Log 'Deployment deferred: requested image servicing did not complete; the previous route remains untouched.' -Level WARN
+        Set-RunSummaryField -Field 'Result' -Value 'WARNING'
+        Set-RunSummaryField -Field 'Why' -Value 'Image servicing incomplete; no deployment attempted'
+        exit $EXIT_WARNING
     }
+    $deploymentHash = Get-LiveWimHash -WimPath $SourceWim
+    if (-not $deploymentHash) { throw 'Prepared deployment WIM is unreadable.' }
+    $deploymentMode = if ($Script:ForeignSourceAccepted) { 'Preserved' } else { 'Managed' }
+    $deploymentDriverVersion = if ($deploymentMode -eq 'Preserved') { $storedDriverVersion } else { $ExpectedDriverSetVersion }
+    $deploymentExit = Start-WinREDeployment -SourceWim $SourceWim -Mode $deploymentMode `
+        -CopyOnly:(-not $needInject) `
+        -ExpectedSourceHash $deploymentHash -DesiredStateId $DesiredStateId `
+        -DriverVersion $deploymentDriverVersion -PriorState $state
+    exit $deploymentExit
 
-    if ($recoveryPartition) {
-        Write-Log "Target recovery partition: disk $($recoveryPartition.DiskNumber) part $($recoveryPartition.PartitionNumber) (letter $($recoveryPartition.DriveLetter):)"
-        $TargetDir = "$($recoveryPartition.DriveLetter):\Recovery\WindowsRE"
-        $permanentPath = "\\?\GLOBALROOT\device\harddisk$($recoveryPartition.DiskNumber)\partition$($recoveryPartition.PartitionNumber)\Recovery\WindowsRE"
-    } else {
-        Write-Log "Target (OS-fallback): C:\Recovery\WindowsRE"
-        $TargetDir = "$env:SystemDrive\Recovery\WindowsRE"
-        $permanentPath = $TargetDir
-    }
-    $FinalWim = Join-Path $TargetDir "winre.wim"
-
-    Write-Log "Step 5: Deploying WIM to $TargetDir"
-    Write-Narration "Deploying the recovery image."
-    if ($Script:DryRun) {
-        Write-Log "[DRY RUN] Would deploy $SourceWim to $TargetDir and enable WinRE"
-        Remove-ItemIfExist $CheckpointFile
-        Set-RunSummaryField -Field 'Result' -Value 'DRY_RUN'
-        Set-RunSummaryField -Field 'Why' -Value 'DryRun requested; deployment was previewed without any mutation'
-        Set-RunSummaryField -Field 'OperatingMode' -Value 'N/A'
-        Set-RunSummaryField -Field 'NextAction' -Value 'Re-run without -DryRun to execute the deployment.'
-        Add-RunSummaryLine -Field 'ChangesNotMade' -Line 'No changes were made (DryRun).'
-        exit $EXIT_SUCCESS
-    }
-
-    # Dedicated: prepare the target recovery partition (reagentc's
-    # BitLocker check is on the target). OS-fallback: gate on C: being
-    # confirmed FullyDecrypted, because there the target IS the OS
-    # volume. Never modify C:'s BitLocker state.
-    if ($recoveryPartition) {
-        if (-not (Set-RecoveryPartitionReadyForWinRE -DiskNumber $recoveryPartition.DiskNumber -PartitionNumber $recoveryPartition.PartitionNumber)) {
-            Write-Log "FATAL: Could not make target recovery partition unencrypted" -Level ERROR
-            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-            Set-RunSummaryField -Field 'Why' -Value 'Could not make target recovery partition unencrypted'
-            exit $EXIT_FATAL
-        }
-    } else {
-        # v44 patch 6: corrected OS-fallback remediation wording.
-        # Actions that complete encryption, add a protector, or enable
-        # protection do NOT satisfy the FullyDecrypted requirement.
-        $osFallbackEnc = Test-VolumeEncrypted -MountPoint "C:"
-        if ($osFallbackEnc -ne $false) {
-            Write-Log "OS-fallback deferred: C: could not be confirmed fully decrypted (Test-VolumeEncrypted=$osFallbackEnc). reagentc refuses to enable WinRE on an encrypted OS volume. The OS-fallback route requires C: to be FullyDecrypted. Actions that complete encryption, add a recovery-password protector, or enable protection do NOT satisfy this requirement. To resolve: complete decryption of C: (e.g. manage-bde -off C:) or wait for an in-progress decryption to finish, then re-run. The dedicated recovery-partition path has its own separate BitLocker policy and is not gated on C:. The script will not modify C:'s BitLocker state." -Level WARN
-            $Script:nonFatalWarning = $true
-            Remove-ItemIfExist $CheckpointFile
-            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
-            Set-RunSummaryField -Field 'Why' -Value 'OS-fallback requires C: FullyDecrypted'
-            Set-RunSummaryField -Field 'OperatingMode' -Value 'OS-FALLBACK'
-            Set-RunSummaryField -Field 'NextAction' -Value 'Complete decryption of C: and re-run.'
-            $Script:ResumeTaskShouldPersist = $true
-            exit $EXIT_WARNING
-        }
-    }
-
-    $CurrentWinREState = Get-WinREState
-    if ($CurrentWinREState.Status -ne "Enabled" -and $CurrentWinREState.Status -ne "Disabled") {
-        Write-Log "WinRE status could not be determined at Step 5 ('$($CurrentWinREState.Status)') - refusing to deploy without positive confirmation of the current WinRE state" -Level ERROR
-        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-        Set-RunSummaryField -Field 'Why' -Value "WinRE status could not be determined at Step 5 ($($CurrentWinREState.Status))"
-        $Script:ResumeTaskShouldPersist = $true
-        exit $EXIT_FATAL
-    }
-    if ($CurrentWinREState.Status -eq "Enabled") {
-        # v47: race-detector recheck immediately before the first
-        # possible /disable of this execution. This site is reached
-        # with the old WinRE route intact and no partition changes
-        # made by Ensure-AdequateRecoveryPartition (if that function
-        # ran and disabled WinRE, this branch does not execute). A
-        # drift-abort here is a clean defer without rollback.
-        if (-not (Assert-RegisteredWinREUnchanged -Captured $Script:RegisteredSourceFingerprint -CalledFrom 'Step 5 deployment')) {
-            Write-Log "Registered WinRE source changed during candidate preparation - aborting before /disable. The old WinRE route remains intact; no partition changes have been made at this site." -Level WARN
-            # Invalidate staged work: the checkpoint and its WIM are tied to
-            # a source that is now known to have drifted.
-            Set-Checkpoint -CheckpointFile $CheckpointFile -Step 2 -DesiredStateId $DesiredStateId
-            Remove-ItemIfExist "$WorkDir\winre_optimized.wim"
-            Remove-ItemIfExist "$WorkDir\base.wim"
-            $Script:nonFatalWarning = $true
-            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
-            Set-RunSummaryField -Field 'Why' -Value 'Registered WinRE source changed during candidate preparation'
-            exit $EXIT_WARNING
-        }
-        Write-Log "Disabling WinRE before deployment"
-        $disOut = cmd /c "reagentc /disable 2>&1"
-        $disExit = $LASTEXITCODE
-        Write-Log "reagentc /disable: exit=$disExit, output=$disOut"
-        if ($disExit -ne 0) {
-            Write-Log "reagentc /disable failed (exit $disExit): $disOut" -Level ERROR
-            Write-Log "FATAL: cannot deploy a new WinRE image while WinRE is still Enabled - aborting" -Level ERROR
-            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-            Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable failed'
-            exit $EXIT_FATAL
-        }
-        Start-Sleep 3
-        $verifyDisabled = Get-WinREState
-        if ($verifyDisabled.Status -ne "Disabled") {
-            Write-Log "WinRE still reports $($verifyDisabled.Status) after reagentc /disable - aborting" -Level ERROR
-            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-            Set-RunSummaryField -Field 'Why' -Value 'reagentc /disable verification failed'
-            exit $EXIT_FATAL
-        }
-    }
-
-    $deployOk = $false
-    if ($recoveryPartition) {
-        $deployOk = Deploy-WimToPartition -Partition $recoveryPartition -SourceWim $SourceWim
-    } else {
-        # v48: transactional WIM replacement. The v47 remove-then-copy
-        # is replaced by Deploy-WimTransactional, which preserves the
-        # existing WIM as a rollback copy, stages the new WIM, verifies
-        # it in place, and restores the old WIM on any failure before
-        # the machine is left with no usable WIM on the OS-fallback
-        # route. Self-copy guard remains: when the source IS the
-        # fallback target, there is nothing to copy.
-        $srcFull = $null; try { $srcFull = [System.IO.Path]::GetFullPath($SourceWim) } catch { }
-        $dstFull = $null; try { $dstFull = [System.IO.Path]::GetFullPath($FinalWim) } catch { }
-        if ($srcFull -and $dstFull -and $srcFull -eq $dstFull) {
-            Write-Log "OS-fallback: source and target are the same file - nothing to copy"
-            $deployOk = $true
-        } else {
-            New-DirectoryIfNotExists $TargetDir
-            $deployOk = Deploy-WimTransactional -SourceWim $SourceWim -TargetPath $FinalWim -TargetDescription "OS-fallback target"
-        }
-    }
-
-    if (-not $deployOk) {
-        Write-Log "FATAL: WIM deployment failed" -Level ERROR
-        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-        Set-RunSummaryField -Field 'Why' -Value 'WIM deployment failed'
-        $Script:ResumeTaskShouldPersist = $true
-        exit $EXIT_FATAL
-    }
-
-    $setImageOutput = cmd /c "reagentc /setreimage /path $permanentPath 2>&1"
-    $setImageExit = $LASTEXITCODE
-    Write-Log "reagentc /setreimage: exit=$setImageExit, output=$setImageOutput -> $permanentPath"
-    if ($setImageExit -ne 0) {
-        Write-Log "FATAL: reagentc /setreimage failed: $setImageOutput" -Level ERROR
-        Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-        Set-RunSummaryField -Field 'Why' -Value 'reagentc /setreimage failed'
-        $Script:ResumeTaskShouldPersist = $true
-        exit $EXIT_FATAL
-    }
-
-    if ($recoveryPartition -and $recoveryPartition.DriveLetter) {
-        $letterToRemove = $recoveryPartition.DriveLetter
-        $removed = Invoke-DriveLetterRemoval -Letter $letterToRemove
-        if ($removed) { Write-Log "Removed drive letter ${letterToRemove}: before enable" }
-        else { Write-Log "Could not remove drive letter ${letterToRemove}: - enable may still work" -Level WARN }
-    }
-
-    $enableResult = if ($recoveryPartition) {
-        Invoke-ReagentcEnable -AllowTempLetter -Partition $recoveryPartition -ReRegisterPath $permanentPath
-    } else {
-        Invoke-ReagentcEnable -ReRegisterPath $permanentPath
-    }
-
-    if ($enableResult -eq "reboot") {
-        $Script:rebootRequired = $true
-    } elseif ($enableResult -eq "failed") {
-        $Script:nonFatalWarning = $true
-    } elseif ($enableResult -eq "bitlocker") {
-        Write-Log "reagentc /enable refused with the BitLocker error after the target partition was confirmed unencrypted. Recording the failure so the loop-breaker can fire if this repeats." -Level ERROR
-        $Script:nonFatalWarning = $true
-    }
-
-    if ($recoveryPartition) {
-        $osDisk = Get-OSDisk
-        $style = if ($osDisk) { $osDisk.PartitionStyle } else { 'GPT' }
-        $attrsOk = Set-RecoveryPartitionAttributes -DiskNumber $recoveryPartition.DiskNumber -PartitionNumber $recoveryPartition.PartitionNumber -Style $style
-        if (-not $attrsOk) {
-            Write-Log "Recovery partition attributes could not be fully applied. WinRE is functional, but the partition may not be correctly marked as a recovery partition." -Level WARN
-            $Script:nonFatalWarning = $true
-        }
-    }
-
-    # v48: the transactional replacement has committed once /setreimage
-    # has succeeded and /enable has been attempted against the new WIM.
-    # The rollback copy is released here regardless of /enable's return
-    # value: the new WIM is in place and reagentc is pointing at it, so
-    # restoring the old bytes would not change the outcome of an enable
-    # failure. Left in place on any earlier exit path (fatal, warning,
-    # or crash); the workspace cleanup on the next run removes it.
-    if ($Script:RollbackWimPath) {
-        if (Test-Path -LiteralPath $Script:RollbackWimPath -PathType Leaf) {
-            Remove-ItemIfExist $Script:RollbackWimPath
-        }
-        $Script:RollbackWimPath = $null
-    }
-
-    # Update the OS-fallback WIM at C:\Recovery\WindowsRE\winre.wim.
-    # In v47 this file serves two roles: the OS-fallback deployment target
-    # when WinRE runs from the OS partition, and the last-known-good (LKG)
-    # source that Get-LKGWinREImagePath validates against
-    # state.CurrentImageHash. Both roles require it to hold the current
-    # image. Skip when the deployment source is already this file: the
-    # block would delete the source and then copy it to itself, destroying
-    # the only copy.
-    $fallbackTarget = "$env:SystemDrive\Recovery\WindowsRE\winre.wim"
-    $srcFullFb = $null; try { $srcFullFb = [System.IO.Path]::GetFullPath($SourceWim) } catch { }
-    $dstFullFb = $null; try { $dstFullFb = [System.IO.Path]::GetFullPath($fallbackTarget) } catch { }
-    $sourceIsFallback = ($srcFullFb -and $dstFullFb -and $srcFullFb -eq $dstFullFb)
-    if ($FinalWim -ne $fallbackTarget -and -not $sourceIsFallback) {
-        New-DirectoryIfNotExists (Split-Path $fallbackTarget -Parent)
-        $copyOk = $false
-        try {
-            if (Test-Path $fallbackTarget) {
-                try { & attrib $fallbackTarget -h -s -r 2>&1 | Out-Null } catch { }
-                try { Remove-Item $fallbackTarget -Force -ErrorAction Stop } catch { }
-            }
-            Copy-Item $SourceWim -Destination $fallbackTarget -Force -ErrorAction Stop
-            Write-Log "Updated fallback WinRE image at $fallbackTarget"
-            $copyOk = $true
-        } catch {
-            Write-Log "Fallback copy attempt 1 failed: $_" -Level WARN
-        }
-        if (-not $copyOk) {
-            try {
-                if (Test-Path $fallbackTarget) {
-                    $backup = "$fallbackTarget.old"
-                    if (Test-Path $backup) { Remove-Item $backup -Force -ErrorAction SilentlyContinue }
-                    Rename-Item $fallbackTarget $backup -Force -ErrorAction Stop
-                }
-                Copy-Item $SourceWim -Destination $fallbackTarget -Force -ErrorAction Stop
-                Write-Log "Updated fallback WinRE image at $fallbackTarget (via rename)"
-                if (Test-Path $backup) {
-                    Remove-Item $backup -Force -ErrorAction SilentlyContinue
-                    Write-Log "Removed backup file $backup"
-                }
-                $copyOk = $true
-            } catch { }
-        }
-        if (-not $copyOk) {
-            Write-Log "Fallback copy to $fallbackTarget denied (likely ACL). Non-fatal." -Level WARN
-            # v48 patch 1: mark the failed fallback copy as a
-            # non-fatal warning so the run exits EXIT_WARNING instead of
-            # EXIT_SUCCESS. Without this, a dedicated deployment can
-            # succeed, the LKG copy can fail, and the run still reports
-            # success - inconsistent with the exit-code discipline and
-            # hiding a degraded LKG from the operator.
-            $Script:nonFatalWarning = $true
-        }
-    }
-
-    # ---- State write ----
-    # v48 patch 2: use cached source-derived values captured before any
-    # drive-letter removal. See the cache-site comment for the reachable
-    # path that motivated this.
-    $finalHash = $cachedSourceHash
-    # v46 patch 2: log the build of the WIM that was actually deployed.
-    # Compare against the pre-touch "WinRE ... Version:" startup line to
-    # see whether this run replaced a newer registered build with an
-    # older one. Informational only.
-    $deployedWimBuild = $cachedSourceBuild
-    Write-Log "Post-deploy WIM build: $(if ($deployedWimBuild) { $deployedWimBuild } else { 'unknown' }) (source: $SourceWim)"
-    # v47: log the final deployed WIM's SHA256. This is the value that
-    # will be written to the state file as CurrentImageHash and will be
-    # compared against the next run's registered hash for byte-drift
-    # evidence. Logged for evidence only; no gate reads it.
-    if ($finalHash) {
-        Write-Log "Final deployed WinRE SHA256: $finalHash"
-    }
-    # v47: capture the metadata of the WIM just deployed so the next run's
-    # drift detection has an anchor. If the metadata cannot be read, store
-    # $null; the next run will then treat the state as missing metadata
-    # and force a rebuild.
-    $deployedMetaNow = $cachedSourceMetadata
-    if ($deployedMetaNow) {
-        $Script:DeployedWinREMetadata = "$($deployedMetaNow.Version)|$($deployedMetaNow.SPBuild)"
-        Write-Log "Deployed WinRE metadata: $($Script:DeployedWinREMetadata)"
-    } else {
-        $Script:DeployedWinREMetadata = $null
-        Write-Log "Deployed WinRE metadata could not be read from $SourceWim; next run will treat this as missing metadata and rebuild" -Level WARN
-    }
-    if ($Script:ImageInjectionComplete -and $finalHash) {
-        $deployedDisk = if ($recoveryPartition) { $recoveryPartition.DiskNumber } else { -1 }
-        $deployedPart = if ($recoveryPartition) { $recoveryPartition.PartitionNumber } else { -1 }
-        # Counter increments on terminal enable failures only.
-        $newEnableAttempts = if ($enableResult -in @("failed","bitlocker")) { [int]$state.EnableFailureAttempts + 1 } else { 0 }
-        Write-WinREState -Hash $finalHash -DriverVersion $ExpectedDriverSetVersion -DesiredStateId $DesiredStateId `
-                         -PendingReboot $Script:rebootRequired `
-                         -DeployedDiskNumber $deployedDisk `
-                         -DeployedPartitionNumber $deployedPart `
-                         -UsedOSFallback $Script:UsedOSFallback `
-                         -RepairAttempts 0 `
-                         -LastEnableResult $enableResult `
-                         -EnableFailureAttempts $newEnableAttempts
-    } else {
-        if (-not $Script:ImageInjectionComplete) {
-            Write-Log "State file NOT updated - requested driver injection did not complete successfully" -Level WARN
-        }
-        if (-not $finalHash) {
-            Write-Log "State file NOT updated - could not compute final WIM hash" -Level WARN
-        }
-        $Script:nonFatalWarning = $true
-    }
-    if ($Script:ImageInjectionComplete) {
-        Set-Checkpoint -CheckpointFile $CheckpointFile -Step 6 -DesiredStateId $DesiredStateId
-    } else {
-        Write-Log "Checkpoint NOT advanced to step 6 - image injection did not complete; next run will retry step 3" -Level WARN
-    }
-
-    Write-Log "Step 6: Cleanup"
-    Remove-ItemIfExist $WorkDir -Recurse; Remove-ItemIfExist $CheckpointFile
-    Remove-EmptyWorkspaceParent -WorkspacePath $WorkDir
-
-    # Step 7: enforce "no type-coded recovery partition on any non-OS disk".
-    Write-Log "Step 7: Removing stray recovery partitions on non-OS disks"
-    $osDisk = Get-OSDisk
-    if (-not $osDisk) {
-        Write-Log "Step 7 skipped: could not determine OS disk" -Level WARN
-        $Script:nonFatalWarning = $true
-    } else {
-        Remove-StrayRecoveryPartitions -OSDiskNumber $osDisk.Number | Out-Null
-    }
-
-    # ---- Final verification ----
-    $finalState = Get-WinREState
-
-    if ($finalState.Status -eq "Enabled" -and $Script:rebootRequired) {
-        Write-Log "WinRE reports Enabled - clearing rebootRequired flag"
-        $Script:rebootRequired = $false
-    }
-
-    if ($finalState.Status -eq "Enabled") {
-        if ($finalState.Location) {
-            $finalPart = $null
-            for ($vfAttempt = 1; $vfAttempt -le 3 -and -not $finalPart; $vfAttempt++) {
-                if ($vfAttempt -gt 1) {
-                    Start-Sleep -Seconds 1
-                    $finalState = Get-WinREState
-                }
-                if ($finalState.Location) {
-                    $finalPart = Resolve-WinRELocationToPartition -Location $finalState.Location
-                }
-            }
-            if (-not $finalPart) {
-                Write-Log "FATAL: WinRE location could not be resolved after 3 verification attempts: $($finalState.Location)" -Level ERROR
-                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-                Set-RunSummaryField -Field 'Why' -Value 'WinRE location could not be resolved after deployment'
-                $Script:ResumeTaskShouldPersist = $true
-                exit $EXIT_FATAL
-            }
-
-            $finalOSPartCheck = Get-OSPartition
-            $isFinalOSPart = ($finalOSPartCheck -and
-                              $finalPart.DiskNumber -eq $finalOSPartCheck.DiskNumber -and
-                              $finalPart.PartitionNumber -eq $finalOSPartCheck.PartitionNumber)
-
-            $isRec = ($finalPart.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') -or
-                     ($finalPart.MbrType -eq 0x27)
-
-            if ($isFinalOSPart) {
-                if ($Script:UsedOSFallback) {
-                    Write-Log "Operating mode: OS-FALLBACK (WinRE on OS partition at $($finalState.Location)) - degraded but functional" -Level WARN
-                    $Script:UsedOSFallback = $true
-                } else {
-                    Write-Log "FATAL: WinRE is on the OS partition but the script did not deploy it via OS-fallback" -Level ERROR
-                    Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-                    Set-RunSummaryField -Field 'Why' -Value 'WinRE ended up on the OS partition without an OS-fallback deployment'
-                    $Script:ResumeTaskShouldPersist = $true
-                    exit $EXIT_FATAL
-                }
-            }
-            elseif ($isRec -and $finalOSPartCheck -and
-                    $finalPart.DiskNumber -eq $finalOSPartCheck.DiskNumber) {
-                if ($finalPart.DriveLetter) {
-                    Write-Log "Removing temporary drive letter $($finalPart.DriveLetter): (assigned for verification)" -Level WARN
-                    if (-not $Script:tempDriveLetters.Contains($finalPart.DriveLetter)) { $Script:tempDriveLetters.Add($finalPart.DriveLetter) }
-                    Invoke-DriveLetterRemoval -Letter $finalPart.DriveLetter | Out-Null
-                }
-                Write-Log "Operating mode: DEDICATED"
-                $Script:UsedOSFallback = $false
-            }
-            else {
-                Write-Log "FATAL: WinRE is on an unexpected partition (disk $($finalPart.DiskNumber) part $($finalPart.PartitionNumber))" -Level ERROR
-                Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-                Set-RunSummaryField -Field 'Why' -Value 'WinRE is on an unexpected partition after deployment'
-                $Script:ResumeTaskShouldPersist = $true
-                exit $EXIT_FATAL
-            }
-        }
-        elseif ($Script:UsedOSFallback) {
-            Write-Log "Operating mode: OS-FALLBACK (WinRE at $($finalState.Location)) - degraded but functional" -Level WARN
-            $Script:UsedOSFallback = $true
-        }
-        else {
-            Write-Log "FATAL: WinRE Enabled but location is empty" -Level ERROR
-            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-            Set-RunSummaryField -Field 'Why' -Value 'WinRE Enabled but location is empty'
-            $Script:ResumeTaskShouldPersist = $true
-            exit $EXIT_FATAL
-        }
-    }
-    elseif ($Script:rebootRequired) {
-        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WinRE"
-        $winreLocation = (Get-ItemProperty -Path $regPath -Name "WinRELocation" -ErrorAction SilentlyContinue).WinRELocation
-        Write-Log "WinRE reports $($finalState.Status) but enable succeeded - reboot will complete setup. Registered location: $winreLocation" -Level WARN
-    }
-    else {
-        if ($enableResult -eq "bitlocker") {
-            Write-Log "WinRE is not enabled at exit. Last enable attempt returned: bitlocker. The state file records the failure for the loop-breaker." -Level WARN
-            Set-RunSummaryField -Field 'Result' -Value 'WARNING'
-            Set-RunSummaryField -Field 'Decision' -Value 'FULL UPDATE'
-            Set-RunSummaryField -Field 'Why' -Value 'reagentc /enable refused with BitLocker error'
-            Set-RunSummaryField -Field 'OperatingMode' -Value $(if ($Script:UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' })
-            Set-RunSummaryField -Field 'NextAction' -Value 'The next scheduled run will retry; the loop-breaker fires after 3 failures.'
-            $Script:ResumeTaskShouldPersist = $true
-            exit $EXIT_WARNING
-        }
-        Write-Log "WinRE not enabled - final attempt" -Level WARN
-        $finalResult = Invoke-ReagentcEnable -ReRegisterPath $permanentPath
-        if ($finalResult -eq "ok") {
-            Write-Log "Final enable attempt succeeded"
-        } elseif ($finalResult -eq "reboot") {
-            $Script:rebootRequired = $true
-            if ($Script:ImageInjectionComplete -and $finalHash) {
-                $deployedDisk = if ($recoveryPartition) { $recoveryPartition.DiskNumber } else { -1 }
-                $deployedPart = if ($recoveryPartition) { $recoveryPartition.PartitionNumber } else { -1 }
-                Write-WinREState -Hash $finalHash -DriverVersion $ExpectedDriverSetVersion -DesiredStateId $DesiredStateId `
-                                 -PendingReboot $true `
-                                 -DeployedDiskNumber $deployedDisk `
-                                 -DeployedPartitionNumber $deployedPart `
-                                 -UsedOSFallback $Script:UsedOSFallback `
-                                 -RepairAttempts 0
-            }
-        }
-        else {
-            Write-Log "FATAL: WinRE is not enabled at exit" -Level ERROR
-            Set-RunSummaryField -Field 'Result' -Value 'FATAL'
-            Set-RunSummaryField -Field 'Why' -Value 'WinRE is not enabled at exit'
-            $Script:ResumeTaskShouldPersist = $true
-            exit $EXIT_FATAL
-        }
-    }
-
-    # ---- Terminal summary fields ----
-    $finalMode = if ($Script:UsedOSFallback) { 'OS-FALLBACK' } else { 'DEDICATED' }
-    $finalResult = if ($Script:rebootRequired) { 'REBOOT_REQUIRED' }
-                   elseif ($Script:UsedOSFallback) { 'WARNING' }
-                   elseif ($Script:nonFatalWarning) { 'WARNING' }
-                   else { 'SUCCESS' }
-    $finalNext = if ($Script:rebootRequired) { 'Reboot the machine to complete WinRE enable.' }
-                 elseif ($Script:UsedOSFallback) { 'Review warnings above; OS-fallback mode is functional but degraded.' }
-                 elseif ($Script:nonFatalWarning) { 'Review warnings above.' }
-                 else { 'No action required.' }
-
-    Set-RunSummaryField -Field 'Result' -Value $finalResult
-    Set-RunSummaryField -Field 'Decision' -Value 'FULL UPDATE'
-    Set-RunSummaryField -Field 'OperatingMode' -Value $finalMode
-    Set-RunSummaryField -Field 'NextAction' -Value $finalNext
-    if (-not $Script:RunSummary.Why) {
-        Set-RunSummaryField -Field 'Why' -Value 'Full update completed'
-    }
-    Add-RunSummaryLine -Field 'ChangesMade' -Line "Deployed WinRE image to $FinalWim"
-    if ($recoveryPartition) {
-        Add-RunSummaryLine -Field 'ChangesMade' -Line "Target: disk $($recoveryPartition.DiskNumber) part $($recoveryPartition.PartitionNumber) (DEDICATED)"
-    } else {
-        Add-RunSummaryLine -Field 'ChangesMade' -Line "Target: OS-fallback at $TargetDir"
-    }
-
-    if ($Script:rebootRequired) { exit $EXIT_REBOOT_REQUIRED }
-    elseif ($Script:UsedOSFallback) { exit $EXIT_WARNING }
-    elseif ($Script:nonFatalWarning) { exit $EXIT_WARNING }
-    else { exit $EXIT_SUCCESS }
 }
 catch {
     Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
@@ -10179,11 +10719,7 @@ catch {
     exit $EXIT_FATAL
 }
 finally {
-    try {
-        Get-WindowsImage -Mounted -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -and $_.Path -like "$WorkDir\*" } |
-            ForEach-Object { try { Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue } catch { } }
-    } catch { }
+    Dismount-OwnedWinREImages -Workspace $WorkDir
 
     if ($Script:TempEnvironmentChanged) {
         $env:TEMP = $Script:OriginalTempPath
